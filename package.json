@@ -1,0 +1,23 @@
+{
+  "name": "pa",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless personal companion built with TypeScript and Pi",
+  "type": "module",
+  "engines": { "node": ">=24.15.0" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "start": "node --env-file-if-exists=.env dist/cli.js",
+    "dev": "npm run build && npm start",
+    "check:config": "node --env-file-if-exists=.env dist/cli.js check"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}
