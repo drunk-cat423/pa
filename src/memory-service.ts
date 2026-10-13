@@ -2,6 +2,9 @@ import { MemoryError, type MemoryRecord, type ProfileField, type MemoryInput } f
 import type { RecordedConversation } from './conversation.js';
 
 export type MemoryRequest =
+  | { type: 'ai_self_update'; content: string }
+  | { type: 'ai_self_clarify' }
+  | { type: 'ai_self_refusal' }
   | { type: 'self_update'; field: ProfileField; content: string }
   | { type: 'admin'; text: string }
   | { type: 'unsupported_delete' }
@@ -14,12 +17,47 @@ const FIELD_NAMES: Record<ProfileField, string> = {
 };
 const CLARIFY = '请明确要更新自己的哪项信息：称呼、饮食偏好、兴趣或回复偏好。涉及他人或当前会话的管理操作仅管理者可用。';
 const DENIED = '你没有记忆管理或画像查询权限；可以明确请求更新自己在当前会话提供的信息。';
+const AI_SELF_ACK = '已记入我的待整理画像，下次对话会参考，后续整理时合并。';
+const AI_SELF_CLARIFY = '请用“/self 内容”明确提供要记入我的长期风格或画像的信息。';
+const AI_SELF_REFUSAL = '我不能更改权限、工具配置或预算；这些设置需通过本地配置调整。';
 function fieldFor(text: string): ProfileField | undefined {
   if (/饮食|口味|吃|微辣|清淡|素食|辣椒|食物|过敏/.test(text)) return 'diet';
   if (/称呼|昵称|名字|叫我|^我叫/.test(text)) return 'preferred_name';
   if (/回复|回答|交流方式|交流偏好/.test(text)) return 'reply_style';
   if (/兴趣|爱好|^我(?:喜欢|不喜欢|热爱)/.test(text)) return 'interests';
   return undefined;
+}
+
+const AI_CONFIG_CHANGE = /(?:权限|授权|工具(?:配置|设置|调用)|配置|预算|系统提示词|系统指令|api(?:\s*key)?|secret|token)/i;
+const AI_CONFIG_ACTION = /(?:改(?:成|为|掉)?|设置(?:成|为)?|开启|关闭|增加|减少|提高|降低|忽略|绕过|不再遵守|授予|允许|禁止|记住|更新|纠正)/;
+const QUOTE_MARKS = /["“”「」『』‘’]/;
+
+function parseAiSelfRequest(text: string): MemoryRequest | undefined {
+  const slash = text.match(/^\/self(?:\s+([\s\S]*))?$/i);
+  const explicit = text.match(/^(?:请(?:你)?|麻烦你)?(?:你\s*)?(?:记住|记一下)(?=$|[\s，,：:。！!你以])([\s\S]*)$/);
+  const rawContent = slash ? slash[1] ?? '' : explicit ? explicit[1] ?? '' : text;
+  const directive = rawContent.trim().replace(/^[，,：:。！!\s]+/, '');
+  const future = directive.match(/^(?:(?:从今)?以后|今后|往后)\s*/u);
+  const target = future ? directive.slice(future[0].length) : '';
+  const hasFutureIdentityAssignment = /^你的(?:名字|名称|定位|身份|角色|称呼|代号).{0,24}(?:叫|是|为)\s*\S/u.test(target);
+  const hasFutureStyleRequest = /^你的(?:回答|回复|表达|风格|语气|交流方式).{0,24}(?:更|尽量|尽可能|简洁|简短|详细|清晰|通俗|自然|正式|轻松|幽默|亲切|中文|英文|优先|不要|别|保持|先|使用|采用|控制)/u.test(target);
+  const hasFutureTarget = hasFutureIdentityAssignment || hasFutureStyleRequest
+    || /^(?:pa|personal\s+agent)\s*指(?:的)?(?:就是|是)/iu.test(target);
+  const question = /[?？]|(?:吗|什么|怎么|为何|为什么|什么意思|是什么(?:呀|呢)?)[。！!？?]*$/u.test(directive);
+  if (!slash && !explicit && !hasFutureTarget) return undefined;
+  if (!slash && question) return undefined;
+  if (!slash && !explicit && /在(?:这|此|本)(?:个)?(?:故事|剧情|游戏|场景)(?:里|中|下)|角色扮演|扮演|假装/u.test(directive)) return undefined;
+
+  let content = rawContent;
+  content = content.trim().replace(/^[，,：:。！!\s]+/, '').replace(/[。！!]+$/, '').trim();
+  if (AI_CONFIG_CHANGE.test(content) && AI_CONFIG_ACTION.test(content)) return { type: 'ai_self_refusal' };
+  const quotedAssignment = Boolean(explicit && /^(?:(?:(?:从今)?以后|今后|往后)\s*)?你的(?:名字|名称|定位|身份|角色|称呼|代号).{0,24}(?:叫|是|为)["“「].+["”」]$/u.test(directive));
+  if (!content || [...content].length > 500 || /[\r\n]/.test(content) || (!slash && QUOTE_MARKS.test(text) && !quotedAssignment)) {
+    return { type: 'ai_self_clarify' };
+  }
+  const selfTarget = /^(?:(?:(?:从今)?以后|今后|往后)\s*)?(?:你的(?:名字|名称|定位|身份|角色|回答|回复|表达|风格|语气|交流方式|称呼|代号|画像|性格|兴趣)|你(?:叫|是|回答|回复|说话|交流)|pa\s*指(?:的)?(?:就是|是))/iu.test(directive);
+  if (!slash && explicit && !selfTarget && !hasFutureTarget) return undefined;
+  return { type: 'ai_self_update', content };
 }
 
 // These explicit forms are handled locally. We never ask a model to choose an
@@ -29,6 +67,10 @@ export function parseMemoryRequest(input: string): MemoryRequest | undefined {
   if (/^\/(?:forget|memory\s+(?:delete|forget))(?:\s|$)/i.test(text)) return { type: 'unsupported_delete' };
   if (/^\/(?:memory|memories|remember|correct|forget)(?:\s|$)/i.test(text)) return { type: 'admin', text };
   if (/^(?:请)?(?:记住|更新|纠正|删除|忘掉)本群/.test(text)) return { type: 'admin', text };
+  if (/^\/self(?:\s|$)/i.test(text)) {
+    const aiSelfRequest = parseAiSelfRequest(text);
+    if (aiSelfRequest) return aiSelfRequest;
+  }
   if ((/画像|个人档案|个人记忆|个人信息|我的记忆|我的偏好|关于我.*记忆|我.*偏好/.test(text)
     && /查看|查询|列出|展示|告诉|总结|记得|知道|有哪些|有什么|导出/.test(text))
     || /你(?:还)?记得我(?:有)?(?:哪些|什么|的)/.test(text)
@@ -36,6 +78,8 @@ export function parseMemoryRequest(input: string): MemoryRequest | undefined {
     || /我(?:保存的|提供的|告诉过的|的).*(?:饮食|称呼|兴趣|爱好|信息|偏好).*(?:是什么|有哪些|有什么)/.test(text)
     || /(?:知道|记得).{0,6}我.{0,12}(?:喜欢什么|叫啥|叫什么|偏好|饮食|兴趣|画像)/.test(text)
     || /^你.*记住.*我.*(?:什么|哪些|偏好|饮食|兴趣|画像)/.test(text)) return { type: 'profile_read' };
+  const aiSelfRequest = parseAiSelfRequest(text);
+  if (aiSelfRequest) return aiSelfRequest;
   if (/^(?:请(?:你)?|帮我)?(?:忘掉|忘记|删除|移除)(?:关于)?(?:我的|我)(?:的)?/.test(text)
     && /偏好|饮食|口味|吃|称呼|昵称|名字|兴趣|爱好|回复|交流|喜欢|不吃|不喜欢|记忆|信息/.test(text)) {
     return { type: 'unsupported_delete' };
@@ -68,6 +112,12 @@ function display(records: MemoryRecord[]): string {
 
 export function executeMemoryRequest(request: MemoryRequest, conversation: RecordedConversation,
   source: MemorySource, owner: boolean, primaryPerson = false): string {
+  if (request.type === 'ai_self_refusal') return AI_SELF_REFUSAL;
+  if (request.type === 'ai_self_clarify') return AI_SELF_CLARIFY;
+  if (request.type === 'ai_self_update') {
+    conversation.addSelfProfile(source.id, request.content);
+    return AI_SELF_ACK;
+  }
   if (request.type === 'unsupported_delete') return '不提供删除记忆或偏好的操作；你可以明确纠正信息，我会保留原记录并更新当前内容。';
   if (request.type === 'clarify') return CLARIFY;
   if (request.type === 'profile_read') return owner ? display(conversation.queryMemories('', 20, source.actorId)) : DENIED;
@@ -142,6 +192,7 @@ function memoryContent(input: string): MemoryInput {
 }
 
 export function safeProfileError(error: MemoryError): string {
+  if (/待整理.*(?:容量|上限|已满)/.test(error.message)) return '待整理自我画像容量已满，本次没有保存。请等待后台整理完成，或缩短建议后重试。';
   return error.message.includes('版本') ? '信息版本已变化，请重新明确要更新的内容。' : '未完成记忆操作，请检查目标和内容；不会展示个人画像。';
 }
 

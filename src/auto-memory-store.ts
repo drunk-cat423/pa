@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { MemoryError, type PrimaryPerson } from './memory-types.js';
 import type { AutoMemoryJob, AutoMemoryMessage, AutoMemoryReason, AutoMemoryTaskInput, PersonProfile, ProfileFact, TopicEmbedding, TopicRecord, TopicSearch, ValidatedExtract } from './auto-memory-types.js';
+import { SelfProfileStore } from './self-profile-store.js';
 
 const timestamp = () => new Date().toISOString();
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -69,7 +70,10 @@ export function migrateAutoMemory(db: DatabaseSync): void {
 }
 
 export class AutoMemoryStore {
-  constructor(private readonly db: DatabaseSync, private readonly transaction?: <T>(operation: () => T) => T) {}
+  readonly selfProfile: SelfProfileStore;
+  constructor(private readonly db: DatabaseSync, private readonly transaction?: <T>(operation: () => T) => T) {
+    this.selfProfile = new SelfProfileStore(db, operation => this.atomic(operation));
+  }
   private atomic<T>(operation: () => T): T {
     if (this.transaction) return this.transaction(operation);
     this.db.exec('SAVEPOINT auto_memory_operation');
@@ -245,7 +249,7 @@ export class AutoMemoryStore {
     if(row.input_json!==null) return {...parse<AutoMemoryTaskInput>(row.input_json),job:this.job(row)};
     const canonical=this.job(row); const messages=this.messages(canonical.messageIds); const cp=this.checkpoint(canonical.conversationId);
     const people=new Set(messages.flatMap(m=>m.personId?[m.personId]:[]));
-    const input:AutoMemoryTaskInput={job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles:[...people].map(p=>this.profile(p)),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
+    const input:AutoMemoryTaskInput={job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles:[...people].map(p=>this.profile(p)),selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
     this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
     return input;
   }
@@ -268,7 +272,7 @@ export class AutoMemoryStore {
   private evidenceSequence(ids:readonly string[]):number {
     return ids.reduce((highest,id)=>Math.max(highest,Number(this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(id)?.ingest_seq??0)),0);
   }
-  commit(jobId:string,leaseToken:string,extract:ValidatedExtract): void {
+  commit(jobId:string,leaseToken:string,extract:ValidatedExtract,selfBudget?:number): void {
     this.atomic(()=>{
       const row=this.active(jobId,leaseToken); const job=this.job(row); const input=this.taskInput(job); const owned=new Set(job.messageIds);
       if(input.messages.some(m=>m.actorId!==undefined&&this.personForActor(m.actorId)!==m.personId)) throw new Error('人物绑定版本冲突，请重读后重试。');
@@ -320,6 +324,10 @@ export class AutoMemoryStore {
           if(!baseline.facts.some(old=>sameFact(old,fact))) evidence(fact.messageIds,fact.sourceType,profile.personId);
         }
         this.writeProfile(profile,jobId);
+      }
+      if (extract.selfProfile !== undefined) {
+        if (input.selfProfile === undefined) throw new Error('自我档案产物缺少已捕获的输入快照。');
+        this.selfProfile.commit(input.selfProfile, extract.selfProfile, input.messages, selfBudget);
       }
       // Check again after all writes; the transaction rolls everything back if the lease expired.
       this.active(jobId,leaseToken);

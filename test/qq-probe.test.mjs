@@ -40,6 +40,19 @@ test('只匹配群内精确测试码，忽略私聊、普通群消息、回声�
   assert.equal(probeMessage({ ...value, d: { ...value.d, content: 'TEST_CODE plus unrelated content' } }, 'TEST_CODE', 'bot'), undefined);
 });
 
+test('全量群事件中的真实机器人mention可匹配测试码，不同身份域使用is_you', () => {
+  const value = { op: 0, t: 'GROUP_MESSAGE_CREATE', d: {
+    id: 'message', group_openid: 'group', content: '<@!group-bot> TEST_CODE',
+    author: { member_openid: 'member' }, mentions: [{ id: 'group-bot', is_you: true }],
+  } };
+  const expected = { groupOpenid: 'group', inputMessageId: 'message', senderOpenid: 'member' };
+  assert.deepEqual(probeMessage(value, 'TEST_CODE', 'ready-bot'), expected);
+  assert.deepEqual(probeMessage({ ...value, t: 'GROUP_AT_MESSAGE_CREATE' }, 'TEST_CODE', 'ready-bot'), expected);
+  assert.equal(probeMessage({ ...value, d: { ...value.d, mentions: [{ id: 'group-bot' }] } }, 'TEST_CODE', 'ready-bot'), undefined);
+  assert.equal(probeMessage({ ...value, d: { ...value.d, mentions: [{ id: 'group-bot', is_you: true, scope: 'all' }] } }, 'TEST_CODE', 'ready-bot'), undefined);
+  assert.equal(probeMessage({ ...value, d: { ...value.d, content: '<@!group-bot> TEST_CODE extra' } }, 'TEST_CODE', 'ready-bot'), undefined);
+});
+
 test('测试回复绑定原消息，固定序号与固定文本，不进行主动群发', () => {
   const body = replyBody('source-message');
   assert.equal(body.msg_id, 'source-message');

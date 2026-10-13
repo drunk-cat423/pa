@@ -1,3 +1,6 @@
+import type { SelfProfileSnapshot, SelfProfileProposal } from './self-profile-store.js';
+export type { SelfProfileSnapshot, SelfProfileProposal } from './self-profile-store.js';
+
 export type AutoMemoryReason = 'count' | 'capacity';
 export type EvidenceType = 'self' | 'third_party' | 'inference';
 export interface ProfileFact {
@@ -21,7 +24,8 @@ export interface AutoMemoryJob {
 }
 export interface AutoMemoryTaskInput {
   job: AutoMemoryJob; roomType: 'private' | 'group'; messages: AutoMemoryMessage[];
-  previousSummary?: string; profiles: PersonProfile[];
+  previousSummary?: string; profiles: PersonProfile[]; selfProfile?: SelfProfileSnapshot;
+  selfProfileBudgetBytes?: number;
 }
 export interface ValidatedExtract {
   ignoredMessageIds: string[];
@@ -29,6 +33,7 @@ export interface ValidatedExtract {
   fragments: { personId: string; content: string; sourceType: EvidenceType; messageIds: string[]; topicIndex?: number }[];
   profiles: PersonProfile[];
   continuationSummary?: string;
+  selfProfile?: SelfProfileProposal;
 }
 export interface TopicRecord {
   id: string; conversationId: string; jobId: string; summary: string; version: number; contentHash: string; messageIds: string[];

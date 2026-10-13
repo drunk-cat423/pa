@@ -8,8 +8,9 @@
 |---|---|
 | src/config.ts | 聊天、后台调用预算及可选 Embedding 配置，不读取其他应用凭据 |
 | src/runtime.ts | 受限 Pi 会话、独立 ModelRuntime 工厂、最终输入容量估算、公开 API 重建投影 |
-| src/store.ts | schema v6、原文/run/投递、显式记忆、迁移备份、去重和上下文水位 |
+| src/store.ts | schema v7、原文/run/投递、显式记忆、迁移备份、去重和上下文水位 |
 | src/auto-memory-store.ts | 通用 person 绑定、固定批次、任务租约、子批次检查点、Topic/画像/向量 |
+| src/self-profile-store.ts | 全局AI画像修订、带来源待整理建议、原子归档和并发版本检查 |
 | src/auto-memory.ts | 与聊天独立的后台调度、严格输出校验、有限重试、容量等待及 Topic 检索 |
 | src/memory-provider.ts | 独立 Pi 提取请求与显式 Embedding HTTP 接口 |
 | src/conversation.ts | 原文与 Pi 关联恢复、按当前发送者/@对象构造上下文、画像预算和私聊续聊 |
@@ -44,8 +45,8 @@ Mock 只验证程序契约。真实模型的人物归属、提取质量、语义
 
 ## 当前完成与后续边界
 
-自动记忆 v1 的本地实现、配置示例、诊断入口及离线验证已完成，参考 [存储规则](storage.md)。实际运行 .env、业务数据库和正在运行的服务本轮未变更；下次应用打开旧数据库会先备份并迁移到 v6。
+自动记忆 v1 和轻量自我画像的实现、配置说明及离线验证已完成，参考 [存储规则](storage.md)。v7升级会先备份旧数据库，再增加自我画像表；服务重启后使用新代码，原文和旧记忆保留。真实提取质量仍需实际互动验证。
 
-后台每次启动的调用上限与 Embedding 配置由操作者明确设置。Telegram、长回答合并转发、Web 工具、自我模型演化和主动插话未在本次实现中。独立群摘要、人物 FTS/向量和删除功能已按用户决定排除。
+后台每次启动的调用上限与 Embedding 配置由操作者明确设置。轻量自我画像已接入：所有成员的明确建议先保存并注入，再随记忆批次归档；没有独立关系模式、好感度或人格审批流程。Telegram、长回答合并转发、Web 工具和主动插话未在本次实现中。独立群摘要、人物 FTS/向量和删除功能已按用户决定排除。
 
 [v0.2 基线](design/pi_evolving_companion_technical_design_v0.2.md) 与 [Shiori 参考](shiori-memory-reference.md) 保留设计来源；发生冲突时以 [记忆 v1](design/companion_memory_v1.md) 和用户最新决定为准。

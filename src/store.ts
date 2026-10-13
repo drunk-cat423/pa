@@ -6,6 +6,7 @@ import { MemoryError } from './memory-types.js';
 import type { MemoryChange, MemoryDeletion, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, MemorySections, PrimaryPerson, ProfileField } from './memory-types.js';
 import type { ChannelRoute, ExternalRunInput } from './channel-types.js';
 import { AutoMemoryStore, migrateAutoMemory } from './auto-memory-store.js';
+import { migrateSelfProfile } from './self-profile-store.js';
 
 export interface ConversationRecord {
   id: string;
@@ -48,7 +49,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const OWNER_ID = 'local-owner';
 const PROFILE_FIELDS = ['diet', 'preferred_name', 'interests', 'reply_style'];
 
@@ -287,6 +288,7 @@ export class ConversationStore {
       if (version < 4) this.migrateGroupMemories();
       if (version < 5) this.migratePersonalMemories();
       if (version < 6) migrateAutoMemory(this.db);
+      if (version < 7) migrateSelfProfile(this.db);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');

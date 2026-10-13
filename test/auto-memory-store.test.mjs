@@ -306,6 +306,7 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
         DROP TABLE person_fragment_messages; DROP TABLE person_fragments; DROP TABLE topic_embeddings; DROP TABLE memory_topic_messages;
         DROP TABLE memory_topics; DROP TABLE auto_memory_job_messages; DROP TABLE auto_memory_jobs; DROP TABLE auto_memory_checkpoints;
         DROP TABLE person_profile_revisions; DROP TABLE actor_person_bindings; DROP TABLE person_bindings; DROP TABLE persons;
+        DROP TABLE self_profile_pending; DROP TABLE self_profile_revisions;
         UPDATE memories SET content=NULL,status='deleted'; UPDATE memory_revisions SET content=NULL,status='deleted'; PRAGMA user_version=5;`);
     });
     f.restart();
@@ -314,7 +315,7 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     assert.ok(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity'));
     assert.equal(f.store.externalMessage(f.conversation.id,old.eventId).id,old.existingMessageId);
     assert.equal(inspect(f,db=>db.prepare('SELECT status,content FROM memories WHERE id=?').get(memory.id)).content,null);
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),6);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),7);
     assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
     assert.equal(readdirSync(f.directory).some(name=>name.includes('.v5.')&&name.endsWith('.bak')),true);
     f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity').messageIds.length,1);

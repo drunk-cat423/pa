@@ -93,6 +93,20 @@ test('model errors, length limits, malformed JSON, and oversized input never ret
   assert.equal(f.requests.length, before);
 });
 
+test('self profile extraction uses the same model request and requires a self result for captured snapshots', async t => {
+  const f = await fixture(t);
+  const provider = createMemoryProvider(f.config);
+  const selfProfile = { baseVersion: 0, content: '', sourceMessageIds: [],
+    pending: [{ id: 'pending-1', content: 'PA 指的是 Personal Agent', sourceMessageId: 'explicit-1' }] };
+  // The fixture intentionally returns only old memory fields: do not silently archive self input.
+  await assert.rejects(provider.extract({ ...input, selfProfile }, new AbortController().signal), /缺少自我画像/);
+  assert.equal(f.requests.length, 1);
+  const body = f.requests[0].body;
+  assert.equal(body.model, f.config.model);
+  assert.ok(body.messages.find(m => m.role === 'system').content.includes('不要求管理者身份'));
+  assert.ok(body.messages.find(m => m.role === 'user').content.includes('pending-1'));
+});
+
 test('embedding rejects invalid JSON, wrong dimensions, and aborts promptly', async t => {
   const f = await fixture(t);
   const provider = createMemoryProvider(f.config);

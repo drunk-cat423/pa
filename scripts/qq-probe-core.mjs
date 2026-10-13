@@ -26,19 +26,32 @@ export function validateGateway(value) {
 }
 
 export function probeMessage(event, expectedCode, botId) {
-  if (event?.op !== 0 || event.t !== 'GROUP_AT_MESSAGE_CREATE') return undefined;
-  return matchMessage(event.d, expectedCode, botId);
+  if (event?.op !== 0 || !['GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE'].includes(event.t)) return undefined;
+  const selfIds = [botId].filter(Boolean);
+  const mentions = Array.isArray(event.d?.mentions) ? event.d.mentions : [];
+  let mentioned = event.t === 'GROUP_AT_MESSAGE_CREATE';
+  for (const mention of mentions) {
+    if (!mention || typeof mention !== 'object' || mention.scope === 'all') continue;
+    if (mention.is_you === true || (botId && (mention.id === botId || mention.member_openid === botId))) mentioned = true;
+    if (mention.is_you === true) for (const id of [mention.id, mention.member_openid, mention.user_openid]) {
+      if (typeof id === 'string' && id.length > 0 && id.length <= 512) selfIds.push(id);
+    }
+  }
+  const content = typeof event.d?.content === 'string' ? event.d.content : '';
+  if (botId && (content.includes(`<@${botId}>`) || content.includes(`<@!${botId}>`))) mentioned = true;
+  if (!mentioned) return undefined;
+  return matchMessage(event.d, expectedCode, botId, selfIds);
 }
 
-function matchMessage(message, expectedCode, botId) {
+function matchMessage(message, expectedCode, botId, selfIds = [botId]) {
   if (!message || typeof message.content !== 'string' || message.author?.bot === true
     || message.author?.id === botId || message.author?.member_openid === botId) return undefined;
   for (const field of ['id', 'group_openid']) {
     if (typeof message[field] !== 'string' || !message[field] || message[field].length > 512) return undefined;
   }
   let text = message.content.trim();
-  for (const prefix of [`<@${botId}>`, `<@!${botId}>`]) {
-    if (botId && text.startsWith(prefix)) text = text.slice(prefix.length).trim();
+  for (const prefix of selfIds.filter(Boolean).flatMap(id => [`<@${id}>`, `<@!${id}>`])) {
+    if (text.startsWith(prefix)) { text = text.slice(prefix.length).trim(); break; }
   }
   if (text !== expectedCode) return undefined;
   const senderId = message.author?.member_openid || message.author?.id;

@@ -2,9 +2,9 @@
 
 SQLite pa.sqlite 保存权威原文、消息来源、运行和投递记录，以及记忆派生数据；Pi session.jsonl 保存模型上下文与审计条目。压缩仅改变活跃模型投影，原文保持完整。两者使用 run ID / Pi entry ID 对应，不能混合恢复不同时点的文件。
 
-## schema v6
+## schema v7
 
-Node 内置 node:sqlite，WAL、外键、FULL 同步及 busy timeout。首次打开 v1–v5 会在同目录创建 pa.sqlite.v版本.UUID.bak 一致性备份，再事务迁移。未知非空库、外键损坏或更高版本会停止打开。
+Node 内置 node:sqlite，WAL、外键、FULL 同步及 busy timeout。首次打开 v1–v6 会在同目录创建 pa.sqlite.v版本.UUID.bak 一致性备份，再事务迁移。未知非空库、外键损坏或更高版本会停止打开。v6升级v7仅增加自我画像表，保留已有后台批次和计数水位。
 
 | 记录 | 内容 |
 |---|---|
@@ -14,6 +14,8 @@ Node 内置 node:sqlite，WAL、外键、FULL 同步及 busy timeout。首次打
 | memories / memory_revisions / memory_events / memory_uses | 既有显式记忆、版本、来源与使用审计；旧删除墓碑保留 |
 | persons / person_bindings / actor_person_bindings | 通用人物、明确路由身份绑定；兼容迁移 primary_person_bindings |
 | person_profile_revisions | 当前人物画像版本和事实证据，旧版本保留 |
+| self_profile_revisions | AI全局自我画像及来源消息ID，内容或来源有变化时追加版本 |
+| self_profile_pending | 所有成员明确提出的AI画像建议、原消息ID、归档版本与时间；按来源幂等 |
 | auto_memory_checkpoints | 起始历史水位、连续成功位置、私聊续聊摘要及其来源任务 |
 | auto_memory_jobs / auto_memory_job_messages | 固定任务成员、状态、租约、输入快照和子批次进度 |
 | memory_topics / memory_topic_messages | Topic 正文、版本、hash 及全部原消息来源 |
@@ -39,6 +41,8 @@ Node 内置 node:sqlite，WAL、外键、FULL 同步及 busy timeout。首次打
 模型等待不持有写事务。提交事务同时验证租约、来源、人物版本和证据时序，并落地 Topic、人物片段、画像及私聊检查点。只有完整提交后才推进连续成功位置；Embedding 独立重试，不重复创建 Topic。
 
 过长批次保存可恢复的子批次结果，已成功子批次不在普通重试时重复调用模型。画像冲突会清除旧提案快照，重新读取当前版本。关闭中断重新排队；崩溃由租约到期后接续。失败达到上限需通过任务 CLI 重排。
+
+自我画像合并和pending归档属于同一记忆提交事务。任务捕获全局版本及待整理ID，模型只能归档该快照内保留来源的条目；并发新增不归档。不同房间使用全局版本检查解决冲突。模型结果与提交时当前pending一起检查完整结构容量，超限或版本冲突保留原数据并重读重试。旧版在途任务缺少selfProfile输入时继续原流程，不伪造自我画像提案。
 
 升级起始水位防止数量触发立即回填全部旧历史。当前请求因旧历史达到容量线时，可以按固定容量批次整理活跃历史；不在启动时对所有旧会话发起模型请求。
 

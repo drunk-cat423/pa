@@ -3,6 +3,7 @@ import type { PaConfig } from './config.js';
 import { sameFact, type AutoMemoryStore } from './auto-memory-store.js';
 import type { AutoMemoryJob, AutoMemoryTaskInput, ValidatedExtract, PersonProfile, ProfileFact } from './auto-memory-types.js';
 import { createMemoryProvider, MemoryInputTooLargeError, type MemoryProvider } from './memory-provider.js';
+import { selfProfileBudget, validateSelfProfileProposal } from './self-profile-store.js';
 
 type Budget = { calls: number; embeddingCalls: number };
 const budgets = new WeakMap<PaConfig, Budget>();
@@ -68,6 +69,10 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
   if (input.messages.some(message => message.role === 'user' && !covered.has(message.id))) throw new Error('整理遗漏了真人消息。');
   if (input.roomType === 'private') text(value.continuationSummary);
   else if (value.continuationSummary !== undefined) throw new Error('群聊不生成独立群摘要。');
+  if (value.selfProfile !== undefined) {
+    if (!input.selfProfile) throw new Error('自我画像缺少输入快照。');
+    validateSelfProfileProposal(value.selfProfile, input.selfProfile, input.messages, input.selfProfileBudgetBytes);
+  }
   return value as unknown as ValidatedExtract;
 }
 
@@ -174,7 +179,7 @@ export class BackgroundMemory {
       const lease = job.leaseToken!;
       try {
         if (this.budget.calls >= setting.maxCalls) throw new Error('budget');
-        const input = this.store.taskInput(job);
+        const input: AutoMemoryTaskInput = { ...this.store.taskInput(job), selfProfileBudgetBytes: selfProfileBudget(this.config.contextWindow) };
         const progress = this.readProgress(job, input);
         while (progress.remaining.length) {
           if (this.closed) throw new Error('closed');
@@ -195,6 +200,12 @@ export class BackgroundMemory {
           const chunk: AutoMemoryTaskInput = { ...input,
             messages: chunkMessages, profiles: profileView,
             ...(progress.summary ? { previousSummary: progress.summary } : {}) };
+          if (input.selfProfile && progress.extract.selfProfile) {
+            const previous = progress.extract.selfProfile;
+            chunk.selfProfile = { baseVersion: previous.baseVersion, content: previous.content,
+              sourceMessageIds: previous.sourceMessageIds,
+              pending: input.selfProfile.pending.filter(item => !previous.pendingIds.includes(item.id)) };
+          }
           let result: ValidatedExtract;
           try { result = validateExtract(await this.request('extract', signal => this.provider.extract(chunk, signal)), chunk); }
           catch (error) {
@@ -226,10 +237,18 @@ export class BackgroundMemory {
             progress.summary = result.continuationSummary;
             progress.extract.continuationSummary = result.continuationSummary;
           }
+          if (result.selfProfile) {
+            const pendingIds = [...new Set([...(progress.extract.selfProfile?.pendingIds ?? []), ...result.selfProfile.pendingIds])];
+            const archivedSources = input.selfProfile?.pending.filter(item => pendingIds.includes(item.id)).map(item => item.sourceMessageId) ?? [];
+            const mergedSelf = { ...result.selfProfile, pendingIds,
+              sourceMessageIds: [...new Set([...result.selfProfile.sourceMessageIds, ...archivedSources])] };
+            validateSelfProfileProposal(mergedSelf, input.selfProfile!, input.messages, input.selfProfileBudgetBytes);
+            progress.extract.selfProfile = mergedSelf;
+          }
           progress.remaining.shift();
           this.store.saveProgress(job.id, lease, progress);
         }
-        this.store.commit(job.id, lease, validateExtract(progress.extract, input, true));
+        this.store.commit(job.id, lease, validateExtract(progress.extract, input, true), input.selfProfileBudgetBytes);
         this.lastError = undefined;
         this.startEmbeddings();
       } catch (error) {

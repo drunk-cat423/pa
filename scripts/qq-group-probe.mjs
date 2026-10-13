@@ -174,7 +174,7 @@ try {
       claimed = true;
       writeFileSync(join(directory, 'claim.json'), JSON.stringify(matched, null, 2), { flag: 'wx', mode: 0o600 });
       status({ state: fullMode ? 'full_message_received' : 'group_received', ...matched });
-      event(fullMode ? 'GROUP_MESSAGE_CREATE' : 'GROUP_AT_MESSAGE_CREATE', matched);
+      event(payload.t, matched);
       console.log(fullMode ? '已收到测试群未 @ 的指定普通消息；5 秒后主动发送一次固定文本。' : '已收到测试群的指定 @ 消息，准备回复一次固定连通性文本。');
       if (fullMode) {
         status({ state: 'active_send_scheduled', fullMessageReceived: true });
