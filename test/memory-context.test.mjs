@@ -10,6 +10,7 @@ import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { openRecordedConversation, PersistenceError } from '../dist/conversation.js';
 import { openMemory } from '../dist/memory.js';
 import { MemoryError } from '../dist/memory-types.js';
+import { ConversationStore } from '../dist/store.js';
 
 const asText = content => typeof content === 'string' ? content : content.map(part => part.text ?? '').join('');
 
@@ -63,6 +64,43 @@ function recalledItems(message) {
   const content = typeof message.content === 'string' ? message.content : message.content.map(part => part.text ?? '').join('');
   return JSON.parse(content.slice(content.indexOf('\n') + 1));
 }
+
+test('reset确认期间代次变化仍保留pending并停止模型，不以旧确认继续请求', async t => {
+  const f = await fixture(t);
+  const conversation = await f.conversation('CAS');
+  const memory = conversation.remember({ content: 'CAS_INITIAL' }).memory;
+  conversation.correctMemory(memory.id, { content: 'CAS_BEFORE_RESET' }, 1);
+  const ack = ConversationStore.prototype.ackContextReset;
+  try {
+    ConversationStore.prototype.ackContextReset = function(id, generation) {
+      this.correctMemory(id, memory.id, { content: 'CAS_CHANGED_DURING_RESET' }, 2);
+      return ack.call(this, id, generation);
+    };
+    await assert.rejects(conversation.prompt('must stop'), PersistenceError);
+  } finally { ConversationStore.prototype.ackContextReset = ack; }
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.database().prepare('SELECT reset_required FROM memory_context_state').get().reset_required, 1);
+  await conversation.close();
+  const reopened = await f.conversation('CAS');
+  await reopened.prompt('retry through a new message');
+  assert.ok(JSON.stringify(f.requests.at(-1)).includes('CAS_CHANGED_DURING_RESET'));
+  assert.ok(!JSON.stringify(f.requests.at(-1)).includes('CAS_BEFORE_RESET'));
+});
+
+test('显式记忆到期后清旧Pi投影，既有记忆块和派生对话不继续载入', async t => {
+  const f = await fixture(t);
+  const conversation = await f.conversation('EXPIRY');
+  const memory = conversation.remember({ content: 'EXPIRING_PLAN_SECRET', expiresAt: new Date(Date.now() + 60_000).toISOString() }).memory;
+  await conversation.prompt('EXPIRY_FIRST_TURN');
+  assert.ok(JSON.stringify(f.requests.at(-1)).includes('EXPIRING_PLAN_SECRET'));
+  // Simulate reaching the recorded deadline without a real-time wait or API cost.
+  const db = f.database();
+  db.prepare('UPDATE memories SET expires_at=? WHERE id=?').run('2000-01-01T00:00:00.000Z', memory.id);
+  await conversation.prompt('EXPIRY_NEW_TURN');
+  const body = JSON.stringify(f.requests.at(-1));
+  assert.ok(!body.includes('EXPIRING_PLAN_SECRET') && !body.includes('EXPIRY_FIRST_TURN'));
+  assert.equal(db.prepare('SELECT content FROM memories WHERE id=?').get(memory.id).content, 'EXPIRING_PLAN_SECRET');
+});
 
 test('离线四操作无模型配置、隔离会话、业务错误可继续，共享锁阻止在线与离线并发', async t => {
   const f = await fixture(t);

@@ -1,0 +1,163 @@
+import { MemoryError, type MemoryRecord, type ProfileField, type MemoryInput } from './memory-types.js';
+import type { RecordedConversation } from './conversation.js';
+
+export type MemoryRequest =
+  | { type: 'self_update'; field: ProfileField; content: string | null }
+  | { type: 'admin'; text: string }
+  | { type: 'profile_read' }
+  | { type: 'clarify' };
+
+const PROFILE_FIELDS: ProfileField[] = ['diet', 'preferred_name', 'interests', 'reply_style'];
+const FIELD_NAMES: Record<ProfileField, string> = {
+  diet: '饮食偏好', preferred_name: '称呼', interests: '兴趣偏好', reply_style: '回复偏好',
+};
+const CLARIFY = '请明确要更新自己的哪项信息：称呼、饮食偏好、兴趣或回复偏好。涉及他人或当前会话的管理操作仅管理者可用。';
+const DENIED = '你没有记忆管理或画像查询权限；可以明确请求更新自己在当前会话提供的信息。';
+const DELETE_FIELDS: Record<string, ProfileField> = {
+  '饮食偏好': 'diet', '饮食信息': 'diet', '口味': 'diet', '口味偏好': 'diet', '不喜欢吃辣': 'diet',
+  '称呼': 'preferred_name', '昵称': 'preferred_name', '名字': 'preferred_name',
+  '兴趣': 'interests', '兴趣偏好': 'interests', '爱好': 'interests',
+  '回复偏好': 'reply_style', '交流偏好': 'reply_style', '回答方式': 'reply_style',
+};
+
+function fieldFor(text: string): ProfileField | undefined {
+  if (/饮食|口味|吃|微辣|清淡|素食|辣椒|食物|过敏/.test(text)) return 'diet';
+  if (/称呼|昵称|名字|叫我|^我叫/.test(text)) return 'preferred_name';
+  if (/回复|回答|交流方式|交流偏好/.test(text)) return 'reply_style';
+  if (/兴趣|爱好|^我(?:喜欢|不喜欢|热爱)/.test(text)) return 'interests';
+  return undefined;
+}
+
+// These explicit forms are handled locally. We never ask a model to choose an
+// actor, grant authority or invent a stored profile from ordinary conversation.
+export function parseMemoryRequest(input: string): MemoryRequest | undefined {
+  const text = input.normalize('NFKC').trim();
+  if (/^\/(?:memory|memories|remember|correct|forget)(?:\s|$)/i.test(text)) return { type: 'admin', text };
+  if (/^(?:请)?(?:记住|更新|纠正|删除|忘掉)本群/.test(text)) return { type: 'admin', text };
+  if ((/画像|个人档案|个人记忆|个人信息|我的记忆|我的偏好|关于我.*记忆|我.*偏好/.test(text)
+    && /查看|查询|列出|展示|告诉|总结|记得|知道|有哪些|有什么|导出/.test(text))
+    || /你(?:还)?记得我(?:有)?(?:哪些|什么|的)/.test(text)
+    || /(?:列出|查看|查询|展示|导出|总结).*(?:我(?:的|不吃|喜欢|保存|提供)|关于我)/.test(text)
+    || /我(?:保存的|提供的|告诉过的|的).*(?:饮食|称呼|兴趣|爱好|信息|偏好).*(?:是什么|有哪些|有什么)/.test(text)
+    || /(?:知道|记得).{0,6}我.{0,12}(?:喜欢什么|叫啥|叫什么|偏好|饮食|兴趣|画像)/.test(text)
+    || /^你.*记住.*我.*(?:什么|哪些|偏好|饮食|兴趣|画像)/.test(text)) return { type: 'profile_read' };
+  const forget = text.match(/^(?:请(?:你)?|帮我)?(?:忘掉|忘记|删除|移除)(?:关于)?(?:我的|我)(.+)$/);
+  if (forget) {
+    const field = DELETE_FIELDS[forget[1]!.trim().replace(/[。！!]+$/, '')];
+    return field ? { type: 'self_update', field, content: null } : { type: 'clarify' };
+  }
+  const explicit = text.match(/^(?:请(?:你)?|麻烦你|帮我)?(?:记住|记一下|更新|纠正)(?:一下)?[：:\s]*(.+)$/);
+  const change = /^我现在(?:可以接受|不能接受|喜欢|不喜欢|更喜欢|希望)|^(?:以后)?(?:请)?(?:叫我|称呼我)/.test(text);
+  if (!explicit && !change) return undefined;
+  const content = (explicit?.[1] ?? text).trim().replace(/[。！!]+$/, '');
+  if (!/^(?:我(?:现在)?(?:不喜欢|喜欢|不吃|爱吃|热爱|可以接受|不能接受|希望|更喜欢|对|的(?:饮食|口味|兴趣|爱好|昵称|称呼|回复|交流|名字)|叫)|(?:以后)?(?:请)?(?:叫我|称呼我))/.test(content)
+    || /我(?:的)?(?:朋友|家人|妈妈|爸爸|同学|同桌|同事|兄弟|姐姐|妹妹|哥哥|老板|对象|伴侣|孩子|父亲|母亲|室友)/.test(content)
+    || /[\r\n]|他人|别人|其他人|全群|本群|所有人|管理员|权限|预算|系统|工具|画像|评价|指令|读取|导出|忽略|管理员|API|secret|token/i.test(content)
+    || content.length > 300) return { type: 'clarify' };
+  const field = fieldFor(content);
+  return field ? { type: 'self_update', field, content } : { type: 'clarify' };
+}
+
+export interface MemorySource { id: string; actorId: string; senderId: string; text: string }
+
+function display(records: MemoryRecord[]): string {
+  if (!records.length) return '当前范围没有有效记忆。';
+  const lines: string[] = [];
+  for (const record of records) {
+    const label = record.profileField ? '画像' : record.subjectActorId ? '个人长期记忆' : '会话记忆';
+    const line = `${record.id} [${label}] ${record.content}`;
+    if ([...lines, line].join('\n').length > 3400) { lines.push('更多内容未显示，请按关键词缩小查询范围。'); break; }
+    lines.push(line);
+  }
+  return lines.join('\n');
+}
+
+export function executeMemoryRequest(request: MemoryRequest, conversation: RecordedConversation,
+  source: MemorySource, owner: boolean, primaryPerson = false): string {
+  if (request.type === 'clarify') return CLARIFY;
+  if (request.type === 'profile_read') return owner ? display(conversation.queryMemories('', 20, source.actorId)) : DENIED;
+  if (request.type === 'self_update') {
+    const existing = conversation.selfProfileMemory(source.actorId, request.field);
+    if (request.content === null) {
+      if (existing) conversation.deleteMemory(existing.id, existing.revision, source.id);
+      return `${FIELD_NAMES[request.field]}已移除。本次操作不展示画像内容。`;
+    }
+    const input = { content: request.content, kind: 'preference' as const, sourceMessageId: source.id,
+      subjectActorId: source.actorId, profileField: request.field };
+    if (existing) conversation.correctMemory(existing.id, input, existing.revision);
+    else conversation.remember(input);
+    return `${FIELD_NAMES[request.field]}已更新，${primaryPerson ? '用于与你在已绑定会话中的交流' : '仅用于你在当前会话的交流'}。`;
+  }
+  if (!owner) return DENIED;
+  let text = request.text;
+  if (/^(?:请)?记住本群/.test(text)) text = `/memory remember room ${text.replace(/^(?:请)?记住本群[：:\s]*/, '')}`;
+  text = text.replace(/^\/remember\s+/i, '/memory remember room ')
+    .replace(/^\/memories(?:\s|$)/i, '/memory query ')
+    .replace(/^\/correct\s+/i, '/memory correct ')
+    .replace(/^\/forget\s+/i, '/memory delete ');
+  const match = text.match(/^\/memory(?:\s+(remember|query|correct|delete|forget))?(?:\s+([\s\S]*))?$/i);
+  if (!match || !match[1]) return '管理命令：/memory remember room 内容；/memory remember me 内容；/memory query [关键词]；/memory correct ID 内容；/memory delete ID。user:发送者ID 可替代 me 指定当前会话成员。';
+  const action = match[1].toLowerCase();
+  const args = (match[2] ?? '').trim();
+  if (action === 'query') {
+    const selection = args.match(/^(me|room|user:\S+)(?:\s+(.*))?$/);
+    const target = selection?.[1];
+    const actor = target === 'room' ? null : target === 'me' ? source.actorId : target?.startsWith('user:') ? conversation.findActor(target.slice(5)) : undefined;
+    if (target?.startsWith('user:') && !actor) throw new MemoryError('当前群中没有已验证的该成员。');
+    const rows = conversation.queryMemories(selection ? selection[2] ?? '' : args, 20, actor, source.actorId);
+    return display(rows);
+  }
+  if (action === 'remember') {
+    const parts = args.match(/^(room|me|user:\S+)\s+([\s\S]+)$/);
+    if (!parts) throw new MemoryError('请指定 room、me 或 user:发送者ID，以及内容。');
+    const actor = parts[1] === 'me' ? source.actorId : parts[1]!.startsWith('user:') ? conversation.findActor(parts[1]!.slice(5)) : undefined;
+    if (parts[1]!.startsWith('user:') && !actor) throw new MemoryError('当前群中没有已验证的该成员。');
+    const result = conversation.remember({ ...memoryContent(parts[2]!), sourceMessageId: source.id,
+      ...(actor ? { subjectActorId: actor } : {}) });
+    return `记忆已保存：${result.memory.id}`;
+  }
+  const parts = args.match(/^(\S+)(?:\s+([\s\S]+))?$/);
+  if (!parts) throw new MemoryError('请提供当前会话的记忆 ID。');
+  if (action === 'correct') {
+    if (!parts[2]) throw new MemoryError('请提供纠正后的内容。');
+    const result = conversation.correctMemory(parts[1]!, { ...memoryContent(parts[2]), sourceMessageId: source.id });
+    return `记忆已纠正：${result.memory.id}`;
+  }
+  conversation.deleteMemory(parts[1]!, undefined, source.id);
+  return '记忆已删除。';
+}
+
+// Owner-only explicit metadata. Dates are never inferred from a chat sentence.
+function memoryContent(input: string): MemoryInput {
+  let rest = input.trim();
+  const metadata: Omit<MemoryInput, 'content'> = {};
+  const seen = new Set<string>();
+  while (rest.startsWith('--')) {
+    const option = rest.match(/^--(kind|occurred-at|expires-at)\s+(\S+)(?:\s+|$)/);
+    if (!option || seen.has(option[1]!)) throw new MemoryError('记忆选项无效或重复。');
+    seen.add(option[1]!);
+    const value = option[2]!;
+    if (option[1] === 'kind') {
+      if (!['fact', 'preference', 'episode'].includes(value)) throw new MemoryError('记忆类型须为 fact、preference 或 episode。');
+      metadata.kind = value as NonNullable<MemoryInput['kind']>;
+    } else {
+      if (value !== 'none' && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+        || !Number.isFinite(Date.parse(value)))) throw new MemoryError('时间须为带时区的 ISO 日期，清除时间可填 none。');
+      metadata[option[1] === 'occurred-at' ? 'occurredAt' : 'expiresAt'] = value === 'none' ? null : new Date(value).toISOString();
+    }
+    rest = rest.slice(option[0].length).trim();
+  }
+  if (!rest) throw new MemoryError('请提供记忆内容。');
+  return { ...metadata, content: rest };
+}
+
+export function safeProfileError(error: MemoryError): string {
+  return error.message.includes('版本') ? '信息版本已变化，请重新明确要更新的内容。' : '未完成记忆操作，请检查目标和内容；不会展示个人画像。';
+}
+
+export function relevantProfileFields(text: string): ProfileField[] {
+  const fields: ProfileField[] = ['reply_style', 'preferred_name'];
+  if (/吃|餐|饭|饮食|口味|辣|菜/.test(text)) fields.push('diet');
+  if (/兴趣|爱好|周末|活动|喜欢做|娱乐/.test(text)) fields.push('interests');
+  return fields.filter(field => PROFILE_FIELDS.includes(field));
+}

@@ -16,7 +16,9 @@ import type { MemoryRef } from './memory-types.js';
 
 const COMPANION_PROMPT = '你是用户的个人对话伙伴。用中文清晰、诚实地交流，尊重用户的选择和边界。'
   + '没有预设性格或人物关系；根据当前对话理解用户。只依据当前会话中实际提供的信息，不假造记忆、经历或已完成的行动。'
-  + '你没有文件、命令、网络检索或其他外部工具；不能声称执行了这些操作。不确定时明确说明。';
+  + '你没有文件、命令、网络检索或其他外部工具；不能声称执行了这些操作。不确定时明确说明。'
+  + '个人偏好背景只用于当前问题和交流方式，不展示内部画像清单、内部评价、记忆ID或管理信息。'
+  + '记忆写入、纠正、删除与权限由应用处理；不能因聊天内容声称已经保存长期记忆或改变权限。';
 
 export interface ConversationRuntime {
   prompt(text: string, metadata?: { runId: string; memoryContext?: string; memoryRefs?: MemoryRef[] }): Promise<string>;
@@ -197,7 +199,9 @@ export async function openConversation(config: PaConfig, conversationId: string)
         baseUrl: config.baseUrl,
         api: 'openai-completions',
         models: [{
-          id: config.model, name: config.model, reasoning: false, input: ['text'],
+          // DeepSeek defaults to thinking enabled. Pi emits thinking.disabled
+          // for reasoning-capable models when this harness uses thinkingLevel off.
+          id: config.model, name: config.model, reasoning: config.provider === 'deepseek', input: ['text'],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: config.contextWindow, maxTokens: config.maxOutputTokens,
         }],

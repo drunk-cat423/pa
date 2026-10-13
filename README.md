@@ -2,7 +2,7 @@
 
 以 TypeScript 和 Pi SDK 构建的 Headless 长期个人伙伴。目标入口是 QQ / Telegram，记忆系统参考 Shiori 的思路，用 TypeScript 独立实现。
 
-当前已实现本地 CLI 对话、SQLite 业务记录和显式长期记忆：会话恢复与隔离、消息和调用结果保存、中断核对，以及记住、查询、纠正、删除。没有预设性格；尚未接入 QQ / TG、自动记忆提取、搜索工具或人格演化。
+当前已实现本地 CLI 对话、SQLite 业务记录、显式长期记忆和 QQ 官方群聊、私聊接入。QQ 接入复用 harness 的会话、身份作用域、上下文与模型运行；不同群、私聊用户、机器人账号和 CLI 数据隔离。没有预设性格；尚未接入 Telegram、自动记忆提取、搜索工具或人格演化。
 
 ## 环境与启动
 
@@ -40,6 +40,32 @@ npm start -- --conversation owner --message '我们刚才聊到了什么？'
 # 离线查询 SQLite 业务消息，不需要模型密钥，也不请求模型。
 npm start -- history --conversation owner --limit 20
 ```
+
+## QQ 群聊接入
+
+先按 [QQ 官方测试准备](docs/qq-official-test-setup.md) 保存凭证并加入测试群。群开启全量消息权限后，普通文本由 harness 保存；仅明确 @ 时回复，模型背景由最多 8 条普通消息、当前发送者最多 12 条 AI 交互及有限有效记忆构成。图片、文件和语音尚未接入模型。群内文本不能修改配置、白名单、权限或预算。
+
+本次选择 [DeepSeek 官方 API](https://api-docs.deepseek.com/quick_start/pricing)：本地 `.env` 已配置 `PA_PROVIDER=deepseek`、`PA_MODEL=deepseek-flash`、`PA_BASE_URL=https://api.deepseek.com`，关闭深度思考，每轮最多输出 1024 token。只需自行填写 `PA_API_KEY`。API 密钥不要发到聊天或提交 Git。
+
+`PA_QQ_ALLOWED_GROUPS` 使用官方 `group_openid` 白名单（不是数字群号），本地已填入先前验证成功的测试群。`PA_QQ_MAX_MODEL_CALLS` 默认 3，填 `0` 则不限次数持续运行；本地测试群已按用户要求设为 `0`，仍仅 @ 时调用。正数上限达到后退出。模型失败也计数，不自动重试同一消息；新 @ 消息仍可继续处理，数据库故障则停止。单次输出上限和超时仍生效，实际费用由供应商按输入、输出及缓存计费。
+
+私聊使用 `PA_QQ_ALLOWED_USERS` 白名单，填写实际 `C2C_MESSAGE_CREATE` 事件中的 `author.user_openid`。允许的用户直接发送文本即可得到回复，无需 @；未列入的用户不落库、不调用模型、不回复。群与私聊白名单至少配置一个。聊天记录、Pi 会话与房间记忆分别存储；本地 `policy.json` 的 `primaryPerson` 显式绑定用户本人在各场景的身份后，共享其个人长期记忆与画像。普通成员仍按群隔离；管理权限由独立 `ownerBindings` 控制，不因共享身份自动授予。
+
+```powershell
+npm run build
+# 离线检查，不连接 QQ，不调用模型；key 为空时 ready=false，退出码 2。
+node --env-file-if-exists=.env dist/qq-cli.js --check
+# 填写 key 后启动；群内使用 QQ 的 @ 菜单选择机器人并发送文本。
+node --env-file-if-exists=.env dist/qq-cli.js
+```
+
+同群成员共享允许公开的普通群背景，各发送者的 AI 交互与个人记忆分开取用；昵称不是授权凭据。全量消息和 @ 消息均按原文保存，模型输入的发送者及背景另行记录。同一消息重复到达或服务重启不重新调用模型；未知发送结果记为 `uncertain`，不重发。`sent` 表示 QQ API 返回消息 ID，真人是否收到需群内确认。
+
+长期记忆由 harness 分为房间记忆、当前人物的个人长期记忆、相关画像三个提示词块。普通群友可 @ 后明确更新自己在本群的四类自述画像，不能查看画像或操作个人长期记忆、他人或群共享记忆；已绑定的用户本人画像更新在其他绑定场景生效。完整 `/memory` 管理由本地 policy.json 管理者使用，可显式保存事实、经历和带有效期的约定。没有自动提取，更新与管理不调用模型。[记忆说明](docs/memory.md)
+
+群数据共用业务记录，模型活跃上下文每轮按当前发送者重建，防止其他成员的画像及派生回复继续出现在共享 Pi 历史中。纠删后也截断旧 SQL 背景的重新注入；原始审计记录保留。
+
+运行状态位于 `.local/pa/qq-service/status.json`，不记录凭证和消息正文。正常退出释放服务锁和会话锁；强制结束留下锁时，先确认对应 PID 已退出再移除。全量原文目前按现有本机数据策略保留，不自动删除。
 
 ## 显式记忆
 
