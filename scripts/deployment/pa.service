@@ -1,0 +1,31 @@
+[Unit]
+Description=PA QQ personal agent
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=pa
+Group=pa
+WorkingDirectory=/opt/pa/current
+Environment=NODE_ENV=production
+Environment=HOME=/var/lib/pa
+EnvironmentFile=/etc/pa/pa.env
+ExecStartPre=/opt/node-v24.15.0/bin/node scripts/clear-stale-locks.mjs
+ExecStart=/opt/node-v24.15.0/bin/node --max-old-space-size=256 dist/qq-cli.js
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pa
+MemoryHigh=384M
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

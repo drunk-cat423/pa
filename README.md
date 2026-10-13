@@ -117,4 +117,4 @@ npm test
 
 [Companion Memory v1 方案](docs/design/companion_memory_v1.md) 保留确认规则和验收依据；当前实现与使用限制见 [记忆说明](docs/memory.md)。
 
-参见 [开发说明](docs/development.md)、[Shiori 记忆参考映射](docs/shiori-memory-reference.md) 和 [v0.2 设计基线](docs/design/pi_evolving_companion_technical_design_v0.2.md)。
+参见 [开发说明](docs/development.md)、[服务器部署](docs/deployment.md)、[Shiori 记忆参考映射](docs/shiori-memory-reference.md) 和 [v0.2 设计基线](docs/design/pi_evolving_companion_technical_design_v0.2.md)。
