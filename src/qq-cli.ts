@@ -39,7 +39,8 @@ async function main(): Promise<void> {
   function status(state: string): void {
     console.log(`QQ harness: ${state}`);
     const snapshot = { pid: process.pid, updatedAt: new Date().toISOString(), state,
-      provider: config.provider, model: config.model, ...(harness?.info() ?? { calls: 0, maxCalls: qq.maxCalls }) };
+      provider: config.provider, model: config.model,
+      ...(state === 'stopped' ? {} : (harness?.info() ?? { calls: 0, maxCalls: qq.maxCalls })) };
     statusQueue = statusQueue.then(() => writeFile(join(directory, 'status.json'), JSON.stringify(snapshot, null, 2), { mode: 0o600 }))
       .catch(() => { process.exitCode = 1; void stop(); });
   }
