@@ -4,8 +4,15 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { parseMemoryRequest } from '../dist/memory-service.js';
 
-test('实际离线 CLI 记住、查询、纠正和删除，无模型配置也可用', async t => {
+test('旧交互删除命令和本人偏好删除请求被识别为本地拒绝', () => {
+  assert.equal(parseMemoryRequest('/forget memory-id').type, 'unsupported_delete');
+  assert.equal(parseMemoryRequest('/memory delete memory-id').type, 'unsupported_delete');
+  assert.equal(parseMemoryRequest('请忘掉我的饮食偏好').type, 'unsupported_delete');
+});
+
+test('实际离线 CLI 记住、查询和纠正；旧删除命令被拒绝且内容保留', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-memory-cli-'));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
   const env = { ...process.env, PA_DATA_DIR: dataDir, PA_PROVIDER: '', PA_MODEL: '', PA_API_KEY: '', PA_BASE_URL: 'http://127.0.0.1:1/v1' };
@@ -30,10 +37,8 @@ test('实际离线 CLI 记住、查询、纠正和删除，无模型配置也可
   assert.equal(run(['memory', 'query', '--conversation', 'owner', '--query', '乌龙']).memories.length, 0);
   assert.equal(run(['memory', 'query', '--conversation', 'owner', '--query', '绿茶']).memories.length, 1);
   assert.match(run(['memory', 'correct', '--conversation', 'owner', '--id', id, '--content', '过时修改', '--expected-revision', '1'], 1), /版本/);
-  const deleted = run(['memory', 'delete', '--conversation', 'owner', '--id', id, '--expected-revision', '2']);
-  assert.equal(deleted.deleted, true);
-  assert.equal(run(['memory', 'delete', '--conversation', 'owner', '--id', id]).revision, deleted.revision);
-  assert.equal(run(['memory', 'query', '--conversation', 'owner']).memories.length, 0);
+  assert.match(run(['memory', 'delete', '--conversation', 'owner', '--id', id, '--expected-revision', '2'], 1), /不提供删除/);
+  assert.equal(run(['memory', 'query', '--conversation', 'owner']).memories[0].content, '我现在更喜欢绿茶');
   for (const args of [
     ['memory'], ['memory', 'unknown'], ['memory', 'remember'], ['memory', 'remember', '--content', ' '],
     ['memory', 'query', '--limit', '201'], ['memory', 'delete'], ['memory', 'remember', '--content', 'x', '--kind', 'unknown'],

@@ -86,15 +86,16 @@ test('普通群友仅更新当前身份画像，不读画像、不越权；控�
   // No tool access, no mutation even when such a sentence is ordinary conversation.
   await h.handle(f.message('correct', '我现在可以接受微辣了'));
   await h.handle(f.message('forget', '忘掉我的饮食偏好'));
+  assert.ok(f.sent.at(-1).text.includes('不提供删除'));
   const db = f.db();
   try {
     const rows = db.prepare('SELECT content,status,revision,subject_actor_id,writer_actor_id FROM memories').all();
     assert.equal(rows.length, 1);
-    assert.equal(rows[0].status, 'deleted');
-    assert.equal(rows[0].content, null);
-    assert.equal(rows[0].revision, 3);
+    assert.equal(rows[0].status, 'active');
+    assert.equal(rows[0].content, '我现在可以接受微辣了');
+    assert.equal(rows[0].revision, 2);
     assert.equal(rows[0].subject_actor_id, rows[0].writer_actor_id);
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM memory_revisions WHERE content IS NOT NULL').get().n, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM memory_revisions WHERE content IS NOT NULL').get().n, 2);
     assert.equal(db.prepare("SELECT COUNT(*) n FROM deliveries d JOIN agent_runs r ON r.id=d.run_id WHERE r.model='memory-control' AND d.status='sent'").get().n, 7);
   } finally { db.close(); }
   assert.equal(f.requests.length, 1); // Only the ordinary impersonation chat, no tool calls.
@@ -113,8 +114,8 @@ test('仅owner管理本群共享/成员记忆，owner命令结果不会进入其
   }
   await h.handle(f.message('query-room', '/memory query room', { senderId: 'owner' }));
   assert.ok(f.sent.at(-1).text.includes('ROOM_SHARED_A'));
-  await h.handle(f.message('query', '/memory query', { senderId: 'owner' }));
-  assert.ok(f.sent.at(-1).text.includes('OWNER_PRIVATE_NOTE_A'));
+  await h.handle(f.message('query', '/memory query user:member-A _20', { senderId: 'owner' }));
+  assert.ok(f.sent.at(-1).text.includes('OWNER_PRIVATE_NOTE_A_20'));
   const id = f.sent.at(-1).text.split(' ')[0];
   await h.handle(f.message('cross-edit', `/memory correct ${id} unauthorized`, { senderId: 'member-B' }));
   assert.ok(f.sent.at(-1).text.includes('没有记忆管理'));
@@ -127,7 +128,7 @@ test('仅owner管理本群共享/成员记忆，owner命令结果不会进入其
   assert.equal(f.requests.length, 2);
 });
 
-test('真实Pi请求不携带其他人的画像和派生回复；纠错删除后旧SQL背景与旧Pi均失效', async t => {
+test('真实Pi请求不携带其他人的画像和派生回复；纠正替换当前画像而保留原始记录', async t => {
   const f = await fixture(t), h = f.harness();
   await h.handle(f.message('old-chat', '我不吃辣PRIVATE_A', { mentioned: false }));
   await h.handle(f.message('save', '请记住我不吃辣PRIVATE_A'));
@@ -143,22 +144,25 @@ test('真实Pi请求不携带其他人的画像和派生回复；纠错删除后
   assert.ok(corrected.includes('我现在可以接受微辣了'));
   assert.ok(!corrected.includes('PRIVATE_A') && !corrected.includes('DERIVED_SECRET_A'));
   await h.handle(f.message('delete', '忘掉我的饮食偏好'));
+  assert.ok(f.sent.at(-1).text.includes('不提供删除'));
   await h.close();
   const reopened = f.harness();
   await reopened.handle(f.message('after-delete', '请推荐晚餐'));
-  const deleted = JSON.stringify(f.requests.at(-1));
-  assert.ok(!deleted.includes('PRIVATE_A') && !deleted.includes('微辣') && !deleted.includes('DERIVED_SECRET_A'));
+  const afterRefusal = JSON.stringify(f.requests.at(-1));
+  assert.ok(!afterRefusal.includes('PRIVATE_A') && afterRefusal.includes('我现在可以接受微辣了')
+    && !afterRefusal.includes('DERIVED_SECRET_A'));
 });
 
 test('自然更新不接受任意目标或权限；本地policy严格校验且缺失时无人拥有管理权', async t => {
   assert.equal(parseMemoryRequest('请记住我不喜欢吃辣').type, 'self_update');
   assert.equal(parseMemoryRequest('我现在可以接受微辣了').type, 'self_update');
-  assert.equal(parseMemoryRequest('忘掉我的饮食偏好').content, null);
+  assert.equal(parseMemoryRequest('忘掉我的饮食偏好').type, 'unsupported_delete');
+  assert.equal(parseMemoryRequest('/memory delete abc').type, 'unsupported_delete');
   assert.equal(parseMemoryRequest('请记住小明不喜欢吃辣').type, 'clarify');
   assert.equal(parseMemoryRequest('请记住我朋友小明不吃辣').type, 'clarify');
   assert.equal(parseMemoryRequest('请记住我有个朋友小明不吃辣').type, 'clarify');
-  assert.equal(parseMemoryRequest('忘掉我的朋友小明的饮食偏好').type, 'clarify');
-  assert.equal(parseMemoryRequest('忘掉我的同桌的饮食偏好').type, 'clarify');
+  assert.equal(parseMemoryRequest('忘掉我的朋友小明的饮食偏好').type, 'unsupported_delete');
+  assert.equal(parseMemoryRequest('忘掉我的同桌的饮食偏好').type, 'unsupported_delete');
   assert.equal(parseMemoryRequest('请记住我的饮食偏好是清淡').type, 'self_update');
   assert.equal(parseMemoryRequest('请记住我的兴趣是登山').type, 'self_update');
   assert.equal(parseMemoryRequest('请记住我的兴趣是群记忆连通测试').type, 'self_update');
@@ -188,24 +192,25 @@ test('三类记忆分别组织，统一本人跨绑定群与私聊召回，其�
   await h.handle(f.message('owner-memory', '/memory remember me --kind episode --occurred-at 2026-10-01T00:00:00Z OWNER_TRIP_EPISODE', ownerA));
   const episodeId = f.sent.at(-1).text.split('：')[1];
   await h.handle(f.message('owner-profile', '请记住我不喜欢吃辣OWNER_DIET_V1', ownerA));
-  assert.ok(f.sent.at(-1).text.includes('已绑定会话'));
+  assert.ok(f.sent.at(-1).text.includes('同一人物已绑定的场景'));
   await h.handle(f.message('member-profile', '请记住我的兴趣是MEMBER_A_HOBBY'));
   await h.handle(f.message('member-memory', '/memory remember user:member-A MEMBER_A_EPISODE', ownerA));
   await h.handle(f.message('expired', '/memory remember me --expires-at 2000-01-01T00:00:00Z EXPIRED_OWNER', ownerA));
   // The first message in a new bound room must already recall this person's memory.
   await h.handle(f.message('first-private', '请推荐晚餐并参考我过去经历', ownerPrivate));
   let body = JSON.stringify(f.requests.at(-1));
-  for (const label of ['roomMemories', 'personalMemories', 'profile']) assert.ok(body.includes(label));
-  assert.ok(body.includes('OWNER_TRIP_EPISODE') && body.includes('OWNER_DIET_V1') && body.includes('2026-10-01'));
-  for (const absent of ['ROOM_ONLY_A', 'MEMBER_A_HOBBY', 'MEMBER_A_EPISODE', 'EXPIRED_OWNER']) assert.ok(!body.includes(absent));
+  for (const label of ['roomMemories', 'profiles', 'personId', 'facts']) assert.ok(body.includes(label));
+  assert.ok(body.includes('OWNER_DIET_V1'));
+  for (const absent of ['OWNER_TRIP_EPISODE', 'ROOM_ONLY_A', 'MEMBER_A_HOBBY', 'MEMBER_A_EPISODE', 'EXPIRED_OWNER']) assert.ok(!body.includes(absent));
   await h.handle(f.message('first-group-b', '请推荐晚餐', ownerB));
   body = JSON.stringify(f.requests.at(-1));
-  assert.ok(body.includes('OWNER_TRIP_EPISODE') && body.includes('OWNER_DIET_V1'));
+  assert.ok(body.includes('OWNER_DIET_V1'));
+  assert.ok(!body.includes('OWNER_TRIP_EPISODE'));
   assert.ok(!body.includes('ROOM_ONLY_A'));
   await h.handle(f.message('member-talk', '周末有什么活动适合我？'));
   body = JSON.stringify(f.requests.at(-1));
-  assert.ok(body.includes('ROOM_ONLY_A') && body.includes('MEMBER_A_EPISODE') && body.includes('MEMBER_A_HOBBY'));
-  assert.ok(!body.includes('OWNER_TRIP_EPISODE') && !body.includes('OWNER_DIET_V1'));
+  assert.ok(body.includes('ROOM_ONLY_A') && body.includes('MEMBER_A_HOBBY'));
+  assert.ok(!body.includes('MEMBER_A_EPISODE') && !body.includes('OWNER_TRIP_EPISODE') && !body.includes('OWNER_DIET_V1'));
   await h.handle(f.message('same-id-other-room', '周末有什么活动适合我？', { route: f.other }));
   body = JSON.stringify(f.requests.at(-1));
   assert.ok(!body.includes('MEMBER_A_HOBBY') && !body.includes('MEMBER_A_EPISODE'));
@@ -217,21 +222,24 @@ test('三类记忆分别组织，统一本人跨绑定群与私聊召回，其�
   assert.ok(body.includes('我现在可以接受微辣了'));
   assert.ok(!body.includes('OWNER_DIET_V1'));
   await h.handle(f.message('cross-delete', '忘掉我的饮食偏好', ownerB));
+  assert.ok(f.sent.at(-1).text.includes('不提供删除'));
   await h.handle(f.message('after-delete-private', '请推荐晚餐', ownerPrivate));
   body = JSON.stringify(f.requests.at(-1));
-  assert.ok(!body.includes('微辣') && !body.includes('OWNER_DIET_V1'));
+  assert.ok(body.includes('我现在可以接受微辣了') && !body.includes('OWNER_DIET_V1'));
   await h.handle(f.message('private-query', '/memory query me', ownerPrivate));
   assert.ok(f.sent.at(-1).text.includes('OWNER_TRIP_EPISODE') && !f.sent.at(-1).text.includes('EXPIRED_OWNER'));
   await h.handle(f.message('member-query', '/memory query me'));
   assert.ok(f.sent.at(-1).text.includes('没有记忆管理'));
   await h.handle(f.message('delete-episode', `/memory delete ${episodeId}`, ownerB));
+  assert.ok(f.sent.at(-1).text.includes('不提供删除'));
   await h.close();
   const reopened = f.harness([f.route, f.other, privateRoute], policy);
   await reopened.handle(f.message('reopen-private', '聊聊我的经历', ownerPrivate));
   assert.ok(!JSON.stringify(f.requests.at(-1)).includes('OWNER_TRIP_EPISODE'));
   const db = f.db();
   try {
-    assert.equal(db.prepare('SELECT count(*) n FROM memory_revisions WHERE memory_id=? AND content IS NOT NULL').get(episodeId).n, 0);
+    assert.equal(db.prepare('SELECT count(*) n FROM memory_revisions WHERE memory_id=? AND content IS NOT NULL').get(episodeId).n, 1);
+    assert.equal(db.prepare('SELECT status FROM memories WHERE id=?').get(episodeId).status, 'active');
     assert.equal(db.prepare('SELECT max(n) n FROM (SELECT count(*) n FROM memory_uses GROUP BY run_id)').get().n <= 8, true);
   } finally { db.close(); }
 });

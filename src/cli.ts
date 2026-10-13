@@ -1,7 +1,8 @@
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { readConfig, readDataDir } from './config.js';
-import { MemoryError, type MemoryInput, type MemoryChange, type MemoryRecord, type MemoryDeletion } from './memory-types.js';
+import { MemoryError, type MemoryInput, type MemoryChange, type MemoryRecord } from './memory-types.js';
+import { parseMemoryRequest } from './memory-service.js';
 
 const help = `pa — TypeScript 个人伙伴的本地对话入口
 
@@ -11,16 +12,15 @@ const help = `pa — TypeScript 个人伙伴的本地对话入口
   npm start -- memory remember --content <内容> [--conversation <名称>]
   npm start -- memory query [--query <关键词>] [--conversation <名称>]
   npm start -- memory correct --id <ID> --content <新内容> [--conversation <名称>]
-  npm start -- memory delete --id <ID> [--conversation <名称>]
   npm start -- check
   npm start -- --help
 
 默认会话：local-owner。同名会话恢复 Pi 上下文，不同名称使用独立历史。
-交互指令：/help、/info、/history、/remember 内容、/memories [关键词]、/correct ID 新内容、/forget ID、/exit。
-SQLite 保存业务消息和会话范围的显式记忆；当前没有网络工具或自动记忆提取。
-history 和 memory 指令无须模型密钥，不请求模型。
+交互指令：/help、/info、/history、/remember 内容、/memories [关键词]、/correct ID 新内容、/exit。
+SQLite 保存原文、显式记忆与人物画像；PA_MEMORY_ENABLED=true 时启用独立后台整理。
+history 和 memory 指令无须模型密钥，不请求模型；不提供删除操作。
 memory remember/correct 可选 --kind fact|preference|episode、--source-message-id <来源用户消息ID>。
-memory correct/delete 可选 --expected-revision <版本>；query 可选 --limit <1-200>。
+memory correct 可选 --expected-revision <版本>；query 可选 --limit <1-200>。
 模型配置：在 .env 中填写 PA_PROVIDER、PA_MODEL、PA_API_KEY。
 `;
 
@@ -29,7 +29,7 @@ interface Options {
   conversationId: string;
   limit: number;
   message?: string;
-  action?: 'remember' | 'query' | 'correct' | 'delete';
+  action?: 'remember' | 'query' | 'correct';
   content?: string;
   query?: string;
   memoryId?: string;
@@ -40,8 +40,9 @@ interface Options {
 
 function parseMemoryArgs(args: string[]): Options {
   const action = args[1];
-  if (action !== 'remember' && action !== 'query' && action !== 'correct' && action !== 'delete') {
-    throw new MemoryError('memory 需要 remember、query、correct 或 delete 操作。');
+  if (action === 'delete') throw new MemoryError('不提供删除记忆的操作；可以使用 correct 纠正信息。');
+  if (action !== 'remember' && action !== 'query' && action !== 'correct') {
+    throw new MemoryError('memory 需要 remember、query 或 correct 操作。');
   }
   const options: Options = { command: 'memory', action, conversationId: 'local-owner', limit: 20 };
   const allowed = new Set(['--conversation']);
@@ -49,7 +50,7 @@ function parseMemoryArgs(args: string[]): Options {
   if (action === 'remember' || action === 'correct') {
     allowed.add('--content'); allowed.add('--kind'); allowed.add('--source-message-id');
   }
-  if (action === 'correct' || action === 'delete') { allowed.add('--id'); allowed.add('--expected-revision'); }
+  if (action === 'correct') { allowed.add('--id'); allowed.add('--expected-revision'); }
   for (let index = 2; index < args.length; index++) {
     const flag = args[index]!;
     if (!allowed.has(flag)) throw new MemoryError(`此记忆操作不支持参数：${flag}。`);
@@ -75,7 +76,7 @@ function parseMemoryArgs(args: string[]): Options {
     }
   }
   if ((action === 'remember' || action === 'correct') && options.content === undefined) throw new MemoryError('此操作需要 --content。');
-  if ((action === 'correct' || action === 'delete') && options.memoryId === undefined) throw new MemoryError('此操作需要 --id。');
+  if (action === 'correct' && options.memoryId === undefined) throw new MemoryError('此操作需要 --id。');
   if (options.conversationId.length > 200) throw new MemoryError('会话名称不能超过 200 个字符。');
   return options;
 }
@@ -114,7 +115,6 @@ interface MemoryAccess {
   remember(input: MemoryInput): MemoryChange;
   queryMemories(query?: string, limit?: number): MemoryRecord[];
   correctMemory(id: string, input: MemoryInput, expectedRevision?: number): MemoryChange;
-  deleteMemory(id: string, expectedRevision?: number): MemoryDeletion;
 }
 
 function performMemory(target: MemoryAccess, options: Options): unknown {
@@ -128,7 +128,6 @@ function performMemory(target: MemoryAccess, options: Options): unknown {
     case 'remember': return { scope, ...target.remember(input) };
     case 'query': return { scope, memories: target.queryMemories(options.query, options.limit) };
     case 'correct': return { scope, ...target.correctMemory(options.memoryId!, input, options.expectedRevision) };
-    case 'delete': return { scope, ...target.deleteMemory(options.memoryId!, options.expectedRevision) };
     default: throw new MemoryError('未知记忆操作。');
   }
 }
@@ -143,7 +142,7 @@ function interactiveMemory(line: string, conversationId: string): Options | unde
     const match = /^\/correct\s+(\S+)\s+([\s\S]+)$/.exec(line);
     if (!match) throw new MemoryError('用法：/correct ID 新内容。');
     args = ['correct', '--id', match[1]!, '--content', match[2]!];
-  } else if (/^\/forget(?:\s|$)/.test(line)) args = ['delete', '--id', line.slice('/forget'.length).trim()];
+  }
   return args ? parseMemoryArgs(['memory', ...args, '--conversation', conversationId]) : undefined;
 }
 
@@ -180,7 +179,6 @@ async function main(): Promise<void> {
         remember: input => session.remember(input),
         queryMemories: (query, limit) => session.query(query, limit),
         correctMemory: (id, input, revision) => session.correct(id, input, revision),
-        deleteMemory: (id, revision) => session.delete(id, revision),
       }, options), null, 2));
     } finally { await session.close(); }
     return;
@@ -234,11 +232,16 @@ async function main(): Promise<void> {
       if (interrupted) break;
       const command = line.trim();
       if (command === '/exit') break;
-      if (command === '/help') await writeLine('直接输入消息。/info、/history、/remember 内容、/memories [关键词]、/correct ID 新内容、/forget ID、/exit。记忆操作不请求模型。');
+      if (command === '/help') await writeLine('直接输入消息。/info、/history、/remember 内容、/memories [关键词]、/correct ID 新内容、/exit。');
       else if (command === '/info') await writeLine(JSON.stringify(runtime.info(), null, 2));
       else if (command === '/history') await writeLine(JSON.stringify(runtime.history(20), null, 2));
       else if (command) {
         try {
+          if (parseMemoryRequest(line)?.type === 'unsupported_delete') {
+            await writeLine('不提供删除记忆或偏好的操作；你可以明确纠正信息，我会保留原记录并更新当前内容。');
+            if (process.stdin.isTTY && !interrupted) reader.prompt();
+            continue;
+          }
           const memoryOptions = interactiveMemory(line.trimStart(), options.conversationId);
           if (memoryOptions) await writeLine(JSON.stringify(performMemory(runtime, memoryOptions), null, 2));
           else await respond(line, '伙伴 > ');

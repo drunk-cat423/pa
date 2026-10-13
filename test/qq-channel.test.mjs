@@ -80,7 +80,7 @@ test('normalizeQQMessage uses safe identity metadata, preserves other mentions a
   assert.deepEqual(normalizeQQMessage(base, 'account-1', 'bot'), {
     route: { channel: 'qq', accountId: 'account-1', roomId: 'group-1', roomType: 'group' },
     eventId: 'msg-1', senderId: 'member-1', senderName: 'Alice', text: 'hello <@someone>',
-    sentAt: '2026-10-12T10:00:00.000Z', mentioned: true,
+    sentAt: '2026-10-12T10:00:00.000Z', mentioned: true, mentionedSenderIds: ['someone'],
   });
   assert.equal(normalizeQQMessage({ ...base, d: { ...base.d, author: { id: 'bot', bot: true } } }, 'a', 'bot'), undefined);
   assert.equal(normalizeQQMessage({ ...base, t: 'C2C_MESSAGE_CREATE' }, 'a', 'bot'), undefined);
@@ -97,6 +97,21 @@ test('normalizeQQMessage uses safe identity metadata, preserves other mentions a
     mentions: [{ id: 'group-bot-openid', bot: true, is_you: false }] } }, 'a', 'ready-numeric-id').mentioned, false);
   assert.equal(normalizeQQMessage({ ...base, d: { ...base.d, content: '所有人好',
     mentions: [{ scope: 'all', is_you: true }] } }, 'a', 'bot').mentioned, false);
+  const targets = normalizeQQMessage({ ...base, d: { ...base.d, content: '文字 @小明', mentions: [
+    { id: 'internal-1', member_openid: 'member-openid-1' },
+    { id: 'internal-2', member_openid: 'member-openid-1' },
+    { id: 'group-bot', member_openid: 'bot-member', is_you: true },
+    { scope: 'all', id: 'everyone' },
+    { id: '', member_openid: '' },
+    { id: 'malformed\nidentity' },
+  ] } }, 'a', 'bot');
+  assert.deepEqual(targets.mentionedSenderIds, ['member-openid-1']);
+  const literal = normalizeQQMessage({ ...base, d: { ...base.d, content: '文字 @小明', mentions: [] } }, 'a', 'bot');
+  assert.equal(literal.mentioned, false);
+  assert.equal(literal.mentionedSenderIds, undefined);
+  const allOnly = normalizeQQMessage({ ...base, d: { ...base.d, content: '全体好', mentions: [{ scope: 'all', id: 'all' }] } }, 'a', 'bot');
+  assert.equal(allOnly.mentioned, false);
+  assert.equal(allOnly.mentionedSenderIds, undefined);
   assert.equal(normalizeQQMessage({ ...base, d: { ...base.d, timestamp: undefined, created_at: undefined } }, 'a', 'bot'), undefined);
   assert.equal(normalizeQQMessage({ ...base, d: { ...base.d, id: 'x'.repeat(513) } }, 'a', 'bot'), undefined);
   assert.equal(normalizeQQMessage({ ...base, d: { ...base.d, group_openid: 'x'.repeat(513) } }, 'a', 'bot'), undefined);

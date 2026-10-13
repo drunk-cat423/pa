@@ -2,8 +2,9 @@ import { MemoryError, type MemoryRecord, type ProfileField, type MemoryInput } f
 import type { RecordedConversation } from './conversation.js';
 
 export type MemoryRequest =
-  | { type: 'self_update'; field: ProfileField; content: string | null }
+  | { type: 'self_update'; field: ProfileField; content: string }
   | { type: 'admin'; text: string }
+  | { type: 'unsupported_delete' }
   | { type: 'profile_read' }
   | { type: 'clarify' };
 
@@ -13,13 +14,6 @@ const FIELD_NAMES: Record<ProfileField, string> = {
 };
 const CLARIFY = '请明确要更新自己的哪项信息：称呼、饮食偏好、兴趣或回复偏好。涉及他人或当前会话的管理操作仅管理者可用。';
 const DENIED = '你没有记忆管理或画像查询权限；可以明确请求更新自己在当前会话提供的信息。';
-const DELETE_FIELDS: Record<string, ProfileField> = {
-  '饮食偏好': 'diet', '饮食信息': 'diet', '口味': 'diet', '口味偏好': 'diet', '不喜欢吃辣': 'diet',
-  '称呼': 'preferred_name', '昵称': 'preferred_name', '名字': 'preferred_name',
-  '兴趣': 'interests', '兴趣偏好': 'interests', '爱好': 'interests',
-  '回复偏好': 'reply_style', '交流偏好': 'reply_style', '回答方式': 'reply_style',
-};
-
 function fieldFor(text: string): ProfileField | undefined {
   if (/饮食|口味|吃|微辣|清淡|素食|辣椒|食物|过敏/.test(text)) return 'diet';
   if (/称呼|昵称|名字|叫我|^我叫/.test(text)) return 'preferred_name';
@@ -32,6 +26,7 @@ function fieldFor(text: string): ProfileField | undefined {
 // actor, grant authority or invent a stored profile from ordinary conversation.
 export function parseMemoryRequest(input: string): MemoryRequest | undefined {
   const text = input.normalize('NFKC').trim();
+  if (/^\/(?:forget|memory\s+(?:delete|forget))(?:\s|$)/i.test(text)) return { type: 'unsupported_delete' };
   if (/^\/(?:memory|memories|remember|correct|forget)(?:\s|$)/i.test(text)) return { type: 'admin', text };
   if (/^(?:请)?(?:记住|更新|纠正|删除|忘掉)本群/.test(text)) return { type: 'admin', text };
   if ((/画像|个人档案|个人记忆|个人信息|我的记忆|我的偏好|关于我.*记忆|我.*偏好/.test(text)
@@ -41,10 +36,9 @@ export function parseMemoryRequest(input: string): MemoryRequest | undefined {
     || /我(?:保存的|提供的|告诉过的|的).*(?:饮食|称呼|兴趣|爱好|信息|偏好).*(?:是什么|有哪些|有什么)/.test(text)
     || /(?:知道|记得).{0,6}我.{0,12}(?:喜欢什么|叫啥|叫什么|偏好|饮食|兴趣|画像)/.test(text)
     || /^你.*记住.*我.*(?:什么|哪些|偏好|饮食|兴趣|画像)/.test(text)) return { type: 'profile_read' };
-  const forget = text.match(/^(?:请(?:你)?|帮我)?(?:忘掉|忘记|删除|移除)(?:关于)?(?:我的|我)(.+)$/);
-  if (forget) {
-    const field = DELETE_FIELDS[forget[1]!.trim().replace(/[。！!]+$/, '')];
-    return field ? { type: 'self_update', field, content: null } : { type: 'clarify' };
+  if (/^(?:请(?:你)?|帮我)?(?:忘掉|忘记|删除|移除)(?:关于)?(?:我的|我)(?:的)?/.test(text)
+    && /偏好|饮食|口味|吃|称呼|昵称|名字|兴趣|爱好|回复|交流|喜欢|不吃|不喜欢|记忆|信息/.test(text)) {
+    return { type: 'unsupported_delete' };
   }
   const explicit = text.match(/^(?:请(?:你)?|麻烦你|帮我)?(?:记住|记一下|更新|纠正)(?:一下)?[：:\s]*(.+)$/);
   const change = /^我现在(?:可以接受|不能接受|喜欢|不喜欢|更喜欢|希望)|^(?:以后)?(?:请)?(?:叫我|称呼我)/.test(text);
@@ -74,29 +68,26 @@ function display(records: MemoryRecord[]): string {
 
 export function executeMemoryRequest(request: MemoryRequest, conversation: RecordedConversation,
   source: MemorySource, owner: boolean, primaryPerson = false): string {
+  if (request.type === 'unsupported_delete') return '不提供删除记忆或偏好的操作；你可以明确纠正信息，我会保留原记录并更新当前内容。';
   if (request.type === 'clarify') return CLARIFY;
   if (request.type === 'profile_read') return owner ? display(conversation.queryMemories('', 20, source.actorId)) : DENIED;
   if (request.type === 'self_update') {
     const existing = conversation.selfProfileMemory(source.actorId, request.field);
-    if (request.content === null) {
-      if (existing) conversation.deleteMemory(existing.id, existing.revision, source.id);
-      return `${FIELD_NAMES[request.field]}已移除。本次操作不展示画像内容。`;
-    }
     const input = { content: request.content, kind: 'preference' as const, sourceMessageId: source.id,
       subjectActorId: source.actorId, profileField: request.field };
     if (existing) conversation.correctMemory(existing.id, input, existing.revision);
     else conversation.remember(input);
-    return `${FIELD_NAMES[request.field]}已更新，${primaryPerson ? '用于与你在已绑定会话中的交流' : '仅用于你在当前会话的交流'}。`;
+    void primaryPerson;
+    return `${FIELD_NAMES[request.field]}已更新，用于同一人物已绑定的场景。`;
   }
   if (!owner) return DENIED;
   let text = request.text;
   if (/^(?:请)?记住本群/.test(text)) text = `/memory remember room ${text.replace(/^(?:请)?记住本群[：:\s]*/, '')}`;
   text = text.replace(/^\/remember\s+/i, '/memory remember room ')
     .replace(/^\/memories(?:\s|$)/i, '/memory query ')
-    .replace(/^\/correct\s+/i, '/memory correct ')
-    .replace(/^\/forget\s+/i, '/memory delete ');
-  const match = text.match(/^\/memory(?:\s+(remember|query|correct|delete|forget))?(?:\s+([\s\S]*))?$/i);
-  if (!match || !match[1]) return '管理命令：/memory remember room 内容；/memory remember me 内容；/memory query [关键词]；/memory correct ID 内容；/memory delete ID。user:发送者ID 可替代 me 指定当前会话成员。';
+    .replace(/^\/correct\s+/i, '/memory correct ');
+  const match = text.match(/^\/memory(?:\s+(remember|query|correct))?(?:\s+([\s\S]*))?$/i);
+  if (!match || !match[1]) return '管理命令：/memory remember room 内容；/memory remember me 内容；/memory query [关键词]；/memory correct ID 内容。user:发送者ID 可替代 me 指定当前会话成员。';
   const action = match[1].toLowerCase();
   const args = (match[2] ?? '').trim();
   if (action === 'query') {
@@ -123,8 +114,7 @@ export function executeMemoryRequest(request: MemoryRequest, conversation: Recor
     const result = conversation.correctMemory(parts[1]!, { ...memoryContent(parts[2]), sourceMessageId: source.id });
     return `记忆已纠正：${result.memory.id}`;
   }
-  conversation.deleteMemory(parts[1]!, undefined, source.id);
-  return '记忆已删除。';
+  return '不提供删除记忆或偏好的操作；你可以明确纠正信息，我会保留原记录并更新当前内容。';
 }
 
 // Owner-only explicit metadata. Dates are never inferred from a chat sentence.

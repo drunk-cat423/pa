@@ -7,6 +7,7 @@ export interface HarnessPolicy {
   version: 1;
   ownerBindings: { route: ChannelRoute; senderId: string }[];
   primaryPerson?: PrimaryPerson;
+  persons?: PrimaryPerson[];
 }
 
 export const NO_OWNER_POLICY: HarnessPolicy = { version: 1, ownerBindings: [] };
@@ -16,6 +17,7 @@ export function validateHarnessPolicy(value: unknown): HarnessPolicy {
     || !('ownerBindings' in value) || !Array.isArray(value.ownerBindings) || value.ownerBindings.length > 32) {
     throw new Error('harness policy 配置无效。');
   }
+  const policyValue = value as Record<string, unknown>;
   function bindings(items: unknown[]): HarnessPolicy['ownerBindings'] { return items.map((binding: unknown) => {
     if (!binding || typeof binding !== 'object' || !('route' in binding) || !('senderId' in binding)) throw new Error('owner 身份配置无效。');
     const route = binding.route;
@@ -27,9 +29,8 @@ export function validateHarnessPolicy(value: unknown): HarnessPolicy {
       roomId: route.roomId as string, roomType: route.roomType as ChannelRoute['roomType'] }, senderId: binding.senderId as string };
   }); }
   const ownerBindings = bindings(value.ownerBindings);
-  let primaryPerson: PrimaryPerson | undefined;
-  if ('primaryPerson' in value) {
-    const person = value.primaryPerson;
+  function primary(value: unknown): PrimaryPerson {
+    const person = value;
     if (!person || typeof person !== 'object' || !('id' in person) || typeof person.id !== 'string'
       || !/^[A-Za-z0-9_-]{1,128}$/.test(person.id) || !('bindings' in person) || !Array.isArray(person.bindings)
       || !person.bindings.length || person.bindings.length > 32) throw new Error('统一人物身份配置无效。');
@@ -37,9 +38,33 @@ export function validateHarnessPolicy(value: unknown): HarnessPolicy {
     const keys = parsed.map(binding => JSON.stringify([binding.route.channel, binding.route.accountId,
       binding.route.roomType, binding.route.roomId, binding.senderId]));
     if (new Set(keys).size !== keys.length) throw new Error('统一人物身份存在重复绑定。');
-    primaryPerson = { id: person.id, bindings: parsed };
+    return { id: person.id, bindings: parsed };
   }
-  return { version: 1, ownerBindings, ...(primaryPerson ? { primaryPerson } : {}) };
+  const hasPrimaryPerson = Object.prototype.hasOwnProperty.call(policyValue, 'primaryPerson');
+  const primaryPerson = hasPrimaryPerson ? primary(policyValue.primaryPerson) : undefined;
+  if (Object.prototype.hasOwnProperty.call(policyValue, 'persons')
+    && (!Array.isArray(policyValue.persons) || policyValue.persons.length > 32)) {
+    throw new Error('人物身份列表配置无效。');
+  }
+  const persons = Array.isArray(policyValue.persons) ? policyValue.persons.map(primary) : undefined;
+  const allPersons = [...(primaryPerson ? [primaryPerson] : []), ...(persons ?? [])];
+  const ids = new Set<string>();
+  const boundIdentities = new Set<string>();
+  for (const person of allPersons) {
+    if (ids.has(person.id)) throw new Error('人物身份 ID 重复或与 primaryPerson 冲突。');
+    ids.add(person.id);
+    for (const binding of person.bindings) {
+      const key = JSON.stringify([binding.route.channel, binding.route.accountId,
+        binding.route.roomType, binding.route.roomId, binding.senderId]);
+      if (boundIdentities.has(key)) throw new Error('不同人物不能绑定相同渠道身份。');
+      boundIdentities.add(key);
+    }
+  }
+  return { version: 1, ownerBindings, ...(primaryPerson ? { primaryPerson } : {}), ...(persons ? { persons } : {}) };
+}
+
+export function configuredPersons(policy: HarnessPolicy): PrimaryPerson[] {
+  return [...(policy.primaryPerson ? [policy.primaryPerson] : []), ...(policy.persons ?? [])];
 }
 
 export async function loadHarnessPolicy(dataDir: string): Promise<HarnessPolicy> {

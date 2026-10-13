@@ -8,6 +8,9 @@ export interface ChannelRoute {
 export interface ExternalRunInput {
   eventId: string;
   senderId: string;
+  existingMessageId?: string;
+  sentAt?: string;
+  mentionedSenderIds?: string[];
   senderName?: string;
   modelInputText: string;
   messageKind?: 'chat' | 'memory';
@@ -22,6 +25,7 @@ export interface InboundMessage {
   text: string;
   sentAt: string;
   mentioned: boolean;
+  mentionedSenderIds?: string[];
 }
 
 export interface OutboundMessage {

@@ -10,6 +10,16 @@ export interface PaConfig {
   contextWindow: number;
   maxOutputTokens: number;
   timeoutMs: number;
+  memory?: AutoMemoryConfig;
+}
+
+export interface AutoMemoryConfig {
+  enabled: boolean;
+  maxCalls: number;
+  timeoutMs: number;
+  maxRetries: number;
+  maxOutputTokens?: number;
+  embedding?: { url: string; model: string; apiKey: string; dimensions: number; maxCalls: number };
 }
 
 export function readDataDir(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string {
@@ -63,5 +73,32 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     contextWindow,
     maxOutputTokens,
     timeoutMs,
+    memory: readAutoMemoryConfig(env),
   };
+}
+
+export function readAutoMemoryConfig(env: NodeJS.ProcessEnv): AutoMemoryConfig {
+  const flag = env.PA_MEMORY_ENABLED?.trim() || 'false';
+  if (!['true', 'false'].includes(flag)) throw new Error('PA_MEMORY_ENABLED 必须为 true 或 false。');
+  const result: AutoMemoryConfig = { enabled: flag === 'true',
+    maxCalls: positiveInteger(env, 'PA_MEMORY_MAX_CALLS', 20),
+    timeoutMs: positiveInteger(env, 'PA_MEMORY_TIMEOUT_MS', 120000),
+    maxRetries: positiveInteger(env, 'PA_MEMORY_MAX_RETRIES', 3),
+    maxOutputTokens: positiveInteger(env, 'PA_MEMORY_MAX_OUTPUT_TOKENS', 8192) };
+  if (result.timeoutMs > 2147483647 || result.maxRetries > 10) throw new Error('后台记忆超时或重试配置超出范围。');
+  const url = env.PA_EMBEDDING_URL?.trim();
+  if (url) {
+    let parsed: URL;
+    try { parsed = new URL(url); } catch { throw new Error('PA_EMBEDDING_URL 无效。'); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error('PA_EMBEDDING_URL 必须是无内嵌认证或查询参数的 HTTP(S) 地址。');
+    }
+    const model = env.PA_EMBEDDING_MODEL?.trim(), apiKey = env.PA_EMBEDDING_API_KEY?.trim();
+    if (!model || !apiKey) throw new Error('Embedding 需要显式模型和密钥。');
+    result.embedding = { url, model, apiKey,
+      dimensions: positiveInteger(env, 'PA_EMBEDDING_DIMENSIONS', 1024),
+      maxCalls: positiveInteger(env, 'PA_EMBEDDING_MAX_CALLS', 100) };
+    if (result.embedding.dimensions > 65536) throw new Error('Embedding 维度过大。');
+  }
+  return result;
 }

@@ -64,6 +64,20 @@ function hasBotMention(eventData: JsonObject, botId: string): boolean {
   return content.includes(`<@${botId}>`) || content.includes(`<@!${botId}>`);
 }
 
+function mentionedSenders(eventData: JsonObject, botId: string): string[] {
+  if (!Array.isArray(eventData.mentions)) return [];
+  const senders = new Set<string>();
+  for (const mention of eventData.mentions) {
+    if (!object(mention) || mention.scope === 'all' || mention.is_you === true) continue;
+    // Group sender IDs use member_openid when available, and otherwise author.id.
+    const id = mention.member_openid ?? mention.id;
+    if (!nonEmptyString(id) || id.trim() !== id || id.length > 512 || /[\u0000-\u001f\u007f]/.test(id)
+      || id === botId || mention.bot === true) continue;
+    senders.add(id);
+  }
+  return [...senders];
+}
+
 function stripBotPrefix(content: string, botIds: string[]): string {
   const trimmed = content.trimStart();
   for (const prefix of botIds.flatMap(id => [`<@${id}>`, `<@!${id}>`])) {
@@ -90,6 +104,7 @@ export function normalizeQQMessage(event: unknown, accountId: string, botId: str
   if (!sentAt) return undefined;
 
   const mentioned = !privateMessage && (event.t === 'GROUP_AT_MESSAGE_CREATE' || hasBotMention(data, botId));
+  const mentionedSenderIds = privateMessage ? [] : mentionedSenders(data, botId);
   // READY.user.id and group mention OpenIDs are different identity domains.
   // Only the authenticated platform's self marker can supply extra self IDs.
   const selfIds = [botId];
@@ -108,6 +123,7 @@ export function normalizeQQMessage(event: unknown, accountId: string, botId: str
     text,
     sentAt,
     mentioned,
+    ...(mentionedSenderIds.length ? { mentionedSenderIds } : {}),
   };
 }
 

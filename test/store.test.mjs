@@ -35,7 +35,7 @@ test('schema启用WAL与外键，会话和消息重开后持久化并隔离', ()
       assert.equal(reopened.listMessages('alpha', 10).map(message => message.text).join('|'), '保留原始内容 🙂|回复');
       const db = new DatabaseSync(f.databasePath);
       try {
-        assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5);
+        assert.equal(db.prepare('PRAGMA user_version').get().user_version, 6);
         assert.equal(db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
         assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
         assert.equal(db.prepare('PRAGMA foreign_key_check').all().length, 0);
@@ -400,9 +400,9 @@ test('上下文SQL在LIMIT之前过滤管理、失败运行与其他成员AI交�
     f.store.ackContextReset(conversation.id, f.store.contextState(conversation.id).generation);
     f.store.recordInbound(conversation.id, '水位后的公开消息', { eventId: 'after', senderId: 'b', modelInputText: '公开消息' });
     assert.deepEqual(f.store.contextMessages(conversation.id, 20, 'a').map(message => message.text), ['水位后的公开消息']);
-    f.store.recordControlRun(conversation.id, '删除', { eventId: 'delete', senderId: 'owner', modelInputText: '删除' }, source => {
-      f.store.deleteMemory(conversation.id, memory.id, 1, source.id);
-      return '已删';
+    f.store.recordControlRun(conversation.id, '纠正', { eventId: 'correct', senderId: 'owner', modelInputText: '纠正' }, source => {
+      f.store.correctMemory(conversation.id, memory.id, {content:'管理员纠正',sourceMessageId:source.id},1);
+      return '已纠正';
     });
     assert.deepEqual(f.store.contextMessages(conversation.id, 20, 'a'), []);
     f.store.close();

@@ -80,7 +80,7 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
   const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'));
   try {
     assert.deepEqual(db.prepare('SELECT text FROM messages WHERE role = ? ORDER BY created_at, rowid').all('user').map(row => row.text),
-      ['周末准备爬山', '建议怎么准备？', '我更喜欢海边', '另外一个群']);
+      ['周末准备爬山', '建议怎么准备？', '我更喜欢海边', '另外一个群', '超出预算']);
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM deliveries WHERE external_message_id = ?').get('qq-output').n, 3);
   } finally { db.close(); }
   await h.close();
@@ -115,7 +115,8 @@ test('不限次数模式超过三轮继续响应，普通消息不调用，单�
   assert.equal(await h.handle(f.message('failure', 'MODEL_FAILURE')), 'failed');
   assert.equal(await h.handle(f.message('failure', 'MODEL_FAILURE')), 'duplicate');
   assert.equal(await h.handle(f.message('after-failure', '继续交流')), 'sent');
-  assert.deepEqual(h.info(), { calls: 6, maxCalls: 0 });
+  assert.equal(h.info().calls, 6); assert.equal(h.info().maxCalls, 0);
+  assert.equal(h.info().memory[0].enabled, false);
   assert.equal(f.requests.length, 6);
   assert.equal(f.sent.length, 5);
 });

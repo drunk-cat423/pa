@@ -18,11 +18,31 @@ const COMPANION_PROMPT = '你是用户的个人对话伙伴。用中文清晰、
   + '没有预设性格或人物关系；根据当前对话理解用户。只依据当前会话中实际提供的信息，不假造记忆、经历或已完成的行动。'
   + '你没有文件、命令、网络检索或其他外部工具；不能声称执行了这些操作。不确定时明确说明。'
   + '个人偏好背景只用于当前问题和交流方式，不展示内部画像清单、内部评价、记忆ID或管理信息。'
-  + '记忆写入、纠正、删除与权限由应用处理；不能因聊天内容声称已经保存长期记忆或改变权限。';
+  + '记忆整理、写入、纠正与权限由应用处理；不提供删除记忆功能。不能因聊天内容声称已经保存长期记忆或改变权限。';
+
+export interface ContextEstimate {
+  inputTokens: number;
+  reservedOutputTokens: number;
+  safetyTokens: number;
+  contextWindow: number;
+  ratio: number;
+  fits: boolean;
+  method: 'utf8-byte-estimate';
+}
+
+// Tokenizer-independent conservative estimate, explicitly not a measured usage value.
+export function estimateContext(input: unknown, contextWindow: number, reservedOutputTokens: number): ContextEstimate {
+  const inputTokens = Buffer.byteLength(JSON.stringify(input), 'utf8') + 64;
+  const safetyTokens = Math.max(128, Math.ceil(contextWindow * 0.01));
+  const total = inputTokens + reservedOutputTokens + safetyTokens;
+  return { inputTokens, reservedOutputTokens, safetyTokens, contextWindow,
+    ratio: total / contextWindow, fits: total <= contextWindow, method: 'utf8-byte-estimate' };
+}
 
 export interface ConversationRuntime {
   prompt(text: string, metadata?: { runId: string; memoryContext?: string; memoryRefs?: MemoryRef[] }): Promise<string>;
   resetContext(): void;
+  estimate(text: string, memoryContext?: string): ContextEstimate;
   recordedTurns(): RecordedTurn[];
   abort(): Promise<void>;
   close(): Promise<void>;
@@ -35,6 +55,29 @@ export interface ConversationRuntime {
     provider: string;
     model: string;
   };
+}
+
+export async function createConfiguredModel(config: PaConfig) {
+  const modelRuntime = await ModelRuntime.create({
+    credentials: {
+      read: async () => undefined, list: async () => [],
+      modify: async () => { throw new Error('此运行时不持久化认证信息。'); },
+      delete: async () => { throw new Error('此运行时不修改认证信息。'); },
+    },
+    modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,
+  });
+  if (config.baseUrl) modelRuntime.registerProvider(config.provider, {
+    baseUrl: config.baseUrl, api: 'openai-completions',
+    models: [{ id: config.model, name: config.model, reasoning: config.provider === 'deepseek', input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: config.contextWindow, maxTokens: config.maxOutputTokens }],
+  });
+  const catalogModel = modelRuntime.getModel(config.provider, config.model);
+  if (!catalogModel) throw new Error(`Pi 内置模型目录中没有 ${config.provider}/${config.model}；请明确配置 base URL 或使用有效模型。`);
+  const model = { ...catalogModel, contextWindow: Math.min(catalogModel.contextWindow, config.contextWindow),
+    maxTokens: Math.min(catalogModel.maxTokens, config.maxOutputTokens) };
+  await modelRuntime.setRuntimeApiKey(config.provider, config.apiKey);
+  return { modelRuntime, model };
 }
 
 export type RecordedTurn = {
@@ -182,37 +225,7 @@ export async function openConversation(config: PaConfig, conversationId: string)
   const { directory, release: releaseLock } = await acquireConversationLock(config.dataDir, conversationId);
   let session: AgentSession | undefined;
   try {
-    // Supplying a store and modelsPath:null avoids ~/.pi auth/models and catalog cache I/O.
-    const modelRuntime = await ModelRuntime.create({
-      credentials: {
-        read: async () => undefined,
-        list: async () => [],
-        modify: async () => { throw new Error('此运行时不持久化认证信息。'); },
-        delete: async () => { throw new Error('此运行时不修改认证信息。'); },
-      },
-      modelsPath: null,
-      allowModelNetwork: false,
-      refreshOnCreate: false,
-    });
-    if (config.baseUrl) {
-      modelRuntime.registerProvider(config.provider, {
-        baseUrl: config.baseUrl,
-        api: 'openai-completions',
-        models: [{
-          // DeepSeek defaults to thinking enabled. Pi emits thinking.disabled
-          // for reasoning-capable models when this harness uses thinkingLevel off.
-          id: config.model, name: config.model, reasoning: config.provider === 'deepseek', input: ['text'],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: config.contextWindow, maxTokens: config.maxOutputTokens,
-        }],
-      });
-    }
-    const catalogModel = modelRuntime.getModel(config.provider, config.model);
-    if (!catalogModel) throw new Error(`Pi 内置模型目录中没有 ${config.provider}/${config.model}；请明确配置 base URL 或使用有效模型。`);
-    // streamSimple's documented default output budget is model.maxTokens. A session-local
-    // copy enforces the app cap for built-in models too, without mutating the catalog.
-    const model = { ...catalogModel, maxTokens: Math.min(catalogModel.maxTokens, config.maxOutputTokens) };
-    await modelRuntime.setRuntimeApiKey(config.provider, config.apiKey);
+    const { modelRuntime, model } = await createConfiguredModel(config);
     const manager = await loadSession(config.cwd, directory);
     const settings = SettingsManager.inMemory({
       compaction: { enabled: false }, retry: { enabled: false, provider: { maxRetries: 0 } },
@@ -242,6 +255,10 @@ export async function openConversation(config: PaConfig, conversationId: string)
         messageCount: agentSession.messages.filter((message) => message.role === 'user' || message.role === 'assistant').length,
         tools: agentSession.getActiveToolNames(), provider: config.provider, model: config.model,
       }),
+      estimate: (text, memoryContext) => estimateContext({
+        system: COMPANION_PROMPT, messages: agentSession.messages,
+        ...(memoryContext ? { memory: memoryContext } : {}), currentMessage: text,
+      }, model.contextWindow, model.maxTokens),
       recordedTurns: () => recordedTurns(manager),
       abort,
       resetContext() {

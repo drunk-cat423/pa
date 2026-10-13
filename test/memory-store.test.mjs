@@ -21,6 +21,14 @@ function inspect(path, callback) {
   try { return callback(db); } finally { db.close(); }
 }
 
+// Fixtures model tombstones that were already present before deletion was retired.
+function historicalDeleted(path, id) {
+  inspect(path, db => {
+    db.prepare("UPDATE memories SET status='deleted',content=NULL,occurred_at=NULL,expires_at=NULL WHERE id=?").run(id);
+    db.prepare("UPDATE memory_revisions SET status='deleted',content=NULL,occurred_at=NULL,expires_at=NULL WHERE memory_id=?").run(id);
+  });
+}
+
 function seedV1Database(databasePath) {
   inspect(databasePath, db => {
     db.exec(`
@@ -54,7 +62,7 @@ function seedV1Database(databasePath) {
   });
 }
 
-test('真实V1布局迁移到V5，保留消息、运行与投递并可写入记忆', () => {
+test('真实V1布局迁移到V6，保留消息、运行与投递并可写入记忆', () => {
   const directory = mkdtempSync(join(tmpdir(), 'pa-memory-v1-'));
   const databasePath = join(directory, 'store.sqlite');
   seedV1Database(databasePath);
@@ -72,7 +80,7 @@ test('真实V1布局迁移到V5，保留消息、运行与投递并可写入记�
     assert.deepEqual(store.contextState('conv'), { required: false, generation: 0 });
     store.ackDelivery('delivery', 'sent');
     inspect(databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 6);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     });
     store.close();
@@ -204,7 +212,7 @@ test('真实V3增量迁移保留所有业务列、rowid及审计，旧群记忆�
     assert.equal(store.queryMemories('conv')[0].revision, 2);
     assert.deepEqual(store.contextState('conv'), { required: true, generation: 4 });
     inspect(databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 6);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       assert.ok(db.prepare('SELECT message_kind FROM messages').all().every(row => row.message_kind === 'chat'));
       assert.ok(db.prepare('SELECT scope_type FROM memories').all().every(row => row.scope_type === 'legacy'));
@@ -242,7 +250,7 @@ test('真实V2迁移保留记忆版本、来源、使用审计与pending重置�
     assert.deepEqual(store.queryMemories(channel.id), []);
     assert.throws(() => store.correctMemory(channel.id, 'memory', { content: '越界' }), MemoryError);
     inspect(databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 6);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       const deliveries = db.prepare('SELECT room_id FROM deliveries WHERE id = ?').get('delivery');
       assert.equal(deliveries.room_id, 'room');
@@ -306,7 +314,7 @@ test('显式CRUD持久化，纠正保留稳定ID、历史版本和无原文事�
   } finally { f.cleanup(); }
 });
 
-test('删除清空全部记忆版本正文，保留元数据和使用审计，重复删除幂等', () => {
+test('删除接口禁用且保留原文与修订；历史deleted fixture保持墓碑不恢复', () => {
   const f = fixture();
   try {
     const sourceRun = f.store.beginRun(f.a.id, '原始聊天不能删除', 'p', 'm');
@@ -314,32 +322,24 @@ test('删除清空全部记忆版本正文，保留元数据和使用审计，�
     const memory = f.store.rememberMemory(f.a.id, { content: '第一份秘密正文', sourceMessageId: sourceRun.inputMessageId }).memory;
     const use = f.store.beginRun(f.a.id, 'use', 'p', 'm', [{ id: memory.id, revision: 1 }]);
     f.store.failRun(use.id, 'failed', 'test', 'test');
-    f.store.correctMemory(f.a.id, memory.id, { content: '第二份秘密正文', kind: 'episode' }, 1);
-    const deletion = f.store.deleteMemory(f.a.id, memory.id, 2);
-    assert.deepEqual(deletion, { id: memory.id, revision: 3, deleted: true, contextResetRequired: true });
-    assert.deepEqual(f.store.queryMemories(f.a.id), []);
-    assert.throws(() => f.store.correctMemory(f.a.id, memory.id, { content: '复活' }), /已删除/);
-    assert.deepEqual(f.store.deleteMemory(f.a.id, memory.id, 1), deletion);
-    assert.deepEqual(f.store.contextState(f.a.id), { required: true, generation: 2 });
+    const corrected = f.store.correctMemory(f.a.id, memory.id, { content: '第二份秘密正文', kind: 'episode' }, 1).memory;
+    assert.throws(() => f.store.deleteMemory(f.a.id, memory.id, 2), /不提供记忆删除/);
+    assert.deepEqual(f.store.queryMemories(f.a.id), [corrected]);
     inspect(f.databasePath, db => {
-      const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(memory.id);
-      assert.equal(row.content, null);
-      assert.equal(row.status, 'deleted');
-      assert.equal(row.source_message_id, null);
-      const versions = db.prepare('SELECT * FROM memory_revisions WHERE memory_id = ? ORDER BY revision').all(memory.id);
-      assert.equal(versions.length, 3);
-      assert.ok(versions.every(version => version.content === null && version.status === 'deleted'));
+      assert.deepEqual(db.prepare('SELECT content FROM memory_revisions WHERE memory_id=? ORDER BY revision').all(memory.id).map(row=>row.content), ['第一份秘密正文','第二份秘密正文']);
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM memory_events').get().n, 2);
       assert.equal(db.prepare('SELECT COUNT(*) AS n FROM memory_uses').get().n, 1);
-      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM memory_events').get().n, 3);
-      for (const table of ['memories', 'memory_revisions', 'memory_events', 'memory_uses', 'memory_context_state']) {
-        assert.equal(JSON.stringify(db.prepare(`SELECT * FROM ${table}`).all()).includes('秘密正文'), false);
-      }
-      assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     });
-    assert.equal(f.store.listMessages('a', 10)[0].text, '原始聊天不能删除');
-    f.store.ackContextReset(f.a.id, 2);
-    assert.equal(f.store.deleteMemory(f.a.id, memory.id).contextResetRequired, false);
-    assert.deepEqual(f.store.contextState(f.a.id), { required: false, generation: 2 });
+    historicalDeleted(f.databasePath,memory.id);
+    f.store.close();
+    const reopened = new ConversationStore(f.databasePath);
+    try {
+      assert.deepEqual(reopened.queryMemories(f.a.id), []);
+      assert.throws(() => reopened.correctMemory(f.a.id,memory.id,{content:'复活'}), /已删除/);
+      assert.throws(() => reopened.deleteMemory(f.a.id,memory.id), /不提供记忆删除/);
+      inspect(f.databasePath,db=>assert.equal(db.prepare('SELECT content FROM memories WHERE id=?').get(memory.id).content,null));
+      assert.equal(reopened.listMessages('a',10)[0].text,'原始聊天不能删除');
+    } finally { reopened.close(); }
   } finally { f.cleanup(); }
 });
 
@@ -358,7 +358,7 @@ test('SQL按会话隔离读改删和引用，来源只能是本会话user消息'
     assert.deepEqual(f.store.queryMemories(f.b.id), []);
     for (const id of [memory.id, 'missing']) {
       assert.throws(() => f.store.correctMemory(f.b.id, id, { content: '越界' }), { name: 'MemoryError', message: '记忆不存在。' });
-      assert.throws(() => f.store.deleteMemory(f.b.id, id), { name: 'MemoryError', message: '记忆不存在。' });
+      assert.throws(() => f.store.deleteMemory(f.b.id, id), /不提供记忆删除/);
       assert.throws(() => f.store.beginRun(f.b.id, '越界引用', 'p', 'm', [{ id, revision: 1 }]), { name: 'MemoryError', message: '记忆不存在。' });
     }
     assert.deepEqual(f.store.queryMemories(f.a.id), [memory]);
@@ -396,7 +396,7 @@ test('版本过期失败不改记忆；beginRun引用与输入运行原子提交
     const other = f.store.rememberMemory(f.b.id, { content: 'other' }).memory;
     f.store.correctMemory(f.a.id, one.id, { content: 'new one' }, 1);
     assert.throws(() => f.store.correctMemory(f.a.id, one.id, { content: 'stale' }, 1), /版本已变化/);
-    assert.throws(() => f.store.deleteMemory(f.a.id, one.id, 1), /版本已变化/);
+    assert.throws(() => f.store.deleteMemory(f.a.id, one.id, 1), /不提供记忆删除/);
     for (const expected of [0, -1, 1.5, NaN]) assert.throws(() => f.store.deleteMemory(f.a.id, one.id, expected), MemoryError);
     const good = { id: two.id, revision: 1 };
     for (const bad of [{ id: one.id, revision: 1 }, { id: other.id, revision: 1 }]) {
@@ -414,7 +414,7 @@ test('版本过期失败不改记忆；beginRun引用与输入运行原子提交
     assert.throws(() => f.store.beginRun(f.a.id, 'second running', 'p', 'm', refs), error => !(error instanceof MemoryError));
     assert.equal(f.store.listMessages('a', 10).length, 1);
     f.store.failRun(run.id, 'failed', 'test', 'test');
-    f.store.deleteMemory(f.a.id, two.id);
+    historicalDeleted(f.databasePath,two.id);
     assert.throws(() => f.store.beginRun(f.a.id, 'deleted', 'p', 'm', [good]), /已删除/);
     assert.equal(f.store.listMessages('a', 10).length, 1);
   } finally { f.cleanup(); }
@@ -433,7 +433,7 @@ test('上下文重置generation递增，CAS不会清除更新期间产生的标�
     assert.deepEqual(f.store.contextState(f.b.id), { required: false, generation: 0 });
     f.store.ackContextReset(f.a.id, 2);
     assert.deepEqual(f.store.contextState(f.a.id), { required: false, generation: 2 });
-    f.store.deleteMemory(f.a.id, memory.id);
+    f.store.correctMemory(f.a.id, memory.id, {content:'fourth'});
     assert.deepEqual(f.store.contextState(f.a.id), { required: true, generation: 3 });
     assert.throws(() => f.store.ackContextReset(f.a.id, -1), MemoryError);
     assert.throws(() => f.store.contextState('missing'), MemoryError);
@@ -524,15 +524,15 @@ test('群来源与subject必须属于当前房间，纠正保留scope与field并
     assert.equal(corrected.profileField, 'diet');
     assert.equal(corrected.sourceMessageId, owner.id);
     assert.equal(f.store.selfProfileMemory(f.group.id, self.actorId, 'diet').id, memory.id);
-    assert.throws(() => f.store.deleteMemory(f.group.id, memory.id, 2), /必须提供/);
+    assert.throws(() => f.store.deleteMemory(f.group.id, memory.id, 2), /不提供记忆删除/);
     assert.throws(() => f.store.deleteMemory(f.group.id, memory.id, 2, foreign.id), MemoryError);
-    f.store.deleteMemory(f.group.id, memory.id, 2, owner.id);
+    f.store.correctMemory(f.group.id, memory.id, {content:'管理员再次纠正',sourceMessageId:owner.id},2);
     inspect(f.databasePath, db => {
       const events = db.prepare('SELECT action, actor_id, source_message_id FROM memory_events WHERE memory_id = ? ORDER BY revision').all(memory.id);
       assert.deepEqual(events.map(row => ({ ...row })), [
         { action: 'remember', actor_id: self.actorId, source_message_id: self.id },
         { action: 'correct', actor_id: owner.actorId, source_message_id: owner.id },
-        { action: 'delete', actor_id: owner.actorId, source_message_id: owner.id },
+        { action: 'correct', actor_id: owner.actorId, source_message_id: owner.id },
       ]);
       // A valid FK can still describe a forged source actor from another room.
       db.prepare('UPDATE messages SET actor_id = ? WHERE id = ?').run(foreign.actorId, self.id);
@@ -555,7 +555,7 @@ test('self资料选择只匹配本人写入，owner note与另一成员字段不
     assert.equal(f.store.selfProfileMemory(f.group.id, self.actorId, 'diet').id, memory.id);
     assert.throws(() => f.store.rememberMemory(f.group.id, { content: '重复资料', subjectActorId: self.actorId, profileField: 'diet', sourceMessageId: self.id }), /UNIQUE/);
     assert.equal(f.store.queryMemories(f.group.id).length, 3);
-    inspect(f.databasePath, db => db.exec('DROP INDEX active_profile_per_writer;'));
+    inspect(f.databasePath, db => db.exec('DROP INDEX active_profile_per_writer; DROP INDEX active_person_profile;'));
     f.store.rememberMemory(f.group.id, { content: '损坏的重复资料', subjectActorId: self.actorId, profileField: 'diet', sourceMessageId: self.id });
     assert.throws(() => f.store.selfProfileMemory(f.group.id, self.actorId, 'diet'), /拒绝猜测/);
   } finally { f.cleanup(); }
@@ -593,7 +593,7 @@ function bindPrimary(f, routes = [f.route, { ...f.route, roomId: 'other' }], sen
   return primary;
 }
 
-test('V5个人共享仅按完整路由显式绑定，群共享/其他人隔离，首次新群成员无需伪造消息', () => {
+test('V6人物共享仅按完整路由显式绑定，群共享/其他人隔离，首次新群成员无需伪造消息', () => {
   const f = groupFixture();
   try {
     bindPrimary(f);
@@ -655,7 +655,7 @@ test('分块召回独立过滤后LIMIT及fallback，关闭画像保留个人长�
   } finally { f.cleanup(); }
 });
 
-test('跨场景纠正及删除使用当前真实来源，保持原始subject/writer/conversation并同时重置全部绑定会话', () => {
+test('跨场景纠正使用当前真实来源，保持原始subject/writer/conversation及旧正文并重置全部绑定会话', () => {
   const f = groupFixture();
   try {
     const privateRoute = { ...f.route, roomType: 'private', roomId: 'self' };
@@ -680,19 +680,19 @@ test('跨场景纠正及删除使用当前真实来源，保持原始subject/wri
     f.store.ackContextReset(f.group.id, snapshot.generation);
     assert.equal(f.store.contextState(f.group.id).required, true);
     assert.throws(() => f.store.correctMemory(f.other.id, memory.id, { content: '越界', sourceMessageId: stranger.id }), /记忆不存在/);
-    assert.throws(() => f.store.deleteMemory(f.other.id, memory.id, 2, source.id), /当前会话/);
+    assert.throws(() => f.store.deleteMemory(f.other.id, memory.id, 2, source.id), /不提供记忆删除/);
     assert.throws(() => f.store.correctMemory(f.other.id, memory.id, { content: 'stale', sourceMessageId: target.id }, 1), /版本已变化/);
     const refs = [{ id: corrected.id, revision: corrected.revision }];
     assert.throws(() => f.store.beginRun(f.other.id, '越界引用', 'p', 'm', refs, { eventId: 'bad-ref', senderId: 'stranger', modelInputText: 'x' }), /记忆不存在/);
     const run = f.store.beginRun(f.other.id, '本人引用', 'p', 'm', refs, { eventId: 'good-ref', senderId: 'self', modelInputText: 'x' });
     f.store.failRun(run.id, 'failed', 'test', 'test');
-    f.store.deleteMemory(f.other.id, memory.id, 2, target.id);
+    f.store.correctMemory(f.other.id, memory.id, {content:'后续本人纠正',sourceMessageId:target.id},2);
     inspect(f.databasePath, db => {
       const events = db.prepare('SELECT conversation_id, actor_id, source_message_id FROM memory_events WHERE memory_id = ? ORDER BY revision').all(memory.id);
       assert.equal(events[1].conversation_id, f.other.id);
       assert.equal(events[1].actor_id, target.actorId);
       assert.equal(events[2].source_message_id, target.id);
-      assert.ok(db.prepare('SELECT content FROM memory_revisions WHERE memory_id = ?').all(memory.id).every(row => row.content === null));
+      assert.deepEqual(db.prepare('SELECT content FROM memory_revisions WHERE memory_id = ? ORDER BY revision').all(memory.id).map(row=>row.content), ['原始画像','新画像','后续本人纠正']);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     });
   } finally { f.cleanup(); }
@@ -718,7 +718,7 @@ test('显式绑定提升仅本人actor记忆，重复画像按时间/rowid取最
       assert.equal(row.content, '旧画像');
       assert.equal(row.is_current, 0);
       assert.equal(db.prepare('SELECT status FROM memory_revisions WHERE memory_id = ?').get(old.id).status, 'superseded');
-      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memories WHERE person_id IS NOT NULL").get().n, 3);
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memories WHERE person_id IS NOT NULL").get().n, 4);
     });
     const generation = f.store.contextState(f.group.id).generation;
     f.store.configurePrimaryPerson(primary);
@@ -727,14 +727,14 @@ test('显式绑定提升仅本人actor记忆，重复画像按时间/rowid取最
     assert.deepEqual(f.store.recallMemorySections(f.group.id, a.actorId, ['diet']).personalMemories, []);
     assert.deepEqual(f.store.recallMemorySections(f.group.id, a.actorId, ['diet']).profile, []);
     assert.deepEqual(f.store.queryMemories(f.group.id, '', 20, a.actorId), []);
-    assert.throws(() => f.store.deleteMemory(f.group.id, personal.id, 1, a.id), /记忆不存在/);
+    assert.throws(() => f.store.correctMemory(f.group.id, personal.id, {content:'解绑后不能修改旧人物',sourceMessageId:a.id},1), /记忆不存在/);
     bindPrimary(f, undefined, 'self', 'different-person');
     assert.deepEqual(f.store.recallMemorySections(f.group.id, a.actorId, ['diet']).personalMemories, []);
     assert.deepEqual(f.store.recallMemorySections(f.group.id, a.actorId, ['diet']).profile, []);
   } finally { f.cleanup(); }
 });
 
-test('时间元数据规范化/保留/清除，有效期在SQL查询召回目标和run引用中过滤，过期仍可按ID删除', () => {
+test('时间元数据规范化/保留/清除，有效期过滤查询与run引用，纠正保留旧时间及正文', () => {
   const f = groupFixture();
   try {
     const self = f.source(f.group.id, 'self');
@@ -757,15 +757,15 @@ test('时间元数据规范化/保留/清除，有效期在SQL查询召回目标
     const cleared = f.store.correctMemory(f.group.id, memory.id, { content: '永久', sourceMessageId: self.id, expiresAt: null }, 2).memory;
     assert.equal(cleared.expiresAt, null);
     assert.equal(f.store.selfProfileMemory(f.group.id, self.actorId, 'diet').id, memory.id);
-    f.store.deleteMemory(f.group.id, memory.id, 3, self.id);
-    inspect(f.databasePath, db => {
-      for (const table of ['memories', 'memory_revisions']) assert.ok(db.prepare(`SELECT content, occurred_at, expires_at FROM ${table}`).all()
-        .every(row => row.content === null && row.occurred_at === null && row.expires_at === null));
+    assert.throws(()=>f.store.deleteMemory(f.group.id,memory.id,3,self.id),/不提供记忆删除/);
+    f.store.correctMemory(f.group.id,memory.id,{content:'现已过期',sourceMessageId:self.id,expiresAt:'2025-01-01T00:00:00Z'},3);
+    inspect(f.databasePath,db=>{
+      assert.deepEqual(db.prepare('SELECT content FROM memory_revisions WHERE memory_id=? ORDER BY revision').all(memory.id).map(row=>row.content),['短期秘密','保留时间','永久','现已过期']);
     });
     const expired = f.store.rememberMemory(f.group.id, { content: '过期画像', subjectActorId: self.actorId, profileField: 'diet', sourceMessageId: self.id, expiresAt: '2025-01-01T00:00:00Z' }).memory;
     const fresh = f.store.rememberMemory(f.group.id, { content: '新画像', subjectActorId: self.actorId, profileField: 'diet', sourceMessageId: self.id }).memory;
     assert.equal(f.store.selfProfileMemory(f.group.id, self.actorId, 'diet').id, fresh.id);
-    f.store.deleteMemory(f.group.id, expired.id, 1, self.id);
+    assert.throws(()=>f.store.deleteMemory(f.group.id,expired.id,1,self.id),/不提供记忆删除/);
   } finally { f.cleanup(); }
 });
 
@@ -778,7 +778,7 @@ test('绑定提升/跨会话重置与修改遇SQLite故障整体回滚，包括�
     assert.throws(() => bindPrimary(f), /reset failure/);
     inspect(f.databasePath, db => {
       assert.equal(db.prepare('SELECT COUNT(*) AS n FROM primary_person_bindings').get().n, 0);
-      assert.equal(db.prepare('SELECT person_id FROM memories WHERE id = ?').get(memory.id).person_id, null);
+      assert.equal(db.prepare('SELECT person_id FROM memories WHERE id = ?').get(memory.id).person_id, `actor:${self.actorId}`);
       db.exec('DROP TRIGGER fail_reset');
     });
     bindPrimary(f);
@@ -821,7 +821,13 @@ test('真实V4增量迁移保留rowid/正文/修订/来源/使用与reset水位�
     f.store.close();
     let before;
     inspect(f.databasePath, db => {
-      db.exec(`DROP INDEX active_person_profile; DROP INDEX memories_by_person; DROP INDEX active_profile_per_writer;
+      db.exec(`PRAGMA foreign_keys=OFF;
+        DROP TRIGGER assign_message_sequence; DROP INDEX message_ingest_sequence; DROP TABLE message_ingest_order;
+        ALTER TABLE messages DROP COLUMN ingest_seq; ALTER TABLE messages DROP COLUMN sent_at;
+        DROP TABLE person_fragment_messages; DROP TABLE person_fragments; DROP TABLE topic_embeddings; DROP TABLE memory_topic_messages;
+        DROP TABLE memory_topics; DROP TABLE auto_memory_job_messages; DROP TABLE auto_memory_jobs; DROP TABLE auto_memory_checkpoints;
+        DROP TABLE person_profile_revisions; DROP TABLE actor_person_bindings; DROP TABLE person_bindings; DROP TABLE persons;
+        DROP INDEX active_person_profile; DROP INDEX memories_by_person; DROP INDEX active_profile_per_writer;
         DROP TABLE primary_person_bindings;
         ALTER TABLE memories DROP COLUMN person_id;
         ALTER TABLE memories DROP COLUMN occurred_at;
@@ -847,7 +853,7 @@ test('真实V4增量迁移保留rowid/正文/修订/来源/使用与reset水位�
     });
     reopened = new ConversationStore(f.databasePath);
     inspect(f.databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 6);
       for (const [table, rows] of Object.entries(before)) {
         const columns = Object.keys(rows[0]).join(', ');
         assert.deepEqual(db.prepare(`SELECT ${columns} FROM ${table}`).all().map(row => ({ ...row })), rows);
@@ -999,6 +1005,6 @@ test('到期刷新reset失败整体回滚，未引用记忆和已过水位的ref
     assert.deepEqual(f.store.contextState(f.a.id), { required: true, generation: 1 });
     f.store.refreshExpiredContext(f.a.id);
     assert.equal(f.store.contextState(f.a.id).generation, 1);
-    f.store.deleteMemory(f.a.id, unused.id);
+    assert.throws(()=>f.store.deleteMemory(f.a.id,unused.id),/不提供记忆删除/);
   } finally { f.cleanup(); }
 });

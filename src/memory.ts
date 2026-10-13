@@ -1,13 +1,12 @@
 import { join } from 'node:path';
 import { acquireConversationLock } from './conversation-lock.js';
-import { MemoryError, type MemoryChange, type MemoryDeletion, type MemoryInput, type MemoryRecord } from './memory-types.js';
+import { MemoryError, type MemoryChange, type MemoryInput, type MemoryRecord } from './memory-types.js';
 import { ConversationStore } from './store.js';
 
 export interface MemorySession {
   remember(input: MemoryInput): MemoryChange;
   query(query?: string, limit?: number): MemoryRecord[];
   correct(id: string, input: MemoryInput, expectedRevision?: number): MemoryChange;
-  delete(id: string, expectedRevision?: number): MemoryDeletion;
   close(): Promise<void>;
 }
 
@@ -35,7 +34,6 @@ export async function openMemory(dataDir: string, conversationKey: string): Prom
       remember: (input) => operate(() => openedStore.rememberMemory(conversation.id, input)),
       query: (query, limit) => operate(() => openedStore.queryMemories(conversation.id, query, limit)),
       correct: (id, input, revision) => operate(() => openedStore.correctMemory(conversation.id, id, input, revision)),
-      delete: (id, revision) => operate(() => openedStore.deleteMemory(conversation.id, id, revision)),
       close() {
         if (closePromise) return closePromise;
         closed = true;

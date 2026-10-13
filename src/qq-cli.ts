@@ -21,6 +21,8 @@ async function main(): Promise<void> {
       allowedGroups: qq.routes.filter(route => route.roomType === 'group').length,
       allowedPrivateUsers: qq.routes.filter(route => route.roomType === 'private').length, ownerBindings: policy.ownerBindings.length,
       primaryPersonBindings: policy.primaryPerson?.bindings.length ?? 0,
+      memoryEnabled: config.memory?.enabled ?? false, memoryMaxCalls: config.memory?.maxCalls ?? 0,
+      embeddingConfigured: Boolean(config.memory?.embedding),
       qqCredentialsPresent: true, modelKeyPresent: keyPresent, ready: keyPresent }));
     process.exitCode = keyPresent ? 0 : 2;
     return;
@@ -70,6 +72,7 @@ async function main(): Promise<void> {
       },
     });
     harness = new ChannelHarness(config, qq.routes, channel, qq.maxCalls, policy);
+    await harness.start();
     await channel.start();
     if (stopping) await stopping;
     else status('ready_waiting_for_mention');

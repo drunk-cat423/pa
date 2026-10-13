@@ -102,7 +102,7 @@ test('显式记忆到期后清旧Pi投影，既有记忆块和派生对话不继
   assert.equal(db.prepare('SELECT content FROM memories WHERE id=?').get(memory.id).content, 'EXPIRING_PLAN_SECRET');
 });
 
-test('离线四操作无模型配置、隔离会话、业务错误可继续，共享锁阻止在线与离线并发', async t => {
+test('离线记忆无模型配置、隔离会话、业务错误可继续，共享锁阻止在线与离线并发', async t => {
   const f = await fixture(t);
   const a = await f.memory('A');
   const saved = a.remember({ content: '  喜欢茶\n保留原文  ', kind: 'preference' });
@@ -116,9 +116,8 @@ test('离线四操作无模型配置、隔离会话、业务错误可继续，�
   assert.equal(corrected.contextResetRequired, true);
   const b = await f.memory('B');
   assert.deepEqual(b.query(), []);
-  assert.throws(() => b.delete(saved.memory.id), MemoryError);
-  assert.equal(a.delete(saved.memory.id, 2).contextResetRequired, true);
-  assert.deepEqual(a.query(), []);
+  assert.equal('delete' in a, false);
+  assert.equal(a.query()[0].content, '喜欢水');
   await assert.rejects(f.conversation('A'), /锁定/);
   await assert.rejects(f.memory('A'), /锁定/);
   await a.close();
@@ -127,7 +126,7 @@ test('离线四操作无模型配置、隔离会话、业务错误可继续，�
   const memory = online.remember({ content: '在线保存' });
   assert.equal(online.queryMemories()[0].id, memory.memory.id);
   assert.throws(() => online.remember({ content: '' }), MemoryError);
-  assert.equal(online.queryMemories().length, 1);
+  assert.deepEqual(online.queryMemories().map(record => record.content).sort(), ['喜欢水', '在线保存']);
   assert.equal(f.requests.length, 0);
   assert.equal(existsSync(online.info().sessionFile), false);
   await online.close();
@@ -219,29 +218,34 @@ test('纠正后仅新记忆进入实际请求，旧user/assistant/记忆均隐�
   assert.equal(reopened.history().length, 6);
 });
 
-test('离线删除后聊天open恢复待重置，SQLquery与Pi活动上下文均无旧记忆而原始历史保留', async t => {
+test('离线纠正后聊天open恢复待重置，旧Pi投影失效而原始历史与修订保留', async t => {
   const f = await fixture(t);
-  const conversation = await f.conversation('delete');
-  const memory = conversation.remember({ content: 'deleted-secret-fact' });
-  await conversation.prompt('deleted-secret-user');
+  const conversation = await f.conversation('offline-correct');
+  const memory = conversation.remember({ content: 'obsolete-secret-fact' });
+  await conversation.prompt('obsolete-secret-user');
   const file = conversation.info().sessionFile;
   await conversation.close();
-  const offline = await f.memory('delete');
-  assert.equal(offline.delete(memory.memory.id).contextResetRequired, true);
-  assert.deepEqual(offline.query(), []);
-  assert.match(await readFile(file, 'utf8'), /deleted-secret-fact/, 'offline operation must not alter Pi');
+  const offline = await f.memory('offline-correct');
+  assert.equal(offline.correct(memory.memory.id, { content: 'current-secret-fact' }, 1).contextResetRequired, true);
+  assert.equal(offline.query()[0].content, 'current-secret-fact');
+  assert.match(await readFile(file, 'utf8'), /obsolete-secret-fact/, 'offline operation must not alter Pi');
   await offline.close();
-  const reopened = await f.conversation('delete');
+  const reopened = await f.conversation('offline-correct');
   assert.equal(reopened.history().length, 2);
   assert.deepEqual(SessionManager.open(file).buildSessionContext().messages.filter(message => message.role !== 'system'), []);
-  await reopened.prompt('after-delete');
-  assert.doesNotMatch(JSON.stringify(f.requests[1]), /deleted-secret/);
-  assert.deepEqual(reopened.queryMemories(), []);
+  await reopened.prompt('after-correction');
+  assert.doesNotMatch(JSON.stringify(f.requests[1]), /obsolete-secret/);
+  assert.match(JSON.stringify(f.requests[1]), /current-secret-fact/);
+  assert.equal(reopened.queryMemories()[0].content, 'current-secret-fact');
   await reopened.close();
-  const again = await f.conversation('delete');
-  await again.prompt('still-deleted');
-  assert.doesNotMatch(JSON.stringify(f.requests[2]), /deleted-secret/);
-  assert.match(await readFile(file, 'utf8'), /deleted-secret/);
+  const again = await f.conversation('offline-correct');
+  await again.prompt('still-corrected');
+  assert.doesNotMatch(JSON.stringify(f.requests[2]), /obsolete-secret/);
+  assert.match(JSON.stringify(f.requests[2]), /current-secret-fact/);
+  assert.match(await readFile(file, 'utf8'), /obsolete-secret/);
+  const db = f.database();
+  assert.deepEqual(db.prepare('SELECT content FROM memory_revisions WHERE memory_id=? ORDER BY revision').all(memory.memory.id)
+    .map(row => row.content), ['obsolete-secret-fact', 'current-secret-fact']);
 });
 
 test('Pi重置部分写入失败保持pending且禁用下一请求，重开幂等完成其余edit', async t => {
@@ -282,7 +286,7 @@ test('SQL reset确认失败保留pending，无下一请求，重开重试不重�
   const conversation = await f.conversation('ack-failure');
   const memory = conversation.remember({ content: 'obsolete-fact' });
   await conversation.prompt('obsolete-input');
-  conversation.deleteMemory(memory.memory.id);
+  conversation.correctMemory(memory.memory.id, { content: 'current-fact' });
   const db = f.database();
   db.exec("CREATE TRIGGER fail_ack BEFORE UPDATE OF reset_required ON memory_context_state WHEN NEW.reset_required = 0 BEGIN SELECT RAISE(ABORT, 'reset ack failure'); END");
   await assert.rejects(conversation.prompt('blocked'), PersistenceError);
@@ -330,7 +334,7 @@ test('活动请求拒绝记忆修改且close取消后仍可重新打开', async 
   assert.equal(f.requests.length, 1);
   assert.throws(() => conversation.remember({ content: 'another' }), /正在处理/);
   assert.throws(() => conversation.correctMemory(memory.memory.id, { content: 'changed' }), /正在处理/);
-  assert.throws(() => conversation.deleteMemory(memory.memory.id), /正在处理/);
+  assert.equal(typeof conversation.deleteMemory, 'undefined');
   await conversation.close();
   await rejected;
   const reopened = await f.conversation('active');
