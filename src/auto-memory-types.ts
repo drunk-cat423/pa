@@ -11,7 +11,12 @@ export interface ProfileFact {
   occurredAt?: string | null;
   expiresAt?: string | null;
 }
-export interface PersonProfile { personId: string; baseVersion: number; facts: ProfileFact[] }
+export interface PersonProfilePending { id: string; content: string; sourceMessageId: string; sourceType: EvidenceType }
+export interface PersonProfile {
+  personId: string; baseVersion: number; facts: ProfileFact[];
+  pending?: PersonProfilePending[];
+  pendingIds?: string[];
+}
 export interface AutoMemoryMessage {
   id: string; conversationId: string; actorId?: string; personId?: string;
   role: 'user' | 'assistant'; text: string; ingestSeq: number; createdAt: string; sentAt?: string;
@@ -26,6 +31,7 @@ export interface AutoMemoryTaskInput {
   job: AutoMemoryJob; roomType: 'private' | 'group'; messages: AutoMemoryMessage[];
   previousSummary?: string; profiles: PersonProfile[]; selfProfile?: SelfProfileSnapshot;
   selfProfileBudgetBytes?: number;
+  profileSources?: AutoMemoryMessage[];
 }
 export interface ValidatedExtract {
   ignoredMessageIds: string[];

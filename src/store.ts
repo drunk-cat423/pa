@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { isDeepStrictEqual } from 'node:util';
 import { MemoryError } from './memory-types.js';
 import type { MemoryChange, MemoryDeletion, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, MemorySections, PrimaryPerson, ProfileField } from './memory-types.js';
-import type { ChannelRoute, ExternalRunInput } from './channel-types.js';
+import type { ChannelRoute, ExternalRunInput, InboundMessage } from './channel-types.js';
 import { AutoMemoryStore, migrateAutoMemory } from './auto-memory-store.js';
 import { migrateSelfProfile } from './self-profile-store.js';
 
@@ -23,6 +24,7 @@ export interface RunRecord {
   status: 'running' | 'completed' | 'failed' | 'interrupted';
   provider: string;
   model: string;
+  piSessionFile?: string;
 }
 
 export interface MessageRecord {
@@ -44,15 +46,40 @@ export interface MessageRecord {
   messageKind?: 'chat' | 'memory';
   ingestSeq?: number;
   sentAt?: string;
+  piSessionFile?: string;
 }
+
+export type ChannelTaskStatus = 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
+export interface ChannelTaskRecord {
+  id: string;
+  messageId: string;
+  input: InboundMessage;
+  status: ChannelTaskStatus;
+  deliveryId?: string;
+}
+export type DeliveryMode = 'passive' | 'active';
 
 export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 10;
 const OWNER_ID = 'local-owner';
 const PROFILE_FIELDS = ['diet', 'preferred_name', 'interests', 'reply_style'];
+const historySegmenter = new Intl.Segmenter('zh', { granularity: 'word' });
+function historyTokens(text: string): string[] {
+  return [...historySegmenter.segment(text.normalize('NFKC').toLocaleLowerCase('zh'))]
+    .filter(segment => segment.isWordLike).map(segment => segment.segment);
+}
+
+export interface HistoryOptions {
+  query?: string; scope?: 'sender' | 'room'; senderId?: string; before?: string; after?: string; limit?: number;
+}
+export interface HistoryMessage {
+  id: string; senderId?: string; senderName?: string; replyToSenderId?: string;
+  role: 'user' | 'assistant'; text: string; sentAt?: string;
+}
+
 
 function now(): string {
   return new Date().toISOString();
@@ -68,6 +95,7 @@ function asRun(row: Record<string, unknown>): RunRecord {
     inputText: String(row.inputText), status: row.status as RunRecord['status'],
     provider: String(row.provider), model: String(row.model),
     ...(row.modelInputText == null ? {} : { modelInputText: String(row.modelInputText) }),
+    ...(row.piSessionFile == null ? {} : { piSessionFile: String(row.piSessionFile) }),
   };
 }
 
@@ -86,7 +114,19 @@ function asMessage(row: Record<string, unknown>): MessageRecord {
     ...(row.messageKind === 'memory' ? { messageKind: 'memory' } : {}),
     ...(row.ingestSeq == null ? {} : { ingestSeq: Number(row.ingestSeq) }),
     ...(row.sentAt == null ? {} : { sentAt: String(row.sentAt) }),
+    ...(row.piSessionFile == null ? {} : { piSessionFile: String(row.piSessionFile) }),
   };
+}
+
+function asChannelTask(row: Record<string, unknown>): ChannelTaskRecord {
+  return { id: String(row.id), messageId: String(row.message_id), input: JSON.parse(String(row.input_json)) as InboundMessage,
+    status: row.status as ChannelTaskStatus,
+    ...(row.result_delivery_id == null ? {} : { deliveryId: String(row.result_delivery_id) }) };
+}
+
+function validateDeliveryMode(mode: DeliveryMode, replySlot?: number): void {
+  if (!['passive', 'active'].includes(mode) || (replySlot !== undefined
+    && (!Number.isSafeInteger(replySlot) || replySlot < 1 || mode !== 'passive'))) throw new Error('投递模式或被动回复序号无效。');
 }
 
 function conversationRoute(key: string, route?: ChannelRoute): ChannelRoute {
@@ -123,13 +163,6 @@ function validateMemoryInput(input: MemoryInput): void {
   normalizeMemoryTime(input.expiresAt);
 }
 
-// A note belongs to its writer without turning a cited person's statement into
-// that writer's self declaration. Generic explicit notes retain weaker evidence.
-function explicitProfileSourceType(content: string): 'self' | 'third_party' {
-  return (/^我(?!听说|听到|看到|听|有(?:个|一个)?朋友|(?:的)?(?:朋友|家人|妈妈|爸爸|同学|同桌|同事|兄弟|姐姐|妹妹|哥哥|老板|对象|伴侣|孩子|父亲|母亲|室友))/u.test(content)
-    || /^(?:以后)?(?:请)?你?(?:叫我|称呼我)/u.test(content)) ? 'self' : 'third_party';
-}
-
 function normalizeMemoryTime(value: string | null | undefined): string | null {
   if (value == null) return null;
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
@@ -162,6 +195,7 @@ export class ConversationStore {
     this.db = new DatabaseSync(this.databasePath);
     try {
       this.db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+      this.db.function('history_tokens', { deterministic: true }, value => historyTokens(String(value ?? '')).join(' '));
       this.initialize();
       this.autoMemory = new AutoMemoryStore(this.db, operation => this.memoryTransaction(operation));
     } catch (error) {
@@ -315,6 +349,65 @@ export class ConversationStore {
         );
         CREATE INDEX delivery_parts_external_id ON delivery_parts(conversation_id, external_message_id)
           WHERE status = 'sent';
+      `);
+      if (version < 9) this.db.exec(`
+        CREATE TABLE self_profile_pending_v9 (
+          id TEXT PRIMARY KEY, content TEXT NOT NULL, source_message_id TEXT NOT NULL REFERENCES messages(id),
+          created_at TEXT NOT NULL, archived_revision INTEGER REFERENCES self_profile_revisions(revision), archived_at TEXT,
+          UNIQUE(source_message_id,content));
+        INSERT INTO self_profile_pending_v9 SELECT * FROM self_profile_pending ORDER BY rowid;
+        DROP TABLE self_profile_pending;
+        ALTER TABLE self_profile_pending_v9 RENAME TO self_profile_pending;
+        CREATE INDEX active_self_profile_pending ON self_profile_pending(archived_revision);
+        CREATE TABLE person_profile_pending (
+          id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id), content TEXT NOT NULL,
+          source_message_id TEXT NOT NULL REFERENCES messages(id), source_type TEXT NOT NULL CHECK(source_type IN ('self','third_party','inference')),
+          created_at TEXT NOT NULL, archived_revision INTEGER, archived_at TEXT,
+          FOREIGN KEY(person_id, archived_revision) REFERENCES person_profile_revisions(person_id, revision));
+        CREATE INDEX active_person_pending ON person_profile_pending(person_id, archived_revision);
+        CREATE TABLE profile_tool_receipts (
+          call_id TEXT NOT NULL, conversation_id TEXT NOT NULL REFERENCES conversations(id),
+          source_message_id TEXT NOT NULL REFERENCES messages(id), operation TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(source_message_id,call_id));
+        CREATE TABLE run_progress (
+          id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES agent_runs(id), text TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','uncertain','rejected')),
+          external_message_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE VIRTUAL TABLE message_history_fts USING fts5(message_id UNINDEXED, tokens, tokenize='unicode61');
+        INSERT INTO message_history_fts(message_id,tokens) SELECT id,history_tokens(text) FROM messages;
+        CREATE TRIGGER history_message_insert AFTER INSERT ON messages BEGIN
+          INSERT INTO message_history_fts(message_id,tokens) VALUES (NEW.id,history_tokens(NEW.text));
+        END;
+        CREATE TRIGGER history_message_update AFTER UPDATE OF text ON messages BEGIN
+          DELETE FROM message_history_fts WHERE message_id=OLD.id;
+          INSERT INTO message_history_fts(message_id,tokens) VALUES (NEW.id,history_tokens(NEW.text));
+        END;
+        CREATE TRIGGER history_message_delete AFTER DELETE ON messages BEGIN
+          DELETE FROM message_history_fts WHERE message_id=OLD.id;
+        END;
+      `);
+      if (version < 10) this.db.exec(`
+        ALTER TABLE agent_runs ADD COLUMN pi_session_file TEXT CHECK (pi_session_file IS NULL OR length(trim(pi_session_file)) > 0);
+        DROP INDEX one_running_run_per_conversation;
+        CREATE UNIQUE INDEX one_running_run_per_conversation ON agent_runs(conversation_id)
+          WHERE status = 'running' AND pi_session_file IS NULL;
+        CREATE UNIQUE INDEX one_running_run_per_session ON agent_runs(pi_session_file)
+          WHERE status = 'running' AND pi_session_file IS NOT NULL;
+        CREATE UNIQUE INDEX message_conversation_identity ON messages(id, conversation_id);
+        CREATE TABLE channel_tasks (
+          id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
+          message_id TEXT NOT NULL UNIQUE, input_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','interrupted')),
+          result_delivery_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          FOREIGN KEY (message_id, conversation_id) REFERENCES messages(id, conversation_id),
+          FOREIGN KEY (result_delivery_id, conversation_id) REFERENCES deliveries(id, conversation_id),
+          CHECK (status <> 'completed' OR result_delivery_id IS NOT NULL)
+        );
+        CREATE INDEX channel_tasks_by_conversation ON channel_tasks(conversation_id, status, created_at);
+        ALTER TABLE run_progress ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'passive' CHECK (delivery_mode IN ('passive','active'));
+        ALTER TABLE run_progress ADD COLUMN reply_slot INTEGER CHECK (reply_slot IS NULL OR reply_slot >= 1);
+        ALTER TABLE delivery_parts ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'passive' CHECK (delivery_mode IN ('passive','active'));
+        ALTER TABLE delivery_parts ADD COLUMN reply_slot INTEGER CHECK (reply_slot IS NULL OR reply_slot >= 1);
       `);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
@@ -671,8 +764,8 @@ export class ConversationStore {
       this.db.prepare(`INSERT INTO memory_revisions (memory_id, revision, content, status, source_event_id, source_message_id, created_at, occurred_at, expires_at)
         VALUES (?, 1, ?, 'active', ?, ?, ?, ?, ?)`).run(id, input.content, eventId, input.sourceMessageId ?? null, createdAt, occurredAt, expiresAt);
       if (personId !== null && input.sourceMessageId !== undefined && writerActorId === input.subjectActorId) {
-        this.autoMemory.updateExplicitProfile(personId, {content: input.content, ...(input.profileField ? {field: input.profileField} : {}),
-          sourceType: explicitProfileSourceType(input.content),
+        this.autoMemory.updateExplicitProfile(personId, {content: input.content,
+          sourceType: 'third_party',
           messageIds: [input.sourceMessageId], occurredAt, expiresAt});
       }
       if (personId !== null || input.profileField !== undefined) this.resetMemoryScopes(conversationId, personId);
@@ -760,6 +853,11 @@ export class ConversationStore {
         }
       }
       if (input.profileField !== undefined && input.profileField !== existing.profile_field) throw new MemoryError('纠正记忆不能改变成员资料字段。');
+      if (input.sourceMessageId !== undefined && existing.source_message_id != null) {
+        const incoming = this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(input.sourceMessageId);
+        const previous = this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(String(existing.source_message_id));
+        if (Number(incoming?.ingest_seq ?? 0) < Number(previous?.ingest_seq ?? 0)) throw new MemoryError('较旧来源不能覆盖较新的明确记忆。');
+      }
       const revision = Number(existing.revision) + 1;
       const eventId = randomUUID();
       const updatedAt = now();
@@ -776,17 +874,15 @@ export class ConversationStore {
       this.db.prepare(`UPDATE memories SET kind = ?, content = ?, revision = ?, source_event_id = ?, source_message_id = ?, updated_at = ?, occurred_at = ?, expires_at = ?, profile_source_self = ?
         WHERE id = ?`).run(input.kind ?? String(existing.kind), input.content, revision, eventId, input.sourceMessageId ?? null, updatedAt, occurredAt, expiresAt, profileSourceSelf, id);
       if (typeof existing.person_id === 'string' && profileSourceSelf === 1) {
-        this.autoMemory.updateExplicitProfile(existing.person_id, {content: input.content, field: String(existing.profile_field),
-          sourceType: 'self', messageIds: [input.sourceMessageId!], occurredAt, expiresAt});
-      } else if (typeof existing.person_id === 'string' && existing.profile_field === null
-        && existing.writer_actor_id === existing.subject_actor_id && input.sourceMessageId !== undefined) {
         this.autoMemory.updateExplicitProfile(existing.person_id, {content: input.content,
-          sourceType: actorId === existing.subject_actor_id || this.personForActor(conversationId, actorId) === existing.person_id
-            ? explicitProfileSourceType(input.content) : 'third_party',
+          sourceType: 'third_party', messageIds: [input.sourceMessageId!], occurredAt, expiresAt});
+      } else if (typeof existing.person_id === 'string' && existing.profile_field === null
+        && existing.writer_actor_id === existing.subject_actor_id && input.sourceMessageId !== undefined
+        && this.autoMemory.personForActor(actorId) === existing.person_id) {
+        this.autoMemory.updateExplicitProfile(existing.person_id, {content: input.content,
+          sourceType: 'third_party',
           messageIds: [input.sourceMessageId], occurredAt, expiresAt},
           existing.source_message_id === null ? undefined : String(existing.source_message_id));
-      } else if (typeof existing.person_id === 'string' && existing.profile_field !== null && existing.writer_actor_id === existing.subject_actor_id) {
-        this.autoMemory.removeExplicitProfile(existing.person_id,String(existing.profile_field));
       }
       this.resetMemoryScopes(conversationId, existing.person_id);
       return { memory: asMemory(this.findMemory(conversationId, id, input.sourceMessageId === undefined ? undefined : actorId)), contextResetRequired: true };
@@ -807,6 +903,127 @@ export class ConversationStore {
     if (!Number.isSafeInteger(generation) || generation < 0) throw new MemoryError('上下文代次必须是非负整数。');
     this.requireMemoryConversation(conversationId);
     this.db.prepare('UPDATE memory_context_state SET reset_required = 0 WHERE conversation_id = ? AND generation = ?').run(conversationId, generation);
+  }
+
+  updateProfileFromTool(conversationId: string, sourceMessageId: string, callId: string,
+    target: 'sender' | 'ai_self', content: string, sourceType: 'self' | 'third_party' = 'third_party'): { saved: true; target: string } {
+    if (!['sender', 'ai_self'].includes(target) || !['self', 'third_party'].includes(sourceType)
+      || typeof callId !== 'string' || !callId.trim() || callId.length > 512
+      || typeof content !== 'string' || !content.trim()
+      || [...content].length > (target === 'sender' ? 4000 : 500)) throw new MemoryError('画像工具参数无效或内容超出上限。');
+    return this.memoryTransaction(() => {
+      const source = this.db.prepare(`SELECT m.text,m.actor_id FROM messages m JOIN actors a ON a.id=m.actor_id
+        JOIN conversations c ON c.id=m.conversation_id
+        WHERE m.id=? AND m.conversation_id=? AND m.role='user' AND (a.room_id=c.room_id OR a.kind='local-owner')`)
+        .get(sourceMessageId, conversationId);
+      if (!source || !String(source.text).normalize('NFKC').includes(content.normalize('NFKC'))) {
+        throw new MemoryError('画像内容必须是当前真人原文的连续摘录。');
+      }
+      const operation = JSON.stringify([target, sourceType]);
+      const receipt = this.db.prepare('SELECT * FROM profile_tool_receipts WHERE source_message_id=? AND call_id=?').get(sourceMessageId,callId);
+      if (receipt) {
+        if (receipt.conversation_id !== conversationId || receipt.source_message_id !== sourceMessageId
+          || receipt.operation !== operation || receipt.content !== content) throw new MemoryError('工具调用 ID 已绑定到其他来源或操作。');
+        return { saved: true, target };
+      }
+      if (target === 'sender') this.autoMemory.addProfilePending(this.autoMemory.ensureActorPerson(String(source.actor_id)),
+        sourceMessageId, content, sourceType);
+      else this.autoMemory.selfProfile.addPending(sourceMessageId, content);
+      this.db.prepare('INSERT INTO profile_tool_receipts VALUES (?,?,?,?,?,?)')
+        .run(callId, conversationId, sourceMessageId, operation, content, now());
+      return { saved: true, target };
+    });
+  }
+
+  readHistory(conversationId: string, currentMessageId: string, options: HistoryOptions = {}): { messages: HistoryMessage[]; scope: 'sender' | 'room' } {
+    const limit = options.limit ?? 6;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10 || !['sender','room'].includes(options.scope ?? 'sender')
+      || (options.query !== undefined && (typeof options.query !== 'string' || [...options.query].length > 1000))
+      || (options.senderId !== undefined && (typeof options.senderId !== 'string' || !options.senderId))) throw new MemoryError('历史检索参数无效。');
+    const before = normalizeMemoryTime(options.before); const after = normalizeMemoryTime(options.after);
+    if (before && after && after >= before) throw new MemoryError('历史时间范围无效。');
+    return this.memoryTransaction(() => {
+      const current = this.db.prepare(`SELECT m.actor_id,m.ingest_seq,r.room_type,c.room_id FROM messages m
+        JOIN actors a ON a.id=m.actor_id JOIN conversations c ON c.id=m.conversation_id JOIN rooms r ON r.id=c.room_id
+        WHERE m.id=? AND m.conversation_id=? AND m.role='user' AND (a.room_id=c.room_id OR a.kind='local-owner')`)
+        .get(currentMessageId,conversationId);
+      if (!current) throw new MemoryError('历史检索边界必须属于当前会话的真人消息。');
+      const scope = options.scope ?? 'sender';
+      if (scope === 'room' && current.room_type !== 'group') throw new MemoryError('仅群聊允许按当前房间检索。');
+      let actorId: string | null = scope === 'sender' ? String(current.actor_id) : null;
+      if (options.senderId !== undefined) {
+        const actor = this.db.prepare('SELECT id FROM actors WHERE room_id=? AND external_user_id=?').get(String(current.room_id),options.senderId);
+        if (!actor) throw new MemoryError('历史检索成员不属于当前房间。');
+        actorId = String(actor.id);
+      }
+      const tokens = historyTokens(options.query ?? '');
+      const match = [...new Set(tokens)].map(token => '"' + token.replaceAll('"','""') + '"').join(' OR ');
+      const filtered = `SELECT m.id,m.role,m.text,m.ingest_seq,m.sent_at,m.created_at,m.sender_name,
+        a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,r.input_message_id,r.response_message_id
+        ${match ? ',bm25(message_history_fts) AS score' : ''}
+        FROM messages m LEFT JOIN actors a ON a.id=m.actor_id
+        LEFT JOIN agent_runs r ON r.input_message_id=m.id OR r.response_message_id=m.id
+        LEFT JOIN messages input ON input.id=r.input_message_id LEFT JOIN actors inputa ON inputa.id=input.actor_id
+        LEFT JOIN deliveries d ON d.message_id=m.id
+        ${match ? 'JOIN message_history_fts ON message_history_fts.message_id=m.id' : ''}
+        WHERE m.conversation_id=? AND m.ingest_seq<?
+          AND (m.role='user' OR (r.status='completed' AND d.status='sent' AND input.ingest_seq<?))
+          AND (? IS NULL OR CASE WHEN m.role='assistant' THEN input.actor_id ELSE m.actor_id END=?)
+          AND (? IS NULL OR COALESCE(m.sent_at,m.created_at)<?)
+          AND (? IS NULL OR COALESCE(m.sent_at,m.created_at)>?)`;
+      const parameters = [conversationId,Number(current.ingest_seq),Number(current.ingest_seq),actorId,actorId,before,before,after,after];
+      const ranked = this.db.prepare(filtered + (match ? ' AND message_history_fts MATCH ? ORDER BY score,m.ingest_seq DESC LIMIT ?' : ' ORDER BY m.ingest_seq DESC LIMIT ?'))
+        .all(...parameters,...(match ? [match] : []),limit);
+      const selected = new Map<string, (typeof ranked)[number]>();
+      // Include the matching turn's other half only inside the same scope and time window.
+      if (match) {
+        const eligible = this.db.prepare(filtered.replace(',bm25(message_history_fts) AS score','')
+          .replace('JOIN message_history_fts ON message_history_fts.message_id=m.id','') + ' AND m.id=?');
+        for (const row of ranked) {
+          if (selected.size >= limit) break;
+          selected.set(String(row.id),row);
+          if (selected.size >= limit) break;
+          const paired = row.role === 'user' ? row.response_message_id : row.input_message_id;
+          if (paired == null || selected.has(String(paired))) continue;
+          const reply = eligible.get(...parameters,paired);
+          if (reply) selected.set(String(reply.id),reply);
+          if (selected.size >= limit) break;
+        }
+      }
+      if (!match) for (const row of ranked) selected.set(String(row.id),row);
+      return { scope, messages: [...selected.values()].sort((a,b) => Number(a.ingest_seq)-Number(b.ingest_seq)).map(row => ({
+        id: String(row.id), role: row.role as 'user'|'assistant', text: String(row.text),
+        ...(row.sender_id == null ? {} : { senderId: String(row.sender_id) }),
+        ...(row.sender_name == null ? {} : { senderName: String(row.sender_name) }),
+        ...(row.role !== 'assistant' || row.reply_sender_id == null ? {} : { replyToSenderId: String(row.reply_sender_id) }),
+        sentAt: String(row.sent_at ?? row.created_at),
+      })) };
+    });
+  }
+
+  createProgress(runId: string, text: string): { id: string } {
+    if (typeof text !== 'string' || !text.trim()) throw new Error('进展内容不能为空。');
+    return this.memoryTransaction(() => {
+      if (!this.db.prepare("SELECT id FROM agent_runs WHERE id=? AND status='running'").get(runId)) throw new Error('进展必须属于正在运行的任务。');
+      const id = randomUUID();
+      this.db.prepare("INSERT INTO run_progress (id,run_id,text,status,external_message_id,created_at,updated_at) VALUES (?,?,?,'pending',NULL,?,?)").run(id,runId,text,now(),now());
+      return { id };
+    });
+  }
+  startProgress(id: string, mode: DeliveryMode = 'passive', replySlot?: number): void {
+    validateDeliveryMode(mode, replySlot);
+    if (this.db.prepare("UPDATE run_progress SET status='sending',delivery_mode=?,reply_slot=?,updated_at=? WHERE id=? AND status='pending'").run(mode,replySlot ?? null,now(),id).changes !== 1) {
+      throw new Error('进展已经尝试发送或不存在。');
+    }
+  }
+  ackProgress(id: string, status: 'sent'|'uncertain'|'rejected', externalId?: string): void {
+    if (!['sent','uncertain','rejected'].includes(status) || (externalId !== undefined && (typeof externalId !== 'string' || !externalId))) throw new Error('进展回执无效。');
+    this.memoryTransaction(() => {
+      const row = this.db.prepare('SELECT status,external_message_id FROM run_progress WHERE id=?').get(id);
+      if (row?.status === status && row.external_message_id === (externalId ?? null)) return;
+      if (!row || row.status !== 'sending') throw new Error('进展不能修改或重复发送。');
+      this.db.prepare('UPDATE run_progress SET status=?,external_message_id=?,updated_at=? WHERE id=?').run(status,externalId ?? null,now(),id);
+    });
   }
 
   hasExternalMessage(conversationId: string, eventId: string): boolean {
@@ -890,12 +1107,122 @@ export class ConversationStore {
     });
   }
 
-  beginRun(conversationId: string, text: string, provider: string, model: string, memoryRefs: readonly MemoryRef[] = [], external?: ExternalRunInput, modelInputText?: string): RunRecord {
+  enqueueChannelTask(conversationId: string, sourceMessageId: string, input: InboundMessage): { id: string; status: ChannelTaskStatus } {
+    return this.memoryTransaction(() => {
+      const source = this.db.prepare(`SELECT m.id,m.text,m.external_event_id,m.sender_name,m.sent_at,a.external_user_id,
+        room.channel,room.account,room.room_type,room.external_chat_id FROM messages m
+        JOIN conversations c ON c.id=m.conversation_id JOIN rooms room ON room.id=c.room_id
+        JOIN actors a ON a.id=m.actor_id AND a.room_id=c.room_id
+        WHERE m.id=? AND m.conversation_id=? AND m.role='user'`).get(sourceMessageId, conversationId);
+      if (!source || !input || !input.route || source.text !== input.text || source.external_event_id !== input.eventId
+        || source.external_user_id !== input.senderId || source.channel !== input.route.channel || source.account !== input.route.accountId
+        || source.room_type !== input.route.roomType || source.external_chat_id !== input.route.roomId
+        || typeof input.mentioned !== 'boolean' || typeof input.sentAt !== 'string'
+        || (input.senderName !== undefined && typeof input.senderName !== 'string')) throw new Error('任务来源与原始渠道消息不一致。');
+      const sentAt = normalizeMemoryTime(input.sentAt);
+      if (source.sent_at != null && source.sent_at !== sentAt) {
+        throw new Error('任务来源与原始渠道消息不一致。');
+      }
+      const inputJson = JSON.stringify(input);
+      const existing = this.db.prepare('SELECT id,status,input_json FROM channel_tasks WHERE message_id=?').get(sourceMessageId);
+      if (existing) {
+        if (!isDeepStrictEqual(JSON.parse(String(existing.input_json)), JSON.parse(inputJson))) throw new Error('任务原始输入不能修改。');
+        return { id: String(existing.id), status: existing.status as ChannelTaskStatus };
+      }
+      if (this.db.prepare('SELECT id FROM agent_runs WHERE input_message_id=?').get(sourceMessageId)) throw new Error('已运行的消息不能重新排队。');
+      const id = randomUUID();
+      const createdAt = now();
+      this.db.prepare(`INSERT INTO channel_tasks (id,conversation_id,message_id,input_json,status,created_at,updated_at)
+        VALUES (?,?,?,?,'queued',?,?)`).run(id, conversationId, sourceMessageId, inputJson, createdAt, createdAt);
+      return { id, status: 'queued' };
+    });
+  }
+
+  claimChannelTask(id: string): boolean {
+    return this.db.prepare(`UPDATE channel_tasks SET status='running',updated_at=? WHERE id=? AND status='queued'
+      AND NOT EXISTS (SELECT 1 FROM agent_runs WHERE input_message_id=channel_tasks.message_id)`).run(now(), id).changes === 1;
+  }
+
+  finishChannelTask(id: string, status: 'completed' | 'failed' | 'interrupted', deliveryId?: string): void {
+    if (!['completed', 'failed', 'interrupted'].includes(status)) throw new Error('任务结束状态无效。');
+    this.memoryTransaction(() => {
+      const task = this.db.prepare('SELECT * FROM channel_tasks WHERE id=?').get(id);
+      if (!task) throw new Error('渠道任务不存在。');
+      let resultId: string | null = null;
+      if (status === 'completed') {
+        const result = this.db.prepare(`SELECT d.id FROM agent_runs r JOIN deliveries d ON d.run_id=r.id
+          WHERE r.input_message_id=? AND r.conversation_id=? AND r.status='completed'
+            AND (? IS NULL OR d.id=?)`).get(String(task.message_id), String(task.conversation_id), deliveryId ?? null, deliveryId ?? null);
+        if (!result) throw new Error('任务没有对应的已完成运行或投递。');
+        resultId = String(result.id);
+      } else if (deliveryId !== undefined) throw new Error('未完成任务不能绑定结果投递。');
+      if (task.status === status && task.result_delivery_id === resultId) return;
+      if (!['queued', 'running'].includes(String(task.status))) throw new Error('渠道任务已结束，不能修改。');
+      this.db.prepare('UPDATE channel_tasks SET status=?,result_delivery_id=?,updated_at=? WHERE id=?').run(status, resultId, now(), id);
+    });
+  }
+
+  listChannelTasks(conversationId: string, status?: ChannelTaskStatus): ChannelTaskRecord[] {
+    if (status !== undefined && !['queued', 'running', 'completed', 'failed', 'interrupted'].includes(status)) throw new Error('任务状态无效。');
+    return this.db.prepare(`SELECT * FROM channel_tasks WHERE conversation_id=? AND (? IS NULL OR status=?)
+      ORDER BY created_at,rowid`).all(conversationId, status ?? null, status ?? null).map(row => asChannelTask(row));
+  }
+
+  recoverChannelTasks(conversationId: string): void {
+    this.memoryTransaction(() => {
+      const tasks = this.db.prepare(`SELECT t.id,t.status,r.status AS run_status,d.id AS delivery_id
+        FROM channel_tasks t LEFT JOIN agent_runs r ON r.input_message_id=t.message_id
+        LEFT JOIN deliveries d ON d.run_id=r.id
+        WHERE t.conversation_id=? AND t.status IN ('queued','running')`).all(conversationId);
+      for (const task of tasks) {
+        if (task.status === 'queued' && task.run_status == null) continue;
+        const status = task.run_status === 'completed' && task.delivery_id != null ? 'completed'
+          : task.run_status === 'failed' ? 'failed' : 'interrupted';
+        this.db.prepare('UPDATE channel_tasks SET status=?,result_delivery_id=?,updated_at=? WHERE id=?')
+          .run(status, status === 'completed' ? String(task.delivery_id) : null, now(), String(task.id));
+      }
+    });
+  }
+
+  latestTaskResult(conversationId: string, senderId: string, taskId?: string): {
+    taskId: string; text: string; deliveryId: string; sourceEventId: string; sourceText: string;
+  } | undefined {
+    if (typeof senderId !== 'string' || !senderId) return undefined;
+    let selectedId: string | undefined;
+    if (taskId !== undefined) {
+      if (!/^(?:[0-9a-f]{8}|[0-9a-f]{8}-[0-9a-f]{3}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.test(taskId)) return undefined;
+      const candidates = this.db.prepare('SELECT id FROM channel_tasks WHERE conversation_id=? AND substr(id,1,?)=? COLLATE NOCASE')
+        .all(conversationId, taskId.length, taskId);
+      if (candidates.length !== 1) return undefined;
+      selectedId = String(candidates[0]!.id);
+    }
+    const row = this.db.prepare(`SELECT t.id,d.id AS delivery_id,response.text,m.external_event_id,m.text AS source_text
+      FROM channel_tasks t JOIN messages m ON m.id=t.message_id AND m.conversation_id=t.conversation_id
+      JOIN actors a ON a.id=m.actor_id JOIN conversations c ON c.id=t.conversation_id AND c.room_id=a.room_id
+      JOIN agent_runs r ON r.input_message_id=m.id AND r.conversation_id=t.conversation_id AND r.status='completed'
+      JOIN deliveries d ON d.run_id=r.id AND d.id=t.result_delivery_id AND d.conversation_id=t.conversation_id
+      JOIN messages response ON response.id=r.response_message_id
+      WHERE t.conversation_id=? AND a.external_user_id=? AND t.status='completed'
+        AND NOT (r.provider='local' AND r.model='memory-control') AND (? IS NULL OR t.id=?)
+      ORDER BY t.created_at DESC,t.rowid DESC LIMIT 1`).get(conversationId, senderId, selectedId ?? null, selectedId ?? null);
+    if (!row) return undefined;
+    const parts = this.db.prepare('SELECT text FROM delivery_parts WHERE delivery_id=? ORDER BY part_index').all(row.delivery_id!);
+    return { taskId: String(row.id), text: parts.length ? parts.map(part => String(part.text)).join('') : String(row.text),
+      deliveryId: String(row.delivery_id), sourceEventId: String(row.external_event_id), sourceText: String(row.source_text) };
+  }
+
+  beginRun(conversationId: string, text: string, provider: string, model: string, memoryRefs: readonly MemoryRef[] = [], external?: ExternalRunInput, modelInputText?: string, piSessionFile?: string): RunRecord {
     if(modelInputText!==undefined&&typeof modelInputText!=='string') throw new Error('模型输入必须是字符串。');
+    if (piSessionFile !== undefined && (typeof piSessionFile !== 'string' || !piSessionFile.trim())) throw new Error('独立 Pi session 路径不能为空。');
     const id = randomUUID();
     const inputMessageId = external?.existingMessageId ?? randomUUID();
     const createdAt = now();
     return this.memoryTransaction(() => {
+      if (piSessionFile !== undefined && this.db.prepare('SELECT id FROM conversations WHERE pi_session_file=?').get(piSessionFile)) {
+        throw new Error('独立运行不能使用会话的 canonical Pi session。');
+      }
+      if (piSessionFile !== undefined && this.db.prepare('SELECT id FROM agent_runs WHERE pi_session_file=? AND input_message_id<>?')
+        .get(piSessionFile, inputMessageId)) throw new Error('独立 Pi session 已绑定其他来源消息。');
       if (external?.existingMessageId !== undefined) {
         const source = this.externalMessage(conversationId, external.eventId);
         if (!source || source.id !== external.existingMessageId || source.senderId !== external.senderId || source.text !== text
@@ -917,12 +1244,13 @@ export class ConversationStore {
       else if (external.messageKind === 'memory') this.db.prepare("UPDATE messages SET message_kind='memory' WHERE id=?").run(inputMessageId);
       const actualModelInput=modelInputText??external?.modelInputText;
       if(actualModelInput!==undefined) this.db.prepare('UPDATE messages SET model_input_text=? WHERE id=?').run(actualModelInput,inputMessageId);
-      this.db.prepare(`INSERT INTO agent_runs (id, conversation_id, input_message_id, status, provider, model, started_at)
-        VALUES (?, ?, ?, 'running', ?, ?, ?)`).run(id, conversationId, inputMessageId, provider, model, createdAt);
+      this.db.prepare(`INSERT INTO agent_runs (id, conversation_id, input_message_id, status, provider, model, started_at, pi_session_file)
+        VALUES (?, ?, ?, 'running', ?, ?, ?, ?)`).run(id, conversationId, inputMessageId, provider, model, createdAt, piSessionFile ?? null);
       for (const ref of memoryRefs) {
         this.db.prepare('INSERT INTO memory_uses (run_id, memory_id, revision) VALUES (?, ?, ?)').run(id, ref.id, ref.revision);
       }
       return { id, conversationId, inputMessageId, inputText: text, status: 'running', provider, model,
+        ...(piSessionFile === undefined ? {} : { piSessionFile }),
         ...(actualModelInput===undefined ? {} : { modelInputText: actualModelInput }) };
     });
   }
@@ -982,13 +1310,26 @@ export class ConversationStore {
 
   unfinishedRuns(conversationId: string): RunRecord[] {
     return this.db.prepare(`SELECT r.id, r.conversation_id AS conversationId, r.input_message_id AS inputMessageId,
-      m.text AS inputText, m.model_input_text AS modelInputText, r.status, r.provider, r.model FROM agent_runs r
+      m.text AS inputText, m.model_input_text AS modelInputText, r.status, r.provider, r.model, r.pi_session_file AS piSessionFile FROM agent_runs r
       JOIN messages m ON m.id = r.input_message_id WHERE r.conversation_id = ? AND r.status = 'running'
       ORDER BY r.started_at, r.rowid`).all(conversationId).map(row => asRun(row as Record<string, unknown>));
   }
 
+  recordedSessionFiles(conversationId: string): string[] {
+    return this.db.prepare(`SELECT DISTINCT pi_session_file FROM agent_runs
+      WHERE conversation_id=? AND pi_session_file IS NOT NULL ORDER BY pi_session_file`).all(conversationId)
+      .map(row => String(row.pi_session_file));
+  }
+
+  recordedTaskSessions(conversationId: string): { piSessionFile: string; inputMessageId: string }[] {
+    return this.db.prepare(`SELECT pi_session_file,input_message_id FROM agent_runs
+      WHERE conversation_id=? AND pi_session_file IS NOT NULL ORDER BY started_at,rowid`).all(conversationId)
+      .map(row => ({ piSessionFile: String(row.pi_session_file), inputMessageId: String(row.input_message_id) }));
+  }
+
   markPendingUncertain(conversationId: string): void {
     this.memoryTransaction(() => {
+      this.db.prepare("UPDATE run_progress SET status='uncertain',updated_at=? WHERE run_id IN (SELECT id FROM agent_runs WHERE conversation_id=?) AND status IN ('pending','sending')").run(now(),conversationId);
       this.db.prepare("UPDATE delivery_parts SET status = 'uncertain', updated_at = ? WHERE conversation_id = ? AND status IN ('pending', 'sending')")
         .run(now(), conversationId);
       this.db.prepare("UPDATE deliveries SET status = 'uncertain', updated_at = ? WHERE conversation_id = ? AND status = 'pending'")
@@ -1009,8 +1350,9 @@ export class ConversationStore {
     });
   }
 
-  beginDeliveryPart(conversationId: string, deliveryId: string, partIndex: number): void {
+  beginDeliveryPart(conversationId: string, deliveryId: string, partIndex: number, mode: DeliveryMode = 'passive', replySlot?: number): void {
     if (!Number.isSafeInteger(partIndex) || partIndex < 0) throw new Error('投递分段序号无效。');
+    validateDeliveryMode(mode, replySlot);
     this.memoryTransaction(() => {
       const parent = this.db.prepare('SELECT status FROM deliveries WHERE id = ? AND conversation_id = ?').get(deliveryId, conversationId);
       const part = this.db.prepare('SELECT status FROM delivery_parts WHERE delivery_id = ? AND conversation_id = ? AND part_index = ?')
@@ -1020,8 +1362,8 @@ export class ConversationStore {
       if (!parent || parent.status !== 'pending' || !part || part.status !== 'pending' || previous !== partIndex) {
         throw new Error('投递分段不存在、已经尝试或前一段尚未确认。');
       }
-      this.db.prepare("UPDATE delivery_parts SET status = 'sending', updated_at = ? WHERE delivery_id = ? AND part_index = ?")
-        .run(now(), deliveryId, partIndex);
+      this.db.prepare("UPDATE delivery_parts SET status = 'sending', delivery_mode = ?, reply_slot = ?, updated_at = ? WHERE delivery_id = ? AND part_index = ?")
+        .run(mode, replySlot ?? null, now(), deliveryId, partIndex);
     });
   }
 
@@ -1077,7 +1419,7 @@ export class ConversationStore {
     const selected = conversationRoute(conversationKey, route);
     const rows = this.db.prepare(`
       SELECT m.id, m.conversation_id AS conversationId, m.role, m.text, m.created_at AS createdAt,
-        m.pi_entry_id AS piEntryId, r.status AS runStatus, d.status AS deliveryStatus, m.rowid AS rowId,
+        m.pi_entry_id AS piEntryId, r.status AS runStatus, r.id AS runId, r.pi_session_file AS piSessionFile, d.status AS deliveryStatus, m.rowid AS rowId,
         m.model_input_text AS modelInputText, m.external_event_id AS eventId, a.external_user_id AS senderId,
         m.sender_name AS senderName, d.external_message_id AS externalMessageId, m.actor_id AS actorId, m.message_kind AS messageKind, m.ingest_seq AS ingestSeq, m.sent_at AS sentAt
       FROM messages m JOIN conversations c ON c.id = m.conversation_id
@@ -1097,7 +1439,7 @@ export class ConversationStore {
     const boundary=beforeMessageId===undefined?undefined:this.db.prepare('SELECT ingest_seq FROM messages WHERE id=? AND conversation_id=?').get(beforeMessageId,conversationId);
     if(beforeMessageId!==undefined&&!boundary) throw new Error('历史边界消息必须属于当前会话。');
     const rows = this.db.prepare(`SELECT m.id, m.conversation_id AS conversationId, m.role, m.text, m.created_at AS createdAt,
-      m.pi_entry_id AS piEntryId, r.status AS runStatus, r.id AS runId, d.status AS deliveryStatus,
+      m.pi_entry_id AS piEntryId, r.status AS runStatus, r.id AS runId, r.pi_session_file AS piSessionFile, d.status AS deliveryStatus,
       m.model_input_text AS modelInputText, m.external_event_id AS eventId, a.external_user_id AS senderId,
       m.sender_name AS senderName, d.external_message_id AS externalMessageId, m.actor_id AS actorId, m.message_kind AS messageKind, m.ingest_seq AS ingestSeq, m.sent_at AS sentAt
       FROM messages m LEFT JOIN memory_context_state s ON s.conversation_id = m.conversation_id

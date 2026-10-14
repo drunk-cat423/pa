@@ -27,18 +27,22 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
     if (!Array.isArray(v) || (!allowEmpty && !v.length) || new Set(v).size !== v.length
       || v.some(id => typeof id !== 'string' || !messages.has(id))) throw new Error('记忆输出引用了输入以外的消息。');
   }
-  function fact(v: unknown, personId: string): void {
+  function fact(v: unknown, personId: string, profileFact = false): void {
     if (!record(v)) throw new Error('人物事实无效。');
     text(v.content, 4000);
     if (!['self', 'third_party', 'inference'].includes(String(v.sourceType))) throw new Error('人物来源类型无效。');
-    if (v.field !== undefined) text(v.field, 100);
+    if (v.field !== undefined && !mergedProfile) throw new Error('人物事实不能输出分类字段。');
     for (const key of ['occurredAt', 'expiresAt']) if (v[key] != null && (typeof v[key] !== 'string' || !Number.isFinite(Date.parse(v[key])))) {
       throw new Error('人物事实时间无效。');
     }
-    const inherited = Array.isArray(v.messageIds) && people.get(personId)?.facts.some(old => sameFact(old, v as unknown as ProfileFact));
+    const inherited = profileFact && Array.isArray(v.messageIds) && people.get(personId)?.facts.some(old => sameFact(old, v as unknown as ProfileFact));
     if (inherited) return;
-    ids(v.messageIds);
-    const human = v.messageIds.map(id => messages.get(id)!).filter(message => message.role === 'user');
+    const captured = profileFact ? people.get(personId)?.pending ?? [] : [];
+    const allowed = new Map([...input.messages,...(input.profileSources ?? []).filter(message => captured.some(item => item.sourceMessageId === message.id))]
+      .map(message => [message.id,message]));
+    if (!Array.isArray(v.messageIds) || !v.messageIds.length || new Set(v.messageIds).size !== v.messageIds.length
+      || v.messageIds.some(id => typeof id !== 'string' || !allowed.has(id) || allowed.get(id)!.role !== 'user')) throw new Error('人物事实必须引用有效原始真人消息。');
+    const human = v.messageIds.map(id => allowed.get(id)!);
     if (!human.length || (v.sourceType === 'self' && human.some(message => message.personId !== personId))) {
       throw new Error('人物事实缺少本人自述或有效原始依据。');
     }
@@ -60,7 +64,12 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
       || updated.has(profile.personId) || profile.baseVersion !== people.get(profile.personId)!.baseVersion
       || !Array.isArray(profile.facts) || (!mergedProfile && profile.facts.length > 200)) throw new Error('人物画像版本或结构无效。');
     updated.add(profile.personId);
-    profile.facts.forEach(item => fact(item, profile.personId as string));
+    profile.facts.forEach(item => fact(item, profile.personId as string, true));
+    if (profile.pendingIds !== undefined && (!Array.isArray(profile.pendingIds) || new Set(profile.pendingIds).size !== profile.pendingIds.length
+      || profile.pendingIds.some(id => {
+        const pending = people.get(profile.personId as string)!.pending?.find(item => item.id === id);
+        return !pending || !(profile.facts as ProfileFact[]).some(item => item.messageIds.includes(pending.sourceMessageId));
+      }))) throw new Error('只能归档已捕获且保留来源的人物待整理条目。');
   }
   ids(value.ignoredMessageIds, true);
   const covered = new Set([...value.ignoredMessageIds,
@@ -201,6 +210,7 @@ export class BackgroundMemory {
           }
           const chunk: AutoMemoryTaskInput = { ...input,
             messages: chunkMessages, profiles: profileView,
+            profileSources: (input.profileSources ?? []).filter(message=>profileView.some(profile=>(profile.pending??[]).some(item=>item.sourceMessageId===message.id))),
             ...(progress.summary ? { previousSummary: progress.summary } : {}) };
           if (input.selfProfile && progress.extract.selfProfile) {
             const previous = progress.extract.selfProfile;
@@ -229,8 +239,10 @@ export class BackgroundMemory {
             const original = progress.profiles.find(old => old.personId === profile.personId)!;
             const viewed = profileView.find(old => old.personId === profile.personId)!;
             const unseen = original.facts.filter(fact => !viewed.facts.some(old => sameFact(old, fact))
-              && !profile.facts.some(next => sameFact(next, fact) || (next.field !== undefined && next.field === fact.field)));
+              && !profile.facts.some(next => sameFact(next, fact)));
             profile.facts = [...unseen, ...profile.facts];
+            profile.pendingIds = [...new Set([...(progress.extract.profiles.find(old=>old.personId===profile.personId)?.pendingIds ?? []),...(profile.pendingIds ?? [])])];
+            profile.pending = (original.pending ?? []).filter(item=>!profile.pendingIds!.includes(item.id));
             progress.profiles = progress.profiles.map(old => old.personId === profile.personId ? profile : old);
             progress.extract.profiles = progress.extract.profiles.filter(old => old.personId !== profile.personId);
             progress.extract.profiles.push(profile);
@@ -294,14 +306,23 @@ export class BackgroundMemory {
       .finally(() => { this.embeddingWork = undefined; });
   }
 
-  async retrieve(query: string) {
+  async retrieve(query: string, signal?: AbortSignal) {
     const embedding = this.provider.embedding;
-    if (!this.config.memory?.enabled || !embedding) return { status: 'unavailable' as const, topics: [] };
+    if (!this.config.memory?.enabled || !embedding || signal?.aborted) return { status: 'unavailable' as const, topics: [] };
+    let onAbort: (()=>void) | undefined;
     try {
-      const vector = await this.request('embedding', signal => embedding.embed(query, signal));
+      const request = this.request('embedding', internalSignal => embedding.embed(query,
+        signal ? AbortSignal.any([internalSignal,signal]) : internalSignal));
+      const vector = signal ? await Promise.race([request,new Promise<never>((_resolve,reject)=>{
+        onAbort=()=>reject(new Error('前台检索已取消。'));
+        signal.addEventListener('abort',onAbort,{once:true});
+        if(signal.aborted) onAbort();
+      })]) : await request;
+      if (signal?.aborted) return { status: 'unavailable' as const, topics: [] };
       return this.store.searchTopics(this.conversationId, { model: embedding.model, dimensions: embedding.dimensions,
         inputVersion: embedding.inputVersion, vector, limit: 5 });
     } catch { this.embeddingError = 'failed_or_budget_exhausted'; return { status: 'unavailable' as const, topics: [] }; }
+    finally { if (signal && onAbort) signal.removeEventListener('abort',onAbort); }
   }
 
   async close(): Promise<void> {

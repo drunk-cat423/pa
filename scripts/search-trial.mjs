@@ -3,7 +3,6 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readConfig } from '../dist/config.js';
 import { openConversation } from '../dist/runtime.js';
-import { explicitWebSearchQuery } from '../dist/search-request.js';
 
 const config = readConfig();
 if (!config.search?.enabled || config.search.maxRequests !== 1 || config.search.maxUses !== 1) {
@@ -20,7 +19,7 @@ try {
   runtime = await openConversation({ ...config, timeoutMs: 120000 }, `search-trial:${config.search.budgetId}`, { enableSearch: true });
   const startedAt = Date.now();
   const answer = await runtime.prompt(question, { runId: `trial:${config.search.budgetId}`,
-    searchQuery: explicitWebSearchQuery(question) });
+    searchQuery: 'DeepSeek 官方文档中 Claude Code 的 Web Search 支持与计费说明' });
   const entries = (await readFile(runtime.info().sessionFile, 'utf8')).trim().split('\n').map(JSON.parse);
   const messages = entries.filter(entry => entry.type === 'message').map(entry => entry.message);
   const mainRequests = messages.filter(message => message.role === 'assistant').map(message => ({

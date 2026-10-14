@@ -258,11 +258,13 @@ export class QQChannel {
   }
 
   async send(message: OutboundMessage): Promise<DeliveryResult> {
+    const deliveryMode = message.deliveryMode ?? 'passive';
     if (this.closed || !this.started || message.route.channel !== 'qq' || message.route.accountId !== this.config.appId
       || !['group', 'private'].includes(message.route.roomType)
-      || !nonEmptyString(message.route.roomId) || !nonEmptyString(message.replyToMessageId)) return { status: 'rejected' };
+      || !nonEmptyString(message.route.roomId) || !['passive', 'active'].includes(deliveryMode)) return { status: 'rejected' };
+    if (deliveryMode === 'passive' && !referenceId(message.replyToMessageId)) return { status: 'rejected' };
     const partIndex = message.partIndex ?? 0;
-    if (!Number.isSafeInteger(partIndex) || partIndex < 0 || partIndex >= 5) return { status: 'rejected' };
+    if (!Number.isSafeInteger(partIndex) || partIndex < 0 || (deliveryMode === 'passive' && partIndex >= 5)) return { status: 'rejected' };
     const content = message.plainText ? message.text : toPlainText(message.text);
     if (!content.trim()) return { status: 'rejected' };
     let token: string;
@@ -275,10 +277,13 @@ export class QQChannel {
     let response: Response;
     try {
       const scope = message.route.roomType === 'private' ? 'users' : 'groups';
+      const payload = deliveryMode === 'active'
+        ? { msg_type: 0, content }
+        : { msg_type: 0, content, msg_id: message.replyToMessageId, msg_seq: partIndex + 1 };
       response = await this.fetchImpl(`${API}/v2/${scope}/${encodeURIComponent(message.route.roomId)}/messages`, {
         method: 'POST', redirect: 'error',
         headers: { 'Content-Type': 'application/json', Authorization: `QQBot ${token}` },
-        body: JSON.stringify({ msg_type: 0, content, msg_id: message.replyToMessageId, msg_seq: partIndex + 1 }),
+        body: JSON.stringify(payload),
         signal: AbortSignal.timeout(10_000),
       });
     } catch {

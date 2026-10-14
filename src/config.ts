@@ -12,6 +12,8 @@ export interface PaConfig {
   contextWindow: number;
   maxOutputTokens: number;
   timeoutMs: number;
+  tasks?: { maxConcurrent: number };
+  loop?: { maxModelCalls: number; maxToolCalls: number };
   memory?: AutoMemoryConfig;
   search?: WebSearchConfig;
   fetch?: WebFetchConfig;
@@ -69,6 +71,10 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
   const contextWindow = positiveInteger(env, 'PA_CONTEXT_WINDOW', 32768);
   const maxOutputTokens = positiveInteger(env, 'PA_MAX_OUTPUT_TOKENS', 2048);
   const timeoutMs = positiveInteger(env, 'PA_TIMEOUT_MS', 60000);
+  const maxConcurrentTasks = positiveInteger(env, 'PA_MAX_CONCURRENT_TASKS', 2);
+  if (maxConcurrentTasks > 16) throw new Error('PA_MAX_CONCURRENT_TASKS 必须在 1 到 16 之间。');
+  const loop = { maxModelCalls: positiveInteger(env, 'PA_LOOP_MAX_MODEL_CALLS', 6),
+    maxToolCalls: positiveInteger(env, 'PA_LOOP_MAX_TOOL_CALLS', 8) };
   if (maxOutputTokens >= contextWindow) {
     throw new Error('PA_MAX_OUTPUT_TOKENS 必须小于 PA_CONTEXT_WINDOW。');
   }
@@ -96,6 +102,8 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     contextWindow,
     maxOutputTokens,
     timeoutMs,
+    tasks: { maxConcurrent: maxConcurrentTasks },
+    loop,
     memory: readAutoMemoryConfig(env),
     search: readWebSearchConfig(env, provider!, baseUrl),
     fetch: readWebFetchConfig(env),

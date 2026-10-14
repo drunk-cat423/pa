@@ -106,12 +106,14 @@ test('第二段拒绝后停止，确认段可跨重启引用实际文本且其�
   assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.status, 'unavailable');
 });
 
-test('QQ超长完整回复最多占五个被动回复槽位', async t => {
+test('QQ超过五段的完整回复走主动发送，保留500字分段和来源标记', async t => {
   const reply = '一二三😀。'.repeat(1000);
   const f = await fixture(t, (_message, index) => ({ status: 'sent', externalMessageId: `huge-${index}` }), reply);
   assert.equal(await f.harness().handle(f.message('huge', '很长回复')), 'sent');
-  assert.equal(f.sent.length, 5);
-  assert.equal(f.sent.map(message => message.text).join(''), reply);
+  assert.ok(f.sent.length > 5);
+  assert.ok(f.sent.every(message => message.deliveryMode === 'active' && !message.replyToMessageId && [...message.text].length <= 500));
+  assert.ok(f.sent.map(message => message.text).join('').endsWith(reply));
+  assert.match(f.sent[0].text, /问题：很长回复/);
   assert.equal(f.requests.length, 1);
 });
 
@@ -152,7 +154,9 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
   assert.equal(request.body.max_tokens, 1024);
   const user = request.body.messages.filter(m => m.role === 'user').at(-1);
   const text = typeof user.content === 'string' ? user.content : user.content.map(p => p.text).join('');
-  assert.ok(text.includes('周末准备爬山') && text.includes('member-B') && text.includes('member-A'));
+  const input = JSON.parse(text.slice(text.lastIndexOf('\n') + 1));
+  assert.equal(input.currentMessage.senderId, 'member-A');
+  assert.deepEqual(input.recentDialogueWithCurrentSender, []);
   assert.equal(await h.handle(f.message('two', '我更喜欢海边', { senderId: 'member-C' })), 'sent');
   assert.equal(await h.handle(f.message('one', '另外一个群', { route: f.other })), 'sent');
   const otherBody = JSON.stringify(f.requests.at(-1).body);

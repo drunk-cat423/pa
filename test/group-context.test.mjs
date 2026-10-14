@@ -64,16 +64,16 @@ test('同一成员连发时续问仍按run配对最近问题和回答，不选�
   assert.ok(!JSON.stringify(pair).includes('BLOCK_FIRST_QUESTION'));
 });
 
-test('独立群问题不带无关闲聊和本人旧话题；明确续问只带本人最近一轮', async t => {
+test('群上下文默认只带本人最近一轮并标记身份，不自动带其他人的闲聊', async t => {
   const f = await fixture(t);
   await f.h.handle(f.message('noise', 'UNRELATED_ROOM_CHAT', { senderId: 'bob', mentioned: false }));
   await f.h.handle(f.message('travel', '讨论一下 OLD_TRAVEL_TOPIC'));
   await f.h.handle(f.message('physics', '解释一下牛顿第二定律'));
   const wire = JSON.stringify(f.requests.at(-1));
   assert.ok(!wire.includes('UNRELATED_ROOM_CHAT'));
-  assert.ok(!wire.includes('OLD_TRAVEL_TOPIC'));
-  assert.ok(!wire.includes('OLD_TRAVEL_ANSWER'));
-  assert.deepEqual(f.input().recentDialogueWithCurrentSender, []);
+  assert.ok(wire.includes('OLD_TRAVEL_TOPIC'));
+  assert.equal(f.input().recentDialogueWithCurrentSender.length, 2);
+  assert.equal(f.input().recentDialogueWithCurrentSender[0].senderId, 'alice');
   await f.h.handle(f.message('follow', '继续解释刚才的力学问题'));
   assert.equal(f.input().recentDialogueWithCurrentSender.length, 2);
   assert.equal(f.input().recentDialogueWithCurrentSender[0].senderId, 'alice');
@@ -89,19 +89,17 @@ test('独立群问题不带无关闲聊和本人旧话题；明确续问只带�
   finally { db.close(); }
 });
 
-test('明确回顾群聊才读取普通背景，引用消息只使用所选引用', async t => {
+test('回顾群聊也不靠规则自动塞群背景，引用只取得所选内容', async t => {
   const f = await fixture(t);
   await f.h.handle(f.message('noise', 'ROOM_REVIEW_MARKER', { senderId: 'bob', mentioned: false }));
   await f.h.handle(f.message('previous', '讨论一下 OLD_TRAVEL_TOPIC'));
   await f.h.handle(f.message('review', '刚才群里大家聊了什么？'));
-  assert.ok(JSON.stringify(f.input().recentRoomMessages).includes('ROOM_REVIEW_MARKER'));
-  assert.equal(f.input().recentRoomMessages[0].senderId, 'bob');
-  assert.deepEqual(f.input().recentDialogueWithCurrentSender, []);
+  assert.ok(!JSON.stringify(f.input()).includes('ROOM_REVIEW_MARKER'));
+  assert.equal(f.input().recentDialogueWithCurrentSender.length, 2);
   await f.h.handle(f.message('quote', '这个应该怎么回复？', { quote: { inlineMessages: [
     { role: 'user', text: 'SELECTED_QUOTE_MARKER' },
   ] } }));
   assert.ok(JSON.stringify(f.input()).includes('SELECTED_QUOTE_MARKER'));
   assert.ok(!JSON.stringify(f.input()).includes('ROOM_REVIEW_MARKER'));
   assert.ok(!JSON.stringify(f.input()).includes('OLD_TRAVEL_TOPIC'));
-  assert.deepEqual(f.input().recentRoomMessages, []);
 });

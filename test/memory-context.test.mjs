@@ -62,7 +62,7 @@ function memoryMessages(request) {
 
 function recalledItems(message) {
   const content = typeof message.content === 'string' ? message.content : message.content.map(part => part.text ?? '').join('');
-  return JSON.parse(content.slice(content.indexOf('\n') + 1));
+  return JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
 }
 
 test('reset确认期间代次变化仍保留pending并停止模型，不以旧确认继续请求', async t => {

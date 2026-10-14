@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
 import { MemoryError } from '../dist/memory-types.js';
+import { downgradeSchema10 } from './fixtures/legacy-schema.mjs';
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'pa-memory-'));
@@ -80,7 +81,7 @@ test('真实V1布局迁移到V6，保留消息、运行与投递并可写入记�
     assert.deepEqual(store.contextState('conv'), { required: false, generation: 0 });
     store.ackDelivery('delivery', 'sent');
     inspect(databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 8);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 10);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     });
     store.close();
@@ -212,7 +213,7 @@ test('真实V3增量迁移保留所有业务列、rowid及审计，旧群记忆�
     assert.equal(store.queryMemories('conv')[0].revision, 2);
     assert.deepEqual(store.contextState('conv'), { required: true, generation: 4 });
     inspect(databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 8);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 10);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       assert.ok(db.prepare('SELECT message_kind FROM messages').all().every(row => row.message_kind === 'chat'));
       assert.ok(db.prepare('SELECT scope_type FROM memories').all().every(row => row.scope_type === 'legacy'));
@@ -250,7 +251,7 @@ test('真实V2迁移保留记忆版本、来源、使用审计与pending重置�
     assert.deepEqual(store.queryMemories(channel.id), []);
     assert.throws(() => store.correctMemory(channel.id, 'memory', { content: '越界' }), MemoryError);
     inspect(databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 8);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 10);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       const deliveries = db.prepare('SELECT room_id FROM deliveries WHERE id = ?').get('delivery');
       assert.equal(deliveries.room_id, 'room');
@@ -518,21 +519,23 @@ test('群来源与subject必须属于当前房间，纠正保留scope与field并
     assert.throws(() => f.store.correctMemory(f.group.id, memory.id, {
       content: '搬动field', profileField: 'interests', sourceMessageId: owner.id,
     }), /不能改变成员资料字段/);
-    const corrected = f.store.correctMemory(f.group.id, memory.id, { content: '纠正饮食', sourceMessageId: owner.id }, 1).memory;
+    const ownerCorrection = f.source(f.group.id, 'owner');
+    const corrected = f.store.correctMemory(f.group.id, memory.id, { content: '纠正饮食', sourceMessageId: ownerCorrection.id }, 1).memory;
     assert.equal(corrected.writerActorId, self.actorId);
     assert.equal(corrected.subjectActorId, self.actorId);
     assert.equal(corrected.profileField, 'diet');
-    assert.equal(corrected.sourceMessageId, owner.id);
+    assert.equal(corrected.sourceMessageId, ownerCorrection.id);
     assert.equal(f.store.selfProfileMemory(f.group.id, self.actorId, 'diet').id, memory.id);
     assert.throws(() => f.store.deleteMemory(f.group.id, memory.id, 2), /不提供记忆删除/);
     assert.throws(() => f.store.deleteMemory(f.group.id, memory.id, 2, foreign.id), MemoryError);
-    f.store.correctMemory(f.group.id, memory.id, {content:'管理员再次纠正',sourceMessageId:owner.id},2);
+    const laterOwnerCorrection = f.source(f.group.id, 'owner');
+    f.store.correctMemory(f.group.id, memory.id, {content:'管理员再次纠正',sourceMessageId:laterOwnerCorrection.id},2);
     inspect(f.databasePath, db => {
       const events = db.prepare('SELECT action, actor_id, source_message_id FROM memory_events WHERE memory_id = ? ORDER BY revision').all(memory.id);
       assert.deepEqual(events.map(row => ({ ...row })), [
         { action: 'remember', actor_id: self.actorId, source_message_id: self.id },
-        { action: 'correct', actor_id: owner.actorId, source_message_id: owner.id },
-        { action: 'correct', actor_id: owner.actorId, source_message_id: owner.id },
+        { action: 'correct', actor_id: owner.actorId, source_message_id: ownerCorrection.id },
+        { action: 'correct', actor_id: owner.actorId, source_message_id: laterOwnerCorrection.id },
       ]);
       // A valid FK can still describe a forged source actor from another room.
       db.prepare('UPDATE messages SET actor_id = ? WHERE id = ?').run(foreign.actorId, self.id);
@@ -817,11 +820,16 @@ test('真实V4增量迁移保留rowid/正文/修订/来源/使用与reset水位�
     const internal = f.store.rememberMemory(group.id, {
       content: 'v4内部判断', subjectActorId: self.actorId, sourceMessageId: owner.id, profileField: 'reply_style',
     }).memory;
-    f.store.correctMemory(group.id, internal.id, { content: 'v4成员回应内部note', sourceMessageId: self.id }, 1);
+    f.store.recordInbound(group.id, 'v4成员回应内部note', {eventId:'self-follow-up',senderId:'self',modelInputText:'v4成员回应内部note'});
+    const selfCorrection = f.store.externalMessage(group.id, 'self-follow-up');
+    f.store.correctMemory(group.id, internal.id, { content: 'v4成员回应内部note', sourceMessageId: selfCorrection.id }, 1);
     f.store.close();
     let before;
     inspect(f.databasePath, db => {
+      downgradeSchema10(db);
       db.exec(`PRAGMA foreign_keys=OFF;
+        DROP TRIGGER history_message_insert; DROP TRIGGER history_message_update; DROP TRIGGER history_message_delete;
+        DROP TABLE message_history_fts; DROP TABLE person_profile_pending; DROP TABLE profile_tool_receipts; DROP TABLE run_progress;
         DROP TRIGGER assign_message_sequence; DROP INDEX message_ingest_sequence; DROP TABLE message_ingest_order;
         ALTER TABLE messages DROP COLUMN ingest_seq; ALTER TABLE messages DROP COLUMN sent_at;
         DROP TABLE person_fragment_messages; DROP TABLE person_fragments; DROP TABLE topic_embeddings; DROP TABLE memory_topic_messages;
@@ -855,7 +863,7 @@ test('真实V4增量迁移保留rowid/正文/修订/来源/使用与reset水位�
     });
     reopened = new ConversationStore(f.databasePath);
     inspect(f.databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 8);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 10);
       for (const [table, rows] of Object.entries(before)) {
         const columns = Object.keys(rows[0]).join(', ');
         assert.deepEqual(db.prepare(`SELECT ${columns} FROM ${table}`).all().map(row => ({ ...row })), rows);
@@ -918,12 +926,14 @@ test('画像当前来源快照区分本人/管理员，成员仍可修改本人�
     assert.throws(() => f.store.beginRun(f.group.id, '不能伪装自述ref', 'p', 'm', [{ id: memory.id, revision: 2 }], {
       eventId: 'owner-edited-ref', senderId: 'self', modelInputText: 'x',
     }), /记忆不存在/);
-    f.store.correctMemory(f.group.id, memory.id, { content: '本人明确纠正', sourceMessageId: self.id }, 2);
+    const selfCorrection = f.source(f.group.id, 'self');
+    f.store.correctMemory(f.group.id, memory.id, { content: '本人明确纠正', sourceMessageId: selfCorrection.id }, 2);
     assert.equal(f.store.recallMemorySections(f.group.id, self.actorId, ['diet']).profile[0].content, '本人明确纠正');
     const internal = f.store.rememberMemory(f.group.id, {
       content: '管理员内部判断', subjectActorId: self.actorId, profileField: 'interests', sourceMessageId: owner.id,
     }).memory;
-    f.store.correctMemory(f.group.id, internal.id, { content: '成员回应内部判断', sourceMessageId: self.id }, 1);
+    const internalCorrection = f.source(f.group.id, 'self');
+    f.store.correctMemory(f.group.id, internal.id, { content: '成员回应内部判断', sourceMessageId: internalCorrection.id }, 1);
     assert.equal(f.store.selfProfileMemory(f.group.id, self.actorId, 'interests'), undefined);
     assert.deepEqual(f.store.recallMemorySections(f.group.id, self.actorId, ['interests']).profile, []);
     inspect(f.databasePath, db => {

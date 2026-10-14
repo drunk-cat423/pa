@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { openRecordedConversation, PersistenceError } from '../dist/conversation.js';
+import { openConversation } from '../dist/runtime.js';
 
 async function harness(t, { repeatedToolCall = false } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-search-boundary-'));
@@ -17,10 +18,10 @@ async function harness(t, { repeatedToolCall = false } = {}) {
     const body = JSON.parse(Buffer.concat(chunks).toString());
     requests.push(body);
     const searchEnabled = body.tools?.some(tool => tool.function?.name === 'web_search');
-    const emitToolCall = searchEnabled && (repeatedToolCall || typeof body.tool_choice === 'object');
+    const emitToolCall = repeatedToolCall || (searchEnabled && !body.messages.some(message => message.role === 'tool'));
     const delta = emitToolCall
       ? { role: 'assistant', tool_calls: [{ index: 0, id: `call_search_${++callId}`, type: 'function',
-        function: { name: 'web_search', arguments: '{}' } }] }
+        function: { name: 'web_search', arguments: JSON.stringify({ query: 'SQLite' }) } }] }
       : { role: 'assistant', content: '本轮回答完成。' };
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const choices of [[{ index: 0, delta, finish_reason: null }],
@@ -49,7 +50,7 @@ async function harness(t, { repeatedToolCall = false } = {}) {
 
   const config = { cwd: process.cwd(), dataDir, provider: 'pa-test', model: 'test', apiKey: 'fixture-key',
     baseUrl: `http://127.0.0.1:${server.address().port}/v1`, contextWindow: 32768,
-    maxOutputTokens: 1024, timeoutMs: 5000,
+    maxOutputTokens: 1024, timeoutMs: 5000, loop: { maxModelCalls: 2, maxToolCalls: 8 },
     search: { enabled: true, budgetId: 'boundary', model: 'deepseek-flash', maxRequests: 2, maxUses: 2,
       maxTokens: 2048, timeoutMs: 1000, maxResults: 5 } };
   const opened = [];
@@ -76,28 +77,20 @@ test('模型忽略 tool_choice none 时最多发两次主请求、调用一次�
   }));
 
   assert.equal(fixture.requests.length, 2);
-  assert.equal(fixture.requests[0].tool_choice.function.name, 'web_search');
+  assert.equal(fixture.requests[0].tool_choice, 'auto');
   assert.equal(fixture.requests[1].tool_choice, 'none');
   assert.equal(fixture.nativeCalls.length, 1);
 });
 
 test('搜索结果使最终主模型请求超过上下文时不再发送第二个主模型请求', async t => {
   const fixture = await harness(t);
-  // Private history is intentionally retained; independent group searches now omit it.
-  const conversation = await fixture.open('final-context-limit', 'private');
-  const longHistory = 'x'.repeat(27_000);
-  const seed = await conversation.prompt(longHistory, {
-    eventId: 'seed-event', senderId: 'user', modelInputText: longHistory,
-  });
-  assert.equal(seed.text, '本轮回答完成。');
-  assert.equal(fixture.requests.length, 1);
-
-  await assert.rejects(conversation.prompt('请搜索一个短问题', {
-    eventId: 'search-event', senderId: 'user', modelInputText: '请搜索一个短问题',
-  }));
-  assert.equal(fixture.requests.length, 2);
-  assert.equal(fixture.requests[1].tool_choice.function.name, 'web_search');
-  assert.equal(fixture.nativeCalls.length, 1);
+  const runtime = await openConversation(fixture.config, 'final-context-limit', { enableSearch: true });
+  try {
+    await assert.rejects(runtime.prompt('搜索', { runId: 'context', memoryContext: 'x'.repeat(27_000) }));
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.requests[0].tool_choice, 'auto');
+    assert.equal(fixture.nativeCalls.length, 1);
+  } finally { await runtime.close(); }
 });
 
 test('搜索账本持久化失败停止会话，不能作为普通工具错误继续模型或下一轮', async t => {

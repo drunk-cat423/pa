@@ -68,7 +68,9 @@ test('last receipt and parent completion are atomic; cross-conversation child re
   assert.deepEqual(f.store.quotedMessage(f.a.id, 'real-id'), { role: 'assistant', text: '实际文本' });
   f.inspect(db => {
     db.exec('PRAGMA foreign_keys=ON');
-    assert.throws(() => db.prepare(`INSERT INTO delivery_parts VALUES (?, ?, 1, 'foreign', 'pending', NULL, 'now', 'now')`)
+    assert.throws(() => db.prepare(`INSERT INTO delivery_parts
+      (delivery_id,conversation_id,part_index,text,status,external_message_id,created_at,updated_at)
+      VALUES (?, ?, 1, 'foreign', 'pending', NULL, 'now', 'now')`)
       .run(f.deliveryId, f.b.id), /FOREIGN KEY/);
   });
 });
@@ -87,10 +89,16 @@ test('v7 migration creates a consistent backup and preserves legacy replies and 
   f.store.ackDelivery(f.deliveryId, 'sent', 'legacy-id');
   f.store.close();
   f.inspect(db => {
-    db.exec('DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity; PRAGMA user_version=7;');
+    db.exec(`DROP TRIGGER history_message_insert; DROP TRIGGER history_message_update; DROP TRIGGER history_message_delete;
+      DROP TABLE message_history_fts; DROP TABLE run_progress; DROP TABLE profile_tool_receipts; DROP TABLE person_profile_pending;
+      DROP TABLE channel_tasks; DROP INDEX message_conversation_identity;
+      DROP INDEX one_running_run_per_session; DROP INDEX one_running_run_per_conversation;
+      ALTER TABLE agent_runs DROP COLUMN pi_session_file;
+      CREATE UNIQUE INDEX one_running_run_per_conversation ON agent_runs(conversation_id) WHERE status='running';
+      DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity; PRAGMA user_version=7;`);
   });
   f.reopen();
-  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 8);
+  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 10);
   assert.deepEqual(f.store.quotedMessage(f.a.id, 'legacy-id'), { role: 'assistant', text: '**完整原文**' });
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM messages').get().n), 2);
   const backups = readdirSync(f.directory).filter(name => name.includes('.v7.') && name.endsWith('.bak'));

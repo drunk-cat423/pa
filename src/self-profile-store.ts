@@ -96,7 +96,7 @@ export class SelfProfileStore {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 20000) throw new MemoryError('自我画像容量上限无效。');
     this.transaction(() => {
       if (!this.humanSource(sourceMessageId)) throw new MemoryError('自我建议必须来自原始真人消息。');
-      if (this.db.prepare('SELECT id FROM self_profile_pending WHERE source_message_id=?').get(sourceMessageId)) return;
+      if (this.db.prepare('SELECT id FROM self_profile_pending WHERE source_message_id=? AND content=?').get(sourceMessageId,content)) return;
       const bytes = Number(this.db.prepare('SELECT COALESCE(SUM(length(CAST(content AS BLOB))),0) AS bytes FROM self_profile_pending WHERE archived_revision IS NULL').get()!.bytes);
       if (bytes + Buffer.byteLength(content, 'utf8') > 12000) throw new MemoryError('待整理自我建议已达到 12000 字节上限。');
       const id = randomUUID();

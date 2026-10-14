@@ -7,7 +7,7 @@ import { SelfProfileStore } from './self-profile-store.js';
 const timestamp = () => new Date().toISOString();
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const parse = <T>(value: unknown): T => JSON.parse(String(value)) as T;
-export const sameFact = (a:ProfileFact,b:ProfileFact) => a.content===b.content && a.field===b.field && a.sourceType===b.sourceType
+export const sameFact = (a:ProfileFact,b:ProfileFact) => a.content===b.content && a.sourceType===b.sourceType
   && (a.occurredAt??null)===(b.occurredAt??null) && (a.expiresAt??null)===(b.expiresAt??null)
   && JSON.stringify([...a.messageIds].sort())===JSON.stringify([...b.messageIds].sort());
 
@@ -124,8 +124,9 @@ export class AutoMemoryStore {
         this.db.prepare('INSERT INTO actor_person_bindings VALUES (?,?) ON CONFLICT(actor_id) DO UPDATE SET person_id=excluded.person_id').run(id,next);
         if(previous===`actor:${id}` && next!==previous) {
           this.db.prepare('UPDATE memories SET person_id=? WHERE subject_actor_id=? AND person_id=?').run(next,id,previous);
+          this.db.prepare('UPDATE person_profile_pending SET person_id=? WHERE person_id=? AND archived_revision IS NULL').run(next,previous);
           const old=this.profile(previous); const target=this.profile(next);
-          const transferable=old.facts.filter(f=>!target.facts.some(current=>sameFact(current,f)||(f.field!==undefined&&current.field===f.field)));
+          const transferable=old.facts.filter(f=>!target.facts.some(current=>sameFact(current,f)));
           if(transferable.length) this.writeProfile({...target,facts:[...target.facts,...transferable]},null);
         }
       }
@@ -144,6 +145,8 @@ export class AutoMemoryStore {
     });
   }
   syncExplicitProfiles(): void {
+    // Existing explicit records were migrated to archived facts once. New saves are pending.
+    if (this.db.prepare("SELECT name FROM sqlite_master WHERE name='person_profile_pending'").get()) return;
     for(const r of this.db.prepare(`SELECT * FROM memories WHERE person_id IS NOT NULL AND profile_field IS NOT NULL
       AND writer_actor_id=subject_actor_id AND profile_source_self=1 AND source_message_id IS NOT NULL AND status='active' AND is_current=1
       ORDER BY updated_at,rowid`).all()) {
@@ -152,7 +155,7 @@ export class AutoMemoryStore {
       const profile=this.profile(String(r.person_id));
       const current=profile.facts.find(f=>f.field===fact.field);
       if(!profile.facts.some(f=>sameFact(f,fact)) && (!current||this.evidenceSequence(fact.messageIds)>=this.evidenceSequence(current.messageIds))) {
-        this.updateExplicitProfile(String(r.person_id),fact);
+        this.writeProfile({...profile,facts:[...profile.facts.filter(old=>old.field!==fact.field),fact]},null);
       }
     }
   }
@@ -237,7 +240,10 @@ export class AutoMemoryStore {
     const baseVersion=Number(person.revision); const row=this.db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=?').get(personId,baseVersion);
     const facts=row?parse<ProfileFact[]>(row.facts_json):[];
     const at=timestamp();
-    return {personId,baseVersion,facts:facts.filter(f=>!f.expiresAt||f.expiresAt>at)};
+    const pending = this.db.prepare("SELECT name FROM sqlite_master WHERE name='person_profile_pending'").get()
+      ? this.db.prepare('SELECT id,content,source_message_id,source_type FROM person_profile_pending WHERE person_id=? AND archived_revision IS NULL ORDER BY rowid').all(personId)
+        .map(row=>({id:String(row.id),content:String(row.content),sourceMessageId:String(row.source_message_id),sourceType:row.source_type as ProfileFact['sourceType']})) : [];
+    return {personId,baseVersion,facts:facts.filter(f=>!f.expiresAt||f.expiresAt>at),pending};
   }
   profileForActors(currentActorId:string,mentionedActorIds:readonly string[]=[]): PersonProfile[] {
     const people=new Set([currentActorId,...mentionedActorIds].map(id=>this.personForActor(id)).filter((id):id is string=>id!==undefined));
@@ -249,18 +255,29 @@ export class AutoMemoryStore {
     if(row.input_json!==null) return {...parse<AutoMemoryTaskInput>(row.input_json),job:this.job(row)};
     const canonical=this.job(row); const messages=this.messages(canonical.messageIds); const cp=this.checkpoint(canonical.conversationId);
     const people=new Set(messages.flatMap(m=>m.personId?[m.personId]:[]));
-    const input:AutoMemoryTaskInput={job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles:[...people].map(p=>this.profile(p)),selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
+    const profiles=[...people].map(p=>this.profile(p));
+    const profileSources=this.messages([...new Set(profiles.flatMap(p=>(p.pending??[]).map(item=>item.sourceMessageId)))]);
+    const input:AutoMemoryTaskInput={profileSources,job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
     this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
     return input;
   }
-  updateExplicitProfile(personId:string,fact:ProfileFact,previousMessageId?:string): void {
-    const profile=this.profile(personId);
-    const existing=profile.facts.find(f=>fact.field!==undefined&&f.field===fact.field);
-    if(existing&&this.evidenceSequence(fact.messageIds)<this.evidenceSequence(existing.messageIds)) throw new MemoryError('较旧来源不能覆盖较新的明确画像字段。');
-    const facts=profile.facts.filter(f=>fact.field===undefined
-      ? previousMessageId===undefined || f.field!==undefined || !f.messageIds.includes(previousMessageId)
-      : f.field!==fact.field); facts.push(fact);
-    this.writeProfile({...profile,facts},null);
+  addProfilePending(personId:string,sourceMessageId:string,content:string,sourceType:ProfileFact['sourceType']='third_party'): void {
+    if(typeof content!=='string'||!content.trim()||[...content].length>4000||!['self','third_party','inference'].includes(sourceType)) throw new MemoryError('待整理人物内容无效。');
+    this.atomic(()=>{
+      const source=this.db.prepare("SELECT actor_id FROM messages WHERE id=? AND role='user' AND actor_id IS NOT NULL").get(sourceMessageId);
+      if(!source||this.personForActor(String(source.actor_id))!==personId) throw new MemoryError('待整理资料必须属于实际发送者。');
+      const profile=this.profile(personId);
+      if((profile.pending??[]).some(item=>item.sourceMessageId===sourceMessageId&&item.content===content&&item.sourceType===sourceType)) return;
+      const pending=profile.pending??[];
+      if(pending.length>=100||pending.reduce((bytes,item)=>bytes+Buffer.byteLength(item.content),0)+Buffer.byteLength(content)>12000
+        ||Buffer.byteLength(JSON.stringify({personId,baseVersion:profile.baseVersion,pending:[...pending,{id:randomUUID(),content,sourceMessageId,sourceType}]}))>20000) throw new MemoryError('待整理人物画像容量已满，请等待归档或缩短内容。');
+      this.db.prepare('INSERT INTO person_profile_pending(id,person_id,content,source_message_id,source_type,created_at) VALUES (?,?,?,?,?,?)')
+        .run(randomUUID(),personId,content,sourceMessageId,sourceType,timestamp());
+    });
+  }
+  updateExplicitProfile(personId:string,fact:ProfileFact,_previousMessageId?:string): void {
+    if(fact.messageIds.length!==1) throw new MemoryError('显式画像保存必须只有一个真人来源。');
+    this.addProfilePending(personId,fact.messageIds[0]!,fact.content,fact.sourceType);
   }
   removeExplicitProfile(personId:string,field:string):void {
     const profile=this.profile(personId);
@@ -277,14 +294,14 @@ export class AutoMemoryStore {
   commit(jobId:string,leaseToken:string,extract:ValidatedExtract,selfBudget?:number): void {
     this.atomic(()=>{
       const row=this.active(jobId,leaseToken); const job=this.job(row); const input=this.taskInput(job); const owned=new Set(job.messageIds);
-      if(input.messages.some(m=>m.actorId!==undefined&&this.personForActor(m.actorId)!==m.personId)) throw new Error('人物绑定版本冲突，请重读后重试。');
+      if([...(input.profileSources??[]),...input.messages].some(m=>m.actorId!==undefined&&this.personForActor(m.actorId)!==m.personId)) throw new Error('人物绑定版本冲突，请重读后重试。');
       const first=this.db.prepare("SELECT id FROM auto_memory_jobs WHERE conversation_id=? AND status<>'done' ORDER BY rowid LIMIT 1").get(job.conversationId);
       if(first?.id!==jobId) throw new Error('同房间整理必须按批次顺序提交。');
       if(!Array.isArray(extract.topics)||!Array.isArray(extract.fragments)||!Array.isArray(extract.profiles)) throw new Error('整理产物结构无效。');
       const evidence=(ids:string[],sourceType?:string,personId?:string)=>{
         if(!Array.isArray(ids)||!ids.length||new Set(ids).size!==ids.length||ids.some(id=>!owned.has(id))) throw new Error('整理证据必须属于固定批次。');
         if(sourceType!==undefined&&!['self','third_party','inference'].includes(sourceType)) throw new Error('证据类型无效。');
-        if(sourceType!==undefined&&!ids.some(id=>input.messages.some(m=>m.id===id&&m.role==='user'))) throw new Error('Bot回复不能作为人物事实的独立证据。');
+        if(sourceType!==undefined&&ids.some(id=>!input.messages.some(m=>m.id===id&&m.role==='user'))) throw new Error('Bot回复不能作为人物事实的原始证据。');
         if(sourceType==='self'&&ids.some(id=>input.messages.some(m=>m.id===id&&m.role==='user'&&m.personId!==personId))) throw new Error('自述证据身份不匹配。');
       };
       const content=(s:string)=>{if(typeof s!=='string'||!s.trim()||s.length>32000) throw new Error('整理正文无效。');};
@@ -312,20 +329,31 @@ export class AutoMemoryStore {
         if(updated.has(profile.personId)||!Array.isArray(profile.facts)) throw new Error('人物画像产物无效。'); updated.add(profile.personId);
         const baseline=input.profiles.find(p=>p.personId===profile.personId);
         if(!baseline||baseline.baseVersion!==profile.baseVersion) throw new Error('人物画像输入版本不匹配。');
-        for(const current of baseline.facts) {
-          if(current.field===undefined||profile.facts.some(f=>sameFact(current,f))) continue;
-          const existingSeq=this.evidenceSequence(current.messageIds);
-          const replacements=profile.facts.filter(f=>f.field===current.field);
-          const newSeq=replacements.length?Math.max(...replacements.map(f=>this.evidenceSequence(f.messageIds)))
-            :Math.max(0,...input.messages.filter(m=>m.role==='user'&&m.personId===profile.personId).map(m=>m.ingestSeq));
-          if(newSeq<existingSeq) throw new Error('较旧批次不能覆盖较新的明确画像字段。');
-        }
         for(const fact of profile.facts) {
           content(fact.content);
           if(!['self','third_party','inference'].includes(fact.sourceType)||!Array.isArray(fact.messageIds)) throw new Error('画像事实证据无效。');
-          if(!baseline.facts.some(old=>sameFact(old,fact))) evidence(fact.messageIds,fact.sourceType,profile.personId);
+          if(!baseline.facts.some(old=>sameFact(old,fact))) {
+            if(fact.field!==undefined) throw new Error('新画像事实不能输出旧分类字段。');
+            const captured=baseline.pending??[];
+            const allowed=new Map([...input.messages,...(input.profileSources??[]).filter(message=>captured.some(item=>item.sourceMessageId===message.id))].map(message=>[message.id,message]));
+            if(!fact.messageIds.length||new Set(fact.messageIds).size!==fact.messageIds.length
+              ||fact.messageIds.some(id=>!allowed.has(id)||allowed.get(id)!.role!=='user')
+              ||(fact.sourceType==='self'&&fact.messageIds.some(id=>allowed.get(id)!.personId!==profile.personId))) throw new Error('人物画像必须引用有效真人来源，且自述必须属于本人。');
+          }
+        }
+        const current=this.profile(profile.personId);
+        if(current.baseVersion!==baseline.baseVersion||JSON.stringify(current.facts)!==JSON.stringify(baseline.facts)) throw new Error('人物画像版本冲突，请重读后重试。');
+        const pendingIds=profile.pendingIds??[];
+        if(!Array.isArray(pendingIds)||new Set(pendingIds).size!==pendingIds.length) throw new Error('待归档人物 ID 无效。');
+        for(const id of pendingIds) {
+          const captured=baseline.pending?.find(item=>item.id===id);
+          const live=current.pending?.find(item=>item.id===id);
+          if(!captured||!live||JSON.stringify(captured)!==JSON.stringify(live)
+            ||!profile.facts.some(fact=>fact.messageIds.includes(captured.sourceMessageId))) throw new Error('只能归档已捕获且保留来源的待整理人物资料。');
         }
         this.writeProfile(profile,jobId);
+        for(const id of pendingIds) this.db.prepare('UPDATE person_profile_pending SET archived_revision=?,archived_at=? WHERE id=? AND person_id=? AND archived_revision IS NULL')
+          .run(profile.baseVersion+1,timestamp(),id,profile.personId);
       }
       if (extract.selfProfile !== undefined) {
         if (input.selfProfile === undefined) throw new Error('自我档案产物缺少已捕获的输入快照。');

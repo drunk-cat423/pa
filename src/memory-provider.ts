@@ -23,9 +23,9 @@ export class MemoryInputTooLargeError extends Error {
 const EXTRACTION_SYSTEM_PROMPT = `你负责把固定批次对话整理为机器可读的长期记忆提案。只使用输入中的原文证据；assistant 回复、生成稿和工具输出只是上下文，不能单独成为用户事实。区分发言者与被描述者，不能把第三方信息标为 self，也不能把推测升级成事实。无法可靠归属人物时不产出人物事实。低价值、重复寒暄和无持续价值内容不生成。
 
 只输出一个严格 JSON 对象，不要 Markdown、代码围栏或解释。对象字段：
-{"ignoredMessageIds":string[],"topics":{"summary":string,"messageIds":string[]}[],"fragments":{"personId":string,"content":string,"sourceType":"self"|"third_party"|"inference","messageIds":string[],"topicIndex"?:number}[],"profiles":{"personId":string,"baseVersion":number,"facts":{"content":string,"sourceType":"self"|"third_party"|"inference","messageIds":string[],"field"?:string,"occurredAt"?:string|null,"expiresAt"?:string|null}[]}[],"continuationSummary"?:string}。
+{"ignoredMessageIds":string[],"topics":{"summary":string,"messageIds":string[]}[],"fragments":{"personId":string,"content":string,"sourceType":"self"|"third_party"|"inference","messageIds":string[],"topicIndex"?:number}[],"profiles":{"personId":string,"baseVersion":number,"pendingIds"?:string[],"facts":{"content":string,"sourceType":"self"|"third_party"|"inference","messageIds":string[],"occurredAt"?:string|null,"expiresAt"?:string|null}[]}[],"continuationSummary"?:string}。
 
-profiles 是对输入中相同 personId 当前完整画像事实的更新提案，baseVersion 必须照抄输入该人物的版本。复用已有画像时保留仍有效事实；每条事实必须带可追溯的 messageIds 和准确 sourceType。仅当用户本人在原文直接自述自己的情况时才可标为 self。不要把同 person 在其他场景的已有事实误当作新消息证据；已有画像可供理解，但新增事实要引用本批真实消息。
+profiles 是对输入中相同 personId 当前完整画像事实的更新提案，baseVersion 必须照抄输入该人物的版本。复用已有画像时保留仍有效事实；每条事实必须带可追溯的 messageIds 和准确 sourceType。仅当用户本人在原文直接自述自己的情况时才可标为 self。不要把同 person 在其他场景的已有事实误当作新消息证据；已有画像可供理解；新增事实要引用本批真实真人消息，或此人物已捕获 pending 对应的 profileSources 原文。profileSources 只为处理对应人物 pending 提供证据，不属于本批 messages，不参与 topics/fragments/ignoredMessageIds 覆盖。不能引用别人的 pending 原文为此人新增事实。每个人的 pendingIds 仅列真正处理且在 facts 保留其 sourceMessageId 的已捕获条目，没有处理就省略或空数组；pending 来源即使早于本批聊天也可引用。本人资料只保存该人的事实，朋友等第三方描述保持 third_party，不可变为该人 self。所有真人画像只有归档 facts 与未归档 pending，不输出任何 field 分类字段。
 
 topics 只概括本批有持续价值的话题，source messageIds 必须来自输入。没有话题时 topics 可为空。ignoredMessageIds 用于覆盖本批没有纳入任何 topic 或 fragment 的消息，必须完整列出未使用消息 ID，不能遗漏。group 批次严禁生成 continuationSummary 字段；private 批次必须提供简短 continuationSummary，保留决定和未完成事项，不冒充人物画像。`;
 
@@ -59,8 +59,8 @@ export function createMemoryProvider(config: PaConfig): MemoryProvider {
       const { modelRuntime, model } = await getConfiguredModel();
       const memoryOutputTokens = config.memory?.maxOutputTokens ?? config.maxOutputTokens;
       const maxTokens = Math.min(model.maxTokens, memoryOutputTokens);
-      const userMessage = { role: 'user' as const, content: JSON.stringify(input), timestamp: Date.now() };
-      const systemPrompt = EXTRACTION_SYSTEM_PROMPT + `\n续聊摘要最多${Math.min(2000, Math.floor(model.contextWindow / 20))}个字符。profiles仅更新所给视图，未给出的旧事实由应用保留；未变事实保留相同字段和来源。`
+      const userMessage = { role: 'user' as const, content: JSON.stringify({ ...input, profiles: input.profiles.map(profile => ({ ...profile, facts: profile.facts.map(({ field: _legacyField, ...fact }) => fact) })) }), timestamp: Date.now() };
+      const systemPrompt = EXTRACTION_SYSTEM_PROMPT + `\n续聊摘要最多${Math.min(2000, Math.floor(model.contextWindow / 20))}个字符。profiles仅更新所给视图，未给出的旧事实由应用保留；未变事实保留相同内容和来源，不输出 field 分类字段。`
         + (input.selfProfile ? SELF_EXTRACTION_PROMPT
           + `\n合并后的自我画像连同来源ID及剩余pending，整个JSON的UTF-8大小必须不超过${input.selfProfileBudgetBytes ?? 20000}字节。保持精简；归档后不再需要的旧来源可在对应描述已移除时省去，未处理pending不得丢弃。` : '');
       const estimate = estimateContext({

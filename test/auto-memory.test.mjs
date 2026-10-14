@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { memoryAssessmentResponse } from './fixtures/memory-assessment.mjs';
+import { companionReply } from './fixtures/companion-tools.mjs';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
 import { BackgroundMemory, validateExtract } from '../dist/auto-memory.js';
 import { ConversationStore } from '../dist/store.js';
@@ -64,10 +64,11 @@ async function fixture(t, extract = async input => extracted(input), overrides =
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); requests.push(body);
     if (JSON.stringify(body.messages.at(-1)).includes('BLOCK_CHAT')) { chatStarted.resolve(); await chatGate.promise; }
+    const reply = companionReply(body,'继续讨论');
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const choices of [
-      [{ index: 0, delta: { role: 'assistant', content: memoryAssessmentResponse(body) ?? '继续讨论' }, finish_reason: null }],
-      [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      [{ index: 0, delta: reply.delta, finish_reason: null }],
+      [{ index: 0, delta: {}, finish_reason: reply.finishReason }],
     ]) response.write(`data: ${JSON.stringify({ id: 'reply', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices })}\n\n`);
     response.end('data: [DONE]\n\n');
   });
@@ -214,22 +215,27 @@ test('容量估算包含完整输入和预留输出，明确标注估算方式',
   assert.ok(high.ratio > low.ratio); assert.ok(high.reservedOutputTokens === 3000);
 });
 
-test('快速连发私聊按提问顺序保留已经发送的上一轮回复', async t => {
+test('快速连发私聊独立计算，不将尚未完成的回复伪作历史', async t => {
   const f = await fixture(t); const h = f.harness();
   const first = h.handle(f.message('q1', 'BLOCK_CHAT', { route: f.privateRoute }));
   await f.chatStarted.promise;
   const second = h.handle(f.message('q2', '继续上一轮', { route: f.privateRoute }));
   await h.handle(f.message('unrelated', '确认入站执行过', { route: f.other }));
   f.chatGate.resolve(); assert.equal(await first, 'sent'); assert.equal(await second, 'sent');
-  const input = JSON.stringify(f.requests.at(-1));
-  assert.match(input, /BLOCK_CHAT/); assert.match(input, /继续讨论/); assert.match(input, /继续上一轮/);
+  const input = JSON.stringify(f.requests.find(request => JSON.stringify(request.messages.at(-1)).includes('继续上一轮')));
+  assert.match(input, /BLOCK_CHAT/); assert.doesNotMatch(input, /继续讨论/); assert.match(input, /继续上一轮/);
 });
 
-test('群聊因历史超限时等待整理后重建输入，不创建群摘要', async t => {
+test('群聊容量批次整理保留原文且不创建群摘要', async t => {
   const f = await fixture(t, undefined, { contextWindow: 7000 }); const h = f.harness();
   for (let i = 1; i <= 4; i++) await h.handle(f.message(`g${i}`, `${i}:` + 'g'.repeat(2000)));
-  assert.equal(await h.handle(f.message('g-question', '刚才群里讨论了什么？', { mentioned: true })), 'sent');
+  const store=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
+  try {
+    const db=f.db();
+    try { store.autoMemory.reserveBatch(db.prepare('SELECT id FROM conversations').get().id,'capacity'); } finally {db.close();}
+  } finally {store.close();}
   await h.waitForMemory();
+  assert.equal(await h.handle(f.message('g-question', '刚才群里讨论了什么？', { mentioned: true })), 'sent');
   assert.equal(f.inputs[0].roomType, 'group'); assert.ok(f.inputs[0].messages.length < 50);
   assert.doesNotMatch(JSON.stringify(f.requests.at(-1)), /gggggggggg/);
   assert.equal(h.info().memory[0].summary, undefined);
@@ -250,11 +256,11 @@ test('超大画像按预算选择完整事实，普通短问题仍可回答且�
   } finally { db.close(); }
 });
 
-test('画像事实继承按字段与证据集合比较，不依赖JSON键顺序', () => {
+test('画像事实继承按内容与证据集合比较，不注入旧分类字段或依赖JSON键顺序', () => {
   const old = { content: '喜欢茶', sourceType: 'self', messageIds: ['old2', 'old1'], field: 'drink' };
   const input = { job: {}, roomType: 'group', messages: [{ id: 'new', role: 'user', text: 'hello', personId: 'a' }],
     profiles: [{ personId: 'a', baseVersion: 1, facts: [old] }] };
-  const reordered = { messageIds: ['old1', 'old2'], field: 'drink', sourceType: 'self', content: '喜欢茶' };
+  const reordered = { messageIds: ['old1', 'old2'], sourceType: 'self', content: '喜欢茶' };
   const output = { topics: [], fragments: [], ignoredMessageIds: ['new'], profiles: [{ personId: 'a', baseVersion: 1, facts: [reordered] }] };
   assert.deepEqual(validateExtract(output, input), output);
 });
@@ -295,8 +301,8 @@ test('关闭中断的后台批次重新排队，重启无需新消息也继续�
 test('后台有限画像视图新增事实后保留超过200条的完整旧证据', async t => {
   const f = await fixture(t, async input => {
     const result = extracted(input); const person = input.profiles[0];
-    result.profiles = [{ ...person, facts: [...person.facts,
-      { content: '新兴趣是天文', sourceType: 'self', messageIds: [input.messages.find(m => m.role === 'user').id], field: 'astronomy' }] }];
+    result.profiles = [{ ...person, facts: [...person.facts.map(({field:_field,...fact})=>fact),
+      { content: '新兴趣是天文', sourceType: 'self', messageIds: [input.messages.find(m => m.role === 'user').id] }] }];
     return result;
   }, { contextWindow: 50000 });
   const h = f.harness(); await h.handle(f.message('profile-base', '首次发言'));

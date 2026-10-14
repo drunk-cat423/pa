@@ -66,6 +66,72 @@ test('harness parts use consecutive msg_seq and preformatted code content is not
   ctx.channel.close();
 });
 
+test('active delivery uses identifier-free payloads for group and private rooms', async () => {
+  const ctx = setup();
+  const starting = ctx.channel.start();
+  await tick();
+  ctx.socket.message({ op: 10, d: { heartbeat_interval: 10_000 } });
+  await tick();
+  ctx.socket.message({ op: 0, t: 'READY', d: { session_id: 's', user: { id: 'bot' } } });
+  await starting;
+
+  const groupRoute = { channel: 'qq', accountId: '123', roomId: 'group', roomType: 'group' };
+  const privateRoute = { channel: 'qq', accountId: '123', roomId: 'user', roomType: 'private' };
+  assert.deepEqual(await ctx.channel.send({ route: groupRoute, deliveryMode: 'active', text: '**group**', partIndex: 8 }),
+    { status: 'sent', externalMessageId: 'sent-id' });
+  assert.deepEqual(await ctx.channel.send({ route: privateRoute, deliveryMode: 'active', text: 'private', partIndex: 12 }),
+    { status: 'sent', externalMessageId: 'sent-id' });
+
+  const posts = ctx.calls.filter(call => call.init.method === 'POST' && call.url.includes('/v2/'));
+  assert.deepEqual(posts.map(post => post.url), [
+    'https://api.bot.qq.com/v2/groups/group/messages',
+    'https://api.bot.qq.com/v2/users/user/messages',
+  ]);
+  assert.deepEqual(posts.map(post => JSON.parse(post.init.body)), [
+    { msg_type: 0, content: 'group' },
+    { msg_type: 0, content: 'private' },
+  ]);
+  ctx.channel.close();
+});
+
+test('invalid delivery mode and passive sends without a valid reply ID reject before requesting', async () => {
+  const ctx = setup();
+  const starting = ctx.channel.start();
+  await tick();
+  ctx.socket.message({ op: 10, d: { heartbeat_interval: 10_000 } });
+  await tick();
+  ctx.socket.message({ op: 0, t: 'READY', d: { session_id: 's', user: { id: 'bot' } } });
+  await starting;
+  const route = { channel: 'qq', accountId: '123', roomId: 'group', roomType: 'group' };
+  const before = ctx.calls.length;
+  assert.deepEqual(await ctx.channel.send({ route, deliveryMode: 'unsupported', text: 'invalid' }), { status: 'rejected' });
+  assert.deepEqual(await ctx.channel.send({ route, text: 'missing reply ID' }), { status: 'rejected' });
+  assert.deepEqual(await ctx.channel.send({ route, replyToMessageId: 'bad\nID', text: 'invalid reply ID' }), { status: 'rejected' });
+  assert.equal(ctx.calls.length, before);
+  ctx.channel.close();
+});
+
+test('active definite rejection and timeout are returned once without retry', async () => {
+  for (const [options, expected] of [
+    [{ postResponse: response(403, {}) }, 'rejected'],
+    [{ postError: new Error('timeout') }, 'uncertain'],
+  ]) {
+    const ctx = setup(options);
+    const starting = ctx.channel.start();
+    await tick();
+    ctx.socket.message({ op: 10, d: { heartbeat_interval: 10_000 } });
+    await tick();
+    ctx.socket.message({ op: 0, t: 'READY', d: { session_id: 's', user: { id: 'bot' } } });
+    await starting;
+    assert.deepEqual(await ctx.channel.send({
+      route: { channel: 'qq', accountId: '123', roomId: 'group', roomType: 'group' },
+      deliveryMode: 'active', text: 'send once',
+    }), { status: expected });
+    assert.equal(ctx.calls.filter(call => call.url.includes('/v2/groups/')).length, 1);
+    ctx.channel.close();
+  }
+});
+
 function setup({ postResponse = response(200, { id: 'sent-id' }), postError, timers = new FakeTimers(), sockets = [new FakeSocket()] } = {}) {
   let socketCount = 0;
   const calls = [];

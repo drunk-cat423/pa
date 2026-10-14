@@ -6,6 +6,19 @@ import { readConfig, readDataDir } from '../dist/config.js';
 
 const valid = { PA_PROVIDER: 'test-provider', PA_MODEL: 'test-model', PA_API_KEY: 'private-test-key' };
 
+test('循环仅配置模型和工具次数，没有总时间预算', () => {
+  assert.deepEqual(readConfig(valid).loop, { maxModelCalls: 6, maxToolCalls: 8 });
+});
+
+test('任务并发默认2且只接受1到16，不配置整次总时限', () => {
+  assert.deepEqual(readConfig(valid).tasks, { maxConcurrent: 2 });
+  assert.equal(readConfig({ ...valid, PA_MAX_CONCURRENT_TASKS: '1' }).tasks.maxConcurrent, 1);
+  assert.equal(readConfig({ ...valid, PA_MAX_CONCURRENT_TASKS: '16' }).tasks.maxConcurrent, 16);
+  for (const value of ['0', '17', '-1', '1.5', 'Infinity', '9007199254740992', 'no']) {
+    assert.throws(() => readConfig({ ...valid, PA_MAX_CONCURRENT_TASKS: value }), /PA_MAX_CONCURRENT_TASKS/);
+  }
+});
+
 test('后台整理允许0不限次数，保留有限预算和无效值校验', () => {
   assert.equal(readConfig(valid).memory.maxCalls, 20);
   assert.equal(readConfig({ ...valid, PA_MEMORY_MAX_CALLS: '0' }).memory.maxCalls, 0);

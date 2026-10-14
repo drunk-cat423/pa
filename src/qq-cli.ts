@@ -38,6 +38,7 @@ async function main(): Promise<void> {
   let channel: QQChannel | undefined;
   let harness: ChannelHarness | undefined;
   let stopping: Promise<void> | undefined;
+  let budgetDrain: Promise<void> | undefined;
   let statusQueue: Promise<unknown> = Promise.resolve();
   function status(state: string): void {
     console.log(`QQ harness: ${state}`);
@@ -68,16 +69,23 @@ async function main(): Promise<void> {
       onMessage: message => {
         void harness!.handle(message).then(async result => {
           if (result !== 'ignored' && result !== 'observed' && result !== 'duplicate') status(result);
-          if (qq.maxCalls > 0 && harness!.info().calls >= qq.maxCalls) {
-            status('test_budget_complete');
-            await stop();
+          if (qq.maxCalls > 0 && harness!.info().calls >= qq.maxCalls && !budgetDrain) {
+            // Reserved calls may still be computing or waiting for their send batch.
+            budgetDrain = harness!.waitForTasks().then(async () => {
+              status('test_budget_complete');
+              await stop();
+            });
+            await budgetDrain;
           }
         }).catch(() => { status('persistence_failed'); process.exitCode = 1; void stop(); });
       },
     });
-    harness = new ChannelHarness(config, qq.routes, channel, qq.maxCalls, policy);
-    await harness.start();
+    harness = new ChannelHarness(config, qq.routes, channel, qq.maxCalls, policy, undefined, () => {
+      status('persistence_failed'); process.exitCode = 1; void stop();
+    });
     await channel.start();
+    // Recovered tasks may finish immediately; their transport must be READY first.
+    if (!stopping) await harness.start();
     if (stopping) await stopping;
     else status('ready_waiting_for_mention');
     // WebSocket and heartbeat keep the process alive. Cleanup is triggered by signals/budget/failure.

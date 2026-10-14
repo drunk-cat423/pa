@@ -40,8 +40,9 @@ export interface InboundMessage {
 
 export interface OutboundMessage {
   route: ChannelRoute;
-  replyToMessageId: string;
+  replyToMessageId?: string;
   text: string;
+  deliveryMode?: 'passive' | 'active';
   partIndex?: number;
   plainText?: boolean;
 }

@@ -3,20 +3,21 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { openConversation } from '../dist/runtime.js';
 import { openRecordedConversation } from '../dist/conversation.js';
 
-test('harness真实Pi工具循环、限定外发查询、普通聊天/CLI禁工具、重启校验及不重放搜索', async t => {
+test('harness真实Pi自主工具循环、查询实参、普通聊天不自动调用、CLI禁工具、重启不重放搜索', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-search-runtime-'));
   const requests = [];
   const server = createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString()); requests.push(body);
     response.writeHead(200, { 'content-type': 'text/event-stream' });
-    const search = typeof body.tool_choice === 'object';
+    const search = requests.length === 1 && body.tools?.some(tool => tool.function.name === 'web_search');
     const delta = search ? { role: 'assistant', tool_calls: [{ index: 0, id: 'call_search_1', type: 'function',
-      function: { name: 'web_search', arguments: '{}' } }] } : { role: 'assistant', content: '检索完成 https://sqlite.org/' };
+      function: { name: 'web_search', arguments: JSON.stringify({ query: 'SQLite 官方文档' }) } }] } : { role: 'assistant', content: '检索完成 https://sqlite.org/' };
     for (const choices of [[{ index: 0, delta, finish_reason: null }],
       [{ index: 0, delta: {}, finish_reason: search ? 'tool_calls' : 'stop' }]]) {
       response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1,
@@ -51,21 +52,24 @@ test('harness真实Pi工具循环、限定外发查询、普通聊天/CLI禁工�
     modelInputText: '请搜索 SQLite 官方文档' });
   assert.match(reply.text, /检索完成/);
   assert.equal(requests.length, 2);
-  assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['web_search']);
-  assert.equal(requests[1].tool_choice, 'none');
+  assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['update_profile', 'read_history', 'answer_in_depth', 'web_search', 'web_fetch']);
+  assert.equal(requests[0].tool_choice, 'auto');
+  assert.equal(requests[1].tool_choice, 'auto');
   assert.equal(requests[1].messages.filter(message => message.role === 'tool').length, 1);
   assert.equal(nativeQueries.length, 1);
   assert.equal(nativeQueries[0].messages[0].content[0].text, 'Perform a web search for the query: SQLite 官方文档');
   assert.doesNotMatch(JSON.stringify(nativeQueries), /senderId|roomMemories|personId/);
   conversation.acknowledge(reply.deliveryId, 'sent', 'reply1');
-  const file = conversation.info().sessionFile;
+  const db = new DatabaseSync(join(dataDir, 'pa.sqlite'), { readOnly: true });
+  const file = db.prepare('SELECT pi_session_file FROM agent_runs WHERE id=?').get(reply.runId).pi_session_file;
+  db.close();
   assert.match(await readFile(file, 'utf8'), /"role":"toolResult"/);
   await conversation.close();
   const reopened = await openRecordedConversation(config, 'group-search', route); opened.push(reopened);
   const normal = await reopened.prompt('你好', { eventId: 'evt2', senderId: 'user', modelInputText: '你好' });
   reopened.acknowledge(normal.deliveryId, 'sent', 'reply2');
   assert.equal(requests.length, 3);
-  assert.ok(!requests[2].tools?.length);
+  assert.ok(requests[2].tools.some(tool => tool.function.name === 'web_search'));
   assert.equal(nativeQueries.length, 1);
   const cli = await openConversation(config, 'cli'); opened.push(cli);
   await cli.prompt('搜索 SQLite', { searchQuery: 'SQLite' });

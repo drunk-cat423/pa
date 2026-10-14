@@ -7,6 +7,7 @@ import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
 import { MemoryError } from '../dist/memory-types.js';
 import { selfProfileBudget, selfProfileBytes, validateSelfProfileProposal } from '../dist/self-profile-store.js';
+import { downgradeSchema10 } from './fixtures/legacy-schema.mjs';
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'pa-self-profile-'));
@@ -43,7 +44,7 @@ function proposal(snapshot, content, sourceMessageIds, pendingIds = snapshot.pen
   return { baseVersion: snapshot.baseVersion, content, sourceMessageIds, pendingIds };
 }
 
-test('all members can add immediate global pending suggestions, persisted and source-idempotent even after archival', () => {
+test('all members can add immediate global pending suggestions, persisted and source-content-idempotent even after archival', () => {
   const f = fixture();
   try {
     assert.deepEqual(f.store.autoMemory.selfProfile.snapshot(), { baseVersion: 0, content: '', sourceMessageIds: [], pending: [] });
@@ -51,7 +52,7 @@ test('all members can add immediate global pending suggestions, persisted and so
     const second = f.inbound('回答简洁', f.rooms[1], 'another');
     f.store.autoMemory.selfProfile.addPending(first.existingMessageId, '名称：初号机');
     f.store.autoMemory.selfProfile.addPending(second.existingMessageId, '回答简洁');
-    f.store.autoMemory.selfProfile.addPending(first.existingMessageId, '重复内容不得改写');
+    f.store.autoMemory.selfProfile.addPending(first.existingMessageId, '名称：初号机');
     const captured = f.store.autoMemory.selfProfile.snapshot();
     assert.equal(captured.baseVersion, 0);
     assert.deepEqual(captured.pending.map(p => p.content), ['名称：初号机', '回答简洁']);
@@ -61,7 +62,7 @@ test('all members can add immediate global pending suggestions, persisted and so
     const input = f.store.autoMemory.taskInput(job);
     f.store.autoMemory.commit(job.id, job.leaseToken, extract(f, job,
       proposal(input.selfProfile, '名称初号机，回答简洁', [first.existingMessageId, second.existingMessageId])));
-    f.store.autoMemory.selfProfile.addPending(first.existingMessageId, '归档后仍幂等');
+    f.store.autoMemory.selfProfile.addPending(first.existingMessageId, '名称：初号机');
     assert.equal(f.store.autoMemory.selfProfile.snapshot().pending.length, 0);
     assert.equal(inspect(f, db => db.prepare('SELECT COUNT(*) AS n FROM self_profile_pending').get().n), 2);
   } finally { f.close(); }
@@ -305,7 +306,11 @@ test('v6 migration backs up the original database and preserves chats, tombstone
     f.store.close();
     const tables = ['messages', 'memories', 'memory_revisions', 'memory_events', 'persons', 'actor_person_bindings', 'auto_memory_jobs', 'auto_memory_job_messages'];
     const before = inspect(f, db => {
-      db.exec(`PRAGMA foreign_keys=OFF; DROP TABLE self_profile_pending; DROP TABLE self_profile_revisions;
+      downgradeSchema10(db);
+      db.exec(`PRAGMA foreign_keys=OFF;
+        DROP TRIGGER history_message_insert; DROP TRIGGER history_message_update; DROP TRIGGER history_message_delete;
+        DROP TABLE message_history_fts; DROP TABLE person_profile_pending; DROP TABLE profile_tool_receipts; DROP TABLE run_progress;
+        DROP TABLE self_profile_pending; DROP TABLE self_profile_revisions;
         DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity;
         UPDATE memories SET content=NULL,status='deleted'; UPDATE memory_revisions SET content=NULL,status='deleted'; PRAGMA user_version=6;`);
       db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=?').run(JSON.stringify(oldInput), job.id);
@@ -313,7 +318,7 @@ test('v6 migration backs up the original database and preserves chats, tombstone
     });
     f.restart();
     inspect(f, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 8);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 10);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       for (const table of tables) assert.deepEqual(db.prepare(`SELECT rowid,* FROM ${table}`).all().map(r => ({ ...r })), before[table]);
     });
