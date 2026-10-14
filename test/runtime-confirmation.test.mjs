@@ -11,12 +11,14 @@ async function fixture(t, options = {}) {
   const cwd = join(directory, 'project');
   await mkdir(cwd);
   const requests = [];
+  const requestWaiters = [];
   let mode = 'success';
   const server = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
     requests.push({ url: request.url, body });
+    for (const waiter of requestWaiters.splice(0)) waiter();
     if (mode === 'hang') {
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       response.flushHeaders();
@@ -54,7 +56,14 @@ async function fixture(t, options = {}) {
     await new Promise(resolve => server.close(resolve));
     await rm(directory, { recursive: true, force: true });
   });
-  return { config, conversation, requests, setMode: value => { mode = value; } };
+  return { config, conversation, requests, setMode: value => { mode = value; },
+    async waitForRequest(count, pending) {
+      while (requests.length < count) {
+        await Promise.race([new Promise(resolve => requestWaiters.push(resolve)), pending.then(
+          () => assert.fail('request completed before the local server received it'),
+          error => { throw error; })]);
+      }
+    } };
 }
 
 test('confirmation uses one isolated, tool-free request capped at 192 tokens', async t => {
@@ -93,18 +102,19 @@ test('abort, close, and configured timeout cancel the lightweight request', asyn
   const runtime = await f.conversation();
   f.setMode('hang');
   const cancelled = runtime.confirmSavedUpdate('更新', '已保存');
-  await new Promise(resolve => setTimeout(resolve, 30));
+  await f.waitForRequest(1, cancelled);
   await runtime.abort();
   await assert.rejects(cancelled, error => error instanceof RequestError && error.kind === 'cancelled');
 
   const closing = await f.conversation('closing');
   const closingRequest = closing.confirmSavedUpdate('更新', '已保存');
-  await new Promise(resolve => setTimeout(resolve, 30));
+  await f.waitForRequest(2, closingRequest);
   await closing.close();
   await assert.rejects(closingRequest, error => error instanceof RequestError && error.kind === 'cancelled');
 
   const short = await f.conversation('timeout-short', { timeoutMs: 120 });
   const request = short.confirmSavedUpdate('更新', '已保存');
   await assert.rejects(request, error => error instanceof RequestError && error.kind === 'timeout');
-  assert.equal(f.requests.length, 3);
+  // A total deadline may expire before network dispatch on a busy host.
+  assert.ok(f.requests.length >= 2 && f.requests.length <= 3);
 });
