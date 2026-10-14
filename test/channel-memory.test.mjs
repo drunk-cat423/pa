@@ -12,12 +12,17 @@ import { parseMemoryRequest } from '../dist/memory-service.js';
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'pa-group-memory-'));
   const requests = [], sent = [], harnesses = [];
+  let responseMode = 'success';
+  let onRequest;
   const server = createServer(async (request, response) => {
     let raw = '';
     for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw);
     requests.push(body);
-    const answer = raw.includes('PRIVATE_A') ? 'DERIVED_SECRET_A' : `local-reply-${requests.length}`;
+    onRequest?.(body);
+    if (responseMode === 'error') { response.writeHead(500); response.end('fixture failure'); return; }
+    const answer = (body.max_tokens ?? body.max_completion_tokens) <= 192 ? '已按这次内容记好。'
+      : raw.includes('PRIVATE_A') ? 'DERIVED_SECRET_A' : `local-reply-${requests.length}`;
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const choices of [
       [{ index: 0, delta: { role: 'assistant', content: answer }, finish_reason: null }],
@@ -32,8 +37,8 @@ async function fixture(t) {
   const route = { channel: 'qq', accountId: 'account', roomId: 'room-A', roomType: 'group' };
   const other = { ...route, roomId: 'room-B' };
   const policy = { version: 1, ownerBindings: [{ route, senderId: 'owner' }, { route: other, senderId: 'owner' }] };
-  function harness(routes = [route, other], bindings = policy) {
-    const value = new ChannelHarness(config, routes, { send: async message => { sent.push(message); return { status: 'sent', externalMessageId: `out-${sent.length}` }; } }, 0, bindings);
+  function harness(routes = [route, other], bindings = policy, maxCalls = 0) {
+    const value = new ChannelHarness(config, routes, { send: async message => { sent.push(message); return { status: 'sent', externalMessageId: `out-${sent.length}` }; } }, maxCalls, bindings);
     harnesses.push(value); return value;
   }
   function message(eventId, text, options = {}) { return { route, eventId, text, senderId: 'member-A',
@@ -44,8 +49,73 @@ async function fixture(t) {
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
     await rm(directory, { recursive: true, force: true });
   });
-  return { directory, config, route, other, requests, sent, harness, message, db };
+  return { directory, config, route, other, requests, sent, harness, message, db,
+    setResponseMode: mode => { responseMode = mode; }, onRequest: callback => { onRequest = callback; } };
 }
+
+test('个人更新、共享记忆保存和纠正成功各确认一次，查询拒绝澄清报错不调用', async t => {
+  const f = await fixture(t), h = f.harness();
+  await h.handle(f.message('profile', '请记住我不喜欢吃辣'));
+  assert.equal(f.requests.length, 1);
+  assert.ok(JSON.stringify(f.requests[0]).includes('当前发言者的饮食偏好已更新'));
+  await h.handle(f.message('profile-correct', '我现在可以接受微辣了'));
+  await h.handle(f.message('save', '/memory remember room PREVIOUS_FACT', { senderId: 'owner' }));
+  const db = f.db();
+  const id = db.prepare('SELECT id FROM memories WHERE content=?').get('PREVIOUS_FACT').id;
+  db.close();
+  await h.handle(f.message('query', '/memory query room', { senderId: 'owner' }));
+  assert.equal(f.requests.length, 3);
+  f.onRequest(() => {
+    const db = f.db();
+    try { assert.equal(db.prepare('SELECT content FROM memories WHERE id=?').get(id).content, 'NEW_FACT'); }
+    finally { db.close(); }
+  });
+  await h.handle(f.message('correct', `/memory correct ${id} NEW_FACT`, { senderId: 'owner' }));
+  f.onRequest(undefined);
+  assert.equal(f.requests.length, 4);
+  assert.equal(f.sent.at(-1).text, '已按这次内容记好。');
+  const wire = JSON.stringify(f.requests.at(-1));
+  assert.ok(wire.includes('NEW_FACT') && wire.includes('旧版本记录保留'));
+  assert.ok(!wire.includes(id) && !wire.includes('PREVIOUS_FACT') && !wire.includes('我现在可以接受微辣了'));
+  assert.equal(f.requests.at(-1).tools, undefined);
+  for (const [eventId, text, extra] of [
+    ['denied', '/memory remember room unauthorized', {}],
+    ['clarify', '请记住项目周五发布', {}],
+    ['bad-save', '/memory remember room', { senderId: 'owner' }],
+    ['bad-correct', '/memory correct nonexistent invalid', { senderId: 'owner' }],
+    ['help', '/memory', { senderId: 'owner' }],
+    ['query-again', '/memory query room', { senderId: 'owner' }],
+  ]) await h.handle(f.message(eventId, text, extra));
+  assert.equal(f.requests.length, 4);
+  assert.equal(h.info().calls, 4);
+  assert.equal(await h.handle(f.message('correct', `/memory correct ${id} NEW_FACT`, { senderId: 'owner' })), 'duplicate');
+  assert.equal(f.requests.length, 4);
+});
+
+test('纠正保存后确认失败不重试，预算用完仍可更新个人偏好', async t => {
+  const f = await fixture(t), h = f.harness();
+  await h.handle(f.message('save', '/memory remember room old', { senderId: 'owner' }));
+  const db = f.db();
+  const id = db.prepare('SELECT id FROM memories WHERE content=?').get('old').id;
+  db.close();
+  f.setResponseMode('error');
+  await h.handle(f.message('correct', `/memory correct ${id} new`, { senderId: 'owner' }));
+  assert.equal(f.requests.length, 2);
+  assert.match(f.sent.at(-1).text, /记忆已纠正.*确认回复生成失败/);
+  const checked = f.db();
+  try { assert.equal(checked.prepare('SELECT content FROM memories WHERE id=?').get(id).content, 'new'); }
+  finally { checked.close(); }
+  await h.close();
+  f.setResponseMode('success');
+  const limited = f.harness(undefined, undefined, 1);
+  await limited.handle(f.message('preference-a', '请记住我的兴趣是登山'));
+  await limited.handle(f.message('preference-b', '请记住我的兴趣是阅读'));
+  assert.equal(f.requests.length, 3);
+  assert.equal(limited.info().calls, 1);
+  const checkedProfile = f.db();
+  try { assert.equal(checkedProfile.prepare("SELECT content FROM memories WHERE profile_field='interests' AND is_current=1").get().content, '我的兴趣是阅读'); }
+  finally { checkedProfile.close(); }
+});
 
 test('私聊画像限定本会话，群管理者不会自动成为私聊管理者', async t => {
   const f = await fixture(t);
@@ -54,10 +124,10 @@ test('私聊画像限定本会话，群管理者不会自动成为私聊管理�
   const h = f.harness([f.route, privateRoute, otherPrivate]);
   const options = { route: privateRoute, senderId: 'owner', mentioned: false };
   await h.handle(f.message('save-private', '请记住我的兴趣是PRIVATE_INTEREST', options));
-  assert.ok(f.sent.at(-1).text.includes('兴趣偏好已更新'));
+  assert.equal(f.sent.at(-1).text, '已按这次内容记好。');
   await h.handle(f.message('read-private', '/memory query', options));
   assert.ok(f.sent.at(-1).text.includes('没有记忆管理或画像查询权限'));
-  assert.equal(f.requests.length, 0);
+  assert.equal(f.requests.length, 1);
   await h.handle(f.message('private-question', '我的兴趣适合做什么？', options));
   assert.ok(JSON.stringify(f.requests.at(-1)).includes('PRIVATE_INTEREST'));
   await h.handle(f.message('group-question', '我的兴趣适合做什么？', { senderId: 'owner' }));
@@ -66,11 +136,11 @@ test('私聊画像限定本会话，群管理者不会自动成为私聊管理�
   assert.ok(!JSON.stringify(f.requests.at(-1)).includes('PRIVATE_INTEREST'));
 });
 
-test('普通群友仅更新当前身份画像，不读画像、不越权；控制投递持久化且无模型费用', async t => {
+test('普通群友仅更新当前身份画像，成功确认调用一次模型，读取和越权仍本地拒绝', async t => {
   const f = await fixture(t), h = f.harness();
   await h.handle(f.message('save', '请记住我不喜欢吃辣'));
-  assert.equal(h.info().calls, 0);
-  assert.ok(f.sent.at(-1).text.includes('饮食偏好已更新'));
+  assert.equal(h.info().calls, 1);
+  assert.equal(f.sent.at(-1).text, '已按这次内容记好。');
   await h.handle(f.message('save', '请记住我不喜欢吃辣'));
   assert.equal(f.sent.length, 1);
   await h.handle(f.message('read', '你记得我有哪些偏好？'));
@@ -78,7 +148,7 @@ test('普通群友仅更新当前身份画像，不读画像、不越权；控�
   for (const [id, text] of [['read-food', '列出我不吃的食物'], ['read-saved', '我保存的饮食信息是什么？']]) {
     await h.handle(f.message(id, text));
     assert.ok(f.sent.at(-1).text.includes('没有记忆管理或画像查询权限'));
-    assert.equal(f.requests.length, 0);
+    assert.equal(f.requests.length, 1);
   }
   await h.handle(f.message('admin', '/memory query'));
   assert.ok(f.sent.at(-1).text.includes('没有记忆管理'));
@@ -98,7 +168,7 @@ test('普通群友仅更新当前身份画像，不读画像、不越权；控�
     assert.equal(db.prepare('SELECT COUNT(*) n FROM memory_revisions WHERE content IS NOT NULL').get().n, 2);
     assert.equal(db.prepare("SELECT COUNT(*) n FROM deliveries d JOIN agent_runs r ON r.id=d.run_id WHERE r.model='memory-control' AND d.status='sent'").get().n, 7);
   } finally { db.close(); }
-  assert.equal(f.requests.length, 1); // Only the ordinary impersonation chat, no tool calls.
+  assert.equal(f.requests.length, 3); // Two successful update confirmations and the ordinary impersonation chat.
   await h.close();
   const reopened = f.harness();
   assert.equal(await reopened.handle(f.message('forget', '忘掉我的饮食偏好')), 'duplicate');
@@ -125,7 +195,7 @@ test('仅owner管理本群共享/成员记忆，owner命令结果不会进入其
   assert.ok(!body.includes('OWNER_PRIVATE_NOTE_A'));
   await h.handle(f.message('other', '请和我聊聊', { route: f.other, senderId: 'member-B' }));
   assert.ok(!JSON.stringify(f.requests.at(-1)).includes('ROOM_SHARED_A'));
-  assert.equal(f.requests.length, 2);
+  assert.equal(f.requests.length, 25); // 23 successful saves plus two ordinary chats; queries/refusals are local.
 });
 
 test('真实Pi请求不携带其他人的画像和派生回复；纠正替换当前画像而保留原始记录', async t => {
@@ -190,9 +260,11 @@ test('三类记忆分别组织，统一本人跨绑定群与私聊召回，其�
   const ownerPrivate = { route: privateRoute, senderId: 'owner-private', mentioned: false };
   await h.handle(f.message('room-save', '/memory remember room ROOM_ONLY_A', ownerA));
   await h.handle(f.message('owner-memory', '/memory remember me --kind episode --occurred-at 2026-10-01T00:00:00Z OWNER_TRIP_EPISODE', ownerA));
-  const episodeId = f.sent.at(-1).text.split('：')[1];
+  const episodeDb = f.db();
+  const episodeId = episodeDb.prepare('SELECT id FROM memories WHERE content=?').get('OWNER_TRIP_EPISODE').id;
+  episodeDb.close();
   await h.handle(f.message('owner-profile', '请记住我不喜欢吃辣OWNER_DIET_V1', ownerA));
-  assert.ok(f.sent.at(-1).text.includes('同一人物已绑定的场景'));
+  assert.equal(f.sent.at(-1).text, '已按这次内容记好。');
   await h.handle(f.message('member-profile', '请记住我的兴趣是MEMBER_A_HOBBY'));
   await h.handle(f.message('member-memory', '/memory remember user:member-A MEMBER_A_EPISODE', ownerA));
   await h.handle(f.message('expired', '/memory remember me --expires-at 2000-01-01T00:00:00Z EXPIRED_OWNER', ownerA));

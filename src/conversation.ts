@@ -5,7 +5,7 @@ import { ConversationStore, DuplicateMessageError, type MessageRecord } from './
 import type { ChannelRoute, ExternalRunInput } from './channel-types.js';
 import { MemoryError, type MemoryChange, type MemoryInput, type MemoryRecord, type MemoryRef } from './memory-types.js';
 import type { ProfileField, PrimaryPerson } from './memory-types.js';
-import type { MemorySource } from './memory-service.js';
+import type { MemoryConfirmation, MemorySource } from './memory-service.js';
 import { BackgroundMemory } from './auto-memory.js';
 import type { MemoryProvider } from './memory-provider.js';
 import { selfProfileBudget } from './self-profile-store.js';
@@ -35,6 +35,8 @@ export interface RecordedConversation {
   selfProfileMemory(actorId: string, field: ProfileField): MemoryRecord | undefined;
   contextHistory(limit?: number, senderId?: string, beforeMessageId?: string): MessageRecord[];
   control(text: string, external: ExternalRunInput, operation: (source: MemorySource) => string): { text: string; runId: string; deliveryId: string };
+  controlWithReply(text: string, external: ExternalRunInput, operation: (source: MemorySource) => string,
+    generate: () => MemoryConfirmation | undefined): Promise<{ text: string; runId: string; deliveryId: string }>;
   correctMemory(id: string, input: MemoryInput, expectedRevision?: number): MemoryChange;
   addSelfProfile(sourceMessageId: string, content: string): void;
   memoryStatus(): ReturnType<BackgroundMemory['info']>;
@@ -174,6 +176,25 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
       control(text, external, operation) {
         manageable();
         return persist(() => openedStore.recordControlRun(conversation.id, text, external, operation), text);
+      },
+      controlWithReply(text, external, operation, generate) {
+        try { manageable(); } catch (error) { return Promise.reject(error); }
+        active = (async () => {
+          const result = persist(() => openedStore.beginControlRun(conversation.id, text, external, operation), text);
+          let reply = result.text;
+          const confirmation = generate();
+          if (confirmation) {
+            try { reply = await runtime.confirmSavedUpdate(confirmation.content, confirmation.status); }
+            catch (error) {
+              if (!(error instanceof RequestError)) throw error;
+              // Saving succeeded independently; a failed acknowledgement must not undo it.
+              reply = result.text + ' 确认回复生成失败，本次未重试。';
+            }
+          }
+          const delivery = persist(() => openedStore.completeRun(result.runId, reply, undefined, undefined), text);
+          return { text: reply, runId: result.runId, deliveryId: delivery.deliveryId };
+        })().finally(() => { active = undefined; });
+        return active;
       },
       hasExternalMessage(eventId) {
         usable();

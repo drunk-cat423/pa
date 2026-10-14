@@ -106,6 +106,7 @@ export function parseMemoryRequest(input: string): MemoryRequest | undefined {
 }
 
 export interface MemorySource { id: string; actorId: string; senderId: string; text: string }
+export interface MemoryConfirmation { content: string; status: string }
 
 function display(records: MemoryRecord[]): string {
   if (!records.length) return '当前范围没有有效记忆。';
@@ -120,11 +121,13 @@ function display(records: MemoryRecord[]): string {
 }
 
 export function executeMemoryRequest(request: MemoryRequest, conversation: RecordedConversation,
-  source: MemorySource, owner: boolean, primaryPerson = false): string {
+  source: MemorySource, owner: boolean, primaryPerson = false,
+  onSaved?: (confirmation: MemoryConfirmation) => void): string {
   if (request.type === 'ai_self_refusal') return AI_SELF_REFUSAL;
   if (request.type === 'ai_self_clarify') return AI_SELF_CLARIFY;
   if (request.type === 'ai_self_update') {
     conversation.addSelfProfile(source.id, request.content);
+    onSaved?.({ content: request.content, status: 'AI待整理画像建议已保存，下次对话可参考，尚未完成正式整理归档。' });
     return AI_SELF_ACK;
   }
   if (request.type === 'unsupported_delete') return '不提供删除记忆或偏好的操作；你可以明确纠正信息，我会保留原记录并更新当前内容。';
@@ -136,6 +139,7 @@ export function executeMemoryRequest(request: MemoryRequest, conversation: Recor
       subjectActorId: source.actorId, profileField: request.field };
     if (existing) conversation.correctMemory(existing.id, input, existing.revision);
     else conversation.remember(input);
+    onSaved?.({ content: request.content, status: `当前发言者的${FIELD_NAMES[request.field]}已更新。` });
     void primaryPerson;
     return `${FIELD_NAMES[request.field]}已更新，用于同一人物已绑定的场景。`;
   }
@@ -164,6 +168,7 @@ export function executeMemoryRequest(request: MemoryRequest, conversation: Recor
     if (parts[1]!.startsWith('user:') && !actor) throw new MemoryError('当前群中没有已验证的该成员。');
     const result = conversation.remember({ ...memoryContent(parts[2]!), sourceMessageId: source.id,
       ...(actor ? { subjectActorId: actor } : {}) });
+    onSaved?.({ content: result.memory.content, status: actor ? '指定人物的长期记忆已保存。' : '当前会话的共享记忆已保存。' });
     return `记忆已保存：${result.memory.id}`;
   }
   const parts = args.match(/^(\S+)(?:\s+([\s\S]+))?$/);
@@ -171,6 +176,7 @@ export function executeMemoryRequest(request: MemoryRequest, conversation: Recor
   if (action === 'correct') {
     if (!parts[2]) throw new MemoryError('请提供纠正后的内容。');
     const result = conversation.correctMemory(parts[1]!, { ...memoryContent(parts[2]), sourceMessageId: source.id });
+    onSaved?.({ content: result.memory.content, status: '指定记忆已纠正，当前内容已更新，旧版本记录保留。' });
     return `记忆已纠正：${result.memory.id}`;
   }
   return '不提供删除记忆或偏好的操作；你可以明确纠正信息，我会保留原记录并更新当前内容。';

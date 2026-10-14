@@ -937,13 +937,23 @@ export class ConversationStore {
   recordControlRun(conversationId: string, text: string, external: ExternalRunInput,
     operation: (source: { id: string; actorId: string; senderId: string; text: string }) => string): { text: string; runId: string; deliveryId: string } {
     return this.memoryTransaction(() => {
+      const result = this.beginControlRun(conversationId, text, external, operation);
+      const delivery = this.completeRun(result.runId, result.text, undefined, undefined);
+      return { ...result, deliveryId: delivery.deliveryId };
+    });
+  }
+
+  // Commit the authoritative operation before an optional model confirmation.
+  // A crash leaves a running marker; recovery never repeats the operation or request.
+  beginControlRun(conversationId: string, text: string, external: ExternalRunInput,
+    operation: (source: { id: string; actorId: string; senderId: string; text: string }) => string): { text: string; runId: string } {
+    return this.memoryTransaction(() => {
       const run = this.beginRun(conversationId, text, 'local', 'memory-control', [], { ...external, messageKind: 'memory' });
       const source = this.externalMessage(conversationId, external.eventId);
       if (!source) throw new Error('渠道管理消息来源不存在。');
       const response = operation(source);
       if (typeof response !== 'string') throw new Error('管理操作回复无效。');
-      const delivery = this.completeRun(run.id, response, undefined, undefined);
-      return { text: response, runId: run.id, deliveryId: delivery.deliveryId };
+      return { text: response, runId: run.id };
     });
   }
 
