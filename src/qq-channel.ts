@@ -1,4 +1,5 @@
-import type { DeliveryResult, InboundMessage, OutboundMessage } from './channel-types.js';
+import type { DeliveryResult, InboundMessage, MessageQuote, OutboundMessage } from './channel-types.js';
+import { toPlainText } from './plain-text.js';
 
 const API = 'https://api.bot.qq.com';
 const INTENTS = 1 << 25;
@@ -86,6 +87,50 @@ function stripBotPrefix(content: string, botIds: string[]): string {
   return content;
 }
 
+function referenceId(value: unknown): string | undefined {
+  return nonEmptyString(value) && value.length <= 512 && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/.test(value) ? value : undefined;
+}
+
+function normalizeQuote(data: JsonObject): MessageQuote | undefined {
+  const messageId = object(data.message_reference) ? referenceId(data.message_reference.message_id) : undefined;
+  const ext = object(data.message_scene) && Array.isArray(data.message_scene.ext) ? data.message_scene.ext : [];
+  // ref_msg_idx is an opaque index, never a message.id. Do not copy auth_token or other scene data.
+  const indexEntry = ext.find(value => typeof value === 'string' && value.startsWith('ref_msg_idx='));
+  const referenceIndex = typeof indexEntry === 'string' ? referenceId(indexEntry.slice('ref_msg_idx='.length)) : undefined;
+  let seenQuote = data.message_type === 103 || Boolean(referenceIndex);
+  let visited = 0, bytes = 0, truncated = false;
+  const inlineMessages: NonNullable<MessageQuote['inlineMessages']> = [];
+  function walk(elements: unknown, depth: number, quoted: boolean): void {
+    if (!Array.isArray(elements)) return;
+    if (depth > 4) { truncated = true; return; }
+    for (const element of elements) {
+      if (++visited > 32) { truncated = true; return; }
+      if (!object(element)) continue;
+      const isQuote = quoted || element.message_type === 103;
+      if (isQuote) seenQuote = true;
+      if (isQuote && typeof element.content === 'string' && element.content.trim()) {
+        if (inlineMessages.length >= 8 || bytes >= 8000) { truncated = true; return; }
+        let text = '';
+        for (const character of element.content) {
+          const size = Buffer.byteLength(character, 'utf8');
+          if (bytes + size > 8000) { truncated = true; break; }
+          text += character; bytes += size;
+        }
+        const author = object(element.author) ? element.author : undefined;
+        const senderId = referenceId(author?.member_openid ?? author?.user_openid ?? author?.id);
+        if (text) inlineMessages.push({ text, ...(senderId ? { senderId } : {}),
+          ...(typeof author?.username === 'string' ? { senderName: author.username.slice(0, 100) } : {}) });
+      }
+      walk(element.msg_elements, depth + 1, isQuote);
+    }
+  }
+  walk(data.msg_elements, 1, seenQuote);
+  if (!seenQuote && !messageId) return undefined;
+  return { ...(messageId ? { messageId } : {}), ...(referenceIndex ? { referenceIndex } : {}),
+    ...(inlineMessages.length ? { inlineMessages } : {}), ...(truncated ? { truncated } : {}) };
+}
+
 export function normalizeQQMessage(event: unknown, accountId: string, botId: string): InboundMessage | undefined {
   if (!object(event) || event.op !== 0 || !['GROUP_AT_MESSAGE_CREATE', 'GROUP_MESSAGE_CREATE', 'C2C_MESSAGE_CREATE'].includes(String(event.t))) return undefined;
   const privateMessage = event.t === 'C2C_MESSAGE_CREATE';
@@ -115,6 +160,7 @@ export function normalizeQQMessage(event: unknown, accountId: string, botId: str
     }
   }
   const text = privateMessage ? data.content : stripBotPrefix(data.content, selfIds.filter(Boolean));
+  const quote = normalizeQuote(data);
   return {
     route: { channel: 'qq', accountId, roomId, roomType: privateMessage ? 'private' : 'group' },
     eventId: data.id,
@@ -124,6 +170,7 @@ export function normalizeQQMessage(event: unknown, accountId: string, botId: str
     sentAt,
     mentioned,
     ...(mentionedSenderIds.length ? { mentionedSenderIds } : {}),
+    ...(quote ? { quote } : {}),
   };
 }
 
@@ -214,6 +261,8 @@ export class QQChannel {
     if (this.closed || !this.started || message.route.channel !== 'qq' || message.route.accountId !== this.config.appId
       || !['group', 'private'].includes(message.route.roomType)
       || !nonEmptyString(message.route.roomId) || !nonEmptyString(message.replyToMessageId)) return { status: 'rejected' };
+    const content = toPlainText(message.text);
+    if (!content.trim()) return { status: 'rejected' };
     let token: string;
     try {
       token = await this.getToken();
@@ -227,7 +276,7 @@ export class QQChannel {
       response = await this.fetchImpl(`${API}/v2/${scope}/${encodeURIComponent(message.route.roomId)}/messages`, {
         method: 'POST', redirect: 'error',
         headers: { 'Content-Type': 'application/json', Authorization: `QQBot ${token}` },
-        body: JSON.stringify({ msg_type: 0, content: message.text, msg_id: message.replyToMessageId, msg_seq: 1 }),
+        body: JSON.stringify({ msg_type: 0, content, msg_id: message.replyToMessageId, msg_seq: 1 }),
         signal: AbortSignal.timeout(10_000),
       });
     } catch {

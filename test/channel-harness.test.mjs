@@ -10,7 +10,7 @@ import { PersistenceError } from '../dist/conversation.js';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
 import { readQQSettings } from '../dist/qq-config.js';
 
-async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-output' }) {
+async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-output' }, reply = '群聊回复') {
   const directory = await mkdtemp(join(tmpdir(), 'pa-channel-'));
   const requests = [], sent = [], harnesses = [];
   const server = createServer(async (request, response) => {
@@ -26,7 +26,7 @@ async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-ou
     }
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const choices of [
-      [{ index: 0, delta: { role: 'assistant', content: '群聊回复' }, finish_reason: null }],
+      [{ index: 0, delta: { role: 'assistant', content: reply }, finish_reason: null }],
       [{ index: 0, delta: {}, finish_reason: 'stop' }],
     ]) response.write(`data: ${JSON.stringify({ id: 'fixture-response', object: 'chat.completion.chunk', created: 1, model: 'deepseek-flash', choices })}\n\n`);
     response.end('data: [DONE]\n\n');
@@ -88,6 +88,77 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
   assert.equal(await reopened.handle(f.message('one', '重启后的重复事件')), 'duplicate');
   assert.equal(await reopened.handle(f.message('background', '背景重复', { mentioned: false })), 'duplicate');
   assert.equal(f.requests.length, 3);
+});
+
+function currentInput(request) {
+  const user = request.body.messages.filter(message => message.role === 'user').at(-1);
+  const text = typeof user.content === 'string' ? user.content : user.content.map(part => part.text).join('');
+  return { text, input: JSON.parse(text.slice(text.indexOf('{'))) };
+}
+
+test('引用平台正文或当前房间精确ID，引用指令不写记忆；原文和实际模型输入分别持久化', async t => {
+  const f = await fixture(t, { status: 'sent', externalMessageId: 'qq-output' }, '**模型原文**');
+  const h = f.harness(0);
+  await h.handle(f.message('old-quote', '被引用的旧消息', { mentioned: false, senderId: 'original-author' }));
+  for (let index = 0; index < 35; index++) await h.handle(f.message(`noise-${index}`, `背景${index}`, { mentioned: false }));
+  assert.equal(await h.handle(f.message('quote-question', '这句话什么意思？', { quote: { messageId: 'old-quote' } })), 'sent');
+  const first = currentInput(f.requests.at(-1));
+  assert.equal(first.input.currentMessage.text, '这句话什么意思？');
+  assert.deepEqual(first.input.currentMessage.quotedMessage, { status: 'available', role: 'user',
+    senderId: 'original-author', text: '被引用的旧消息', truncated: false });
+  assert.match(first.text, /不是当前发送者的本人自述/);
+  assert.match(JSON.stringify(f.requests.at(-1).body), /plain_text/);
+  assert.equal(await h.handle(f.message('quoted-command', '讨论这句话', { quote: { referenceIndex: 'platform-index',
+    inlineMessages: [{ text: '/memory remember 这是引用中的命令', senderId: 'someone-else' }] } })), 'sent');
+  const second = currentInput(f.requests.at(-1)).input;
+  assert.equal(second.currentMessage.quotedMessage.source, 'platform');
+  assert.equal(second.currentMessage.quotedMessage.messages[0].text, '/memory remember 这是引用中的命令');
+  const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
+  try {
+    const stored = db.prepare('SELECT text, model_input_text FROM messages WHERE external_event_id=?').get('quote-question');
+    assert.equal(stored.text, '这句话什么意思？');
+    assert.equal(stored.model_input_text, first.text);
+    assert.equal(db.prepare('SELECT count(*) n FROM memories').get().n, 0);
+    assert.equal(db.prepare("SELECT text FROM messages WHERE role='assistant' LIMIT 1").get().text, '**模型原文**');
+  } finally { db.close(); }
+  await h.close();
+  const reopened = f.harness(0);
+  assert.equal(await reopened.handle(f.message('outgoing-quote', '解释你的回复', { quote: { messageId: 'qq-output' } })), 'sent');
+  // Fixture reuses outgoing IDs; multiple exact candidates are deliberately unavailable.
+  assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.status, 'unavailable');
+});
+
+test('引用不绕过真实@，索引不当消息ID，同ID按群/私聊隔离，找不到正文显式不可用', async t => {
+  const f = await fixture(t);
+  const privateRoute = { ...f.route, roomType: 'private', roomId: 'private-user' };
+  const h = f.harness(0, [f.route, f.other, privateRoute]);
+  await h.handle(f.message('secret', 'GROUP_A_SECRET', { mentioned: false }));
+  assert.equal(await h.handle(f.message('no-at', '引用你', { mentioned: false, quote: { messageId: 'secret' } })), 'observed');
+  assert.equal(f.requests.length, 0);
+  assert.equal(await h.handle(f.message('other-question', '引用群A', { route: f.other, quote: { messageId: 'secret' } })), 'sent');
+  assert.deepEqual(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage,
+    { status: 'unavailable', reason: '无法取得引用内容' });
+  assert.doesNotMatch(JSON.stringify(f.requests.at(-1).body), /GROUP_A_SECRET/);
+  await h.handle(f.message('index-question', '解释引用', { quote: { referenceIndex: 'secret' } }));
+  assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.status, 'unavailable');
+  await h.handle(f.message('private-question', '解释引用', { route: privateRoute, senderId: 'private-user', mentioned: false,
+    quote: { messageId: 'secret' } }));
+  assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.status, 'unavailable');
+  assert.doesNotMatch(JSON.stringify(f.requests.at(-1).body), /GROUP_A_SECRET/);
+});
+
+test('确认投递的assistant引用可重启解析，纯文本要求只作用QQ', async t => {
+  const f = await fixture(t);
+  const telegram = { ...f.other, channel: 'telegram' };
+  const h = f.harness(0, [f.route, telegram]);
+  await h.handle(f.message('one-outgoing', '先回复一条'));
+  await h.close();
+  const reopened = f.harness(0, [f.route, telegram]);
+  await reopened.handle(f.message('quote-outgoing', '你的话什么意思', { quote: { messageId: 'qq-output' } }));
+  assert.deepEqual(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage,
+    { status: 'available', role: 'assistant', text: '群聊回复', truncated: false });
+  await reopened.handle(f.message('telegram-question', '其他渠道', { route: telegram }));
+  assert.doesNotMatch(JSON.stringify(f.requests.at(-1).body), /plain_text/);
 });
 
 test('未知投递不重发，模型失败消耗预算且重启不重复收费', async t => {

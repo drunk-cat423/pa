@@ -5,6 +5,13 @@ export interface ChannelRoute {
   roomType: 'group' | 'private';
 }
 
+export interface MessageQuote {
+  messageId?: string;
+  referenceIndex?: string;
+  inlineMessages?: { text: string; senderId?: string; senderName?: string }[];
+  truncated?: boolean;
+}
+
 export interface ExternalRunInput {
   eventId: string;
   senderId: string;
@@ -13,6 +20,8 @@ export interface ExternalRunInput {
   mentionedSenderIds?: string[];
   senderName?: string;
   modelInputText: string;
+  quote?: MessageQuote;
+  responseFormat?: 'plain_text';
   messageKind?: 'chat' | 'memory';
   profileFields?: import('./memory-types.js').ProfileField[];
 }
@@ -26,6 +35,7 @@ export interface InboundMessage {
   sentAt: string;
   mentioned: boolean;
   mentionedSenderIds?: string[];
+  quote?: MessageQuote;
 }
 
 export interface OutboundMessage {

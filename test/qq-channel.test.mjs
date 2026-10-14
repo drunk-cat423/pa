@@ -158,6 +158,74 @@ test('start resolves only after READY, then delivery makes one exact reply reque
   ctx.channel.close();
 });
 
+test('QQ官方引用树仅规范化引用正文与公开作者，不保存scene令牌或把索引当消息ID', () => {
+  const event = { op: 0, t: 'GROUP_AT_MESSAGE_CREATE', d: {
+    id: 'question', group_openid: 'group', content: '解释这句话', timestamp: '2026-10-13T00:00:00Z',
+    author: { member_openid: 'asker' }, message_type: 103,
+    message_scene: { ext: ['msg_idx=current-index', 'ref_msg_idx=quote-index', 'auth_token=SECRET_TOKEN'] },
+    msg_elements: [{ content: '被引用的原话', author: { member_openid: 'original-author', username: '原作者' },
+      attachments: [{ url: 'SECRET_ATTACHMENT_URL' }], ark_data: { fields: { token: 'SECRET_CARD' } } }],
+  } };
+  const message = normalizeQQMessage(event, 'account', 'bot');
+  assert.equal(message.text, '解释这句话');
+  assert.deepEqual(message.quote, { referenceIndex: 'quote-index', inlineMessages: [
+    { text: '被引用的原话', senderId: 'original-author', senderName: '原作者' },
+  ] });
+  assert.doesNotMatch(JSON.stringify(message), /SECRET|current-index/);
+  const referenceOnly = normalizeQQMessage({ ...event, d: { ...event.d, msg_elements: undefined } }, 'account', 'bot');
+  assert.deepEqual(referenceOnly.quote, { referenceIndex: 'quote-index' });
+  const legacy = normalizeQQMessage({ ...event, d: { ...event.d, message_type: 0, message_scene: undefined,
+    msg_elements: undefined, message_reference: { message_id: 'actual-message-id' } } }, 'account', 'bot');
+  assert.deepEqual(legacy.quote, { messageId: 'actual-message-id' });
+  const unquoted = normalizeQQMessage({ ...event, d: { ...event.d, message_type: 0, message_scene: undefined,
+    msg_elements: [{ content: '普通消息元素' }] } }, 'account', 'bot');
+  assert.equal(unquoted.quote, undefined);
+  const nested = normalizeQQMessage({ ...event, d: { ...event.d, message_type: 101, message_scene: undefined,
+    msg_elements: [{ content: '普通消息元素', msg_elements: [{ message_type: 103, content: '嵌套引用' }] }] } }, 'account', 'bot');
+  assert.deepEqual(nested.quote, { inlineMessages: [{ text: '嵌套引用' }] });
+});
+
+test('引用提取限制深度、节点数和UTF8正文预算；只有引用不凭空创建当前问题', () => {
+  const base = { op: 0, t: 'GROUP_AT_MESSAGE_CREATE', d: { id: 'question', group_openid: 'group', content: '问题',
+    timestamp: '2026-10-13T00:00:00Z', author: { member_openid: 'asker' }, message_type: 103 } };
+  const huge = normalizeQQMessage({ ...base, d: { ...base.d,
+    msg_elements: [{ content: '中'.repeat(10000) }, { content: '不会超限进入' }] } }, 'account', 'bot');
+  assert.equal(huge.quote.truncated, true);
+  assert.ok(Buffer.byteLength(huge.quote.inlineMessages.map(item => item.text).join('')) <= 8000);
+  let deep = { content: 'TOO_DEEP' };
+  for (let depth = 0; depth < 5; depth++) deep = { msg_elements: [deep] };
+  const bounded = normalizeQQMessage({ ...base, d: { ...base.d, msg_elements: [deep] } }, 'account', 'bot');
+  assert.equal(bounded.quote.truncated, true);
+  assert.doesNotMatch(JSON.stringify(bounded), /TOO_DEEP/);
+  const many = normalizeQQMessage({ ...base, d: { ...base.d,
+    msg_elements: Array.from({ length: 50 }, (_, index) => ({ content: `quote-${index}` })) } }, 'account', 'bot');
+  assert.equal(many.quote.inlineMessages.length, 8);
+  assert.equal(many.quote.truncated, true);
+  const blank = normalizeQQMessage({ ...base, d: { ...base.d, content: ' ', msg_elements: [{ content: '引用原话' }] } }, 'account', 'bot');
+  assert.equal(blank.text, ' ');
+});
+
+test('QQ发送只转换传输副本，常见Markdown变纯文本，代码和符号原样保留', async () => {
+  const ctx = setup();
+  const starting = ctx.channel.start();
+  await tick();
+  ctx.socket.message({ op: 10, d: { heartbeat_interval: 10_000 } });
+  await tick();
+  ctx.socket.message({ op: 0, t: 'READY', d: { session_id: 's', user: { id: 'bot' } } });
+  await starting;
+  const message = { route: { channel: 'qq', accountId: '123', roomId: 'g', roomType: 'group' }, replyToMessageId: 'in',
+    text: '# 标题\n**重点** 和 *说明*\n```js\nconst a_b = 2 * 3; // #原文\n```\n[官网](https://example.com/a_b?q=*x*)' };
+  await ctx.channel.send(message);
+  const post = ctx.calls.find(call => call.url.includes('/v2/groups/'));
+  assert.equal(JSON.parse(post.init.body).content,
+    '标题\n重点 和 说明\nconst a_b = 2 * 3; // #原文\n官网 (https://example.com/a_b?q=*x*)');
+  assert.ok(message.text.startsWith('# 标题'));
+  const sentCount = ctx.calls.filter(call => call.url.includes('/v2/groups/')).length;
+  assert.deepEqual(await ctx.channel.send({ ...message, text: '---\n***' }), { status: 'rejected' });
+  assert.equal(ctx.calls.filter(call => call.url.includes('/v2/groups/')).length, sentCount);
+  ctx.channel.close();
+});
+
 test('C2C uses user_openid exclusively, forwards without @ and replies through the private endpoint', async () => {
   const event = { op: 0, t: 'C2C_MESSAGE_CREATE', d: {
     id: 'private-in', content: '<@bot-id> literal text', timestamp: new Date().toISOString(),

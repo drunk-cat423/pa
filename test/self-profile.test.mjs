@@ -52,6 +52,41 @@ async function fixture(t, provider, overrides = {}) {
   return { config, route, other, message, open, snapshot, requests, sent };
 }
 
+test('自然语言回复风格建议跨群即时注入待整理画像，且不调用模型保存', async t => {
+  const f = await fixture(t), h = f.open();
+  const advice = '你记住一下，你以后回复不要太正式';
+  await h.handle(f.message('natural-style-advice', advice));
+  assert.match(f.sent.at(-1).text, /待整理/);
+  assert.equal(f.requests.length, 0);
+  assert.equal(h.info().calls, 0);
+  assert.equal(f.snapshot().pending.length, 1);
+
+  await h.handle(f.message('natural-style-question', '请介绍一下自己', { route: f.other, senderId: 'another-member' }));
+  const wire = JSON.stringify(f.requests.at(-1));
+  assert.ok(wire.includes('不要太正式'));
+  assert.ok(wire.includes('全局自我画像'));
+});
+
+test('未来称呼指令按用户画像处理，不改变跨场景 AI 待整理画像', async t => {
+  const f = await fixture(t), h = f.open();
+  await h.handle(f.message('baseline-ai-profile', '/self 保持简洁友好的回复风格'));
+  const pendingBefore = f.snapshot().pending;
+  assert.equal(pendingBefore.length, 1);
+
+  const requests = [
+    ['name-a', '以后叫我小林', f.route],
+    ['name-b', '请记住以后叫我小林', f.other],
+    ['name-c', '你记住一下以后叫我小林', f.other],
+  ];
+  for (const [eventId, text, route] of requests) {
+    await h.handle(f.message(eventId, text, { route }));
+    assert.match(f.sent.at(-1).text, /称呼已更新/);
+    assert.deepEqual(f.snapshot().pending, pendingBefore);
+  }
+  assert.equal(f.snapshot().content, '');
+  assert.equal(f.requests.length, 0);
+});
+
 test('所有成员可保存AI待整理画像：无模型费用、跨群下一轮注入、重复去重及重启保留', async t => {
   const f = await fixture(t), h = f.open();
   const advice = '你记住 以后pa指的就是personal agent';

@@ -72,7 +72,9 @@ export class ChannelHarness {
       || !message.text.trim() || message.text.length > 4000
       || !Number.isFinite(Date.parse(message.sentAt))) return Promise.resolve('ignored');
     const input = { ...message, route: { ...message.route },
-      ...(message.mentionedSenderIds ? { mentionedSenderIds: [...message.mentionedSenderIds] } : {}) };
+      ...(message.mentionedSenderIds ? { mentionedSenderIds: [...message.mentionedSenderIds] } : {}),
+      ...(message.quote ? { quote: { ...message.quote,
+        ...(message.quote.inlineMessages ? { inlineMessages: message.quote.inlineMessages.map(item => ({ ...item })) } : {}) } } : {}) };
     return this.accept(key, input);
   }
 
@@ -98,6 +100,8 @@ export class ChannelHarness {
       eventId: message.eventId, senderId: message.senderId, existingMessageId: source.id, sentAt: message.sentAt,
       ...(message.mentionedSenderIds ? { mentionedSenderIds: message.mentionedSenderIds } : {}),
       ...(message.senderName ? { senderName: message.senderName.slice(0, 100) } : {}),
+      ...(message.quote ? { quote: message.quote } : {}),
+      ...(message.route.channel === 'qq' ? { responseFormat: 'plain_text' as const } : {}),
     };
     const memoryRequest = parseMemoryRequest(message.text);
     // Process recent messages only, reserving time inside QQ's passive reply window.

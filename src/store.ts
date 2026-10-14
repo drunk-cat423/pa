@@ -786,6 +786,23 @@ export class ConversationStore {
     return row ? { id: String(row.id), actorId: String(row.actor_id), senderId: String(row.external_user_id), text: String(row.text) } : undefined;
   }
 
+  quotedMessage(conversationId: string, externalId: string): { role: 'user' | 'assistant'; senderId?: string; text: string } | undefined {
+    if (typeof externalId !== 'string' || !externalId || externalId.length > 512
+      || externalId.trim() !== externalId || /[\u0000-\u001f\u007f]/.test(externalId)) return undefined;
+    // Both inbound event IDs and confirmed outgoing IDs are scoped to this exact conversation.
+    // Ambiguous IDs fail closed instead of selecting an arbitrary message.
+    const rows = this.db.prepare(`SELECT m.id, m.role, m.text, a.external_user_id AS senderId FROM messages m
+      LEFT JOIN actors a ON a.id = m.actor_id
+      WHERE m.conversation_id = ? AND ((m.role = 'user' AND m.external_event_id = ?)
+        OR (m.role = 'assistant' AND EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id
+          AND d.conversation_id = m.conversation_id AND d.status = 'sent' AND d.external_message_id = ?)))
+      LIMIT 2`).all(conversationId, externalId, externalId);
+    if (rows.length !== 1) return undefined;
+    const row = rows[0]!;
+    return { role: row.role as 'user' | 'assistant', text: String(row.text),
+      ...(row.senderId == null ? {} : { senderId: String(row.senderId) }) };
+  }
+
   findActor(conversationId: string, senderId: string): string | undefined {
     const row = this.db.prepare(`SELECT a.id FROM actors a JOIN conversations c ON c.room_id = a.room_id
       WHERE c.id = ? AND a.external_user_id = ?`).get(conversationId, senderId);
