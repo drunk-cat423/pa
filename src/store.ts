@@ -33,6 +33,7 @@ export interface MessageRecord {
   createdAt: string;
   piEntryId: string | null;
   runStatus: string | null;
+  runId?: string;
   deliveryStatus: string | null;
   modelInputText?: string;
   eventId?: string;
@@ -75,6 +76,7 @@ function asMessage(row: Record<string, unknown>): MessageRecord {
     id: String(row.id), conversationId: String(row.conversationId), role: row.role as MessageRecord['role'],
     text: String(row.text), createdAt: String(row.createdAt), piEntryId: row.piEntryId === null ? null : String(row.piEntryId),
     runStatus: row.runStatus === null ? null : String(row.runStatus),
+    ...(row.runId == null ? {} : { runId: String(row.runId) }),
     deliveryStatus: row.deliveryStatus === null ? null : String(row.deliveryStatus),
     ...(row.modelInputText == null ? {} : { modelInputText: String(row.modelInputText) }),
     ...(row.eventId == null ? {} : { eventId: String(row.eventId) }),
@@ -119,6 +121,13 @@ function validateMemoryInput(input: MemoryInput): void {
   if (input.profileField !== undefined && !PROFILE_FIELDS.includes(input.profileField)) throw new MemoryError('成员资料字段无效。');
   normalizeMemoryTime(input.occurredAt);
   normalizeMemoryTime(input.expiresAt);
+}
+
+// A note belongs to its writer without turning a cited person's statement into
+// that writer's self declaration. Generic explicit notes retain weaker evidence.
+function explicitProfileSourceType(content: string): 'self' | 'third_party' {
+  return (/^我(?!听说|听到|看到|听|有(?:个|一个)?朋友|(?:的)?(?:朋友|家人|妈妈|爸爸|同学|同桌|同事|兄弟|姐姐|妹妹|哥哥|老板|对象|伴侣|孩子|父亲|母亲|室友))/u.test(content)
+    || /^(?:以后)?(?:请)?你?(?:叫我|称呼我)/u.test(content)) ? 'self' : 'third_party';
 }
 
 function normalizeMemoryTime(value: string | null | undefined): string | null {
@@ -661,8 +670,9 @@ export class ConversationStore {
           input.profileField !== undefined && input.sourceMessageId !== undefined && writerActorId === input.subjectActorId ? 1 : 0);
       this.db.prepare(`INSERT INTO memory_revisions (memory_id, revision, content, status, source_event_id, source_message_id, created_at, occurred_at, expires_at)
         VALUES (?, 1, ?, 'active', ?, ?, ?, ?, ?)`).run(id, input.content, eventId, input.sourceMessageId ?? null, createdAt, occurredAt, expiresAt);
-      if (personId !== null && input.profileField !== undefined && input.sourceMessageId !== undefined && writerActorId === input.subjectActorId) {
-        this.autoMemory.updateExplicitProfile(personId, {content: input.content, field: input.profileField, sourceType: 'self',
+      if (personId !== null && input.sourceMessageId !== undefined && writerActorId === input.subjectActorId) {
+        this.autoMemory.updateExplicitProfile(personId, {content: input.content, ...(input.profileField ? {field: input.profileField} : {}),
+          sourceType: explicitProfileSourceType(input.content),
           messageIds: [input.sourceMessageId], occurredAt, expiresAt});
       }
       if (personId !== null || input.profileField !== undefined) this.resetMemoryScopes(conversationId, personId);
@@ -768,6 +778,13 @@ export class ConversationStore {
       if (typeof existing.person_id === 'string' && profileSourceSelf === 1) {
         this.autoMemory.updateExplicitProfile(existing.person_id, {content: input.content, field: String(existing.profile_field),
           sourceType: 'self', messageIds: [input.sourceMessageId!], occurredAt, expiresAt});
+      } else if (typeof existing.person_id === 'string' && existing.profile_field === null
+        && existing.writer_actor_id === existing.subject_actor_id && input.sourceMessageId !== undefined) {
+        this.autoMemory.updateExplicitProfile(existing.person_id, {content: input.content,
+          sourceType: actorId === existing.subject_actor_id || this.personForActor(conversationId, actorId) === existing.person_id
+            ? explicitProfileSourceType(input.content) : 'third_party',
+          messageIds: [input.sourceMessageId], occurredAt, expiresAt},
+          existing.source_message_id === null ? undefined : String(existing.source_message_id));
       } else if (typeof existing.person_id === 'string' && existing.profile_field !== null && existing.writer_actor_id === existing.subject_actor_id) {
         this.autoMemory.removeExplicitProfile(existing.person_id,String(existing.profile_field));
       }
@@ -1080,7 +1097,7 @@ export class ConversationStore {
     const boundary=beforeMessageId===undefined?undefined:this.db.prepare('SELECT ingest_seq FROM messages WHERE id=? AND conversation_id=?').get(beforeMessageId,conversationId);
     if(beforeMessageId!==undefined&&!boundary) throw new Error('历史边界消息必须属于当前会话。');
     const rows = this.db.prepare(`SELECT m.id, m.conversation_id AS conversationId, m.role, m.text, m.created_at AS createdAt,
-      m.pi_entry_id AS piEntryId, r.status AS runStatus, d.status AS deliveryStatus,
+      m.pi_entry_id AS piEntryId, r.status AS runStatus, r.id AS runId, d.status AS deliveryStatus,
       m.model_input_text AS modelInputText, m.external_event_id AS eventId, a.external_user_id AS senderId,
       m.sender_name AS senderName, d.external_message_id AS externalMessageId, m.actor_id AS actorId, m.message_kind AS messageKind, m.ingest_seq AS ingestSeq, m.sent_at AS sentAt
       FROM messages m LEFT JOIN memory_context_state s ON s.conversation_id = m.conversation_id

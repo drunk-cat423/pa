@@ -40,6 +40,15 @@ function positiveInteger(env: NodeJS.ProcessEnv, name: string, fallback: number)
   return parsed;
 }
 
+function nonNegativeInteger(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const value = env[name]?.trim();
+  if (!value) return fallback;
+  if (!/^\d+$/.test(value)) throw new Error(`${name} 必须是 0（不限次数）或正整数。`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${name} 必须是 0（不限次数）或正整数。`);
+  return parsed;
+}
+
 function memoryCallLimit(env: NodeJS.ProcessEnv): number {
   const value = env.PA_MEMORY_MAX_CALLS?.trim() || '20';
   const parsed = Number(value);
@@ -119,8 +128,8 @@ export function readWebSearchConfig(env: NodeJS.ProcessEnv, provider: string, ba
   }
   const result: WebSearchConfig = { enabled: flag === 'true', budgetId,
     model: env.PA_SEARCH_MODEL?.trim() || 'deepseek-flash',
-    maxRequests: positiveInteger(env, 'PA_SEARCH_MAX_REQUESTS', 1),
-    maxUses: positiveInteger(env, 'PA_SEARCH_MAX_USES', 1),
+    maxRequests: nonNegativeInteger(env, 'PA_SEARCH_MAX_REQUESTS', 0),
+    maxUses: nonNegativeInteger(env, 'PA_SEARCH_MAX_USES', 0),
     maxTokens: positiveInteger(env, 'PA_SEARCH_MAX_TOKENS', 2048),
     timeoutMs: positiveInteger(env, 'PA_SEARCH_TIMEOUT_MS', 60000),
     maxResults: positiveInteger(env, 'PA_SEARCH_MAX_RESULTS', 5) };

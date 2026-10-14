@@ -7,7 +7,7 @@ import { RequestError } from './runtime.js';
 import { configuredPersons, isMemoryOwner, isPrimaryPerson, NO_OWNER_POLICY, validateHarnessPolicy, type HarnessPolicy } from './harness-policy.js';
 import { executeMemoryRequest, parseMemoryRequest, safeProfileError } from './memory-service.js';
 import { MemoryError } from './memory-types.js';
-import type { MemoryConfirmation, MemorySource } from './memory-service.js';
+import type { MemorySource } from './memory-service.js';
 import type { MemoryProvider } from './memory-provider.js';
 import { toPlainText } from './plain-text.js';
 import { appendReferenceUrls, splitReply, QQ_PASSIVE_REPLY_LIMIT } from './reply-chunks.js';
@@ -109,23 +109,36 @@ export class ChannelHarness {
     // Process recent messages only, reserving time inside QQ's passive reply window.
     if (Date.now() - Date.parse(message.sentAt) > 240_000) return 'ignored';
     if (memoryRequest) {
-      let saved: MemoryConfirmation | undefined;
-      const operation = (source: MemorySource) => {
+      let assessedRequest = memoryRequest;
+      let assessedReply: string | undefined;
+      let skipped = false;
+      if (memoryRequest.type === 'ai_self_update' || memoryRequest.type === 'self_update') {
+        if (this.maxCalls > 0 && this.calls >= this.maxCalls) return 'budget_exhausted';
+        this.calls++;
         try {
-          const response = executeMemoryRequest(memoryRequest, conversation, source, isMemoryOwner(this.policy, message),
-            isPrimaryPerson(this.policy, message), confirmation => { saved = confirmation; });
-          return response;
+          const assessment = await conversation.assessMemoryUpdate(message.text);
+          if (this.closed) return 'ignored';
+          assessedReply = assessment.reply;
+          if (assessment.request) assessedRequest = assessment.request;
+          else skipped = true;
+        } catch (error) {
+          if (!(error instanceof RequestError)) throw error;
+          if (this.closed) return 'ignored';
+          skipped = true;
+          assessedReply = '记忆判断失败，本次没有保存，请稍后重试。';
+        }
+      }
+      const operation = (source: MemorySource) => {
+        if (skipped) return assessedReply!;
+        try {
+          const response = executeMemoryRequest(assessedRequest, conversation, source, isMemoryOwner(this.policy, message),
+            isPrimaryPerson(this.policy, message));
+          return assessedReply ?? response;
         }
         catch (error) { if (error instanceof MemoryError) return safeProfileError(error); throw error; }
       };
       const external = { ...sender, modelInputText: message.text, messageKind: 'memory' as const };
-      const control = ['ai_self_update', 'self_update', 'admin'].includes(memoryRequest.type)
-        ? await conversation.controlWithReply(message.text, external, operation, () => {
-          if (!saved || this.closed || (this.maxCalls > 0 && this.calls >= this.maxCalls)) return undefined;
-          this.calls++;
-          return { content: [...saved.content].slice(0, 500).join(''), status: saved.status };
-        })
-        : conversation.control(message.text, external, operation);
+      const control = conversation.control(message.text, external, operation);
       return this.deliver(conversation, message, control);
     }
     if (this.maxCalls > 0 && this.calls >= this.maxCalls) return 'budget_exhausted';

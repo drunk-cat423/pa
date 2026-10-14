@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { memoryAssessmentResponse } from './fixtures/memory-assessment.mjs';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
 import { BackgroundMemory, validateExtract } from '../dist/auto-memory.js';
 import { ConversationStore } from '../dist/store.js';
@@ -65,7 +66,7 @@ async function fixture(t, extract = async input => extracted(input), overrides =
     if (JSON.stringify(body.messages.at(-1)).includes('BLOCK_CHAT')) { chatStarted.resolve(); await chatGate.promise; }
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const choices of [
-      [{ index: 0, delta: { role: 'assistant', content: '继续讨论' }, finish_reason: null }],
+      [{ index: 0, delta: { role: 'assistant', content: memoryAssessmentResponse(body) ?? '继续讨论' }, finish_reason: null }],
       [{ index: 0, delta: {}, finish_reason: 'stop' }],
     ]) response.write(`data: ${JSON.stringify({ id: 'reply', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices })}\n\n`);
     response.end('data: [DONE]\n\n');
@@ -190,6 +191,9 @@ test('仅发送者及真实@对象画像，绑定人物私聊自述可在群使�
   assert.doesNotMatch(JSON.stringify(f.requests.at(-1)), /绘画/);
   assert.equal(await h.handle(f.message('ask-at', '和被提及的人玩什么', { mentioned: true, mentionedSenderIds: ['b', 'b'] })), 'sent');
   const last = JSON.stringify(f.requests.at(-1)); assert.match(last, /登山/); assert.match(last, /绘画/);
+  assert.match(last, /senderIds/);
+  const projection = f.requests.at(-1).messages.map(message => JSON.stringify(message)).join('');
+  assert.ok(projection.includes('senderIds'));
 });
 
 test('模型提案不可伪造人物/消息，自述不能引用其他人', () => {
@@ -224,7 +228,7 @@ test('快速连发私聊按提问顺序保留已经发送的上一轮回复', as
 test('群聊因历史超限时等待整理后重建输入，不创建群摘要', async t => {
   const f = await fixture(t, undefined, { contextWindow: 7000 }); const h = f.harness();
   for (let i = 1; i <= 4; i++) await h.handle(f.message(`g${i}`, `${i}:` + 'g'.repeat(2000)));
-  assert.equal(await h.handle(f.message('g-question', '现在可以继续吗', { mentioned: true })), 'sent');
+  assert.equal(await h.handle(f.message('g-question', '刚才群里讨论了什么？', { mentioned: true })), 'sent');
   await h.waitForMemory();
   assert.equal(f.inputs[0].roomType, 'group'); assert.ok(f.inputs[0].messages.length < 50);
   assert.doesNotMatch(JSON.stringify(f.requests.at(-1)), /gggggggggg/);

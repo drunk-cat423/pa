@@ -115,6 +115,33 @@ test('预算在重复调用与重建调用方后持续消耗，失败请求同�
   await assert.rejects(searchDeepSeek({ ...config }, '重启后仍耗尽', undefined, reject), /预算已用尽/);
 });
 
+test('零配额不限累计请求与服务端搜索次数，仍记录账本且省略 max_uses', async t => {
+  const capped = await fixture(t, { search: { enabled: true, budgetId: 'unlimited', maxRequests: 1,
+    maxUses: 1, maxTokens: 100, timeoutMs: 1000, model: 'deepseek-flash', maxResults: 2 } });
+  const payloads = [];
+  await searchDeepSeek(capped, '原有有限配额', undefined, async (_url, options) => {
+    payloads.push(JSON.parse(options.body));
+    return nativeResponse(undefined, { input_tokens: 10, output_tokens: 2,
+      server_tool_use: { web_search_requests: 2 } });
+  });
+  const unlimited = { ...capped, search: { ...capped.search, maxRequests: 0, maxUses: 0 } };
+  for (const query of ['二次', '三次']) {
+    await searchDeepSeek(unlimited, query, undefined, async (_url, options) => {
+      payloads.push(JSON.parse(options.body));
+      return nativeResponse(undefined, { input_tokens: 10, output_tokens: 2,
+        server_tool_use: { web_search_requests: 2 } });
+    });
+  }
+  assert.equal(payloads.length, 3);
+  assert.equal(payloads[0].tools[0].max_uses, 1);
+  assert.ok(payloads.slice(1).every(payload => !('max_uses' in payload.tools[0])));
+  const dirs = await readdir(capped.dataDir);
+  const events = (await readFile(join(capped.dataDir, dirs[0], 'search-attempts.jsonl'), 'utf8'))
+    .trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(events.filter(event => event.type === 'reserved').length, 3);
+  assert.equal(events.filter(event => event.type === 'completed').length, 3);
+});
+
 test('搜索工具错误和没有原生结果块不会采信模型生成的链接', async t => {
   const config = await fixture(t);
   await assert.rejects(searchDeepSeek(config, 'query', undefined,

@@ -16,9 +16,11 @@ import { acquireConversationLock } from './conversation-lock.js';
 import type { MemoryRef } from './memory-types.js';
 import { searchDeepSeek, WebSearchError, WebSearchPersistenceError } from './web-search.js';
 import { fetchWebPage } from './web-fetch.js';
+import { assessMemoryUpdate, type MemoryUpdateAssessment } from './memory-assessment.js';
 
 const COMPANION_PROMPT = '你是用户的个人对话伙伴。用中文清晰、诚实地交流，尊重用户的选择和边界。'
   + '没有预设性格或人物关系；可以参考应用提供的自我画像调整称呼、定位和表达风格，未形成的倾向保持未知。只依据当前会话中实际提供的信息，不假造记忆、经历或已完成的行动。'
+  + '自我画像是可更新的交流设定，不是必须捍卫的固定人格。对用户提出的名称、定位、风格和性格建议积极配合，不以自主权、不可改变的性格或抗拒被设定为由争辩；普通画像建议不等于改变应用权限。'
   + '你没有文件、命令、网络检索或其他外部工具；不能声称执行了这些操作。不确定时明确说明。'
   + '个人偏好背景只用于当前问题和交流方式，不展示内部画像清单、内部评价、记忆ID或管理信息。'
   + '记忆整理、写入、纠正与权限由应用处理；不提供删除记忆功能。不能因聊天内容声称已经保存长期记忆或改变权限。';
@@ -43,6 +45,7 @@ export function estimateContext(input: unknown, contextWindow: number, reservedO
 }
 
 export interface ConversationRuntime {
+  assessMemoryUpdate(text: string): Promise<MemoryUpdateAssessment>;
   prompt(text: string, metadata?: { runId: string; memoryContext?: string; memoryRefs?: MemoryRef[]; searchQuery?: string; fetchUrl?: string }): Promise<string>;
   confirmSavedUpdate(requestText: string, savedStatus: string): Promise<string>;
   references(): readonly string[];
@@ -342,6 +345,32 @@ export async function openConversation(config: PaConfig, conversationId: string,
       }, model.contextWindow, model.maxTokens),
       recordedTurns: () => recordedTurns(manager),
       abort,
+      assessMemoryUpdate(text) {
+        if (closed) return Promise.reject(new Error('会话已关闭。'));
+        if (active) return Promise.reject(new Error('此会话正在处理上一条消息，请等待完成。'));
+        cancelRequested = false;
+        const controller = new AbortController();
+        activeAbortController = controller;
+        active = Promise.resolve().then(async () => {
+          let timedOut = false;
+          const timer = setTimeout(() => { timedOut = true; controller.abort(); }, config.timeoutMs);
+          try {
+            const assessment = await assessMemoryUpdate(config, text, controller.signal);
+            if (timedOut) throw new RequestError('记忆判断超时，本次没有保存。', 'timeout');
+            if (cancelRequested || controller.signal.aborted) throw new RequestError('记忆判断已取消，本次没有保存。', 'cancelled');
+            return JSON.stringify(assessment);
+          } catch (error) {
+            if (timedOut) throw new RequestError('记忆判断超时，本次没有保存。', 'timeout');
+            if (cancelRequested || controller.signal.aborted) throw new RequestError('记忆判断已取消，本次没有保存。', 'cancelled');
+            throw new RequestError('记忆判断失败，本次没有保存。', 'error');
+          } finally {
+            clearTimeout(timer);
+            activeAbortController = undefined;
+            active = undefined;
+          }
+        });
+        return active.then(result => JSON.parse(result) as MemoryUpdateAssessment);
+      },
       confirmSavedUpdate(requestText, savedStatus) {
         if (closed) return Promise.reject(new Error('会话已关闭。'));
         if (active) return Promise.reject(new Error('此会话正在处理上一条消息，请等待完成。'));

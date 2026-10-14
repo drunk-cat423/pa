@@ -8,7 +8,9 @@ import { acquireConversationLock } from './conversation-lock.js';
 export interface WebSearchConfig {
   enabled: boolean;
   budgetId: string;
+  /** 0 disables the local total request cap; requests are still recorded. */
   maxRequests: number;
+  /** 0 omits the provider's per-request max_uses cap. */
   maxUses: number;
   maxTokens: number;
   timeoutMs: number;
@@ -58,14 +60,20 @@ function positiveInteger(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new WebSearchError(`网页搜索配置 ${label} 无效。`);
 }
 
+function nonNegativeConfigInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) throw new WebSearchError(`网页搜索配置 ${label} 无效。`);
+}
+
 function validateConfig(search: WebSearchConfig): void {
   if (!search || typeof search !== 'object' || search.enabled !== true) throw new WebSearchError('网页搜索未启用。');
   if (typeof search.budgetId !== 'string' || !/^[A-Za-z0-9._-]{1,100}$/.test(search.budgetId)) {
     throw new WebSearchError('网页搜索预算标识无效。');
   }
+  for (const [value, label] of [[search.maxRequests, 'maxRequests'], [search.maxUses, 'maxUses']] as const) {
+    nonNegativeConfigInteger(value, label);
+  }
   for (const [value, label] of [
-    [search.maxRequests, 'maxRequests'], [search.maxUses, 'maxUses'], [search.maxTokens, 'maxTokens'],
-    [search.timeoutMs, 'timeoutMs'], [search.maxResults, 'maxResults'],
+    [search.maxTokens, 'maxTokens'], [search.timeoutMs, 'timeoutMs'], [search.maxResults, 'maxResults'],
   ] as const) positiveInteger(value, label);
   if (search.timeoutMs > 2_147_483_647 || search.maxResults > 100 || search.maxUses > 100
     || search.maxTokens > 100_000 || typeof search.model !== 'string' || !search.model.trim()) {
@@ -313,17 +321,20 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
     return await withLedger(lock.directory, async (entries, append) => {
       if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
       const reservations = entries.filter(entry => entry.type === 'reserved');
-      if (entries.some(entry => entry.type === 'completed' && entry.usage.serverSearches !== null
+      if (search.maxUses > 0 && entries.some(entry => entry.type === 'completed' && entry.usage.serverSearches !== null
         && entry.usage.serverSearches > search.maxUses)) {
         throw new WebSearchError('服务端上次报告的搜索次数超过请求上限，此预算已暂停。');
       }
-      if (reservations.length >= search.maxRequests) throw new WebSearchError('网页搜索请求预算已用尽。');
+      if (search.maxRequests > 0 && reservations.length >= search.maxRequests) {
+        throw new WebSearchError('网页搜索请求预算已用尽。');
+      }
       const attemptId = randomUUID();
       await append({ type: 'reserved', attemptId, timestamp: new Date().toISOString(), query });
       const body = {
         model: search.model, max_tokens: search.maxTokens,
         messages: [{ role: 'user', content: [{ type: 'text', text: `Perform a web search for the query: ${query}` }] }],
-        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: search.maxUses }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search',
+          ...(search.maxUses > 0 ? { max_uses: search.maxUses } : {}) }],
       };
       await saveEvidence(lock.directory, attemptId, 'request', { endpoint: ENDPOINT, body }, config.apiKey);
       const controller = new AbortController();

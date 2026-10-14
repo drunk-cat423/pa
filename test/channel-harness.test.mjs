@@ -142,7 +142,7 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
   assert.equal(await h.handle(f.message('outside', '不允许的群', { route: { ...f.route, roomId: 'outside' } })), 'ignored');
   assert.equal(await h.handle(f.message('background', '周末准备爬山', { mentioned: false, senderId: 'member-B' })), 'observed');
   assert.equal(f.requests.length, 0);
-  assert.equal(await h.handle(f.message('one', '建议怎么准备？')), 'sent');
+  assert.equal(await h.handle(f.message('one', '刚才群里说的爬山，建议怎么准备？')), 'sent');
   assert.equal(await h.handle(f.message('one', '重复事件')), 'duplicate');
   assert.equal(f.requests.length, 1);
   const request = f.requests[0];
@@ -163,7 +163,7 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
   const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'));
   try {
     assert.deepEqual(db.prepare('SELECT text FROM messages WHERE role = ? ORDER BY created_at, rowid').all('user').map(row => row.text),
-      ['周末准备爬山', '建议怎么准备？', '我更喜欢海边', '另外一个群', '超出预算']);
+      ['周末准备爬山', '刚才群里说的爬山，建议怎么准备？', '我更喜欢海边', '另外一个群', '超出预算']);
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM deliveries WHERE external_message_id = ?').get('qq-output').n, 3);
   } finally { db.close(); }
   await h.close();

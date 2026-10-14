@@ -253,11 +253,13 @@ export class AutoMemoryStore {
     this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
     return input;
   }
-  updateExplicitProfile(personId:string,fact:ProfileFact): void {
+  updateExplicitProfile(personId:string,fact:ProfileFact,previousMessageId?:string): void {
     const profile=this.profile(personId);
     const existing=profile.facts.find(f=>fact.field!==undefined&&f.field===fact.field);
     if(existing&&this.evidenceSequence(fact.messageIds)<this.evidenceSequence(existing.messageIds)) throw new MemoryError('较旧来源不能覆盖较新的明确画像字段。');
-    const facts=profile.facts.filter(f=>fact.field===undefined||f.field!==fact.field); facts.push(fact);
+    const facts=profile.facts.filter(f=>fact.field===undefined
+      ? previousMessageId===undefined || f.field!==undefined || !f.messageIds.includes(previousMessageId)
+      : f.field!==fact.field); facts.push(fact);
     this.writeProfile({...profile,facts},null);
   }
   removeExplicitProfile(personId:string,field:string):void {

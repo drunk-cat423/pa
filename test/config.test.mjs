@@ -19,13 +19,20 @@ test('搜索默认关闭，复用官方key但要求明确持久预算，拒绝�
   assert.equal(readConfig(valid).search.enabled, false);
   const enabled = { ...valid, PA_PROVIDER: 'deepseek', PA_BASE_URL: 'https://api.deepseek.com',
     PA_SEARCH_ENABLED: 'true', PA_SEARCH_BUDGET_ID: 'trial-1' };
-  assert.equal(readConfig(enabled).search.maxRequests, 1);
-  assert.equal(readConfig(enabled).search.maxUses, 1);
+  assert.equal(readConfig(enabled).search.maxRequests, 0);
+  assert.equal(readConfig(enabled).search.maxUses, 0);
+  assert.equal(readConfig({ ...enabled, PA_SEARCH_MAX_REQUESTS: '3', PA_SEARCH_MAX_USES: '2' }).search.maxRequests, 3);
+  assert.equal(readConfig({ ...enabled, PA_SEARCH_MAX_REQUESTS: '3', PA_SEARCH_MAX_USES: '2' }).search.maxUses, 2);
   assert.equal(readConfig(enabled).apiKey, valid.PA_API_KEY);
   for (const env of [{ ...enabled, PA_PROVIDER: 'other' }, { ...enabled, PA_BASE_URL: 'https://gateway.test' },
-    { ...enabled, PA_SEARCH_BUDGET_ID: '' }, { ...enabled, PA_SEARCH_MAX_REQUESTS: '0' },
+    { ...enabled, PA_SEARCH_BUDGET_ID: '' },
     { ...enabled, PA_SEARCH_MAX_USES: '6' }, { ...enabled, PA_SEARCH_MAX_TOKENS: '9999' }]) {
     assert.throws(() => readConfig(env));
+  }
+  for (const value of ['-1', '1.5', 'Infinity', '9007199254740992', 'no']) {
+    for (const name of ['PA_SEARCH_MAX_REQUESTS', 'PA_SEARCH_MAX_USES']) {
+      assert.throws(() => readConfig({ ...enabled, [name]: value }), new RegExp(name));
+    }
   }
 });
 

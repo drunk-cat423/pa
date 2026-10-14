@@ -60,9 +60,9 @@ async function harness(t, { repeatedToolCall = false } = {}) {
     await new Promise(resolve => server.close(resolve));
     await rm(dataDir, { recursive: true, force: true });
   });
-  return { config, requests, nativeCalls, open: async id => {
+  return { config, requests, nativeCalls, open: async (id, roomType = 'group') => {
     const conversation = await openRecordedConversation(config, id,
-      { channel: 'fixture', accountId: 'bot', roomId: id, roomType: 'group' });
+      { channel: 'fixture', accountId: 'bot', roomId: id, roomType });
     opened.push(conversation);
     return conversation;
   } };
@@ -83,7 +83,8 @@ test('模型忽略 tool_choice none 时最多发两次主请求、调用一次�
 
 test('搜索结果使最终主模型请求超过上下文时不再发送第二个主模型请求', async t => {
   const fixture = await harness(t);
-  const conversation = await fixture.open('final-context-limit');
+  // Private history is intentionally retained; independent group searches now omit it.
+  const conversation = await fixture.open('final-context-limit', 'private');
   const longHistory = 'x'.repeat(27_000);
   const seed = await conversation.prompt(longHistory, {
     eventId: 'seed-event', senderId: 'user', modelInputText: longHistory,

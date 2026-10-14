@@ -5,7 +5,7 @@ export type MemoryRequest =
   | { type: 'ai_self_update'; content: string }
   | { type: 'ai_self_clarify' }
   | { type: 'ai_self_refusal' }
-  | { type: 'self_update'; field: ProfileField; content: string }
+  | { type: 'self_update'; field?: ProfileField; content: string }
   | { type: 'admin'; text: string }
   | { type: 'unsupported_delete' }
   | { type: 'profile_read' }
@@ -15,10 +15,10 @@ const PROFILE_FIELDS: ProfileField[] = ['diet', 'preferred_name', 'interests', '
 const FIELD_NAMES: Record<ProfileField, string> = {
   diet: '饮食偏好', preferred_name: '称呼', interests: '兴趣偏好', reply_style: '回复偏好',
 };
-const CLARIFY = '请明确要更新自己的哪项信息：称呼、饮食偏好、兴趣或回复偏好。涉及他人或当前会话的管理操作仅管理者可用。';
+const CLARIFY = '请提供要记住的内容。';
 const DENIED = '你没有记忆管理或画像查询权限；可以明确请求更新自己在当前会话提供的信息。';
-const AI_SELF_ACK = '已记入我的待整理画像，下次对话会参考，后续整理时合并。';
-const AI_SELF_CLARIFY = '请具体说明希望我长期采用的名称、定位或回复方式；也可以用“/self 内容”提供画像建议。';
+const AI_SELF_ACK = '记住了。';
+const AI_SELF_CLARIFY = '请提供要记住的内容，画像建议限500字符且不换行。';
 const AI_SELF_REFUSAL = '我不能更改权限、工具配置或预算；这些设置需通过本地配置调整。';
 function fieldFor(text: string): ProfileField | undefined {
   if (/饮食|口味|吃|微辣|清淡|素食|辣椒|食物|过敏/.test(text)) return 'diet';
@@ -28,14 +28,25 @@ function fieldFor(text: string): ProfileField | undefined {
   return undefined;
 }
 
-const AI_CONFIG_CHANGE = /(?:权限|授权|工具(?:配置|设置|调用)|配置|预算|系统提示词|系统指令|api(?:\s*key)?|secret|token)/i;
-const AI_CONFIG_ACTION = /(?:改(?:成|为|掉)?|设置(?:成|为)?|开启|关闭|增加|减少|提高|降低|忽略|绕过|不再遵守|授予|允许|禁止|记住|更新|纠正)/;
+const AI_CONFIG_CHANGE = /(?:权限|授权|管理员|身份绑定|工具|配置|预算|系统提示词|系统指令|api(?:\s*key)?|secret|token)/i;
+const AI_CONFIG_ACTION = /(?:改(?:成|为|掉)?|设置(?:成|为)?|开启|启用|关闭|增加|减少|提高|降低|忽略|绕过|不再遵守|授予|允许|禁止|使用|调用|拥有|记住|更新|纠正)/;
 const QUOTE_MARKS = /["“”「」『』‘’]/;
 const SELF_PROFILE_PROPERTY_REQUEST = /^你的(?:画像|性格|兴趣|倾向).{0,24}(?:是|为|更|尽量|尽可能|保持|偏向|倾向于|喜欢|热爱|简洁|简短|详细|清晰|自然|正式|轻松|幽默|亲切|温和|耐心|谨慎|乐观|谦逊|好奇|先|优先|采用|使用)/u;
+const EXPLICIT_MEMORY = /^(?:(?:请(?:你)?|麻烦你|帮我)\s*)?(?:你\s*)?(?:记住|记一下|更新|纠正)(?:一下)?[\s，,：:。！!]*([\s\S]*)$/u;
+const TEMPORARY_ROLE = /在(?:这|此|本)(?:个)?(?:故事|剧情|游戏|场景)(?:里|中|下)|角色扮演|扮演|假装/u;
+const MEMORY_QUESTION = /[?？]|(?:吗|什么|怎么|为何|为什么|什么意思|是什么(?:呀|呢)?)[。！!？?]*$/u;
+
+function configurationDirective(content: string): boolean {
+  const directive = content.replace(/^(?:(?:从今)?以后|今后|往后)\s*/u, '');
+  if (!AI_CONFIG_CHANGE.test(directive)) return false;
+  return /^你的(?:权限|授权|工具|配置|预算|身份绑定|系统提示词|系统指令)/u.test(directive)
+    || (/^(?:你(?:可以|应该|必须|要|拥有|需要)?(?:使用|调用|开启|启用|关闭|读取|修改|设置|提高|忽略|绕过|拥有)|把|将|改|设置|开启|启用|关闭|增加|减少|提高|降低|忽略|绕过|授予|允许|禁止|使用|调用)/u.test(directive)
+      && AI_CONFIG_ACTION.test(directive));
+}
 
 function parseAiSelfRequest(text: string): MemoryRequest | undefined {
   const slash = text.match(/^\/self(?:\s+([\s\S]*))?$/i);
-  const explicit = text.match(/^(?:请(?:你)?|麻烦你)?(?:你\s*)?(?:记住(?:一下)?|记一下)(?=$|[\s，,：:。！!你以])([\s\S]*)$/);
+  const explicit = text.match(EXPLICIT_MEMORY);
   const rawContent = slash ? slash[1] ?? '' : explicit ? explicit[1] ?? '' : text;
   const directive = rawContent.trim().replace(/^[，,：:。！!\s]+/, '');
   const normalizedDirective = directive.replace(/^你(?=(?:(?:从今)?以后|今后|往后))/u, '');
@@ -49,28 +60,34 @@ function parseAiSelfRequest(text: string): MemoryRequest | undefined {
   const hasFutureTarget = Boolean(future && !speakerOwned && (hasFutureIdentityAssignment || hasFutureStyleRequest
     || SELF_PROFILE_PROPERTY_REQUEST.test(target)
     || /^(?:pa|personal\s+agent)\s*指(?:的)?(?:就是|是)/iu.test(target)));
-  const question = /[?？]|(?:吗|什么|怎么|为何|为什么|什么意思|是什么(?:呀|呢)?)[。！!？?]*$/u.test(directive);
+  const question = MEMORY_QUESTION.test(directive);
   if (!slash && !explicit && !hasFutureTarget) return undefined;
   if (!slash && question) return undefined;
-  if (/在(?:这|此|本)(?:个)?(?:故事|剧情|游戏|场景)(?:里|中|下)|角色扮演|扮演|假装/u.test(directive)) return undefined;
+  if (TEMPORARY_ROLE.test(directive)) return undefined;
 
   let content = rawContent;
   content = content.trim().replace(/^[，,：:。！!\s]+/, '').replace(/[。！!]+$/, '').trim();
-  if (AI_CONFIG_CHANGE.test(content) && AI_CONFIG_ACTION.test(content)) return { type: 'ai_self_refusal' };
+  if (configurationDirective(content)) return { type: 'ai_self_refusal' };
   const quotedAssignment = Boolean(explicit && /^(?:(?:(?:从今)?以后|今后|往后)\s*)?(?:你的(?:名字|名称|定位|身份|角色|称呼|代号).{0,24}(?:叫|是|为)|你(?:叫|是))["“「].+["”」]$/u.test(directive));
-  if (!content || [...content].length > 500 || /[\r\n]/.test(content) || (!slash && QUOTE_MARKS.test(text) && !quotedAssignment)) {
-    return { type: 'ai_self_clarify' };
-  }
+  if (!content) return { type: 'ai_self_clarify' };
   const selfTarget = !speakerOwned && (hasFutureTarget
+    || Boolean(explicit && !/^(?:(?:从今)?以后|今后|往后)?\s*(?:请)?你?(?:叫我|称呼我)/u.test(directive)
+      && (/^(?:(?:(?:从今)?以后|今后|往后)\s*)?你(?:可以|要|应该|必须|以后|今后|不要|别|不能|尽量|优先|保持|记得|需要)/u.test(directive)
+        || (/^(?:(?:(?:从今)?以后|今后|往后)\s*)?你的\S/u.test(directive)
+          && !/^你的.{0,24}(?:很好|真好|好听|不错|真棒)[。！!]*$/u.test(directive))
+        || /^(?:(?:从今)?以后|今后|往后)\s*(?:不要|别|请|要|应该|必须|尽量|优先|保持|采用|使用|记得)/u.test(directive)))
     || /^(?:(?:(?:从今)?以后|今后|往后)\s*)?(?:你的(?:名字|名称|定位|身份|角色|称呼|代号).{0,24}(?:叫(?!我)|是|为)|你(?:叫(?!我)|是)|pa\s*指(?:的)?(?:就是|是))/iu.test(directive)
     || SELF_PROFILE_PROPERTY_REQUEST.test(directive)
     || /^(?:(?:(?:从今)?以后|今后|往后)\s*)?(?:(?:你的|你)?(?:回答|回复|说话|交流|交流方式|表达|风格|语气)).{0,24}(?:更|尽量|尽可能|简洁|简短|详细|清晰|通俗|自然|正式|轻松|幽默|亲切|中文|英文|优先|不要|别|保持|先|使用|采用|控制|要|得)/iu.test(directive));
   if (!slash && explicit && !selfTarget && !hasFutureTarget) return undefined;
+  if ([...content].length > 500 || /[\r\n]/.test(content) || (!slash && QUOTE_MARKS.test(text) && !quotedAssignment)) {
+    return { type: 'ai_self_clarify' };
+  }
   return { type: 'ai_self_update', content };
 }
 
-// These explicit forms are handled locally. We never ask a model to choose an
-// actor, grant authority or invent a stored profile from ordinary conversation.
+// Explicit syntax selects a candidate. The model judges natural updates before
+// saving, while actor binding and authority always remain application-owned.
 export function parseMemoryRequest(input: string): MemoryRequest | undefined {
   const text = input.normalize('NFKC').trim();
   if (/^\/(?:forget|memory\s+(?:delete|forget))(?:\s|$)/i.test(text)) return { type: 'unsupported_delete' };
@@ -93,16 +110,19 @@ export function parseMemoryRequest(input: string): MemoryRequest | undefined {
     && /偏好|饮食|口味|吃|称呼|昵称|名字|兴趣|爱好|回复|交流|喜欢|不吃|不喜欢|记忆|信息/.test(text)) {
     return { type: 'unsupported_delete' };
   }
-  const explicit = text.match(/^(?:请(?:你)?|麻烦你|帮我)?(?:你\s*)?(?:记住|记一下|更新|纠正)(?:一下)?[：:\s]*(.+)$/);
+  const explicit = text.match(EXPLICIT_MEMORY);
   const change = /^我现在(?:可以接受|不能接受|喜欢|不喜欢|更喜欢|希望)|^(?:以后)?(?:请)?(?:你)?(?:叫我|称呼我)/.test(text);
   if (!explicit && !change) return undefined;
   const content = (explicit?.[1] ?? text).trim().replace(/[。！!]+$/, '');
-  if (!/^(?:我(?:现在)?(?:不喜欢|喜欢|不吃|爱吃|热爱|可以接受|不能接受|希望|更喜欢|对|的(?:饮食|口味|兴趣|爱好|昵称|称呼|回复|交流|名字)|叫)|(?:以后)?(?:请)?(?:你)?(?:叫我|称呼我))/.test(content)
-    || /我(?:的)?(?:朋友|家人|妈妈|爸爸|同学|同桌|同事|兄弟|姐姐|妹妹|哥哥|老板|对象|伴侣|孩子|父亲|母亲|室友)/.test(content)
-    || /[\r\n]|他人|别人|其他人|全群|本群|所有人|管理员|权限|预算|系统|工具|画像|评价|指令|读取|导出|忽略|管理员|API|secret|token/i.test(content)
-    || content.length > 300) return { type: 'clarify' };
-  const field = fieldFor(content);
-  return field ? { type: 'self_update', field, content } : { type: 'clarify' };
+  if (!content || [...content].length > 4000) return { type: 'clarify' };
+  if (MEMORY_QUESTION.test(content) || TEMPORARY_ROLE.test(content)
+    || /^["“「『‘].*(?:记住|更新|纠正|你以后|你的).*["”」』’]/u.test(content)
+    || /^(?:他|她|别人|有人|朋友)说.*(?:记住|你(?:以后|今后|的名字|的名称))/u.test(content)) return undefined;
+  if (configurationDirective(content)) return { type: 'ai_self_refusal' };
+  const personal = /^(?:我(?:现在)?(?:不喜欢|喜欢|不吃|爱吃|热爱|可以接受|不能接受|希望|更喜欢|对|的(?:饮食|口味|兴趣|爱好|昵称|称呼|回复|交流|名字)|叫)|(?:以后)?(?:请)?(?:你)?(?:叫我|称呼我))/.test(content)
+    && !/我(?:有(?:个|一个)?|的)?(?:朋友|家人|妈妈|爸爸|同学|同桌|同事|兄弟|姐姐|妹妹|哥哥|老板|对象|伴侣|孩子|父亲|母亲|室友)/.test(content);
+  const field = personal ? fieldFor(content) : undefined;
+  return { type: 'self_update', ...(field ? { field } : {}), content };
 }
 
 export interface MemorySource { id: string; actorId: string; senderId: string; text: string }
@@ -134,14 +154,14 @@ export function executeMemoryRequest(request: MemoryRequest, conversation: Recor
   if (request.type === 'clarify') return CLARIFY;
   if (request.type === 'profile_read') return owner ? display(conversation.queryMemories('', 20, source.actorId)) : DENIED;
   if (request.type === 'self_update') {
-    const existing = conversation.selfProfileMemory(source.actorId, request.field);
-    const input = { content: request.content, kind: 'preference' as const, sourceMessageId: source.id,
-      subjectActorId: source.actorId, profileField: request.field };
+    const existing = request.field ? conversation.selfProfileMemory(source.actorId, request.field) : undefined;
+    const input = { content: request.content, kind: request.field ? 'preference' as const : 'fact' as const, sourceMessageId: source.id,
+      subjectActorId: source.actorId, ...(request.field ? { profileField: request.field } : {}) };
     if (existing) conversation.correctMemory(existing.id, input, existing.revision);
     else conversation.remember(input);
-    onSaved?.({ content: request.content, status: `当前发言者的${FIELD_NAMES[request.field]}已更新。` });
+    onSaved?.({ content: request.content, status: request.field ? `当前发言者的${FIELD_NAMES[request.field]}已更新。` : '当前发言者提供的记忆已保存。' });
     void primaryPerson;
-    return `${FIELD_NAMES[request.field]}已更新，用于同一人物已绑定的场景。`;
+    return '记住了。';
   }
   if (!owner) return DENIED;
   let text = request.text;
@@ -169,7 +189,7 @@ export function executeMemoryRequest(request: MemoryRequest, conversation: Recor
     const result = conversation.remember({ ...memoryContent(parts[2]!), sourceMessageId: source.id,
       ...(actor ? { subjectActorId: actor } : {}) });
     onSaved?.({ content: result.memory.content, status: actor ? '指定人物的长期记忆已保存。' : '当前会话的共享记忆已保存。' });
-    return `记忆已保存：${result.memory.id}`;
+    return '记住了。';
   }
   const parts = args.match(/^(\S+)(?:\s+([\s\S]+))?$/);
   if (!parts) throw new MemoryError('请提供当前会话的记忆 ID。');
@@ -177,7 +197,7 @@ export function executeMemoryRequest(request: MemoryRequest, conversation: Recor
     if (!parts[2]) throw new MemoryError('请提供纠正后的内容。');
     const result = conversation.correctMemory(parts[1]!, { ...memoryContent(parts[2]), sourceMessageId: source.id });
     onSaved?.({ content: result.memory.content, status: '指定记忆已纠正，当前内容已更新，旧版本记录保留。' });
-    return `记忆已纠正：${result.memory.id}`;
+    return '记住了。';
   }
   return '不提供删除记忆或偏好的操作；你可以明确纠正信息，我会保留原记录并更新当前内容。';
 }

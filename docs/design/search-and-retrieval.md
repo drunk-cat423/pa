@@ -8,7 +8,7 @@ QQ 只传入问题和引用信息，通用的 `web_search` 能力由 harness 管
 
 当前方案参考 [DeepSeek 搜索提供方源码](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/web/web-search-deepseek/src/provider.ts)：复用 PA_API_KEY，固定 POST `https://api.deepseek.com/anthropic/v1/messages`，携带 `web_search_20250305` 服务端工具。一次搜索是独立模型请求，增加输入、输出和缓存 token；分别解析结构化来源、存在时的引用摘录和接口生成的总结。总结交给主聊天模型组织回答，明确标为生成资料，不冒充原文摘录。没有成功结果块时报错，不解析模型编造的链接。搜索不会自动抓取 URL 或遍历网站。
 
-启用配置见 `.env.example` 的 `PA_SEARCH_*`。`PA_SEARCH_BUDGET_ID` 标识一笔持久预算，`MAX_REQUESTS=1` 为首轮硬上限，`MAX_USES=1` 发送给服务端；同一 ID 的预算重启后仍有效，失败和未知请求也占用。服务端usage计数可能包含被拒绝的工具调用，不能把它当成功搜索次数或费用硬上限；当前同一预算发现报告计数超出后会保守暂停。更换预算 ID 或提高上限属于新的费用额度，不能由聊天更新。只有官方 DeepSeek 配置可以复用密钥。
+启用配置见 `.env.example` 的 `PA_SEARCH_*`。`PA_SEARCH_BUDGET_ID` 标识持久请求账本，默认 `MAX_REQUESTS=0` 和 `MAX_USES=0` 表示不限次数；后者省略发送服务端 max_uses。也可配置正整数：MAX_REQUESTS限制账本中的累计尝试，MAX_USES发送给服务端；重启不重置，失败和未知请求也计入尝试。有限MAX_USES模式发现历史服务端计数超出后会保守暂停；不限模式不因旧试用账本暂停，也不删除账本。服务端usage计数可能包含被拒绝的工具调用，不能把它当成功搜索次数或费用硬上限。只有官方 DeepSeek 配置可以复用密钥；聊天不能改变这些设置。
 
 已实现执行边界：
 
