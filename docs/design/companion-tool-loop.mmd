@@ -1,0 +1,80 @@
+---
+config:
+  theme: base
+  markdownAutoWrap: false
+  themeVariables:
+    fontFamily: Microsoft YaHei, Noto Sans CJK SC, sans-serif
+    fontSize: 16px
+    primaryTextColor: '#17324d'
+    lineColor: '#60778e'
+  flowchart:
+    htmlLabels: false
+    curve: linear
+    nodeSpacing: 35
+    rankSpacing: 45
+    wrappingWidth: 360
+    useMaxWidth: false
+---
+flowchart TD
+  subgraph INPUT["QQ 接入与任务调度"]
+    A["QQ Gateway READY 后恢复任务<br/>接收群聊 / 私聊消息"] --> B["适配器规范化事件<br/>白名单、发送者 ID、事件去重<br/>SQLite 保存原文"]
+    B --> C{"群内真实 @<br/>或允许的私聊？"}
+    C -->|否| OBS["仅保存观察，不调用聊天模型"]
+    C -->|是| TASK["SQLite 持久任务队列<br/>默认并发 2；超额等待"]
+    TASK --> CMD{"显式命令？"}
+    CMD -->|"/memory 等"| ADMIN["本地管理鉴权与执行<br/>保存控制回复，不调用模型"]
+    CMD -->|"/result"| RESULT["领取本人在当前房间的模型结果<br/>保存控制回复，不调用模型"]
+    CMD -->|自然语言| CTX["模型任务使用独立 Pi 会话<br/>组装身份、画像、历史、引用<br/>Topic 召回仅在 Embedding 配置后可用"]
+    CTX --> CAP{"完整上下文含预留输出<br/>是否能装入模型窗口？"}
+    CAP -->|不能| WAIT["等待后台整理并重新组装<br/>仍超限或整理失败则结束本次请求"]
+    WAIT -->|整理成功后| CTX
+  end
+
+  subgraph AGENT["Pi 工具循环：最多 6 次模型请求 / 8 次工具执行"]
+    LLM["调用 LLM<br/>默认轻松简短；专业模式严谨分析<br/>最后一次请求关闭工具，预留收尾"] --> CHOICE{"模型是否请求工具？"}
+    CHOICE -->|否| SAVE["核对 Pi 运行标记与 entry ID<br/>SQLite 保存最终答案、投递与任务结果<br/>释放计算槽，允许下一问开始"]
+    CHOICE -->|是| TOOL["程序核验工具、参数、身份与次数<br/>update_profile → 原文保存为未归档画像<br/>read_history → 本房间 FTS5 / BM25，最多 10 条<br/>web_search / web_fetch → 公开资料与内部来源<br/>answer_in_depth → 专业提示与一次短进度"]
+    TOOL --> TOOLRESULT["工具结果及错误交回 Pi<br/>同一任务继承证据、身份和剩余次数<br/>专业模式禁重复切换及画像写入"]
+    TOOLRESULT --> LLM
+    TOOL -. "短进度也走发送队列" .-> PROGRESS["保存 run_progress<br/>不作为人物事实证据"]
+  end
+
+  subgraph DELIVERY["QQ 投递：计算并行，同房间完整回答依次发送"]
+    SAVE --> OUT["同房间发送队列<br/>转纯文本，约 500 字符分段<br/>搜索回答不附来源网址 / 参考链接"]
+    ADMIN --> OUT
+    RESULT --> OUT
+    PROGRESS --> QUEUE["等待本房间正在发送的回答完成"]
+    QUEUE --> MODE
+    OUT --> MODE{"临发送判断<br/>仍在 5 分钟被动窗口且槽位足够？"}
+    MODE -->|是| PASS["被动回复：带原消息 ID<br/>进度与正文共用最多 5 个槽位"]
+    MODE -->|否| ACTIVE["主动发送：不带原消息 ID / msg_seq<br/>最终答案附昵称、问题摘要与任务编号"]
+    PASS --> INTENT["发送前持久化模式、槽位与发送意图"]
+    ACTIVE --> INTENT
+    INTENT --> SEND["QQ REST API 投递<br/>逐段保存真实回执；同一回答连续发送"]
+    SEND --> ACK{"投递结果？"}
+    ACK -->|确认成功| SENT["完成当前批次发送<br/>最终答案可通过 /result 再领取"]
+    ACK -->|拒绝或未知| HOLD["停止当前批次剩余发送<br/>保留已完成模型结果<br/>不自动重发；可用 /result 领取"]
+  end
+
+  subgraph MEMORY["独立后台记忆：同房间按序整理，聊天可继续"]
+    TRIGGER["群聊 50 条真人聊天 / 私聊 50 轮完整已发送问答<br/>或组装上下文含预留输出达到窗口 85%"] --> SNAP["捕获固定消息 ID、最后序号和画像快照<br/>持久任务、租约及分块进度"]
+    SNAP --> EXTRACT["后台 LLM 提炼话题与人物 / AI 自身画像<br/>私聊额外生成续聊摘要；无独立群摘要"]
+    EXTRACT --> COMMIT["核验来源、版本与租约<br/>事务提交画像、Topic、已处理 pending 和检查点<br/>原文保留；在途新增仍为未归档"]
+    COMMIT --> RECALL["下次请求注入新画像与私聊摘要<br/>可选：Topic 向量化与语义召回<br/>未配置 Embedding 时压缩仍可用"]
+  end
+  CAP -->|能| LLM
+  B -. "数量触发；仅在记忆启用时" .-> TRIGGER
+  SENT -. "确认发送后检查私聊轮数" .-> TRIGGER
+  CTX -. "达到 85% 则异步触发" .-> TRIGGER
+  WAIT -. "超硬上限需等待" .-> TRIGGER
+
+  classDef input fill:#eaf2ff,stroke:#648bb4,color:#17324d
+  classDef agent fill:#e7f5ef,stroke:#4f9279,color:#163d31
+  classDef output fill:#fff3df,stroke:#c79545,color:#5f421b
+  classDef memory fill:#f0ebfa,stroke:#9780b9,color:#4c3a6c
+  classDef guard fill:#fff8d9,stroke:#c39c3c,color:#53441d
+  class A,B,OBS,TASK,ADMIN,RESULT,CTX,WAIT input
+  class LLM,SAVE,TOOL,TOOLRESULT,PROGRESS agent
+  class OUT,QUEUE,PASS,ACTIVE,INTENT,SEND,SENT,HOLD output
+  class TRIGGER,SNAP,EXTRACT,COMMIT,RECALL memory
+  class C,CMD,CAP,CHOICE,MODE,ACK guard
