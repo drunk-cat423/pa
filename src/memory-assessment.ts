@@ -16,6 +16,7 @@ const SYSTEM_PROMPT = `你是应用的记忆更新判断模块。只依据本条
 只输出一个严格JSON对象，不要Markdown、代码围栏或解释：
 {"save":boolean,"target":"ai_self"|"sender","content":string,"field"?:"diet"|"preferred_name"|"interests"|"reply_style","reply":string}
 不要增加任何其他字段。content必须直接摘录本条消息中的连续原文，可去掉请求前缀和末尾标点，不能改写、补造信息或把“我”和“你”换成别的对象。ai_self正文最多500个Unicode字符且不换行；sender最多4000个Unicode字符。field仅sender在确实匹配这四项本人偏好时可带，其他有效笔记省略field，未知类别不阻止保存。save=false时content为空字符串。
+AI示例：{"save":true,"target":"ai_self","content":"回答简洁一些","reply":"记住了。"}。AI画像不要包含field；普通笔记无需分类，不适用时省略field。
 
 reply用中文纯文本简短回应，最多80个Unicode字符，无列表、无分类要求。save=true时只准备应用提交成功后可用的一句确认，不提问或再要求确认，例如“记住了。”。save=false时回应本次未保存的原因或请求补充具体内容，不能声称已经记住、保存或更新。`;
 
@@ -44,9 +45,12 @@ function validate(value: unknown, sourceText: string): MemoryUpdateAssessment {
   if (Object.keys(object).some(key => !['save', 'target', 'content', 'field', 'reply'].includes(key))
     || typeof object.save !== 'boolean' || !['ai_self', 'sender'].includes(String(object.target))
     || typeof object.content !== 'string' || typeof object.reply !== 'string') invalid();
-  if (object.field !== undefined && (object.target !== 'sender' || !FIELDS.includes(object.field as ProfileField))) invalid();
+  if (object.field != null && !FIELDS.includes(object.field as ProfileField)) invalid();
+  // Classification is only optional sender metadata; a known label on an AI
+  // verdict (or null for no category) must not prevent an otherwise valid save.
+  const field = object.target === 'sender' && object.field != null ? object.field as ProfileField : undefined;
   if (!object.save) {
-    if (object.content !== '' || object.field !== undefined) invalid();
+    if (object.content !== '' || field !== undefined) invalid();
     return { request: null, reply: safeReply(object.reply, false) };
   }
   const content = object.content.normalize('NFKC').trim();
@@ -54,7 +58,7 @@ function validate(value: unknown, sourceText: string): MemoryUpdateAssessment {
   if (!content || [...content].length > (aiSelf ? 500 : 4000) || (aiSelf && /[\r\n]/u.test(content))
     || !sourceText.normalize('NFKC').includes(content)) invalid();
   const request: SaveRequest = aiSelf ? { type: 'ai_self_update', content }
-    : { type: 'self_update', content, ...(object.field === undefined ? {} : { field: object.field as ProfileField }) };
+    : { type: 'self_update', content, ...(field === undefined ? {} : { field }) };
   return { request, reply: safeReply(object.reply, true) };
 }
 

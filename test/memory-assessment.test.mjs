@@ -127,7 +127,7 @@ test('strict schema rejects malformed output, extra identity fields, unsupported
     '{broken json', `\`\`\`json\n${JSON.stringify(good)}\n\`\`\``, null, [],
     { ...good, actorId: 'another-person' }, { ...good, personId: 'another-person' },
     { ...good, target: 'room' }, { ...good, target: 'another-person' }, { ...good, save: 'true' },
-    { ...good, field: 'generic' }, { ...good, target: 'ai_self', field: 'diet' },
+    { ...good, field: 'generic' },
     { ...good, content: '我下周要出差去巴黎' }, { ...good, content: '' }, { ...good, reply: null },
     { save: false, target: 'sender', content: '我下周要出差', reply: '未保存。' },
     { save: false, target: 'sender', content: '', field: 'diet', reply: '未保存。' },
@@ -146,6 +146,16 @@ test('strict schema rejects malformed output, extra identity fields, unsupported
     assert.equal((await f.assess(`记住${content}`, { contextWindow: 65536 })).request.content, content);
   }
   assert.deepEqual(await readdir(f.directory), []);
+});
+
+test('optional null categories and known AI category labels do not reject valid verdicts or become stored fields', async t => {
+  const f = await fixture(t);
+  for (const field of [null, 'reply_style']) {
+    f.set({ save: true, target: 'ai_self', content: '回答简洁一些', field, reply: '记住了。' });
+    assert.deepEqual((await f.assess('记住回答简洁一些')).request, { type: 'ai_self_update', content: '回答简洁一些' });
+  }
+  f.set({ save: true, target: 'sender', content: '我下周要出差', field: null, reply: '记住了。' });
+  assert.deepEqual((await f.assess('记住我下周要出差')).request, { type: 'self_update', content: '我下周要出差' });
 });
 
 test('provider errors, output truncation, forbidden tool calls, and cancellation fail without revealing credentials or retrying', async t => {
