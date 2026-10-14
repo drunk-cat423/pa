@@ -17,7 +17,7 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const search = requests.length === 1 && body.tools?.some(tool => tool.function.name === 'web_search');
     const delta = search ? { role: 'assistant', tool_calls: [{ index: 0, id: 'call_search_1', type: 'function',
-      function: { name: 'web_search', arguments: JSON.stringify({ query: 'SQLite 官方文档' }) } }] } : { role: 'assistant', content: '检索完成 https://sqlite.org/' };
+      function: { name: 'web_search', arguments: JSON.stringify({ query: 'SQLite 官方文档' }) } }] } : { role: 'assistant', content: '检索完成' };
     for (const choices of [[{ index: 0, delta, finish_reason: null }],
       [{ index: 0, delta: {}, finish_reason: search ? 'tool_calls' : 'stop' }]]) {
       response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1,
@@ -51,6 +51,7 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
   const reply = await conversation.prompt('请搜索 SQLite 官方文档', { eventId: 'evt1', senderId: 'user',
     modelInputText: '请搜索 SQLite 官方文档' });
   assert.match(reply.text, /检索完成/);
+  assert.equal(reply.referenceUrls, undefined);
   assert.equal(requests.length, 2);
   assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['update_profile', 'read_history', 'answer_in_depth', 'web_search', 'web_fetch']);
   assert.equal(requests[0].tool_choice, 'auto');

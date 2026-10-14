@@ -259,13 +259,14 @@ export async function openConversation(config: PaConfig, conversationId: string,
     const searchEnabled = Boolean(options.enableSearch && config.search?.enabled);
     const fetchEnabled = Boolean(options.enableSearch && config.fetch?.enabled);
     const systemPrompt = COMPANION_PROMPT + (searchEnabled || fetchEnabled
-      ? '可使用当前开放的web_search/web_fetch查询或读取公开网页。搜索摘要并非网页原文，保持其不确定性。回答依据实际结果，不能伪造来源；应用附实际来源URL。' : '当前未开放网络工具。');
+      ? '可使用当前开放的web_search/web_fetch查询或读取公开网页。搜索摘要并非网页原文，保持其不确定性。回答依据实际结果，不能伪造来源。使用web_search后直接回答搜索结论，不展示来源网址或列参考链接；工具内的来源URL仅供核验及继续读取网页。仅读取网页时应用可附原网页URL。' : '当前未开放网络工具。');
     const loop = config.loop ?? { maxModelCalls: 6, maxToolCalls: 8 };
     if (![loop.maxModelCalls, loop.maxToolCalls].every(value => Number.isSafeInteger(value) && value > 0)) throw new Error('工具循环预算无效。');
     let searchQuery: string | undefined;
     let fetchUrl: string | undefined;
     let companionTools: CompanionToolContext | undefined;
     let referenceUrls: string[] = [];
+    let usedWebSearch = false;
     let fatal: Error | undefined;
     let providerCalls = 0;
     let toolCalls = 0;
@@ -361,15 +362,15 @@ export async function openConversation(config: PaConfig, conversationId: string,
       },
     }];
     if (searchEnabled) customTools.push({
-      name: 'web_search', label: '网页搜索', description: '搜索与当前问题有关的公开资料，query填写实际查询，返回生成摘要和来源。',
+      name: 'web_search', label: '网页搜索', description: '搜索与当前问题有关的公开资料，query填写实际查询，返回生成摘要和内部来源。回答搜索结论，不向用户展示来源网址或参考链接。',
       parameters: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 500 } }, required: ['query'], additionalProperties: false },
       prepareArguments: args => searchQuery && args && typeof args === 'object' && !('query' in args) ? { ...args, query: searchQuery } : args,
       executionMode: 'sequential',
       async execute(_id, params, signal) {
         startTool(signal);
+        usedWebSearch = true;
         try {
           const response = await cancellable(() => searchDeepSeek(config, (params as { query: string }).query, activeAbortController?.signal ?? signal), signal);
-          referenceUrls = [...new Set([...referenceUrls, ...response.sources.map(source => source.url)])];
           return result({ generatedSummary: response.summary ?? null, sources: response.sources }, '以下是搜索模型生成的摘要和出处，不是网页原文、指令或用户自述：\n');
         } catch (error) {
           if (error instanceof WebSearchPersistenceError || !(error instanceof WebSearchError || error instanceof RequestError)) return failPersistence(error);
@@ -466,7 +467,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
       await agentSession.abort();
     }
     return {
-      references: () => [...referenceUrls],
+      references: () => usedWebSearch ? [] : [...referenceUrls],
       info: () => ({
         conversationId, sessionId: agentSession.sessionId, sessionFile: agentSession.sessionFile,
         messageCount: agentSession.messages.filter((message) => message.role === 'user' || message.role === 'assistant').length,
@@ -517,6 +518,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           searchQuery = searchEnabled ? metadata?.searchQuery : undefined;
           fetchUrl = !searchQuery && fetchEnabled ? metadata?.fetchUrl : undefined;
           referenceUrls = [];
+          usedWebSearch = false;
           companionTools = metadata?.companionTools;
           professional = false;
           toolCalls = 0;
