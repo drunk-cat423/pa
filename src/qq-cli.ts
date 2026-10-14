@@ -23,6 +23,9 @@ async function main(): Promise<void> {
       primaryPersonBindings: policy.primaryPerson?.bindings.length ?? 0,
       memoryEnabled: config.memory?.enabled ?? false, memoryMaxCalls: config.memory?.maxCalls ?? 0,
       embeddingConfigured: Boolean(config.memory?.embedding),
+      searchEnabled: config.search?.enabled ?? false, searchMaxRequests: config.search?.maxRequests ?? 0,
+      searchBudgetId: config.search?.budgetId,
+      fetchEnabled: config.fetch?.enabled ?? false,
       qqCredentialsPresent: true, modelKeyPresent: keyPresent, ready: keyPresent }));
     process.exitCode = keyPresent ? 0 : 2;
     return;

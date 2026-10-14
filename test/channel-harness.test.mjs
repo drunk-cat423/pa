@@ -38,7 +38,7 @@ async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-ou
   const route = { channel: 'qq', accountId: 'fixture-account', roomId: 'group-A', roomType: 'group' };
   const other = { ...route, roomId: 'group-B' };
   function harness(maxCalls = 3, routes = [route, other]) {
-    const h = new ChannelHarness(config, routes, { send: async message => { sent.push(message); return delivery; } }, maxCalls);
+    const h = new ChannelHarness(config, routes, { send: async message => { sent.push(message); return typeof delivery === 'function' ? delivery(message, sent.length) : delivery; } }, maxCalls);
     harnesses.push(h); return h;
   }
   function message(eventId, text, options = {}) {
@@ -52,6 +52,89 @@ async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-ou
   });
   return { config, directory, route, other, requests, sent, harness, message };
 }
+
+test('长回复格式化后每段500 Unicode字符，完整落库且仅一次模型调用', async t => {
+  const original = '**开头**\n\n' + ('你好😀。'.repeat(290)) + '\nhttps://example.com/reference';
+  const f = await fixture(t, (message, index) => {
+    const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
+    try {
+      const current = db.prepare('SELECT text, status FROM delivery_parts WHERE part_index=?').get(message.partIndex);
+      assert.equal(current.text, message.text);
+      assert.equal(current.status, 'sending');
+      assert.equal(db.prepare("SELECT count(*) n FROM delivery_parts WHERE status='sent'").get().n, index - 1);
+    } finally { db.close(); }
+    return { status: 'sent', externalMessageId: `part-${index}` };
+  }, original);
+  const h = f.harness();
+  assert.equal(await h.handle(f.message('long', '请长回复')), 'sent');
+  assert.equal(f.requests.length, 1);
+  assert.ok(f.sent.length > 1 && f.sent.length <= 5);
+  assert.ok(f.sent.every(message => [...message.text].length <= 500 && message.plainText));
+  assert.deepEqual(f.sent.map(message => message.partIndex), f.sent.map((_, index) => index));
+  assert.equal(f.sent.map(message => message.text).join(''), original.replace('**开头**', '开头'));
+  const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
+  try {
+    assert.equal(db.prepare("SELECT text FROM messages WHERE role='assistant'").get().text, original);
+    const parts = db.prepare('SELECT * FROM delivery_parts ORDER BY part_index').all();
+    assert.equal(parts.map(part => part.text).join(''), f.sent.map(message => message.text).join(''));
+    assert.ok(parts.every(part => part.status === 'sent'));
+    assert.equal(db.prepare('SELECT status FROM deliveries').get().status, 'sent');
+  } finally { db.close(); }
+});
+
+test('第二段拒绝后停止，确认段可跨重启引用实际文本且其他群不可引用', async t => {
+  const f = await fixture(t, (_message, index) => index === 2 ? { status: 'rejected' }
+    : { status: 'sent', externalMessageId: `part-${index}` }, '**开头**' + '😀'.repeat(1100));
+  const h = f.harness(0);
+  assert.equal(await h.handle(f.message('partial', '长回复')), 'rejected');
+  assert.equal(f.sent.length, 2);
+  const first = f.sent[0].text;
+  const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
+  try {
+    assert.equal(db.prepare('SELECT status FROM deliveries').get().status, 'uncertain');
+    assert.deepEqual(db.prepare('SELECT status FROM delivery_parts ORDER BY part_index').all().map(part => part.status),
+      ['sent', 'rejected', 'uncertain']);
+  } finally { db.close(); }
+  await h.close();
+  const reopened = f.harness(0);
+  assert.equal(await reopened.handle(f.message('partial', '重复')), 'duplicate');
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.sent.length, 2);
+  await reopened.handle(f.message('quote-part', '解释这一段', { quote: { messageId: 'part-1' } }));
+  assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.text, first);
+  await reopened.handle(f.message('other-quote', '解释另一群', { route: f.other, quote: { messageId: 'part-1' } }));
+  assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.status, 'unavailable');
+});
+
+test('QQ超长完整回复最多占五个被动回复槽位', async t => {
+  const reply = '一二三😀。'.repeat(1000);
+  const f = await fixture(t, (_message, index) => ({ status: 'sent', externalMessageId: `huge-${index}` }), reply);
+  assert.equal(await f.harness().handle(f.message('huge', '很长回复')), 'sent');
+  assert.equal(f.sent.length, 5);
+  assert.equal(f.sent.map(message => message.text).join(''), reply);
+  assert.equal(f.requests.length, 1);
+});
+
+test('关闭发生于段发送期间仍记录回执，并停止后续段', async t => {
+  let started, resume;
+  const sending = new Promise(resolve => { started = resolve; });
+  const release = new Promise(resolve => { resume = resolve; });
+  const f = await fixture(t, async () => { started(); await release; return { status: 'sent', externalMessageId: 'before-close' }; }, '😀'.repeat(1100));
+  const h = f.harness();
+  const result = h.handle(f.message('closing', '关闭时长回复'));
+  await sending;
+  const closing = h.close();
+  resume();
+  assert.equal(await result, 'uncertain');
+  await closing;
+  assert.equal(f.sent.length, 1);
+  const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
+  try {
+    assert.equal(db.prepare('SELECT status FROM deliveries').get().status, 'uncertain');
+    assert.deepEqual(db.prepare('SELECT status FROM delivery_parts ORDER BY part_index').all().map(part => part.status),
+      ['sent', 'uncertain', 'uncertain']);
+  } finally { db.close(); }
+});
 
 test('全量消息落库，明确@才调用真实Pi；身份、上下文、去重、群隔离和调用预算', async t => {
   const f = await fixture(t);

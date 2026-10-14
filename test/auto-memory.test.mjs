@@ -26,6 +26,34 @@ function extracted(input) {
     fragments: [], profiles: [], ignoredMessageIds: [],
     ...(input.roomType === 'private' ? { continuationSummary: '已经讨论测试计划，下一步继续执行。' } : {}) };
 }
+
+for (const scenario of [
+  { name: '不限整理次数超过20次仍继续，失败重试也可恢复', limit: 0, rounds: 21, failures: 1, calls: 22, completed: 21 },
+  { name: '有限整理预算仍阻止超过上限的调用', limit: 1, rounds: 2, failures: 0, calls: 1, completed: 1 },
+  { name: '不限总次数仍保留每个任务的三次失败重试上限', limit: 0, rounds: 1, failures: Infinity, calls: 3, completed: 0 },
+]) test(scenario.name, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'pa-memory-limit-'));
+  const store = new ConversationStore(join(directory, 'store.sqlite'));
+  const conversation = store.ensureConversation('room', join(directory, 'session.jsonl'),
+    { channel: 'qq', accountId: 'a', roomId: 'g', roomType: 'group' });
+  let calls = 0;
+  const background = new BackgroundMemory({ memory: { enabled: true, maxCalls: scenario.limit, timeoutMs: 5000, maxRetries: 3 }, contextWindow: 100000 },
+    store.autoMemory, conversation.id, { extract: async input => {
+      calls++;
+      if (calls <= scenario.failures) throw new Error('fixture failure');
+      return extracted(input);
+    } });
+  t.after(async () => { await background.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
+  for (let i = 0; i < scenario.rounds; i++) {
+    store.recordInbound(conversation.id, 'hello', { eventId: String(i), senderId: 'a', modelInputText: 'hello' });
+    background.start('capacity');
+    if (i < scenario.completed) await background.wait(undefined, 3000);
+    else await assert.rejects(background.wait(undefined, 3000), /失败/);
+  }
+  assert.equal(calls, scenario.calls);
+  assert.equal(background.info().calls, scenario.calls);
+  assert.equal(store.autoMemory.status(conversation.id).completed, scenario.completed);
+});
 async function fixture(t, extract = async input => extracted(input), overrides = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'pa-memory-integration-'));
   const requests = [], sent = [], inputs = [], harnesses = [];

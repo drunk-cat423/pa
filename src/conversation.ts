@@ -9,6 +9,7 @@ import type { MemorySource } from './memory-service.js';
 import { BackgroundMemory } from './auto-memory.js';
 import type { MemoryProvider } from './memory-provider.js';
 import { selfProfileBudget } from './self-profile-store.js';
+import { explicitWebSearchQuery, explicitWebFetchUrl } from './search-request.js';
 
 export class PersistenceError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -18,11 +19,15 @@ export class PersistenceError extends Error {
 }
 
 export interface RecordedConversation {
-  prompt(text: string, external?: ExternalRunInput): Promise<{ text: string; runId: string; deliveryId: string }>;
+  prompt(text: string, external?: ExternalRunInput): Promise<{ text: string; runId: string; deliveryId: string; referenceUrls?: readonly string[] }>;
   hasExternalMessage(eventId: string): boolean;
   observe(text: string, external: ExternalRunInput): boolean;
   ingest(text: string, external: ExternalRunInput): MemorySource | undefined;
   acknowledge(deliveryId: string, status: 'sent' | 'uncertain', externalMessageId?: string): void;
+  prepareDeliveryParts(deliveryId: string, texts: readonly string[]): void;
+  beginDeliveryPart(deliveryId: string, partIndex: number): void;
+  acknowledgePart(deliveryId: string, partIndex: number, status: 'sent' | 'uncertain' | 'rejected', externalMessageId?: string): void;
+  abort(): Promise<void>;
   history(limit?: number): MessageRecord[];
   remember(input: MemoryInput): MemoryChange;
   queryMemories(query?: string, limit?: number, subjectActorId?: string | null, viewerActorId?: string): MemoryRecord[];
@@ -75,7 +80,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
   primaryPerson?: PrimaryPerson | null,
   options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider } = {}): Promise<RecordedConversation> {
   // Acquire the Pi conversation lock before inspecting or mutating its business records.
-  const runtime = await openConversation(config, conversationKey);
+  const runtime = await openConversation(config, conversationKey, { enableSearch: Boolean(route) });
   let store: ConversationStore | undefined;
   let broken = false;
   function persist<T>(operation: () => T, input = ''): T {
@@ -209,9 +214,23 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
       waitForMemory: () => background.wait(),
       acknowledge(deliveryId, status, externalMessageId) {
         usable();
-        persist(() => openedStore.ackDelivery(deliveryId, status, externalMessageId));
+        persist(() => openedStore.ackDelivery(deliveryId, status, externalMessageId, conversation.id));
         background.start();
       },
+      prepareDeliveryParts(deliveryId, texts) {
+        usable();
+        persist(() => openedStore.prepareDeliveryParts(conversation.id, deliveryId, texts));
+      },
+      beginDeliveryPart(deliveryId, partIndex) {
+        usable();
+        persist(() => openedStore.beginDeliveryPart(conversation.id, deliveryId, partIndex));
+      },
+      acknowledgePart(deliveryId, partIndex, status, externalMessageId) {
+        usable();
+        persist(() => openedStore.ackDeliveryPart(conversation.id, deliveryId, partIndex, status, externalMessageId));
+        background.start();
+      },
+      abort: () => runtime.abort(),
       prompt(text, external) {
         try { usable(); } catch (error) { return Promise.reject(error); }
         if (active) return Promise.reject(new Error('此会话正在处理上一条消息，请等待完成。'));
@@ -333,8 +352,12 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
           const run = persist(() => openedStore.beginRun(conversation.id, text, config.provider, config.model, recalled.refs, runExternal, modelInput), text);
           let reply: string;
           try {
+            const searchQuery = external && config.search?.enabled ? explicitWebSearchQuery(text) : undefined;
+            const fetchUrl = external && config.fetch?.enabled ? explicitWebFetchUrl(text) : undefined;
             reply = await runtime.prompt(modelInput, {
               runId: run.id, ...(recalled.content ? { memoryContext: recalled.content } : {}), memoryRefs: recalled.refs,
+              ...(searchQuery ? { searchQuery } : {}),
+              ...(fetchUrl ? { fetchUrl } : {}),
             });
           } catch (error) {
             const kind = error instanceof RequestError ? error.kind : 'error';
@@ -357,7 +380,9 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
             throw new PersistenceError('Pi 回复缺少可验证的本轮持久化关联，请关闭并重新打开会话。');
           }
           const delivery = persist(() => openedStore.completeRun(run.id, reply, turn.user?.entryId, turn.assistant?.entryId), text);
-          return { text: reply, runId: run.id, deliveryId: delivery.deliveryId };
+          const referenceUrls = runtime.references();
+          return { text: reply, runId: run.id, deliveryId: delivery.deliveryId,
+            ...(referenceUrls.length ? { referenceUrls } : {}) };
         })().finally(() => { active = undefined; });
         return active;
       },

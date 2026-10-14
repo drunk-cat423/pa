@@ -306,13 +306,14 @@ test('v6 migration backs up the original database and preserves chats, tombstone
     const tables = ['messages', 'memories', 'memory_revisions', 'memory_events', 'persons', 'actor_person_bindings', 'auto_memory_jobs', 'auto_memory_job_messages'];
     const before = inspect(f, db => {
       db.exec(`PRAGMA foreign_keys=OFF; DROP TABLE self_profile_pending; DROP TABLE self_profile_revisions;
+        DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity;
         UPDATE memories SET content=NULL,status='deleted'; UPDATE memory_revisions SET content=NULL,status='deleted'; PRAGMA user_version=6;`);
       db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=?').run(JSON.stringify(oldInput), job.id);
       return Object.fromEntries(tables.map(table => [table, db.prepare(`SELECT rowid,* FROM ${table}`).all().map(r => ({ ...r }))]));
     });
     f.restart();
     inspect(f, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 7);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 8);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       for (const table of tables) assert.deepEqual(db.prepare(`SELECT rowid,* FROM ${table}`).all().map(r => ({ ...r })), before[table]);
     });

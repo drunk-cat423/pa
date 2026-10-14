@@ -156,7 +156,9 @@ export class BackgroundMemory {
     const setting = this.config.memory!;
     const key = kind === 'extract' ? 'calls' : 'embeddingCalls';
     const max = kind === 'extract' ? setting.maxCalls : setting.embedding?.maxCalls ?? 100;
-    if (this.closed || this.budget[key] >= max) throw new Error('后台模型调用预算已用完或正在关闭。');
+    if (this.closed || ((kind === 'embedding' || max > 0) && this.budget[key] >= max)) {
+      throw new Error('后台模型调用预算已用完或正在关闭。');
+    }
     this.budget[key]++;
     const controller = new AbortController(); this.controllers.add(controller);
     const timer = setTimeout(() => controller.abort(), setting.timeoutMs);
@@ -178,7 +180,7 @@ export class BackgroundMemory {
       if (!job) return;
       const lease = job.leaseToken!;
       try {
-        if (this.budget.calls >= setting.maxCalls) throw new Error('budget');
+        if (setting.maxCalls > 0 && this.budget.calls >= setting.maxCalls) throw new Error('budget');
         const input: AutoMemoryTaskInput = { ...this.store.taskInput(job), selfProfileBudgetBytes: selfProfileBudget(this.config.contextWindow) };
         const progress = this.readProgress(job, input);
         while (progress.remaining.length) {
@@ -257,7 +259,7 @@ export class BackgroundMemory {
         if (conflict) this.store.clearProgress(job.id, lease);
         this.store.fail(job.id, lease, conflict ? 'profile_conflict' : this.lastError);
         if (this.closed) { this.store.retry(job.id); return; }
-        if (job.attempts < setting.maxRetries && this.budget.calls < setting.maxCalls) this.store.retry(job.id);
+        if (job.attempts < setting.maxRetries && (setting.maxCalls === 0 || this.budget.calls < setting.maxCalls)) this.store.retry(job.id);
         else return;
       }
     }

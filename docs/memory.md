@@ -54,7 +54,7 @@ PA_MEMORY_MAX_RETRIES=3
 PA_MEMORY_MAX_OUTPUT_TOKENS=8192
 ```
 
-启用会增加调用费用。后台复用聊天 provider/model，使用独立 ModelRuntime、输出预算和超时，不共享正在聊天的 Pi 会话。每次启动中所有房间共用 PA_MEMORY_MAX_CALLS，失败请求也计数，本地预检超限拆分不计实际请求。SDK 重试关闭，由持久任务控制重试。后台输出量还受实际模型上限和窗口四分之一限制。
+启用会增加调用费用。后台复用聊天 provider/model，使用独立 ModelRuntime、输出预算和超时，不共享正在聊天的 Pi 会话。每次启动中所有房间共用 PA_MEMORY_MAX_CALLS；设为0表示不限整理调用次数，但每个任务仍受 PA_MEMORY_MAX_RETRIES 和超时限制。失败请求也计数，本地预检超限拆分不计实际请求。SDK 重试关闭，由持久任务控制重试。后台输出量还受实际模型上限和窗口四分之一限制。Embedding 仍使用独立次数预算。
 
 可选话题语义召回需显式 Embedding 配置：
 

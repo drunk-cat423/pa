@@ -1,4 +1,6 @@
 import { resolve } from 'node:path';
+import type { WebSearchConfig } from './web-search.js';
+import type { WebFetchConfig } from './web-fetch.js';
 
 export interface PaConfig {
   cwd: string;
@@ -11,10 +13,13 @@ export interface PaConfig {
   maxOutputTokens: number;
   timeoutMs: number;
   memory?: AutoMemoryConfig;
+  search?: WebSearchConfig;
+  fetch?: WebFetchConfig;
 }
 
 export interface AutoMemoryConfig {
   enabled: boolean;
+  /** 0 disables the per-start extraction call limit. */
   maxCalls: number;
   timeoutMs: number;
   maxRetries: number;
@@ -32,6 +37,15 @@ function positiveInteger(env: NodeJS.ProcessEnv, name: string, fallback: number)
   if (!/^\d+$/.test(value)) throw new Error(`${name} 必须是正整数。`);
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${name} 必须是正整数。`);
+  return parsed;
+}
+
+function memoryCallLimit(env: NodeJS.ProcessEnv): number {
+  const value = env.PA_MEMORY_MAX_CALLS?.trim() || '20';
+  const parsed = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error('PA_MEMORY_MAX_CALLS 必须为 0（不限次数）或正整数。');
+  }
   return parsed;
 }
 
@@ -74,14 +88,54 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     maxOutputTokens,
     timeoutMs,
     memory: readAutoMemoryConfig(env),
+    search: readWebSearchConfig(env, provider!, baseUrl),
+    fetch: readWebFetchConfig(env),
   };
+}
+
+export function readWebFetchConfig(env: NodeJS.ProcessEnv): WebFetchConfig {
+  const flag = env.PA_FETCH_ENABLED?.trim() || 'false';
+  if (!['true', 'false'].includes(flag)) throw new Error('PA_FETCH_ENABLED 必须为 true 或 false。');
+  const publicDns = env.PA_FETCH_PUBLIC_DNS?.trim() || 'false';
+  if (!['true', 'false'].includes(publicDns)) throw new Error('PA_FETCH_PUBLIC_DNS 必须为 true 或 false。');
+  const config: WebFetchConfig = { enabled: flag === 'true',
+    publicDns: publicDns === 'true',
+    timeoutMs: positiveInteger(env, 'PA_FETCH_TIMEOUT_MS', 15000),
+    maxResponseBytes: positiveInteger(env, 'PA_FETCH_MAX_BYTES', 1048576),
+    maxTextChars: positiveInteger(env, 'PA_FETCH_MAX_CHARS', 8000) };
+  if (config.timeoutMs > 30000 || config.maxResponseBytes > 1048576 || config.maxTextChars > 16000) {
+    throw new Error('网页抓取配置超出允许范围。');
+  }
+  return config;
+}
+
+export function readWebSearchConfig(env: NodeJS.ProcessEnv, provider: string, baseUrl?: string): WebSearchConfig {
+  const flag = env.PA_SEARCH_ENABLED?.trim() || 'false';
+  if (!['true', 'false'].includes(flag)) throw new Error('PA_SEARCH_ENABLED 必须为 true 或 false。');
+  const budgetId = env.PA_SEARCH_BUDGET_ID?.trim() || '';
+  if (flag === 'true' && (!/^[a-zA-Z0-9_-]{1,80}$/.test(budgetId)
+    || provider !== 'deepseek' || (baseUrl && !/^https:\/\/api\.deepseek\.com\/?(?:v1\/?)?$/.test(baseUrl)))) {
+    throw new Error('搜索需官方 DeepSeek 配置及明确的 PA_SEARCH_BUDGET_ID；不会把其他供应商的密钥发送到 DeepSeek。');
+  }
+  const result: WebSearchConfig = { enabled: flag === 'true', budgetId,
+    model: env.PA_SEARCH_MODEL?.trim() || 'deepseek-flash',
+    maxRequests: positiveInteger(env, 'PA_SEARCH_MAX_REQUESTS', 1),
+    maxUses: positiveInteger(env, 'PA_SEARCH_MAX_USES', 1),
+    maxTokens: positiveInteger(env, 'PA_SEARCH_MAX_TOKENS', 2048),
+    timeoutMs: positiveInteger(env, 'PA_SEARCH_TIMEOUT_MS', 60000),
+    maxResults: positiveInteger(env, 'PA_SEARCH_MAX_RESULTS', 5) };
+  if (result.maxRequests > 100 || result.maxUses > 5 || result.maxTokens > 4096
+    || result.timeoutMs > 120000 || result.maxResults > 10 || !/^[a-zA-Z0-9_-]{1,100}$/.test(result.model)) {
+    throw new Error('搜索预算、模型或结果上限超出支持范围。');
+  }
+  return result;
 }
 
 export function readAutoMemoryConfig(env: NodeJS.ProcessEnv): AutoMemoryConfig {
   const flag = env.PA_MEMORY_ENABLED?.trim() || 'false';
   if (!['true', 'false'].includes(flag)) throw new Error('PA_MEMORY_ENABLED 必须为 true 或 false。');
   const result: AutoMemoryConfig = { enabled: flag === 'true',
-    maxCalls: positiveInteger(env, 'PA_MEMORY_MAX_CALLS', 20),
+    maxCalls: memoryCallLimit(env),
     timeoutMs: positiveInteger(env, 'PA_MEMORY_TIMEOUT_MS', 120000),
     maxRetries: positiveInteger(env, 'PA_MEMORY_MAX_RETRIES', 3),
     maxOutputTokens: positiveInteger(env, 'PA_MEMORY_MAX_OUTPUT_TOKENS', 8192) };

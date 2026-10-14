@@ -6,6 +6,41 @@ import { readConfig, readDataDir } from '../dist/config.js';
 
 const valid = { PA_PROVIDER: 'test-provider', PA_MODEL: 'test-model', PA_API_KEY: 'private-test-key' };
 
+test('后台整理允许0不限次数，保留有限预算和无效值校验', () => {
+  assert.equal(readConfig(valid).memory.maxCalls, 20);
+  assert.equal(readConfig({ ...valid, PA_MEMORY_MAX_CALLS: '0' }).memory.maxCalls, 0);
+  assert.equal(readConfig({ ...valid, PA_MEMORY_MAX_CALLS: '1' }).memory.maxCalls, 1);
+  for (const value of ['-1', '1.5', 'Infinity', '9007199254740992', 'no']) {
+    assert.throws(() => readConfig({ ...valid, PA_MEMORY_MAX_CALLS: value }), /PA_MEMORY_MAX_CALLS/);
+  }
+});
+
+test('搜索默认关闭，复用官方key但要求明确持久预算，拒绝其他供应商凭据', () => {
+  assert.equal(readConfig(valid).search.enabled, false);
+  const enabled = { ...valid, PA_PROVIDER: 'deepseek', PA_BASE_URL: 'https://api.deepseek.com',
+    PA_SEARCH_ENABLED: 'true', PA_SEARCH_BUDGET_ID: 'trial-1' };
+  assert.equal(readConfig(enabled).search.maxRequests, 1);
+  assert.equal(readConfig(enabled).search.maxUses, 1);
+  assert.equal(readConfig(enabled).apiKey, valid.PA_API_KEY);
+  for (const env of [{ ...enabled, PA_PROVIDER: 'other' }, { ...enabled, PA_BASE_URL: 'https://gateway.test' },
+    { ...enabled, PA_SEARCH_BUDGET_ID: '' }, { ...enabled, PA_SEARCH_MAX_REQUESTS: '0' },
+    { ...enabled, PA_SEARCH_MAX_USES: '6' }, { ...enabled, PA_SEARCH_MAX_TOKENS: '9999' }]) {
+    assert.throws(() => readConfig(env));
+  }
+});
+
+test('网页抓取独立于收费搜索，默认关闭且读取与DNS配置有硬上限', () => {
+  const config = readConfig({ ...valid, PA_FETCH_ENABLED: 'true', PA_FETCH_PUBLIC_DNS: 'true' });
+  assert.equal(config.search.enabled, false);
+  assert.equal(config.fetch.enabled, true);
+  assert.equal(config.fetch.publicDns, true);
+  assert.equal(config.fetch.maxTextChars, 8000);
+  for (const env of [{ PA_FETCH_PUBLIC_DNS: 'yes' }, { PA_FETCH_ENABLED: 'yes' },
+    { PA_FETCH_TIMEOUT_MS: '30001' }, { PA_FETCH_MAX_BYTES: '1048577' }, { PA_FETCH_MAX_CHARS: '16001' }]) {
+    assert.throws(() => readConfig({ ...valid, ...env }));
+  }
+});
+
 test('配置不预选供应商，错误不泄露密钥', () => {
   assert.throws(() => readConfig({}), /PA_PROVIDER.*PA_MODEL.*PA_API_KEY/);
   assert.throws(() => readConfig({ PA_API_KEY: valid.PA_API_KEY }), error => !error.message.includes(valid.PA_API_KEY));

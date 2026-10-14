@@ -2,15 +2,16 @@
 
 SQLite pa.sqlite 保存权威原文、消息来源、运行和投递记录，以及记忆派生数据；Pi session.jsonl 保存模型上下文与审计条目。压缩仅改变活跃模型投影，原文保持完整。两者使用 run ID / Pi entry ID 对应，不能混合恢复不同时点的文件。
 
-## schema v7
+## schema v8
 
-Node 内置 node:sqlite，WAL、外键、FULL 同步及 busy timeout。首次打开 v1–v6 会在同目录创建 pa.sqlite.v版本.UUID.bak 一致性备份，再事务迁移。未知非空库、外键损坏或更高版本会停止打开。v6升级v7仅增加自我画像表，保留已有后台批次和计数水位。
+Node 内置 node:sqlite，WAL、外键、FULL 同步及 busy timeout。首次打开 v1–v7 会在同目录创建 pa.sqlite.v版本.UUID.bak 一致性备份，再事务迁移。未知非空库、外键损坏或更高版本会停止打开。v8增加逐段投递记录，保留已有聊天、记忆、后台批次和计数水位。
 
 | 记录 | 内容 |
 |---|---|
 | rooms / actors / conversations | 房间四维路由、房间内发言身份、Pi 文件映射，保留已有 ID |
 | messages / message_ingest_order | 原文、独立模型输入、发送时间、接收时间、单调入库序号；平台事件在会话内唯一 |
 | agent_runs / deliveries | 输入/回复、Pi 关联、完成/失败及 sent/uncertain 投递 |
+| delivery_parts | 实际发送的分段正文、序号、pending/sending/sent/rejected/uncertain 状态与平台消息 ID |
 | memories / memory_revisions / memory_events / memory_uses | 既有显式记忆、版本、来源与使用审计；旧删除墓碑保留 |
 | persons / person_bindings / actor_person_bindings | 通用人物、明确路由身份绑定；兼容迁移 primary_person_bindings |
 | person_profile_revisions | 当前人物画像版本和事实证据，旧版本保留 |
@@ -31,6 +32,8 @@ Node 内置 node:sqlite，WAL、外键、FULL 同步及 busy timeout。首次打
 同一个 conversation 最多一个 running 聊天调用；不同房间独立。后到的提问可能在前一回答生成之前入库，构造历史时按提问边界选择完整问答，保留更早提问的已发送回复。
 
 回复及 completed 状态与 pending 投递一并提交后才能发送。sent 仅表示发送端接受，不表示人已阅读。明确拒绝/结果未知保持未确认语义，不自动重发。
+
+分段计划先整体入库，每段在网络请求前写入 sending，收到回执后逐段确认；全部成功才将父投递标为 sent。一段拒绝或未知会停止后续投递，父投递标 uncertain，重启将剩余 pending/sending 段标 uncertain，不自动续发。messages 保存完整模型原文，delivery_parts 保存转纯文本、追加参考链接后的实际文本；引用已确认发送的分段时返回该段实际文本，即使父投递未完全成功。
 
 恢复时核对 pa_run 标记、原文或 model_input_text 与 Pi entry：有可验证回复则补齐 SQL；无回复标 interrupted；pending 投递改 uncertain；已关联历史不一致则停止。平台原文不会被模型输入 JSON 替代。
 

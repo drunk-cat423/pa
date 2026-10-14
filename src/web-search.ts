@@ -1,0 +1,376 @@
+import { randomUUID } from 'node:crypto';
+import { constants } from 'node:fs';
+import { lstat, open, type FileHandle } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { PaConfig } from './config.js';
+import { acquireConversationLock } from './conversation-lock.js';
+
+export interface WebSearchConfig {
+  enabled: boolean;
+  budgetId: string;
+  maxRequests: number;
+  maxUses: number;
+  maxTokens: number;
+  timeoutMs: number;
+  model: string;
+  maxResults: number;
+}
+
+export interface WebSearchResult {
+  summary?: string;
+  sources: { url: string; title?: string; snippet?: string; publishedAt?: string }[];
+  usage: {
+    inputTokens: number | null;
+    outputTokens: number | null;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    totalTokens: number | null;
+    serverSearches: number | null;
+  };
+  attemptId: string;
+}
+
+export class WebSearchError extends Error {
+  constructor(message: string) { super(message); this.name = 'WebSearchError'; }
+}
+
+export class WebSearchPersistenceError extends Error {
+  constructor() { super('网页搜索预算记录无法安全读取或持久化。'); this.name = 'WebSearchPersistenceError'; }
+}
+
+type LedgerEvent =
+  | { type: 'reserved'; attemptId: string; timestamp: string; query: string }
+  | { type: 'completed'; attemptId: string; timestamp: string; sources: WebSearchResult['sources']; usage: WebSearchResult['usage']; summary?: string }
+  | { type: 'failed'; attemptId: string; timestamp: string; reason: string };
+
+const ENDPOINT = 'https://api.deepseek.com/anthropic/v1/messages';
+const MAX_RESPONSE_BYTES = 1024 * 1024;
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function boundedString(value: unknown, max: number): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value.slice(0, max) : undefined;
+}
+
+function positiveInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 1) throw new WebSearchError(`网页搜索配置 ${label} 无效。`);
+}
+
+function validateConfig(search: WebSearchConfig): void {
+  if (!search || typeof search !== 'object' || search.enabled !== true) throw new WebSearchError('网页搜索未启用。');
+  if (typeof search.budgetId !== 'string' || !/^[A-Za-z0-9._-]{1,100}$/.test(search.budgetId)) {
+    throw new WebSearchError('网页搜索预算标识无效。');
+  }
+  for (const [value, label] of [
+    [search.maxRequests, 'maxRequests'], [search.maxUses, 'maxUses'], [search.maxTokens, 'maxTokens'],
+    [search.timeoutMs, 'timeoutMs'], [search.maxResults, 'maxResults'],
+  ] as const) positiveInteger(value, label);
+  if (search.timeoutMs > 2_147_483_647 || search.maxResults > 100 || search.maxUses > 100
+    || search.maxTokens > 100_000 || typeof search.model !== 'string' || !search.model.trim()) {
+    throw new WebSearchError('网页搜索配置超出允许范围。');
+  }
+}
+
+function validUsage(value: unknown): WebSearchResult['usage'] {
+  const usage = record(value) ?? {};
+  const inputTokens = nonNegativeIntegerOrNull(usage.input_tokens);
+  const outputTokens = nonNegativeIntegerOrNull(usage.output_tokens);
+  const cacheReadTokens = nonNegativeInteger(usage.cache_read_input_tokens);
+  const cacheWriteTokens = nonNegativeInteger(usage.cache_creation_input_tokens);
+  const native = record(usage.server_tool_use);
+  return {
+    inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
+    totalTokens: inputTokens === null || outputTokens === null ? null
+      : inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens,
+    serverSearches: nonNegativeIntegerOrNull(native?.web_search_requests),
+  };
+}
+
+function nonNegativeInteger(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+function nonNegativeIntegerOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+export function parseSearchResponse(body: unknown, maxResults: number): Omit<WebSearchResult, 'attemptId'> {
+  const root = record(body);
+  if (!root || !Array.isArray(root.content)) throw new WebSearchError('DeepSeek 网页搜索响应格式无效。');
+  const sourcesByUrl = new Map<string, WebSearchResult['sources'][number]>();
+  let sawSearchResults = false;
+  let sawSuccessfulBlock = false;
+  let sawNativeError = false;
+  for (const rawBlock of root.content) {
+    const block = record(rawBlock);
+    if (!block) continue;
+    if (block.type === 'web_search_tool_error' || block.type === 'web_search_tool_result' && block.is_error === true) {
+      throw new WebSearchError('DeepSeek 网页搜索工具执行失败。');
+    }
+    if (block.type === 'web_search_tool_result') {
+      if (!Array.isArray(block.content)) throw new WebSearchError('DeepSeek 网页搜索结果格式无效。');
+      sawSearchResults = true;
+      if (block.content.length === 0 || block.content.some(item => record(item)?.type === 'web_search_result')) sawSuccessfulBlock = true;
+      for (const itemRaw of block.content) {
+        const item = record(itemRaw);
+        if (item?.type === 'web_search_tool_result_error') sawNativeError = true;
+        if (!item || item.type !== 'web_search_result' || typeof item.url !== 'string') continue;
+        let url: URL;
+        try { url = new URL(item.url); } catch { continue; }
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) continue;
+        const canonicalUrl = url.href.slice(0, 2048);
+        if (!sourcesByUrl.has(canonicalUrl)) {
+          sourcesByUrl.set(canonicalUrl, {
+            url: canonicalUrl,
+            ...(boundedString(item.title, 200) ? { title: boundedString(item.title, 200)! } : {}),
+            ...(boundedString(item.page_age, 200) ? { publishedAt: boundedString(item.page_age, 200)! } : {}),
+          });
+        }
+      }
+    }
+  }
+  if (!sawSearchResults) throw new WebSearchError('DeepSeek 响应没有网页搜索结果块。');
+  if (sawNativeError && !sawSuccessfulBlock) throw new WebSearchError('DeepSeek 网页搜索工具执行失败。');
+
+  // Ordinary anchors locate the same page. Hash routes may identify different documents.
+  // Keep query strings and #/ or #! routes; never join different routed pages.
+  const pageKey = (value: string) => {
+    const url = new URL(value);
+    if (!url.hash.startsWith('#/') && !url.hash.startsWith('#!')) url.hash = '';
+    return url.href;
+  };
+  const sourcesByPage = new Map<string, WebSearchResult['sources']>();
+  for (const source of sourcesByUrl.values()) {
+    const key = pageKey(source.url);
+    const matches = sourcesByPage.get(key) ?? [];
+    matches.push(source);
+    sourcesByPage.set(key, matches);
+  }
+  // Citations are accepted only from text blocks and only enrich native search results.
+  for (const rawBlock of root.content) {
+    const block = record(rawBlock);
+    if (block?.type !== 'text' || !Array.isArray(block.citations)) continue;
+    for (const rawCitation of block.citations) {
+      const citation = record(rawCitation);
+      if (!citation || typeof citation.url !== 'string') continue;
+      let url: string;
+      try { url = new URL(citation.url).href.slice(0, 2048); } catch { continue; }
+      const sources = sourcesByPage.get(pageKey(url)) ?? [];
+      const snippet = boundedString(citation.cited_text, 1000);
+      for (const source of sources) if (snippet && !source.snippet) source.snippet = snippet;
+    }
+  }
+  const summary = root.content.flatMap(block => {
+    const value = record(block);
+    return value?.type === 'text' && typeof value.text === 'string' ? [value.text] : [];
+  }).join('\n\n').trim().slice(0, 8000);
+  return { sources: [...sourcesByUrl.values()].slice(0, maxResults), usage: validUsage(root.usage),
+    ...(summary ? { summary } : {}) };
+}
+
+async function saveEvidence(directory: string, attemptId: string, kind: 'request' | 'response',
+  value: unknown, apiKey: string): Promise<void> {
+  let handle: FileHandle | undefined;
+  try {
+    // Request headers are never passed here. Provider bodies remain local, bounded and ignored by Git.
+    const json = JSON.stringify(value).split(apiKey).join('[redacted]');
+    handle = await open(join(directory, `${attemptId}.${kind}.json`), 'wx', 0o600);
+    await handle.writeFile(json + '\n', 'utf8');
+    await handle.sync();
+  } catch { throw new WebSearchPersistenceError(); }
+  finally {
+    try { await handle?.close(); } catch { throw new WebSearchPersistenceError(); }
+  }
+}
+
+async function readBoundedBody(response: Response): Promise<unknown> {
+  if (!response.body) throw new WebSearchError('DeepSeek 响应为空。');
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        throw new WebSearchError('DeepSeek 响应超过大小限制。');
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    if (error instanceof WebSearchError) throw error;
+    throw new WebSearchError('DeepSeek 响应读取失败或已取消。');
+  } finally { reader.releaseLock(); }
+  try { return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks))); }
+  catch { throw new WebSearchError('DeepSeek 响应不是有效 JSON。'); }
+}
+
+function validateLedgerLine(value: unknown): LedgerEvent {
+  const entry = record(value);
+  if (!entry || typeof entry.type !== 'string' || typeof entry.attemptId !== 'string'
+    || !/^[0-9a-f-]{36}$/.test(entry.attemptId) || typeof entry.timestamp !== 'string'
+    || !Number.isFinite(Date.parse(entry.timestamp))) throw new WebSearchPersistenceError();
+  const exactKeys = (...keys: string[]) => Object.keys(entry).length === keys.length && keys.every(key => key in entry);
+  if (entry.type === 'reserved' && exactKeys('type', 'attemptId', 'timestamp', 'query')
+    && typeof entry.query === 'string' && entry.query.length <= 500) return entry as LedgerEvent;
+  if (entry.type === 'failed' && exactKeys('type', 'attemptId', 'timestamp', 'reason')
+    && typeof entry.reason === 'string' && entry.reason.length <= 200) return entry as LedgerEvent;
+  const usage = record(entry.usage);
+  const validUsage = usage && Object.keys(usage).length === 6
+    && ['cacheReadTokens', 'cacheWriteTokens'].every(key =>
+      typeof usage[key] === 'number' && Number.isSafeInteger(usage[key]) && (usage[key] as number) >= 0)
+    && ['inputTokens', 'outputTokens', 'totalTokens'].every(key => usage[key] === null
+      || typeof usage[key] === 'number' && Number.isSafeInteger(usage[key]) && (usage[key] as number) >= 0)
+    && (usage.serverSearches === null || typeof usage.serverSearches === 'number'
+      && Number.isSafeInteger(usage.serverSearches) && usage.serverSearches >= 0);
+  const validSources = Array.isArray(entry.sources) && entry.sources.every(sourceRaw => {
+    const source = record(sourceRaw);
+    return source && typeof source.url === 'string' && source.url.length <= 2048
+      && Object.keys(source).every(key => ['url', 'title', 'snippet', 'publishedAt'].includes(key))
+      && (source.title === undefined || typeof source.title === 'string' && source.title.length <= 200)
+      && (source.snippet === undefined || typeof source.snippet === 'string' && source.snippet.length <= 1000)
+      && (source.publishedAt === undefined || typeof source.publishedAt === 'string' && source.publishedAt.length <= 200);
+  });
+  if (entry.type === 'completed' && exactKeys('type', 'attemptId', 'timestamp', 'sources', 'usage',
+    ...('summary' in entry ? ['summary'] : [])) && validSources && validUsage
+    && (entry.summary === undefined || typeof entry.summary === 'string' && entry.summary.length <= 8000)) {
+    return entry as LedgerEvent;
+  }
+  throw new WebSearchPersistenceError();
+}
+
+async function withLedger<T>(directory: string, callback: (entries: LedgerEvent[], append: (event: LedgerEvent) => Promise<void>) => Promise<T>): Promise<T> {
+  const path = join(directory, 'search-attempts.jsonl');
+  let handle: FileHandle | undefined;
+  try {
+    try {
+      const stat = await lstat(path);
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new WebSearchPersistenceError();
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    }
+    const noFollow = constants.O_NOFOLLOW ?? 0;
+    handle = await open(path, constants.O_RDWR | constants.O_APPEND | constants.O_CREAT | noFollow, 0o600);
+    if (!(await handle.stat()).isFile()) throw new WebSearchPersistenceError();
+    const raw = await handle.readFile('utf8');
+    const lines = raw.split('\n');
+    if (lines.at(-1) === '') lines.pop();
+    const entries = lines.map(line => {
+      if (!line) throw new WebSearchPersistenceError();
+      try { return validateLedgerLine(JSON.parse(line)); } catch { throw new WebSearchPersistenceError(); }
+    });
+    const attempts = new Map<string, boolean>();
+    for (const event of entries) {
+      const completed = attempts.get(event.attemptId);
+      if (event.type === 'reserved') {
+        if (completed !== undefined || attempts.has(event.attemptId)) throw new WebSearchPersistenceError();
+        attempts.set(event.attemptId, false);
+      } else {
+        if (completed !== false) throw new WebSearchPersistenceError();
+        attempts.set(event.attemptId, true);
+      }
+    }
+    const append = async (event: LedgerEvent) => {
+      if (event.type === 'reserved' ? attempts.has(event.attemptId) : attempts.get(event.attemptId) !== false) {
+        throw new WebSearchPersistenceError();
+      }
+      try {
+        await handle!.writeFile(`${JSON.stringify(event)}\n`, 'utf8');
+        await handle!.sync();
+        entries.push(event);
+        attempts.set(event.attemptId, event.type !== 'reserved');
+      } catch { throw new WebSearchPersistenceError(); }
+    };
+    return await callback(entries, append);
+  } catch (error) {
+    if (error instanceof WebSearchPersistenceError || error instanceof WebSearchError) throw error;
+    throw new WebSearchPersistenceError();
+  } finally { await handle?.close().catch(() => {}); }
+}
+
+export async function searchDeepSeek(config: PaConfig, query: string, signal?: AbortSignal, fetcher: typeof fetch = fetch): Promise<WebSearchResult> {
+  const search = (config as PaConfig & { search?: WebSearchConfig }).search;
+  if (!search) throw new WebSearchError('网页搜索配置缺失。');
+  validateConfig(search);
+  if (!config.apiKey) throw new WebSearchError('DeepSeek API 密钥未配置。');
+  if (typeof query !== 'string' || !query.trim() || query.length > 500) throw new WebSearchError('网页搜索问题必须为 1 至 500 个字符。');
+  if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+
+  let lock: Awaited<ReturnType<typeof acquireConversationLock>>;
+  try { lock = await acquireConversationLock(config.dataDir, `web-search-budget:${search.budgetId}`); }
+  catch (error) {
+    if (error instanceof Error && (('code' in error && error.code === 'EEXIST') || error.message.startsWith('此会话已被锁定：'))) {
+      throw new WebSearchError('网页搜索预算当前被其他请求占用。');
+    }
+    throw new WebSearchPersistenceError();
+  }
+
+  try {
+    if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+    return await withLedger(lock.directory, async (entries, append) => {
+      if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+      const reservations = entries.filter(entry => entry.type === 'reserved');
+      if (entries.some(entry => entry.type === 'completed' && entry.usage.serverSearches !== null
+        && entry.usage.serverSearches > search.maxUses)) {
+        throw new WebSearchError('服务端上次报告的搜索次数超过请求上限，此预算已暂停。');
+      }
+      if (reservations.length >= search.maxRequests) throw new WebSearchError('网页搜索请求预算已用尽。');
+      const attemptId = randomUUID();
+      await append({ type: 'reserved', attemptId, timestamp: new Date().toISOString(), query });
+      const body = {
+        model: search.model, max_tokens: search.maxTokens,
+        messages: [{ role: 'user', content: [{ type: 'text', text: `Perform a web search for the query: ${query}` }] }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: search.maxUses }],
+      };
+      await saveEvidence(lock.directory, attemptId, 'request', { endpoint: ENDPOINT, body }, config.apiKey);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), search.timeoutMs);
+      const onAbort = () => controller.abort();
+      signal?.addEventListener('abort', onAbort, { once: true });
+      try {
+        if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+        let response: Response;
+        try {
+          response = await fetcher(ENDPOINT, {
+            method: 'POST', redirect: 'error',
+            headers: {
+              'Content-Type': 'application/json', 'x-api-key': config.apiKey,
+              Authorization: `Bearer ${config.apiKey}`, 'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+        } catch {
+          throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求失败或超时。');
+        }
+        if (controller.signal.aborted) {
+          throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求超时。');
+        }
+        if (!response.ok) throw new WebSearchError(`DeepSeek 网页搜索请求失败（HTTP ${response.status}）。`);
+        const rawResponse = await readBoundedBody(response);
+        await saveEvidence(lock.directory, attemptId, 'response', rawResponse, config.apiKey);
+        const safeResponse: unknown = JSON.parse(JSON.stringify(rawResponse).split(config.apiKey).join('[redacted]'));
+        const parsed = parseSearchResponse(safeResponse, search.maxResults);
+        if (controller.signal.aborted) {
+          throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求超时。');
+        }
+        const result: WebSearchResult = { ...parsed, attemptId };
+        await append({ type: 'completed', attemptId, timestamp: new Date().toISOString(), sources: result.sources,
+          usage: result.usage, ...(result.summary ? { summary: result.summary } : {}) });
+        return result;
+      } catch (error) {
+        if (error instanceof WebSearchPersistenceError) throw error;
+        const safeReason = error instanceof WebSearchError ? error.message.slice(0, 200) : '网页搜索处理失败。';
+        await append({ type: 'failed', attemptId, timestamp: new Date().toISOString(), reason: safeReason });
+        if (error instanceof WebSearchError) throw error;
+        throw new WebSearchError('DeepSeek 网页搜索处理失败。');
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+      }
+    });
+  } finally { await lock.release(); }
+}

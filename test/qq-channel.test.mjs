@@ -47,6 +47,25 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 const response = (status, body) => ({ status, json: async () => body });
 const tokenBody = { access_token: 'test-token', expires_in: 3600 };
 
+test('harness parts use consecutive msg_seq and preformatted code content is not formatted twice', async () => {
+  const ctx = setup();
+  const starting = ctx.channel.start();
+  await tick();
+  ctx.socket.message({ op: 10, d: { heartbeat_interval: 10_000 } });
+  await tick();
+  ctx.socket.message({ op: 0, t: 'READY', d: { session_id: 's', user: { id: 'bot' } } });
+  await starting;
+  const route = { channel: 'qq', accountId: '123', roomId: 'group', roomType: 'group' };
+  for (let partIndex = 0; partIndex < 3; partIndex++) {
+    assert.equal((await ctx.channel.send({ route, replyToMessageId: 'input', text: '# code **literal**', plainText: true, partIndex })).status, 'sent');
+  }
+  const posts = ctx.calls.filter(call => call.url.endsWith('/messages')).map(call => JSON.parse(call.init.body));
+  assert.deepEqual(posts.map(body => body.msg_seq), [1, 2, 3]);
+  assert.ok(posts.every(body => body.content === '# code **literal**' && body.msg_id === 'input'));
+  assert.equal((await ctx.channel.send({ route, replyToMessageId: 'input', text: 'invalid', partIndex: 5 })).status, 'rejected');
+  ctx.channel.close();
+});
+
 function setup({ postResponse = response(200, { id: 'sent-id' }), postError, timers = new FakeTimers(), sockets = [new FakeSocket()] } = {}) {
   let socketCount = 0;
   const calls = [];

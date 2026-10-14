@@ -49,7 +49,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const OWNER_ID = 'local-owner';
 const PROFILE_FIELDS = ['diet', 'preferred_name', 'interests', 'reply_style'];
 
@@ -289,6 +289,24 @@ export class ConversationStore {
       if (version < 5) this.migratePersonalMemories();
       if (version < 6) migrateAutoMemory(this.db);
       if (version < 7) migrateSelfProfile(this.db);
+      if (version < 8) this.db.exec(`
+        CREATE UNIQUE INDEX delivery_conversation_identity ON deliveries(id, conversation_id);
+        CREATE TABLE delivery_parts (
+          delivery_id TEXT NOT NULL,
+          conversation_id TEXT NOT NULL,
+          part_index INTEGER NOT NULL CHECK (part_index >= 0),
+          text TEXT NOT NULL CHECK (length(text) > 0),
+          status TEXT NOT NULL CHECK (status IN ('pending', 'sending', 'sent', 'uncertain', 'rejected')),
+          external_message_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (delivery_id, part_index),
+          FOREIGN KEY (delivery_id, conversation_id) REFERENCES deliveries(id, conversation_id),
+          CHECK (status <> 'sent' OR (external_message_id IS NOT NULL AND length(external_message_id) > 0))
+        );
+        CREATE INDEX delivery_parts_external_id ON delivery_parts(conversation_id, external_message_id)
+          WHERE status = 'sent';
+      `);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
@@ -795,8 +813,11 @@ export class ConversationStore {
       LEFT JOIN actors a ON a.id = m.actor_id
       WHERE m.conversation_id = ? AND ((m.role = 'user' AND m.external_event_id = ?)
         OR (m.role = 'assistant' AND EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id
-          AND d.conversation_id = m.conversation_id AND d.status = 'sent' AND d.external_message_id = ?)))
-      LIMIT 2`).all(conversationId, externalId, externalId);
+          AND d.conversation_id = m.conversation_id AND d.status = 'sent' AND d.external_message_id = ?
+          AND NOT EXISTS (SELECT 1 FROM delivery_parts p WHERE p.delivery_id = d.id))))
+      UNION ALL SELECT p.delivery_id || ':' || p.part_index, 'assistant', p.text, NULL FROM delivery_parts p
+        WHERE p.conversation_id = ? AND p.status = 'sent' AND p.external_message_id = ?
+      LIMIT 2`).all(conversationId, externalId, externalId, conversationId, externalId);
     if (rows.length !== 1) return undefined;
     const row = rows[0]!;
     return { role: row.role as 'user' | 'assistant', text: String(row.text),
@@ -940,30 +961,88 @@ export class ConversationStore {
   }
 
   markPendingUncertain(conversationId: string): void {
-    this.db.prepare("UPDATE deliveries SET status = 'uncertain', updated_at = ? WHERE conversation_id = ? AND status = 'pending'")
-      .run(now(), conversationId);
+    this.memoryTransaction(() => {
+      this.db.prepare("UPDATE delivery_parts SET status = 'uncertain', updated_at = ? WHERE conversation_id = ? AND status IN ('pending', 'sending')")
+        .run(now(), conversationId);
+      this.db.prepare("UPDATE deliveries SET status = 'uncertain', updated_at = ? WHERE conversation_id = ? AND status = 'pending'")
+        .run(now(), conversationId);
+    });
   }
 
-  ackDelivery(deliveryId: string, status: 'sent' | 'uncertain', externalMessageId?: string): void {
+  prepareDeliveryParts(conversationId: string, deliveryId: string, texts: readonly string[]): void {
+    if (!texts.length || texts.some(text => typeof text !== 'string' || !text.length)) throw new Error('投递分段不能为空。');
+    this.memoryTransaction(() => {
+      const parent = this.db.prepare('SELECT status FROM deliveries WHERE id = ? AND conversation_id = ?').get(deliveryId, conversationId);
+      if (!parent || parent.status !== 'pending') throw new Error('投递不存在或不能继续。');
+      if (this.db.prepare('SELECT 1 FROM delivery_parts WHERE delivery_id = ?').get(deliveryId)) throw new Error('投递分段已经保存，不能覆盖或重发。');
+      const createdAt = now();
+      texts.forEach((text, index) => this.db.prepare(`INSERT INTO delivery_parts
+        (delivery_id, conversation_id, part_index, text, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'pending', ?, ?)`).run(deliveryId, conversationId, index, text, createdAt, createdAt));
+    });
+  }
+
+  beginDeliveryPart(conversationId: string, deliveryId: string, partIndex: number): void {
+    if (!Number.isSafeInteger(partIndex) || partIndex < 0) throw new Error('投递分段序号无效。');
+    this.memoryTransaction(() => {
+      const parent = this.db.prepare('SELECT status FROM deliveries WHERE id = ? AND conversation_id = ?').get(deliveryId, conversationId);
+      const part = this.db.prepare('SELECT status FROM delivery_parts WHERE delivery_id = ? AND conversation_id = ? AND part_index = ?')
+        .get(deliveryId, conversationId, partIndex);
+      const previous = Number(this.db.prepare("SELECT count(*) n FROM delivery_parts WHERE delivery_id = ? AND part_index < ? AND status = 'sent'")
+        .get(deliveryId, partIndex)?.n ?? 0);
+      if (!parent || parent.status !== 'pending' || !part || part.status !== 'pending' || previous !== partIndex) {
+        throw new Error('投递分段不存在、已经尝试或前一段尚未确认。');
+      }
+      this.db.prepare("UPDATE delivery_parts SET status = 'sending', updated_at = ? WHERE delivery_id = ? AND part_index = ?")
+        .run(now(), deliveryId, partIndex);
+    });
+  }
+
+  ackDeliveryPart(conversationId: string, deliveryId: string, partIndex: number,
+    status: 'sent' | 'uncertain' | 'rejected', externalMessageId?: string): void {
+    if (!['sent', 'uncertain', 'rejected'].includes(status) || !Number.isSafeInteger(partIndex) || partIndex < 0
+      || (status === 'sent' && (typeof externalMessageId !== 'string' || !externalMessageId))) throw new Error('投递分段回执无效。');
+    this.memoryTransaction(() => {
+      const parent = this.db.prepare('SELECT status FROM deliveries WHERE id = ? AND conversation_id = ?').get(deliveryId, conversationId);
+      const part = this.db.prepare('SELECT status, external_message_id FROM delivery_parts WHERE delivery_id = ? AND conversation_id = ? AND part_index = ?')
+        .get(deliveryId, conversationId, partIndex);
+      if (!parent || !part) throw new Error('投递分段不存在。');
+      if (part.status === status && part.external_message_id === (externalMessageId ?? null)) return;
+      if (parent.status !== 'pending' || part.status !== 'sending') throw new Error('投递分段不能修改或继续。');
+      this.db.prepare('UPDATE delivery_parts SET status = ?, external_message_id = ?, updated_at = ? WHERE delivery_id = ? AND part_index = ?')
+        .run(status, externalMessageId ?? null, now(), deliveryId, partIndex);
+      if (status !== 'sent') {
+        this.ackDelivery(deliveryId, 'uncertain', undefined, conversationId);
+      } else if (!this.db.prepare("SELECT 1 FROM delivery_parts WHERE delivery_id = ? AND status <> 'sent'").get(deliveryId)) {
+        // Preserve the legacy parent ID for a one-part response only.
+        const count = Number(this.db.prepare('SELECT count(*) n FROM delivery_parts WHERE delivery_id = ?').get(deliveryId)?.n);
+        this.db.prepare("UPDATE deliveries SET status = 'sent', external_message_id = ?, updated_at = ? WHERE id = ?")
+          .run(count === 1 ? externalMessageId! : null, now(), deliveryId);
+      }
+    });
+  }
+
+  ackDelivery(deliveryId: string, status: 'sent' | 'uncertain', externalMessageId?: string, conversationId?: string): void {
     if (externalMessageId !== undefined && (typeof externalMessageId !== 'string' || !externalMessageId)) throw new Error('渠道投递消息 ID 无效。');
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    this.memoryTransaction(() => {
       const row = this.db.prepare('SELECT status, external_message_id FROM deliveries WHERE id = ?').get(deliveryId) as Record<string, unknown> | undefined;
-      if (!row) throw new Error('投递记录不存在。');
+      if (!row || (conversationId !== undefined && !this.db.prepare('SELECT 1 FROM deliveries WHERE id = ? AND conversation_id = ?')
+        .get(deliveryId, conversationId))) throw new Error('投递记录不存在。');
+      if (status === 'sent' && this.db.prepare('SELECT 1 FROM delivery_parts WHERE delivery_id = ?').get(deliveryId)) {
+        throw new Error('分段投递必须逐段确认。');
+      }
       const current = String(row.status);
       if (current === status) {
         if (externalMessageId !== undefined && row.external_message_id !== null && row.external_message_id !== externalMessageId) throw new Error('投递已绑定到不同的渠道消息 ID。');
         if (externalMessageId !== undefined && row.external_message_id === null) this.db.prepare('UPDATE deliveries SET external_message_id = ?, updated_at = ? WHERE id = ?')
           .run(externalMessageId, now(), deliveryId);
-        this.db.exec('COMMIT'); return;
+        return;
       }
       if (current !== 'pending') throw new Error(`不能将 ${current} 投递改为 ${status}。`);
       this.db.prepare('UPDATE deliveries SET status = ?, external_message_id = ?, updated_at = ? WHERE id = ?').run(status, externalMessageId ?? null, now(), deliveryId);
-      this.db.exec('COMMIT');
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+      if (status === 'uncertain') this.db.prepare("UPDATE delivery_parts SET status = 'uncertain', updated_at = ? WHERE delivery_id = ? AND status IN ('pending', 'sending')")
+        .run(now(), deliveryId);
+    });
   }
 
   listMessages(conversationKey: string, limit: number, route?: ChannelRoute): MessageRecord[] {

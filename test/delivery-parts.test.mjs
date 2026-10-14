@@ -1,0 +1,104 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import test from 'node:test';
+import { ConversationStore } from '../dist/store.js';
+
+function fixture(t) {
+  const directory = mkdtempSync(join(tmpdir(), 'pa-delivery-parts-'));
+  const path = join(directory, 'pa.sqlite');
+  let store = new ConversationStore(path);
+  const route = { channel: 'qq', accountId: 'account', roomType: 'group', roomId: 'group' };
+  const a = store.ensureConversation('A', '/pi/a.jsonl', route);
+  const b = store.ensureConversation('B', '/pi/b.jsonl', { ...route, roomId: 'other' });
+  const run = store.beginRun(a.id, '问题', 'p', 'm', [], { eventId: 'input', senderId: 'member', modelInputText: '问题' });
+  const delivery = store.completeRun(run.id, '**完整原文**', undefined, undefined);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  return { directory, path, get store() { return store; }, a, b, deliveryId: delivery.deliveryId,
+    reopen() { store.close(); store = new ConversationStore(path); return store; },
+    inspect(operation) { const db = new DatabaseSync(path); try { return operation(db); } finally { db.close(); } } };
+}
+
+test('parts are ordered, exact confirmed text can be quoted under an uncertain parent, and state survives restart', t => {
+  const f = fixture(t);
+  f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['第一段', '第二段', '第三段']);
+  assert.throws(() => f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['替换']), /不能覆盖/);
+  assert.throws(() => f.store.beginDeliveryPart(f.b.id, f.deliveryId, 0), /不存在/);
+  assert.throws(() => f.store.beginDeliveryPart(f.a.id, f.deliveryId, 1), /前一段/);
+  f.store.beginDeliveryPart(f.a.id, f.deliveryId, 0);
+  assert.throws(() => f.store.beginDeliveryPart(f.a.id, f.deliveryId, 0), /已经尝试/);
+  f.store.ackDeliveryPart(f.a.id, f.deliveryId, 0, 'sent', 'external-0');
+  assert.throws(() => f.store.ackDelivery(f.deliveryId, 'sent', 'fake'), /逐段确认/);
+  f.store.beginDeliveryPart(f.a.id, f.deliveryId, 1);
+  f.store.ackDeliveryPart(f.a.id, f.deliveryId, 1, 'uncertain');
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'external-0'), { role: 'assistant', text: '第一段' });
+  assert.equal(f.store.quotedMessage(f.b.id, 'external-0'), undefined);
+  f.reopen().markPendingUncertain(f.a.id);
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'external-0'), { role: 'assistant', text: '第一段' });
+  assert.throws(() => f.store.beginDeliveryPart(f.a.id, f.deliveryId, 2), /不存在/);
+  assert.equal(f.inspect(db => db.prepare('SELECT text FROM messages WHERE role=?').get('assistant').text), '**完整原文**');
+});
+
+test('pending and sending become uncertain on restart, while acknowledged parts are preserved', t => {
+  const f = fixture(t);
+  f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['A', 'B', 'C']);
+  f.store.beginDeliveryPart(f.a.id, f.deliveryId, 0);
+  f.store.ackDeliveryPart(f.a.id, f.deliveryId, 0, 'sent', 'known');
+  f.store.beginDeliveryPart(f.a.id, f.deliveryId, 1);
+  f.reopen().markPendingUncertain(f.a.id);
+  assert.deepEqual(f.inspect(db => db.prepare('SELECT status FROM delivery_parts ORDER BY part_index').all().map(p => p.status)),
+    ['sent', 'uncertain', 'uncertain']);
+  assert.equal(f.inspect(db => db.prepare('SELECT status FROM deliveries').get().status), 'uncertain');
+});
+
+test('last receipt and parent completion are atomic; cross-conversation child references fail', t => {
+  const f = fixture(t);
+  f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['实际文本']);
+  f.store.beginDeliveryPart(f.a.id, f.deliveryId, 0);
+  f.inspect(db => db.exec(`CREATE TRIGGER prevent_completion BEFORE UPDATE OF status ON deliveries
+    WHEN NEW.status='sent' BEGIN SELECT RAISE(ABORT, 'fixture parent failure'); END;`));
+  assert.throws(() => f.store.ackDeliveryPart(f.a.id, f.deliveryId, 0, 'sent', 'real-id'), /fixture parent failure/);
+  assert.equal(f.inspect(db => db.prepare('SELECT status FROM delivery_parts').get().status), 'sending');
+  assert.equal(f.inspect(db => db.prepare('SELECT status FROM deliveries').get().status), 'pending');
+  f.inspect(db => db.exec('DROP TRIGGER prevent_completion'));
+  f.store.ackDeliveryPart(f.a.id, f.deliveryId, 0, 'sent', 'real-id');
+  // Parent and child have the same ID, but quote resolution returns the actual transmitted part once.
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'real-id'), { role: 'assistant', text: '实际文本' });
+  f.inspect(db => {
+    db.exec('PRAGMA foreign_keys=ON');
+    assert.throws(() => db.prepare(`INSERT INTO delivery_parts VALUES (?, ?, 1, 'foreign', 'pending', NULL, 'now', 'now')`)
+      .run(f.deliveryId, f.b.id), /FOREIGN KEY/);
+  });
+});
+
+test('part creation rolls back all prior inserts when a later child fails', t => {
+  const f = fixture(t);
+  f.inspect(db => db.exec(`CREATE TRIGGER prevent_second BEFORE INSERT ON delivery_parts
+    WHEN NEW.part_index=1 BEGIN SELECT RAISE(ABORT, 'fixture insertion failure'); END;`));
+  assert.throws(() => f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['A', 'B']), /fixture insertion failure/);
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM delivery_parts').get().n), 0);
+  assert.equal(f.inspect(db => db.prepare('SELECT status FROM deliveries').get().status), 'pending');
+});
+
+test('v7 migration creates a consistent backup and preserves legacy replies and unrelated records', t => {
+  const f = fixture(t);
+  f.store.ackDelivery(f.deliveryId, 'sent', 'legacy-id');
+  f.store.close();
+  f.inspect(db => {
+    db.exec('DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity; PRAGMA user_version=7;');
+  });
+  f.reopen();
+  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 8);
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'legacy-id'), { role: 'assistant', text: '**完整原文**' });
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM messages').get().n), 2);
+  const backups = readdirSync(f.directory).filter(name => name.includes('.v7.') && name.endsWith('.bak'));
+  assert.equal(backups.length, 1);
+  const backup = new DatabaseSync(join(f.directory, backups[0]));
+  try {
+    assert.equal(backup.prepare('PRAGMA user_version').get().user_version, 7);
+    assert.equal(backup.prepare('SELECT count(*) n FROM messages').get().n, 2);
+    assert.deepEqual(backup.prepare('PRAGMA foreign_key_check').all(), []);
+  } finally { backup.close(); }
+});

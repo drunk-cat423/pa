@@ -42,6 +42,8 @@ export interface OutboundMessage {
   route: ChannelRoute;
   replyToMessageId: string;
   text: string;
+  partIndex?: number;
+  plainText?: boolean;
 }
 
 export type DeliveryResult =

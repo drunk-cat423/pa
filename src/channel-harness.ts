@@ -9,6 +9,8 @@ import { executeMemoryRequest, parseMemoryRequest, safeProfileError } from './me
 import { MemoryError } from './memory-types.js';
 import type { MemorySource } from './memory-service.js';
 import type { MemoryProvider } from './memory-provider.js';
+import { toPlainText } from './plain-text.js';
+import { appendReferenceUrls, splitReply, QQ_PASSIVE_REPLY_LIMIT } from './reply-chunks.js';
 
 export interface ChannelTransport {
   send(message: OutboundMessage): Promise<DeliveryResult>;
@@ -130,26 +132,39 @@ export class ChannelHarness {
   }
 
   private async deliver(conversation: RecordedConversation, message: InboundMessage,
-    reply: { text: string; deliveryId: string }): Promise<HarnessResult> {
-    if (this.closed) {
+    reply: { text: string; deliveryId: string; referenceUrls?: readonly string[] }): Promise<HarnessResult> {
+    const qq = message.route.channel === 'qq';
+    const text = appendReferenceUrls(qq ? toPlainText(reply.text) : reply.text, reply.referenceUrls);
+    const parts = splitReply(text, 500, qq ? QQ_PASSIVE_REPLY_LIMIT : undefined);
+    if (!parts.length) {
       conversation.acknowledge(reply.deliveryId, 'uncertain');
-      return 'uncertain';
+      return 'rejected';
     }
-    let delivery: DeliveryResult;
-    try {
-      delivery = await this.transport.send({ route: message.route, replyToMessageId: message.eventId, text: reply.text });
-    } catch { delivery = { status: 'uncertain' }; }
-    // A rejected send also remains unconfirmed in the existing delivery state model.
-    conversation.acknowledge(reply.deliveryId, delivery.status === 'sent' ? 'sent' : 'uncertain',
-      delivery.status === 'sent' ? delivery.externalMessageId : undefined);
-    return delivery.status;
+    conversation.prepareDeliveryParts(reply.deliveryId, parts);
+    for (const [partIndex, part] of parts.entries()) {
+      if (this.closed || Date.now() - Date.parse(message.sentAt) > 240_000) {
+        conversation.acknowledge(reply.deliveryId, 'uncertain');
+        return 'uncertain';
+      }
+      conversation.beginDeliveryPart(reply.deliveryId, partIndex);
+      let delivery: DeliveryResult;
+      try {
+        delivery = await this.transport.send({ route: message.route, replyToMessageId: message.eventId,
+          text: part, partIndex, ...(qq ? { plainText: true } : {}) });
+      } catch { delivery = { status: 'uncertain' }; }
+      conversation.acknowledgePart(reply.deliveryId, partIndex, delivery.status,
+        delivery.status === 'sent' ? delivery.externalMessageId : undefined);
+      if (delivery.status !== 'sent') return delivery.status;
+    }
+    return 'sent';
   }
 
   async close(): Promise<void> {
     this.closed = true;
-    // Closing active conversations aborts their model requests while preserving the run.
-    await Promise.all([...this.conversations.values()].map(conversation => conversation.close()));
+    // Abort model work first; in-flight transport receipts still need the open store.
+    await Promise.all([...this.conversations.values()].map(conversation => conversation.abort()));
     await Promise.allSettled(this.opening.values());
+    await Promise.all([...this.conversations.values()].map(conversation => conversation.abort()));
     await Promise.allSettled(this.queues.values());
     // An open operation already in progress may have completed after the first close pass.
     await Promise.all([...this.conversations.values()].map(conversation => conversation.close()));
