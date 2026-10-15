@@ -83,7 +83,7 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.match(requests[0].messages.find(message => message.role === 'system').content, /不展示来源网址或列参考链接/);
   assert.equal(requests[0].tool_choice, 'auto');
   assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['update_profile', 'read_history', 'answer_in_depth', 'web_search', 'web_fetch']);
-  assert.equal(nativeSearch[0].messages[0].content[0].text, 'Perform a web search for the query: 与 example.com search-source 有关的资料');
+  assert.ok(nativeSearch[0].messages[0].content[0].text.endsWith('Perform a web search for the query: 与 example.com search-source 有关的资料'));
   assert.deepEqual(requests[0].tools.find(tool => tool.function.name === 'web_search').function.parameters.required, ['query']);
   assert.match(JSON.stringify(requests[1].messages.filter(message => message.role === 'tool')), /SUMMARY_MARKER/);
   assert.match(JSON.stringify(requests[1].messages.filter(message => message.role === 'tool')), /https:\/\/example.com\/search-source/);

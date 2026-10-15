@@ -48,6 +48,8 @@ test('调用固定 DeepSeek 搜索端点，提取原生来源、引用片段和 
   assert.match(payload.messages[0].content[0].text, /最新官方文档/);
   assert.deepEqual(result.sources.map(source => source.url), ['https://example.com/article', 'https://example.com/second']);
   assert.equal(result.sources[0].snippet.length, 1000);
+  assert.equal(result.sources[0].pageUpdatedAt, '2 days ago');
+  assert.equal(result.sources[0].publishedAt, undefined);
   assert.deepEqual(result.usage, { inputTokens: 10, outputTokens: 4, cacheReadTokens: 3,
     cacheWriteTokens: 2, totalTokens: 19, serverSearches: 2 });
   const dirs = await readdir(config.dataDir);
@@ -56,6 +58,56 @@ test('调用固定 DeepSeek 搜索端点，提取原生来源、引用片段和 
   assert.deepEqual(events.map(event => event.type), ['reserved', 'completed']);
   assert.equal(events[0].query, '最新官方文档');
   assert.deepEqual(events[1].sources, result.sources);
+});
+
+test('搜索助手接收当前北京时间及软日期范围，不添加未支持的API过滤参数', async t => {
+  const config = await fixture(t);
+  const before = Date.now();
+  let payload, calls = 0;
+  const range = { startDate: '2026-10-08', endDate: '2026-10-15' };
+  const output = await searchDeepSeek(config, '近期更新', undefined, async (_url, options) => {
+    calls++; payload = JSON.parse(options.body); return nativeResponse();
+  }, range);
+  const context = JSON.parse(payload.messages[0].content[0].text.split('\n')[1]);
+  assert.equal(context.timeZone, 'Asia/Shanghai');
+  assert.ok(Date.parse(context.currentTime) >= Math.floor(before / 1000) * 1000);
+  assert.ok(Date.parse(context.currentTime) <= Date.now());
+  assert.deepEqual(context.requestedDateRange, range);
+  assert.deepEqual(Object.keys(payload).sort(), ['max_tokens', 'messages', 'model', 'tools']);
+  assert.deepEqual(Object.keys(payload.tools[0]).sort(), ['max_uses', 'name', 'type']);
+  assert.deepEqual(output.freshness, { searchedAt: context.currentTime, timeZone: 'Asia/Shanghai',
+    requestedDateRange: range, dateFilterApplied: false, verification: 'unverified' });
+  assert.equal(calls, 1);
+});
+
+test('非法日期与倒置范围在预算预留前拒绝，无范围不擅自限制历史搜索', async t => {
+  const config = await fixture(t);
+  let calls = 0;
+  const fetcher = async () => { calls++; return nativeResponse(); };
+  for (const range of [{ startDate: '2026-02-29' }, { endDate: '2026-10-32' },
+    { startDate: 'today' }, { startDate: '2026-10-16', endDate: '2026-10-15' }]) {
+    await assert.rejects(searchDeepSeek(config, '历史', undefined, fetcher, range), WebSearchError);
+  }
+  assert.equal(calls, 0);
+  assert.deepEqual(await readdir(config.dataDir), []);
+  const result = await searchDeepSeek(config, '历史', undefined, fetcher);
+  assert.equal(result.freshness.requestedDateRange, null);
+  assert.equal(result.freshness.verification, 'unverified');
+  const leap = await searchDeepSeek(config, '闰年', undefined, fetcher, { startDate: '2024-02-29' });
+  assert.deepEqual(leap.freshness.requestedDateRange, { startDate: '2024-02-29' });
+});
+
+test('旧publishedAt账本仍计入原有预算，不会因日期字段修正重置调用上限', async t => {
+  const config = await fixture(t);
+  config.search.maxRequests = 1;
+  await searchDeepSeek(config, '历史调用', undefined, async () => nativeResponse());
+  const directory = join(config.dataDir, createHash('sha256').update('web-search-budget:test-budget').digest('hex'));
+  const path = join(directory, 'search-attempts.jsonl');
+  const events = (await readFile(path, 'utf8')).trim().split('\n').map(JSON.parse);
+  events[1].sources[0].publishedAt = events[1].sources[0].pageUpdatedAt;
+  delete events[1].sources[0].pageUpdatedAt;
+  await writeFile(path, events.map(event => JSON.stringify(event)).join('\n') + '\n');
+  await assert.rejects(searchDeepSeek(config, '继续', undefined, async () => { throw Error('must not dispatch'); }), /预算已用尽/);
 });
 
 test('摘录按同一页面关联：忽略URL锚点但不合并不同查询参数，不采信生成回答', () => {

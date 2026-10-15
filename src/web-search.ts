@@ -4,6 +4,7 @@ import { lstat, open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { PaConfig } from './config.js';
 import { acquireConversationLock } from './conversation-lock.js';
+import { requestTimeData } from './request-time.js';
 
 export interface WebSearchConfig {
   enabled: boolean;
@@ -18,9 +19,21 @@ export interface WebSearchConfig {
   maxResults: number;
 }
 
+export interface SearchDateRange {
+  startDate?: string;
+  endDate?: string;
+}
+
 export interface WebSearchResult {
   summary?: string;
-  sources: { url: string; title?: string; snippet?: string; publishedAt?: string }[];
+  sources: { url: string; title?: string; snippet?: string; pageUpdatedAt?: string }[];
+  freshness: {
+    searchedAt: string;
+    timeZone: string;
+    requestedDateRange: SearchDateRange | null;
+    dateFilterApplied: false;
+    verification: 'unverified';
+  };
   usage: {
     inputTokens: number | null;
     outputTokens: number | null;
@@ -103,7 +116,7 @@ function nonNegativeIntegerOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
-export function parseSearchResponse(body: unknown, maxResults: number): Omit<WebSearchResult, 'attemptId'> {
+export function parseSearchResponse(body: unknown, maxResults: number): Omit<WebSearchResult, 'attemptId' | 'freshness'> {
   const root = record(body);
   if (!root || !Array.isArray(root.content)) throw new WebSearchError('DeepSeek 网页搜索响应格式无效。');
   const sourcesByUrl = new Map<string, WebSearchResult['sources'][number]>();
@@ -132,7 +145,7 @@ export function parseSearchResponse(body: unknown, maxResults: number): Omit<Web
           sourcesByUrl.set(canonicalUrl, {
             url: canonicalUrl,
             ...(boundedString(item.title, 200) ? { title: boundedString(item.title, 200)! } : {}),
-            ...(boundedString(item.page_age, 200) ? { publishedAt: boundedString(item.page_age, 200)! } : {}),
+            ...(boundedString(item.page_age, 200) ? { pageUpdatedAt: boundedString(item.page_age, 200)! } : {}),
           });
         }
       }
@@ -237,10 +250,13 @@ function validateLedgerLine(value: unknown): LedgerEvent {
   const validSources = Array.isArray(entry.sources) && entry.sources.every(sourceRaw => {
     const source = record(sourceRaw);
     return source && typeof source.url === 'string' && source.url.length <= 2048
-      && Object.keys(source).every(key => ['url', 'title', 'snippet', 'publishedAt'].includes(key))
+      // Old persisted ledgers called page_age publishedAt. Read them for budget
+      // accounting only; new results never expose that misleading field.
+      && Object.keys(source).every(key => ['url', 'title', 'snippet', 'publishedAt', 'pageUpdatedAt'].includes(key))
       && (source.title === undefined || typeof source.title === 'string' && source.title.length <= 200)
       && (source.snippet === undefined || typeof source.snippet === 'string' && source.snippet.length <= 1000)
-      && (source.publishedAt === undefined || typeof source.publishedAt === 'string' && source.publishedAt.length <= 200);
+      && (source.publishedAt === undefined || typeof source.publishedAt === 'string' && source.publishedAt.length <= 200)
+      && (source.pageUpdatedAt === undefined || typeof source.pageUpdatedAt === 'string' && source.pageUpdatedAt.length <= 200);
   });
   if (entry.type === 'completed' && exactKeys('type', 'attemptId', 'timestamp', 'sources', 'usage',
     ...('summary' in entry ? ['summary'] : [])) && validSources && validUsage
@@ -299,12 +315,32 @@ async function withLedger<T>(directory: string, callback: (entries: LedgerEvent[
   } finally { await handle?.close().catch(() => {}); }
 }
 
-export async function searchDeepSeek(config: PaConfig, query: string, signal?: AbortSignal, fetcher: typeof fetch = fetch): Promise<WebSearchResult> {
+function checkedDateRange(range?: SearchDateRange): SearchDateRange | null {
+  if (!range) return null;
+  const result: SearchDateRange = {};
+  for (const key of ['startDate', 'endDate'] as const) {
+    const value = range[key];
+    if (value === undefined) continue;
+    const timestamp = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? Date.parse(value) : NaN;
+    if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString().slice(0, 10) !== value) {
+      throw new WebSearchError('搜索日期范围必须是有效的 YYYY-MM-DD 日期。');
+    }
+    result[key] = value;
+  }
+  if (result.startDate && result.endDate && result.startDate > result.endDate) {
+    throw new WebSearchError('搜索开始日期不能晚于结束日期。');
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+export async function searchDeepSeek(config: PaConfig, query: string, signal?: AbortSignal, fetcher: typeof fetch = fetch,
+  dateRange?: SearchDateRange): Promise<WebSearchResult> {
   const search = (config as PaConfig & { search?: WebSearchConfig }).search;
   if (!search) throw new WebSearchError('网页搜索配置缺失。');
   validateConfig(search);
   if (!config.apiKey) throw new WebSearchError('DeepSeek API 密钥未配置。');
   if (typeof query !== 'string' || !query.trim() || query.length > 500) throw new WebSearchError('网页搜索问题必须为 1 至 500 个字符。');
+  const requestedDateRange = checkedDateRange(dateRange);
   if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
 
   let lock: Awaited<ReturnType<typeof acquireConversationLock>>;
@@ -330,9 +366,14 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
       }
       const attemptId = randomUUID();
       await append({ type: 'reserved', attemptId, timestamp: new Date().toISOString(), query });
+      const clock = requestTimeData();
       const body = {
         model: search.model, max_tokens: search.maxTokens,
-        messages: [{ role: 'user', content: [{ type: 'text', text: `Perform a web search for the query: ${query}` }] }],
+        messages: [{ role: 'user', content: [{ type: 'text', text:
+          '[搜索时间环境｜由harness提供]\n' + JSON.stringify({ ...clock, requestedDateRange }) + '\n'
+          + '以上日期范围按北京时间理解，是查询约束提示，不是搜索引擎已执行的过滤。将相对时间明确为日期；核对来源发布时间、页面更新时间和事件发生日期，三者不能混同。'
+          + '优先与目标日期范围相关的原始来源，实时可用性应查当前状态页；没有日期证据或结果过时时明确说明，不能称为最新。\n'
+          + `Perform a web search for the query: ${query}` }] }],
         tools: [{ type: 'web_search_20250305', name: 'web_search',
           ...(search.maxUses > 0 ? { max_uses: search.maxUses } : {}) }],
       };
@@ -368,7 +409,10 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
         if (controller.signal.aborted) {
           throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求超时。');
         }
-        const result: WebSearchResult = { ...parsed, attemptId };
+        const result: WebSearchResult = { ...parsed, attemptId, freshness: {
+          searchedAt: clock.currentTime, timeZone: clock.timeZone, requestedDateRange,
+          dateFilterApplied: false, verification: 'unverified',
+        } };
         await append({ type: 'completed', attemptId, timestamp: new Date().toISOString(), sources: result.sources,
           usage: result.usage, ...(result.summary ? { summary: result.summary } : {}) });
         return result;

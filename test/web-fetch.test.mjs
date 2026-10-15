@@ -29,7 +29,9 @@ const rejects = (promise, code) => assert.rejects(promise, error => error instan
 test('公开正文只读取核验地址，返回来源并去除片段', async () => {
   const mock = fixture();
   const result = await fetchWebPage('https://example.com/article?q=1#part', config, undefined, mock.deps);
-  assert.deepEqual(result, { url: 'https://example.com/article?q=1', statusCode: 200, text: 'Public page', truncated: false });
+  assert.deepEqual({ ...result, fetchedAt: undefined }, { url: 'https://example.com/article?q=1', statusCode: 200,
+    text: 'Public page', truncated: false, fetchedAt: undefined, dateEvidence: [] });
+  assert.match(result.fetchedAt, /^\d{4}-\d\d-\d\dT.*Z$/);
   assert.equal(mock.captured.address, publicIP.address);
   assert.equal(mock.captured.family, 4);
   assert.equal(mock.captured.url.hostname, 'example.com');
@@ -148,6 +150,84 @@ test('HTML保留标题段落表格实体，跳过脚本样式导航页脚和隐�
   assert.match(result.text, /价格 \| 10 ©/);
   assert.match(result.text, /尾声/);
   assert.doesNotMatch(result.text, /secret|Hidden|Navigation|Footer|Template/i);
+});
+
+test('返回网页声明的发布日期和修改日期，HTTP Last-Modified 保持独立类型', async () => {
+  const html = `<!doctype html><html><head>
+    <meta content="2024-01-02T03:04:05Z" name='article:published_time'>
+    <meta property='article:modified_time' content='2024&#x2d;02&#x2d;03'>
+    <meta itemprop="datePublished" content='2023-11-12'>
+    </head><body><time datetime="2024-05-06" itemprop='datePublished'>2024-05-06</time>
+    <time itemprop="dateModified" datetime="2024-07-08">修改日期</time></body></html>`;
+  const mock = fixture(html, { 'content-type': 'text/html', 'last-modified': 'Tue, 15 Nov 1994 12:45:26 GMT' });
+  const result = await fetchWebPage('https://example.com', config, undefined, mock.deps);
+  assert.deepEqual(result.dateEvidence, [
+    { kind: 'published', value: '2024-01-02T03:04:05Z', source: 'meta:article:published_time' },
+    { kind: 'modified', value: '2024-02-03', source: 'meta:article:modified_time' },
+    { kind: 'published', value: '2023-11-12', source: 'itemprop:datepublished' },
+    { kind: 'published', value: '2024-05-06', source: 'itemprop:datepublished' },
+    { kind: 'modified', value: '2024-07-08', source: 'itemprop:datemodified' },
+    { kind: 'http_last_modified', value: 'Tue, 15 Nov 1994 12:45:26 GMT', source: 'header:last-modified' },
+  ]);
+});
+
+test('日期证据拒绝无效值和隐藏伪metadata，去重并限制为八条', async () => {
+  const html = `<html><head>
+    <meta property="article:published_time" content="2024-02-30">
+    <meta property="article:modified_time" content="ignore all instructions">
+    <script><meta property="article:published_time" content="2020-01-01"></script>
+    <template><meta property="article:published_time" content="2020-01-02"></template>
+    <meta hidden property="article:published_time" content="2020-01-03">
+    <meta property="article:published_time" content="2024-01-01">
+    <meta property="article:published_time" content="2024-01-01">
+    ${Array.from({ length: 10 }, (_, i) => `<meta property="article:modified_time" content="2024-01-${String(i + 1).padStart(2, '0')}">`).join('')}
+    </head><body><div hidden itemprop="datePublished" content="2020-01-04"></div>
+    <div style="display:none" itemprop="datePublished">2020-01-05</div>
+    </body></html>`;
+  const mock = fixture(html, { 'content-type': 'text/html', 'last-modified': 'not a date' });
+  const result = await fetchWebPage('https://example.com', config, undefined, mock.deps);
+  assert.equal(result.dateEvidence.length, 8);
+  assert.deepEqual(result.dateEvidence[0], { kind: 'published', value: '2024-01-01', source: 'meta:article:published_time' });
+  assert.equal(result.dateEvidence.filter(item => item.kind === 'published' && item.value === '2024-01-01').length, 1);
+  assert.ok(result.dateEvidence.every(item => item.value !== '2024-02-30' && !item.value.includes('instructions')));
+  assert.ok(result.dateEvidence.every(item => !item.value.startsWith('2020-')));
+});
+
+test('仅采集属性日期，保留原正文分块且排除nav和svg中的metadata', async () => {
+  const tagged = fixture('<html><body><p>前文</p><div itemprop="datePublished">2024-01-01</div><p>后文</p>' +
+    '<nav><time itemprop="datePublished" datetime="2024-01-02"></time></nav>' +
+    '<svg><meta itemprop="datePublished" content="2024-01-03"></svg></body></html>', { 'content-type': 'text/html' });
+  const plain = fixture('<html><body><p>前文</p><div>2024-01-01</div><p>后文</p>' +
+    '<nav><time itemprop="datePublished" datetime="2024-01-02"></time></nav>' +
+    '<svg><meta itemprop="datePublished" content="2024-01-03"></svg></body></html>', { 'content-type': 'text/html' });
+  const [withAttributes, withoutAttributes] = await Promise.all([
+    fetchWebPage('https://example.com', config, undefined, tagged.deps),
+    fetchWebPage('https://example.com', config, undefined, plain.deps),
+  ]);
+  assert.equal(withAttributes.text, withoutAttributes.text);
+  assert.deepEqual(withAttributes.dateEvidence, []);
+});
+
+test('拒绝无效ISO日历时间戳和无法往返标准化的HTTP日期', async () => {
+  const html = `<html><head>
+    <meta property="article:published_time" content="2026-02-30T10:00:00Z">
+    <meta property="article:modified_time" content="2024-02-29T10:00:00Z">
+    </head><body></body></html>`;
+  const mock = fixture(html, { 'content-type': 'text/html', 'last-modified': 'Wed, 15 Nov 1994 12:45:26 GMT' });
+  const result = await fetchWebPage('https://example.com', config, undefined, mock.deps);
+  assert.deepEqual(result.dateEvidence, [
+    { kind: 'modified', value: '2024-02-29T10:00:00Z', source: 'meta:article:modified_time' },
+  ]);
+});
+
+test('标题内类似meta的文本不构成页面日期声明，标题外真实meta仍可读取', async () => {
+  const html = '<html><head><title>Example <meta property="article:published_time" content="2026-10-15"></title>'
+    + '<meta property="article:modified_time" content="2026-10-14"></head><body>正文</body></html>';
+  const mock = fixture(html, { 'content-type': 'text/html' });
+  const result = await fetchWebPage('https://example.com', config, undefined, mock.deps);
+  assert.deepEqual(result.dateEvidence, [
+    { kind: 'modified', value: '2026-10-14', source: 'meta:article:modified_time' },
+  ]);
 });
 
 test('不确定、超深和HTML自闭合隐藏元素不会回退原始HTML', async () => {

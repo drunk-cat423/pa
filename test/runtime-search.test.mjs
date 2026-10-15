@@ -17,7 +17,7 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const search = requests.length === 1 && body.tools?.some(tool => tool.function.name === 'web_search');
     const delta = search ? { role: 'assistant', tool_calls: [{ index: 0, id: 'call_search_1', type: 'function',
-      function: { name: 'web_search', arguments: JSON.stringify({ query: 'SQLite 官方文档' }) } }] } : { role: 'assistant', content: '检索完成' };
+      function: { name: 'web_search', arguments: JSON.stringify({ query: 'SQLite 官方文档', startDate: '2026-10-08', endDate: '2026-10-15' }) } }] } : { role: 'assistant', content: '检索完成' };
     for (const choices of [[{ index: 0, delta, finish_reason: null }],
       [{ index: 0, delta: {}, finish_reason: search ? 'tool_calls' : 'stop' }]]) {
       response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1,
@@ -58,7 +58,14 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
   assert.equal(requests[1].tool_choice, 'auto');
   assert.equal(requests[1].messages.filter(message => message.role === 'tool').length, 1);
   assert.equal(nativeQueries.length, 1);
-  assert.equal(nativeQueries[0].messages[0].content[0].text, 'Perform a web search for the query: SQLite 官方文档');
+  const searchInput = nativeQueries[0].messages[0].content[0].text;
+  assert.ok(searchInput.endsWith('Perform a web search for the query: SQLite 官方文档'));
+  assert.deepEqual(JSON.parse(searchInput.split('\n')[1]).requestedDateRange, { startDate: '2026-10-08', endDate: '2026-10-15' });
+  const toolText = requests[1].messages.find(message => message.role === 'tool').content;
+  const toolOutput = JSON.parse(toolText.slice(toolText.lastIndexOf('\n') + 1));
+  assert.deepEqual(toolOutput.freshness.requestedDateRange, { startDate: '2026-10-08', endDate: '2026-10-15' });
+  assert.equal(toolOutput.freshness.dateFilterApplied, false);
+  assert.equal(toolOutput.freshness.verification, 'unverified');
   assert.doesNotMatch(JSON.stringify(nativeQueries), /senderId|roomMemories|personId/);
   conversation.acknowledge(reply.deliveryId, 'sent', 'reply1');
   const db = new DatabaseSync(join(dataDir, 'pa.sqlite'), { readOnly: true });

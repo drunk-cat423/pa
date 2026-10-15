@@ -23,6 +23,12 @@ export interface WebFetchDeps {
   transport?: (request: { url: URL; address: string; family: number; signal: AbortSignal }) => Promise<WebFetchResponse>;
 }
 
+export interface WebFetchDateEvidence {
+  kind: 'published' | 'modified' | 'http_last_modified';
+  value: string;
+  source: string;
+}
+
 type Failure = 'disabled' | 'config' | 'url' | 'address' | 'redirect' | 'status' | 'type' | 'size' | 'html' | 'encoding' | 'cancelled' | 'timeout' | 'network';
 const messages: Record<Failure, string> = {
   disabled: '网页读取未启用。', config: '网页读取配置无效。', url: '网页地址无效或不受支持。',
@@ -172,9 +178,10 @@ const skipTags = new Set('script style head nav footer template noscript svg mat
 const rawTags = new Set(['script', 'style']);
 const blockTags = new Set('address article aside blockquote div dl dt dd fieldset figcaption figure h1 h2 h3 h4 h5 h6 header hr li main ol p pre section table tbody thead tfoot tr ul'.split(' '));
 
-function htmlText(html: string): string {
-  const stack: { tag: string; hidden: boolean }[] = [];
+function htmlText(html: string): { text: string; dateEvidence: WebFetchDateEvidence[] } {
+  const stack: { tag: string; hidden: boolean; metadataHidden: boolean }[] = [];
   const output: string[] = [];
+  const dateCandidates: { kind: WebFetchDateEvidence['kind']; value: string; source: string }[] = [];
   let index = 0;
   let tokens = 0;
   const visible = () => !stack.at(-1)?.hidden;
@@ -257,35 +264,88 @@ function htmlText(html: string): string {
       attrs.set(name, decodeEntities(item[2] ?? item[3] ?? item[4] ?? ''));
       offset = attribute.lastIndex;
     }
-    const hidden = !visible() || skipTags.has(tag) || attrs.has('hidden') || attrs.has('inert')
+    const ownMetadataHidden = attrs.has('hidden') || attrs.has('inert')
       || attrs.get('aria-hidden')?.trim().toLowerCase() === 'true'
       || /(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse))(?:\s*!important)?\s*(?:;|$)/i.test(attrs.get('style') ?? '');
+    const metadataHidden = stack.some(entry => entry.metadataHidden) || ownMetadataHidden
+      || tag === 'title' || (skipTags.has(tag) && tag !== 'head');
+    const hidden = !visible() || skipTags.has(tag) || ownMetadataHidden;
+    const inHead = stack.some(entry => entry.tag === 'head');
+    const inBody = stack.some(entry => entry.tag === 'body');
+    const attributeValue = attrs.get('content') ?? attrs.get('datetime');
+    if (!metadataHidden && inHead && tag === 'meta') {
+      const property = (attrs.get('property') ?? attrs.get('name') ?? '').trim().toLowerCase();
+      if ((property === 'article:published_time' || property === 'article:modified_time') && attributeValue !== undefined) {
+        dateCandidates.push({ kind: property.endsWith('published_time') ? 'published' : 'modified', value: attributeValue, source: `meta:${property}` });
+      }
+    }
+    const itemprop = (attrs.get('itemprop') ?? '').trim().toLowerCase().split(/\s+/);
+    const property = itemprop.find(value => value === 'datepublished' || value === 'datemodified');
+    if (!metadataHidden && (inHead || inBody) && property) {
+      const kind: 'published' | 'modified' = property === 'datepublished' ? 'published' : 'modified';
+      if (attributeValue !== undefined) dateCandidates.push({ kind, value: attributeValue, source: `itemprop:${property}` });
+    }
     if (!hidden) {
       boundary(tag);
       if (tag === 'br') output.push('\n');
       if (tag === 'td' || tag === 'th') output.push(' | ');
     }
     if (!voidTags.has(tag) && !selfClosing) {
-      stack.push({ tag, hidden });
+      stack.push({ tag, hidden, metadataHidden });
       if (stack.length > 64) fail('html');
     }
   }
   if (stack.some(entry => !['html', 'body', 'p', 'li', 'dt', 'dd', 'td', 'th', 'tr', 'tbody', 'thead', 'tfoot'].includes(entry.tag))) fail('html');
-  return output.join('');
+  return { text: output.join(''), dateEvidence: normalizeDateEvidence(dateCandidates) };
 }
 
-function textContent(bytes: Uint8Array, contentType: string): string {
+function normalizeDateEvidence(candidates: { kind: WebFetchDateEvidence['kind']; value: string; source: string }[]): WebFetchDateEvidence[] {
+  const result: WebFetchDateEvidence[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const value = candidate.value.trim().replace(/\s+/g, ' ');
+    if (value.length > 128 || !(candidate.kind === 'http_last_modified' ? isHttpDate(value) : isDateValue(value))
+      || /(?:ignore|instruction|system\s*prompt|assistant|developer|忽略|指令|提示词)/i.test(value)) continue;
+    const key = `${candidate.kind}\0${value.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ kind: candidate.kind, value, source: candidate.source });
+    if (result.length === 8) break;
+  }
+  return result;
+}
+
+function isDateValue(value: string): boolean {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return isCalendarDate(value);
+  if (/^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/i.test(value))
+    return isCalendarDate(value.slice(0, 10)) && Number.isFinite(Date.parse(value));
+  return false;
+}
+
+function isCalendarDate(value: string): boolean {
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function isHttpDate(value: string): boolean {
+  if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/i.test(value)) return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toUTCString().toLowerCase() === value.toLowerCase();
+}
+
+function textContent(bytes: Uint8Array, contentType: string): { text: string; dateEvidence: WebFetchDateEvidence[] } {
   const charset = /;\s*charset\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
   const encoding = (charset?.[1] ?? charset?.[2] ?? 'utf-8').toLowerCase();
   if (!['utf-8', 'utf8', 'us-ascii'].includes(encoding)) fail('encoding');
   let text: string;
   try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { return fail('encoding'); }
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) fail('type');
-  if (contentType.split(';')[0]?.trim().toLowerCase() !== 'text/plain') text = htmlText(text);
-  return text.replace(/[\t \u00a0]+/g, ' ').replace(/ *\r?\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  const parsed = contentType.split(';')[0]?.trim().toLowerCase() !== 'text/plain'
+    ? htmlText(text) : { text, dateEvidence: [] as WebFetchDateEvidence[] };
+  return { text: parsed.text.replace(/[\t \u00a0]+/g, ' ').replace(/ *\r?\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim(), dateEvidence: parsed.dateEvidence };
 }
 
-export async function fetchWebPage(url: string, config: WebFetchConfig, signal?: AbortSignal, deps: WebFetchDeps = {}): Promise<{ url: string; statusCode: number; text: string; truncated: boolean }> {
+export async function fetchWebPage(url: string, config: WebFetchConfig, signal?: AbortSignal, deps: WebFetchDeps = {}): Promise<{ url: string; statusCode: number; text: string; truncated: boolean; fetchedAt: string; dateEvidence: WebFetchDateEvidence[] }> {
   if (!config || config.enabled !== true) fail('disabled');
   if (config.publicDns !== undefined && typeof config.publicDns !== 'boolean') fail('config');
   for (const [value, limit] of [[config.timeoutMs, 120_000], [config.maxResponseBytes, 10 * 1024 * 1024], [config.maxTextChars, 100_000]] as const) {
@@ -328,10 +388,14 @@ export async function fetchWebPage(url: string, config: WebFetchConfig, signal?:
       if (size > config.maxResponseBytes) fail('size');
       chunks.push(chunk.value);
     }
-    const text = textContent(Buffer.concat(chunks, size), type);
+    const content = textContent(Buffer.concat(chunks, size), type);
+    const dateEvidence = [...content.dateEvidence];
+    const lastModified = response.headers['last-modified'];
+    if (typeof lastModified === 'string') dateEvidence.push({ kind: 'http_last_modified', value: lastModified, source: 'header:last-modified' });
+    const normalizedDateEvidence = normalizeDateEvidence(dateEvidence);
     if (Date.now() >= deadline) fail('timeout');
-    const excerpt = text.slice(0, config.maxTextChars).replace(/[\ud800-\udbff]$/, '');
-    return { url: parsed.href, statusCode: response.statusCode, text: excerpt, truncated: text.length > excerpt.length };
+    const excerpt = content.text.slice(0, config.maxTextChars).replace(/[\ud800-\udbff]$/, '');
+    return { url: parsed.href, statusCode: response.statusCode, text: excerpt, truncated: content.text.length > excerpt.length, fetchedAt: new Date().toISOString(), dateEvidence: normalizedDateEvidence };
   } catch (error) {
     if (controller.signal.aborted) throw controller.signal.reason;
     if (error instanceof WebFetchError) throw error;
