@@ -31,7 +31,7 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
   globalThis.fetch = async (url, options) => {
     if (String(url) !== 'https://api.deepseek.com/anthropic/v1/messages') return originalFetch(url, options);
     const body = JSON.parse(options.body); nativeQueries.push(body);
-    return new Response(JSON.stringify({ content: [{ type: 'web_search_tool_result', content: [
+    return new Response(JSON.stringify({ stop_reason: 'max_tokens', content: [{ type: 'web_search_tool_result', content: [
       { type: 'web_search_result', url: 'https://sqlite.org/', title: 'SQLite' },
     ] }, { type: 'text', citations: [{ url: 'https://sqlite.org/', cited_text: 'SQLite official documentation' }] }],
     usage: { input_tokens: 100, output_tokens: 10 } }));
@@ -66,6 +66,8 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
   assert.deepEqual(toolOutput.freshness.requestedDateRange, { startDate: '2026-10-08', endDate: '2026-10-15' });
   assert.equal(toolOutput.freshness.dateFilterApplied, false);
   assert.equal(toolOutput.freshness.verification, 'unverified');
+  assert.equal(toolOutput.summaryTruncated, true);
+  assert.match(toolText, /不推断遗漏部分或声称列表完整/);
   assert.doesNotMatch(JSON.stringify(nativeQueries), /senderId|roomMemories|personId/);
   conversation.acknowledge(reply.deliveryId, 'sent', 'reply1');
   const db = new DatabaseSync(join(dataDir, 'pa.sqlite'), { readOnly: true });

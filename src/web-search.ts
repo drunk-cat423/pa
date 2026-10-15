@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { PaConfig } from './config.js';
 import { acquireConversationLock } from './conversation-lock.js';
 import { requestTimeData } from './request-time.js';
+import { outputLengthGuidance } from './output-length.js';
 
 export interface WebSearchConfig {
   enabled: boolean;
@@ -26,6 +27,7 @@ export interface SearchDateRange {
 
 export interface WebSearchResult {
   summary?: string;
+  truncated: boolean;
   sources: { url: string; title?: string; snippet?: string; pageUpdatedAt?: string }[];
   freshness: {
     searchedAt: string;
@@ -182,11 +184,13 @@ export function parseSearchResponse(body: unknown, maxResults: number): Omit<Web
       for (const source of sources) if (snippet && !source.snippet) source.snippet = snippet;
     }
   }
-  const summary = root.content.flatMap(block => {
+  const fullSummary = root.content.flatMap(block => {
     const value = record(block);
     return value?.type === 'text' && typeof value.text === 'string' ? [value.text] : [];
-  }).join('\n\n').trim().slice(0, 8000);
+  }).join('\n\n').trim();
+  const summary = fullSummary.slice(0, 8000);
   return { sources: [...sourcesByUrl.values()].slice(0, maxResults), usage: validUsage(root.usage),
+    truncated: root.stop_reason === 'max_tokens' || summary.length < fullSummary.length,
     ...(summary ? { summary } : {}) };
 }
 
@@ -373,6 +377,8 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
           '[搜索时间环境｜由harness提供]\n' + JSON.stringify({ ...clock, requestedDateRange }) + '\n'
           + '以上日期范围按北京时间理解，是查询约束提示，不是搜索引擎已执行的过滤。将相对时间明确为日期；核对来源发布时间、页面更新时间和事件发生日期，三者不能混同。'
           + '优先与目标日期范围相关的原始来源，实时可用性应查当前状态页；没有日期证据或结果过时时明确说明，不能称为最新。\n'
+          + outputLengthGuidance(search.maxTokens)
+          + '只输出简短的最终检索结论，最多列出5条关键信息并保留对应来源与日期；不预告搜索步骤、不重复问题、不列冗长的检索过程。\n'
           + `Perform a web search for the query: ${query}` }] }],
         tools: [{ type: 'web_search_20250305', name: 'web_search',
           ...(search.maxUses > 0 ? { max_uses: search.maxUses } : {}) }],

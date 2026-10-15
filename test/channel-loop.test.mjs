@@ -136,6 +136,7 @@ test('专业切换先持久化并发送进度，最终答案继续使用下一�
   assert.deepEqual(f.sent.map(m => m.partIndex), [0, 1]);
   assert.equal(f.requests.length, 2);
   assert.ok(JSON.stringify(f.requests[1].messages[0]).includes('专业回答模式'));
+  assert.ok(JSON.stringify(f.requests[1].messages[0]).includes('不超过307 tokens'));
   const db = f.db();
   try { assert.equal(db.prepare('SELECT status,external_message_id FROM run_progress').get().status, 'sent');
     assert.equal(db.prepare('SELECT count(*) n FROM agent_runs').get().n, 1);

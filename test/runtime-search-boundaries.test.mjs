@@ -8,7 +8,7 @@ import test from 'node:test';
 import { openRecordedConversation, PersistenceError } from '../dist/conversation.js';
 import { openConversation } from '../dist/runtime.js';
 
-async function harness(t, { repeatedToolCall = false } = {}) {
+async function harness(t, { repeatedToolCall = false, truncatedSummary = false } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-search-boundary-'));
   const requests = [];
   let callId = 0;
@@ -42,9 +42,9 @@ async function harness(t, { repeatedToolCall = false } = {}) {
       type: 'web_search_result', url: `https://example.test/${index}`, title: `Source ${index}`,
     }));
     const citations = results.map(item => ({ url: item.url, cited_text: 's'.repeat(1000) }));
-    return new Response(JSON.stringify({ content: [
+    return new Response(JSON.stringify({ stop_reason: truncatedSummary ? 'max_tokens' : 'end_turn', content: [
       { type: 'web_search_tool_result', content: results },
-      { type: 'text', citations },
+      { type: 'text', citations, ...(truncatedSummary ? { text: 'SUMMARY'.repeat(1000) } : {}) },
     ], usage: { input_tokens: 100, output_tokens: 10 } }));
   };
 
@@ -80,6 +80,17 @@ test('模型忽略 tool_choice none 时最多发两次主请求、调用一次�
   assert.equal(fixture.requests[0].tool_choice, 'auto');
   assert.equal(fixture.requests[1].tool_choice, 'none');
   assert.equal(fixture.nativeCalls.length, 1);
+});
+
+test('长工具结果裁剪仍先保留摘要截断标记，不自动续搜或追加收尾调用', async t => {
+  const fixture = await harness(t, { truncatedSummary: true });
+  const conversation = await fixture.open('truncated-summary');
+  await conversation.prompt('查询', { eventId: 'event', senderId: 'user', modelInputText: '查询' });
+  assert.equal(fixture.nativeCalls.length, 1);
+  assert.equal(fixture.requests.length, 2);
+  const content = fixture.requests[1].messages.find(message => message.role === 'tool').content;
+  assert.match(content, /"summaryTruncated":true/);
+  assert.match(content, /\[工具结果已截断\]/);
 });
 
 test('搜索结果使最终主模型请求超过上下文时不再发送第二个主模型请求', async t => {

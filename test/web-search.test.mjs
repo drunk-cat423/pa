@@ -46,6 +46,10 @@ test('调用固定 DeepSeek 搜索端点，提取原生来源、引用片段和 
   assert.equal(payload.tools[0].max_uses, 2);
   assert.equal(payload.max_tokens, 400);
   assert.match(payload.messages[0].content[0].text, /最新官方文档/);
+  assert.match(payload.messages[0].content[0].text, /硬上限为400 tokens/);
+  assert.match(payload.messages[0].content[0].text, /不超过240 tokens/);
+  assert.match(payload.messages[0].content[0].text, /只输出简短的最终检索结论/);
+  assert.equal(result.truncated, false);
   assert.deepEqual(result.sources.map(source => source.url), ['https://example.com/article', 'https://example.com/second']);
   assert.equal(result.sources[0].snippet.length, 1000);
   assert.equal(result.sources[0].pageUpdatedAt, '2 days ago');
@@ -130,6 +134,26 @@ test('摘录按同一页面关联：忽略URL锚点但不合并不同查询参�
   assert.equal(result.sources[2].snippet, undefined);
   assert.equal(result.sources[3].snippet, undefined);
   assert.equal(result.sources.length, 4);
+});
+
+test('保留搜索摘要的真实截断状态，不追加模型调用', async t => {
+  const config = await fixture(t);
+  let calls = 0;
+  const result = await searchDeepSeek(config, '查询', undefined, async () => {
+    calls++;
+    return new Response(JSON.stringify({ stop_reason: 'max_tokens', content: [
+      { type: 'web_search_tool_result', content: [{ type: 'web_search_result', url: 'https://example.com' }] },
+      { type: 'text', text: '未完成的摘要' },
+    ] }));
+  });
+  assert.equal(result.truncated, true);
+  assert.equal(result.summary, '未完成的摘要');
+  assert.equal(calls, 1);
+  const localCut = parseSearchResponse({ stop_reason: 'end_turn', content: [
+    { type: 'web_search_tool_result', content: [] }, { type: 'text', text: 'a'.repeat(8001) },
+  ] }, 5);
+  assert.equal(localCut.summary.length, 8000);
+  assert.equal(localCut.truncated, true);
 });
 
 test('原始请求/响应本地留证不含认证头或key，保留未解析字段用于离线诊断', async t => {

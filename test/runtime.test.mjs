@@ -204,6 +204,21 @@ test('输出 length 截断不触发自动压缩或追加模型请求', async (t)
   assert.equal(f.requests.length, 1);
 });
 
+test('正文留出收尾余量且不提升API硬上限，同一配置的固定提示保持稳定', async t => {
+  const f = await fixture(t, { maxOutputTokens: 4096 });
+  const runtime = await f.conversation('output-length');
+  await runtime.prompt('one');
+  await runtime.prompt('two');
+  const system = f.requests[0].body.messages.find(message => message.role === 'system').content;
+  assert.match(system, /硬上限为4096 tokens/);
+  assert.match(system, /不超过2457 tokens/);
+  assert.match(system, /确有尚未展开的细节时/);
+  assert.match(system, /不要每次机械附加邀请/);
+  assert.equal(f.requests[1].body.messages.find(message => message.role === 'system').content, system);
+  assert.equal(f.requests[0].body.max_tokens ?? f.requests[0].body.max_completion_tokens, 4096);
+  assert.equal(f.requests.length, 2);
+});
+
 test('文件锁阻止其他进程修改同一会话，其他会话仍可打开', async (t) => {
   const f = await fixture(t);
   const runtime = await f.conversation('locked');

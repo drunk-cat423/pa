@@ -242,7 +242,9 @@ test('群聊容量批次整理保留原文且不创建群摘要', async t => {
 });
 
 test('超大画像按预算选择完整事实，普通短问题仍可回答且数据库保留完整画像', async t => {
-  const f = await fixture(t, undefined, { contextWindow: 7000 }); const h = f.harness();
+  // Leave room for fixed response guidance while keeping the profile far larger than the window.
+  const contextWindow = 8000;
+  const f = await fixture(t, undefined, { contextWindow }); const h = f.harness();
   await h.handle(f.message('seed', '首次发言'));
   const db = f.db();
   try {
@@ -251,7 +253,14 @@ test('超大画像按预算选择完整事实，普通短问题仍可回答且�
     db.prepare('UPDATE persons SET revision=1 WHERE id=?').run(person);
     db.prepare('INSERT INTO person_profile_revisions VALUES (?,1,?,NULL,?)').run(person, JSON.stringify(facts), new Date().toISOString());
     assert.equal(await h.handle(f.message('short', '你好', { mentioned: true })), 'sent');
-    assert.ok(JSON.stringify(f.requests.at(-1)).length < 7000);
+    assert.ok(Buffer.byteLength(JSON.stringify(f.requests.at(-1)), 'utf8') < contextWindow);
+    const background = f.requests.at(-1).messages.find(message => JSON.stringify(message.content).includes('已保存的背景数据'));
+    const content = typeof background?.content === 'string' ? background.content : background?.content.map(part => part.text ?? '').join('');
+    assert.ok(content);
+    const payload = JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
+    const selected = payload.profiles.flatMap(profile => profile.archived);
+    assert.ok(selected.length > 0 && selected.length < facts.length);
+    assert.ok(selected.every(fact => facts.some(original => original.content === fact.content)));
     assert.equal(JSON.parse(db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=1').get(person).facts_json).length, 100);
   } finally { db.close(); }
 });
