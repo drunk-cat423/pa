@@ -9,6 +9,7 @@ import test from 'node:test';
 import { openRecordedConversation, PersistenceError } from '../dist/conversation.js';
 import { openConversation } from '../dist/runtime.js';
 import { ConversationStore } from '../dist/store.js';
+import { requestText } from './fixtures/request-text.mjs';
 
 async function waitFor(predicate) {
   const deadline = Date.now() + 3000;
@@ -30,7 +31,7 @@ async function fixture(t, overrides = {}) {
       const body = JSON.parse(Buffer.concat(chunks).toString());
       requests.push(body);
       const asText = content => typeof content === 'string' ? content : content.map(part => part.text ?? '').join('');
-      const users = body.messages.filter(message => message.role === 'user').map(message => asText(message.content));
+      const users = body.messages.filter(message => message.role === 'user').map(message => requestText(asText(message.content)));
       const text = users.at(-1);
       onRequest?.(text);
       if (text === 'error') {

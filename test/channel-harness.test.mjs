@@ -180,7 +180,7 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
 function currentInput(request) {
   const user = request.body.messages.filter(message => message.role === 'user').at(-1);
   const text = typeof user.content === 'string' ? user.content : user.content.map(part => part.text).join('');
-  return { text, input: JSON.parse(text.slice(text.indexOf('{'))) };
+  return { text, input: JSON.parse(text.slice(text.lastIndexOf('\n') + 1)) };
 }
 
 test('引用平台正文或当前房间精确ID，引用指令不写记忆；原文和实际模型输入分别持久化', async t => {

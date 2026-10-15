@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
+import { requestText } from './fixtures/request-text.mjs';
 
 test('实际 CLI 多轮输入、管理指令、退出及重启恢复', { timeout: 60000 }, async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-cli-'));
@@ -17,7 +18,7 @@ test('实际 CLI 多轮输入、管理指令、退出及重启恢复', { timeout
     requests.push(body);
     const users = body.messages.filter(message => message.role === 'user')
       .map(message => typeof message.content === 'string' ? message.content : message.content.map(part => part.text ?? '').join(''));
-    const answer = users.join('|');
+    const answer = users.map(requestText).join('|');
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     response.write(`data: ${JSON.stringify({ id: 'cli-test', object: 'chat.completion.chunk', model: 'cli-model', choices: [{ index: 0, delta: { role: 'assistant', content: answer }, finish_reason: null }] })}\n\n`);
     response.write(`data: ${JSON.stringify({ id: 'cli-test', object: 'chat.completion.chunk', model: 'cli-model', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);

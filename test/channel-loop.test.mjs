@@ -40,8 +40,9 @@ async function fixture(t) {
     maxOutputTokens: 512, timeoutMs: 5000 };
   const route = { channel: 'qq', accountId: 'bot', roomType: 'group', roomId: 'one' };
   const other = { ...route, roomId: 'two' };
+  const privateRoute = { ...route, roomType: 'private', roomId: 'alice' };
   const db = () => new DatabaseSync(join(config.dataDir, 'pa.sqlite'), { readOnly: true });
-  const h = new ChannelHarness(config, [route, other], { send: async message => {
+  const h = new ChannelHarness(config, [route, other, privateRoute], { send: async message => {
     const check = db();
     try {
       if (message.text === '我仔细分析一下。') assert.equal(check.prepare('SELECT status FROM run_progress').get().status, 'sending');
@@ -52,8 +53,40 @@ async function fixture(t) {
     sentAt: new Date().toISOString(), ...extra });
   t.after(async () => { await h.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
     await rm(directory, { recursive: true, force: true }); });
-  return { h, db, message, requests, sent, plans, route, other, onRequest: cb => { onRequest = cb; } };
+  return { h, db, message, requests, sent, plans, route, other, privateRoute, onRequest: cb => { onRequest = cb; } };
 }
+
+test('群聊与私聊每轮刷新北京时间，固定系统前缀不变且原文不混入时钟', async t => {
+  const f = await fixture(t);
+  const realNow = Date.now.bind(Date);
+  let offset = 0;
+  t.mock.method(Date, 'now', () => realNow() + offset);
+  const userText = body => {
+    const content = body.messages.findLast(m => m.role === 'user').content;
+    return typeof content === 'string' ? content : content.map(b => b.text ?? '').join('');
+  };
+  const clock = body => JSON.parse(userText(body).split('\n')[1]);
+  const before = Date.now();
+  await f.h.handle(f.message('clock-group', '今天是几号？', { sentAt: new Date(before - 60000).toISOString() }));
+  const first = clock(f.requests[0]);
+  assert.equal(first.timeZone, 'Asia/Shanghai');
+  assert.ok(Date.parse(first.currentTime) >= Math.floor(before / 1000) * 1000);
+  assert.ok(Date.parse(first.currentTime) <= Date.now());
+  offset = 60000;
+  await f.h.handle(f.message('clock-private', '现在几点？', { route: f.privateRoute, mentioned: false }));
+  assert.ok(Date.parse(clock(f.requests[1]).currentTime) - Date.parse(first.currentTime) >= 60000);
+  const fixed = body => body.messages.filter(m => m.role === 'system');
+  assert.ok(fixed(f.requests[0]).length > 0);
+  assert.deepEqual(fixed(f.requests[0]), fixed(f.requests[1]));
+  assert.ok(!JSON.stringify(fixed(f.requests[0])).includes('本轮时间环境'));
+  const db = f.db();
+  try {
+    const rows = db.prepare("SELECT text,model_input_text FROM messages WHERE role='user' ORDER BY ingest_seq").all();
+    assert.deepEqual(rows.map(row => row.text), ['今天是几号？', '现在几点？']);
+    assert.equal(rows[0].model_input_text, userText(f.requests[0]));
+    assert.equal(rows[1].model_input_text, userText(f.requests[1]));
+  } finally { db.close(); }
+});
 
 test('普通自然语言由Pi自主调用画像工具，无分类；pending下轮可用且不串人', async t => {
   const f = await fixture(t);

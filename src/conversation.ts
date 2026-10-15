@@ -9,6 +9,7 @@ import type { MemorySource } from './memory-service.js';
 import { BackgroundMemory } from './auto-memory.js';
 import type { MemoryProvider } from './memory-provider.js';
 import { selfProfileBudget } from './self-profile-store.js';
+import { requestTimeContext } from './request-time.js';
 
 export class PersistenceError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -392,7 +393,9 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
             return { content: MEMORY_PREFIX + JSON.stringify(payload), refs: usedRoom.map(record => ({ id: record.id, revision: record.revision })) };
           };
           const build = () => {
+            modelInput = inputExternal?.modelInputText ?? text;
             const recalled = buildMemories();
+            modelInput = requestTimeContext() + modelInput;
             const self = persist(() => openedStore.autoMemory.selfProfile.snapshot());
             const additions = [
               ...(inputExternal?.responseFormat === 'plain_text' ? [PLAIN_TEXT_GUIDANCE] : []),

@@ -11,6 +11,7 @@ import { openRecordedConversation, PersistenceError } from '../dist/conversation
 import { openMemory } from '../dist/memory.js';
 import { MemoryError } from '../dist/memory-types.js';
 import { ConversationStore } from '../dist/store.js';
+import { requestText } from './fixtures/request-text.mjs';
 
 const asText = content => typeof content === 'string' ? content : content.map(part => part.text ?? '').join('');
 
@@ -25,7 +26,7 @@ async function fixture(t) {
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
     requests.push(body);
-    const input = asText(body.messages.at(-1).content);
+    const input = requestText(asText(body.messages.at(-1).content));
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     if (input === 'hang') { response.flushHeaders(); return; }
     const answer = `answer:${input}`;
@@ -173,7 +174,7 @@ test('JSON转义计入8000字符预算，不截断单条，长chat原文仍可�
   const items = recalledItems(recalled);
   assert.ok(items.length > 0 && items.length < 8);
   assert.ok(items.every(item => item.content === original.get(item.id)));
-  assert.equal(asText(f.requests[0].messages.at(-1).content), input);
+  assert.equal(requestText(asText(f.requests[0].messages.at(-1).content)), input);
   assert.equal(conversation.history()[0].text, input);
 });
 
