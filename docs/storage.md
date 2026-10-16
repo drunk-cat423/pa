@@ -2,7 +2,11 @@
 
 SQLite pa.sqlite 保存权威原文、消息来源、运行和投递记录，以及记忆派生数据；Pi session.jsonl 保存模型上下文与审计条目。压缩仅改变活跃模型投影，原文保持完整。两者使用 run ID / Pi entry ID 对应，不能混合恢复不同时点的文件。
 
-## schema v15
+## schema v16
+
+v16增加 `auto_memory_job_retirements` 旁表，保存旧count任务退出执行队列的原因、时间及原输入/进度哈希。升级不自动退役任务。显式维护只允许在本会话首次滚动快照前，对无租约的queued/failed旧count任务执行；原任务行、成员、输入、进度、错误和已有搁置记录保持不变。已退役任务不能领取、重试或迟到提交，也不再形成deferred缺口。原文在新容量快照成功前继续完整注入；退役不推进检查点、不生成摘要、不调用模型。普通搁置任务仍保留原有缺口语义。
+
+## schema v15（历史升级）
 
 v15增加可见消息序列 `conversation_context_messages`、滚动摘要状态 `conversation_context_state`，以及容量任务快照 `auto_memory_context_jobs` / `auto_memory_context_job_messages`。真人入站和AI确认送达时追加上下文序号；AI生成但未确认送达不进入历史，晚送达只追加。旧可见消息一次性回填；旧群聊没有续聊摘要时保留完整历史，不能因Topic已整理而消失。
 
@@ -35,6 +39,7 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 | conversation_context_messages / conversation_context_state | 持久可见消息顺序、当前滚动摘要及摘要覆盖位置、连续检查点和版本 |
 | auto_memory_context_jobs / auto_memory_context_job_messages | 容量压缩的原摘要版本、固定可见边界和全部消息成员 |
 | auto_memory_jobs / auto_memory_job_messages | 固定任务成员、状态、租约、输入快照和子批次进度 |
+| auto_memory_job_retirements | 旧count执行任务的退役原因、时间、冻结输入/进度哈希；不表示原文已压缩 |
 | memory_topics / memory_topic_messages | Topic 正文、版本、hash 及全部原消息来源 |
 | person_fragments / person_fragment_messages | 人物片段、自述/转述/推断类型及消息来源 |
 | topic_embeddings | 历史向量数据保留；当前无读写或派发入口 |

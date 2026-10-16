@@ -1,4 +1,9 @@
+export function downgradeSchema15(db) {
+  db.exec('DROP TABLE IF EXISTS auto_memory_job_retirements;');
+}
+
 export function downgradeSchema14(db) {
+  downgradeSchema15(db);
   db.exec(`
     PRAGMA foreign_keys=OFF;
     DROP TRIGGER IF EXISTS context_inbound_insert;

@@ -290,8 +290,10 @@ export class AutoMemoryStore {
   private deferredContextIds(conversationId:string): Set<string> {
     return new Set(this.db.prepare(`SELECT message_id FROM auto_memory_job_messages jm
       JOIN auto_memory_jobs j ON j.id=jm.job_id JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=?
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)
       UNION SELECT message_id FROM auto_memory_context_job_messages jm
-      JOIN auto_memory_jobs j ON j.id=jm.job_id JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=?`)
+      JOIN auto_memory_jobs j ON j.id=jm.job_id JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=?
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)`)
       .all(conversationId,conversationId).map(row=>String(row.message_id)));
   }
   private reserveContextBatch(conversationId:string,beforeMessageId?:string): AutoMemoryJob | undefined {
@@ -363,11 +365,13 @@ export class AutoMemoryStore {
   }
   private nextPending(conversationId:string): Record<string,unknown> | undefined {
     return this.db.prepare(`SELECT j.* FROM auto_memory_jobs j WHERE j.conversation_id=? AND j.status<>'done'
-      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=j.id) ORDER BY j.rowid LIMIT 1`).get(conversationId);
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=j.id)
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id) ORDER BY j.rowid LIMIT 1`).get(conversationId);
   }
   private active(jobId:string,leaseToken:string): Record<string,unknown> {
     const row=this.db.prepare(`SELECT * FROM auto_memory_jobs WHERE id=? AND status='running' AND lease_token=? AND lease_until>?
-      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=auto_memory_jobs.id)`).get(jobId,leaseToken,Date.now());
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=auto_memory_jobs.id)
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=auto_memory_jobs.id)`).get(jobId,leaseToken,Date.now());
     if(!row) throw new Error('整理租约已失效。'); return row;
   }
   private messages(ids: readonly string[]): AutoMemoryMessage[] {
@@ -657,6 +661,7 @@ export class AutoMemoryStore {
   }
   retry(jobId:string): void {
     this.atomic(()=>{
+      if(this.db.prepare('SELECT job_id FROM auto_memory_job_retirements WHERE job_id=?').get(jobId)) throw new Error('已退役的整理任务不能重试。');
       if(this.db.prepare('SELECT job_id FROM auto_memory_job_deferrals WHERE job_id=?').get(jobId)) throw new Error('已搁置的整理任务不能重试。');
       if(this.db.prepare("UPDATE auto_memory_jobs SET status='queued',error=NULL WHERE id=? AND status='failed'").run(jobId).changes!==1) throw new Error('任务不处于失败状态。');
     });
@@ -664,6 +669,7 @@ export class AutoMemoryStore {
   defer(jobId:string,reason:string): void {
     if(typeof reason!=='string'||!reason.trim()||reason.length>4000) throw new Error('整理搁置原因无效。');
     this.atomic(()=>{
+      if(this.db.prepare('SELECT job_id FROM auto_memory_job_retirements WHERE job_id=?').get(jobId)) throw new Error('已退役的整理任务不能搁置。');
       const row=this.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(jobId);
       if(!row||row.status!=='failed'||row.lease_token!=null||row.lease_owner!=null||row.lease_until!=null) throw new Error('只能搁置无租约的失败整理任务。');
       const existing=this.db.prepare('SELECT reason FROM auto_memory_job_deferrals WHERE job_id=?').get(jobId);
@@ -675,9 +681,33 @@ export class AutoMemoryStore {
         .run(jobId,reason,timestamp(),row.input_json==null?null:hash(String(row.input_json)),row.progress_json==null?null:hash(String(row.progress_json)));
     });
   }
+  /** Retire only the legacy executor; the first rolling snapshot still owns all original messages. */
+  retireLegacyCountJobs(conversationId:string,reason:string): string[] {
+    if(typeof reason!=='string'||!reason.trim()||reason.length>4000) throw new Error('整理退役原因无效。');
+    return this.atomic(()=>{
+      if(!this.db.prepare('SELECT id FROM conversations WHERE id=?').get(conversationId)) throw new Error('会话不存在。');
+      const rows=this.db.prepare(`SELECT j.* FROM auto_memory_jobs j WHERE j.conversation_id=? AND j.reason='count' AND j.status<>'done'
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id) ORDER BY j.rowid`).all(conversationId);
+      if(!rows.length) return [];
+      if(rows.some(row=>!['queued','failed'].includes(String(row.status))||row.lease_token!=null||row.lease_owner!=null||row.lease_until!=null)
+        ||this.db.prepare("SELECT 1 FROM auto_memory_jobs WHERE conversation_id=? AND status='running'").get(conversationId))
+        throw new Error('旧 count 退役要求任务均为无租约的 queued/failed，且会话没有运行中的整理任务。');
+      const state=this.db.prepare('SELECT cursor,revision FROM conversation_context_state WHERE conversation_id=?').get(conversationId);
+      if((state&&(Number(state.cursor)!==0||Number(state.revision)!==0))
+        ||this.db.prepare(`SELECT 1 FROM auto_memory_context_jobs cj JOIN auto_memory_jobs j ON j.id=cj.job_id
+          WHERE j.conversation_id=?`).get(conversationId))
+        throw new Error('旧 count 只能在首次 rolling 快照创建前退役。');
+      const createdAt=timestamp();
+      for(const row of rows) this.db.prepare(`INSERT INTO auto_memory_job_retirements(job_id,reason,created_at,input_hash,progress_hash)
+        VALUES (?,?,?,?,?)`).run(String(row.id),reason,createdAt,row.input_json==null?null:hash(String(row.input_json)),
+          row.progress_json==null?null:hash(String(row.progress_json)));
+      return rows.map(row=>String(row.id));
+    });
+  }
   deferredRanges(conversationId:string): {startSeq:number;endSeq:number}[] {
     return this.db.prepare(`SELECT j.start_seq,j.end_seq FROM auto_memory_jobs j JOIN auto_memory_job_deferrals d ON d.job_id=j.id
-      WHERE j.conversation_id=? ORDER BY j.start_seq,j.rowid`).all(conversationId)
+      WHERE j.conversation_id=? AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)
+      ORDER BY j.start_seq,j.rowid`).all(conversationId)
       .map(row=>({startSeq:Number(row.start_seq),endSeq:Number(row.end_seq)}));
   }
   renewLease(jobId:string,leaseToken:string,leaseMs:number):void {
@@ -696,24 +726,28 @@ export class AutoMemoryStore {
     this.atomic(()=>{this.active(jobId,leaseToken);this.db.prepare('UPDATE auto_memory_jobs SET progress_json=NULL,input_json=NULL WHERE id=?').run(jobId);});
   }
   pendingConversations(): string[] {
-    return this.db.prepare("SELECT DISTINCT conversation_id FROM auto_memory_jobs WHERE status IN ('queued','running')").all().map(r=>String(r.conversation_id));
+    return this.db.prepare(`SELECT DISTINCT j.conversation_id FROM auto_memory_jobs j WHERE j.status IN ('queued','running')
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)`).all().map(r=>String(r.conversation_id));
   }
-  listJobs(limit=100): {id:string;conversationId:string;status:string;reason:string;attempts:number;error:string|null;deferred?:true;deferredReason?:string}[] {
+  listJobs(limit=100): {id:string;conversationId:string;status:string;reason:string;attempts:number;error:string|null;deferred?:true;deferredReason?:string;retired?:true;retiredReason?:string}[] {
     if(!Number.isSafeInteger(limit)||limit<1||limit>1000) throw new Error('任务查询数量无效。');
-    return this.db.prepare(`SELECT j.id,j.conversation_id,j.status,j.reason,j.attempts,j.error,d.reason AS deferred_reason
-      FROM auto_memory_jobs j LEFT JOIN auto_memory_job_deferrals d ON d.job_id=j.id ORDER BY j.rowid DESC LIMIT ?`).all(limit)
+    return this.db.prepare(`SELECT j.id,j.conversation_id,j.status,j.reason,j.attempts,j.error,d.reason AS deferred_reason,r.reason AS retired_reason
+      FROM auto_memory_jobs j LEFT JOIN auto_memory_job_deferrals d ON d.job_id=j.id
+      LEFT JOIN auto_memory_job_retirements r ON r.job_id=j.id ORDER BY j.rowid DESC LIMIT ?`).all(limit)
       .map(r=>({id:String(r.id),conversationId:String(r.conversation_id),
         status:String(r.status),reason:String(r.reason),attempts:Number(r.attempts),error:r.error==null?null:String(r.error),
-        ...(r.deferred_reason==null?{}:{deferred:true as const,deferredReason:String(r.deferred_reason)})}));
+        ...(r.deferred_reason==null?{}:{deferred:true as const,deferredReason:String(r.deferred_reason)}),
+        ...(r.retired_reason==null?{}:{retired:true as const,retiredReason:String(r.retired_reason)})}));
   }
-  status(conversationId:string): {queued:number;running:number;failed:number;deferred:number;completed:number;checkpoint:number;summary?:string} {
-    const cp=this.checkpoint(conversationId);const result={queued:0,running:0,failed:0,deferred:0,completed:0,checkpoint:Number(cp.completed_seq),...(cp.summary==null?{}:{summary:String(cp.summary)})};
+  status(conversationId:string): {queued:number;running:number;failed:number;deferred:number;retired?:number;completed:number;checkpoint:number;summary?:string} {
+    const cp=this.checkpoint(conversationId);const result:ReturnType<AutoMemoryStore['status']>={queued:0,running:0,failed:0,deferred:0,completed:0,checkpoint:Number(cp.completed_seq),...(cp.summary==null?{}:{summary:String(cp.summary)})};
     const context=this.db.prepare(`SELECT s.* FROM conversation_context_state s WHERE s.conversation_id=?
       AND EXISTS(SELECT 1 FROM auto_memory_context_jobs cj JOIN auto_memory_jobs j ON j.id=cj.job_id WHERE j.conversation_id=s.conversation_id)`).get(conversationId);
     if(context) {result.checkpoint=Number(context.completed_seq); if(context.summary!=null) result.summary=String(context.summary);}
-    for(const r of this.db.prepare(`SELECT CASE WHEN d.job_id IS NOT NULL THEN 'deferred' ELSE j.status END AS status,COUNT(*) AS count
-      FROM auto_memory_jobs j LEFT JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=? GROUP BY 1`).all(conversationId)) {
-      const key=r.status==='done'?'completed':r.status as 'queued'|'running'|'failed'|'deferred';result[key]=Number(r.count);
+    for(const r of this.db.prepare(`SELECT CASE WHEN r.job_id IS NOT NULL THEN 'retired' WHEN d.job_id IS NOT NULL THEN 'deferred' ELSE j.status END AS status,COUNT(*) AS count
+      FROM auto_memory_jobs j LEFT JOIN auto_memory_job_deferrals d ON d.job_id=j.id
+      LEFT JOIN auto_memory_job_retirements r ON r.job_id=j.id WHERE j.conversation_id=? GROUP BY 1`).all(conversationId)) {
+      const key=r.status==='done'?'completed':r.status as 'queued'|'running'|'failed'|'deferred'|'retired';result[key]=Number(r.count);
     } return result;
   }
   contextAfterCheckpoint(conversationId:string,excludeMessageId?:string): AutoMemoryMessage[] {

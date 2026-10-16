@@ -8,7 +8,7 @@
 |---|---|
 | src/config.ts | 聊天与后台调用预算，不读取其他应用凭据 |
 | src/runtime.ts | 受限 Pi 会话、独立 ModelRuntime 工厂、最终输入容量估算、公开 API 重建投影 |
-| src/store.ts | schema v15、原文/run/投递、显式记忆、迁移备份、去重和上下文水位 |
+| src/store.ts | schema v16、原文/run/投递、显式记忆、迁移备份、去重和上下文水位 |
 | src/auto-memory-store.ts | 通用person绑定、可见消息序列、滚动摘要及容量快照、任务租约、子批次检查点、Topic/画像/关键词检索 |
 | src/self-profile-store.ts | 全局AI画像修订、带来源待整理建议、原子归档和并发版本检查 |
 | src/auto-memory.ts | 与聊天独立的后台调度、严格输出校验、显式失败重试、容量等待及 Topic 关键词检索 |
@@ -20,7 +20,7 @@
 | src/channel-types.ts / src/qq-channel.ts | 标准化发送者与真实 mention 目标、QQ 收发/鉴权/重连 |
 | src/harness-policy.ts / src/memory-service.ts | 明确人物绑定、独立 owner 权限、本人显式更新及记忆管理 |
 | src/cli.ts / src/memory.ts | 本地聊天和离线 remember/query/correct；拒绝删除 |
-| src/memory-jobs-cli.ts | 无模型调用的任务状态查询和失败任务重新排队 |
+| src/memory-jobs-cli.ts | 无模型调用的任务状态查询、显式重排/搁置和旧count协议退役 |
 
 沿用 NodeNext / ESM，内部 import 使用 .js 后缀。数据库采用Node内置node:sqlite，Topic在房间范围内使用FTS5/BM25；没有 ORM、Python 或新生产依赖。
 

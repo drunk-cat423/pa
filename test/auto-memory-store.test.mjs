@@ -165,7 +165,7 @@ test('v12 migration backs up the consistent original database before adding defe
     });
     const original=inspect(f,snapshot);
     f.store.close();inspect(f,db=>{downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; DROP TABLE auto_memory_job_deferrals; PRAGMA user_version=12;');});f.restart();
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),15);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),16);
     assert.deepEqual(inspect(f,snapshot),original);
     const backups=readdirSync(f.directory).filter(name=>name.includes('.v12.')&&name.endsWith('.bak'));
     assert.equal(backups.length,1);
@@ -425,7 +425,7 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     assert.equal(inspect(f,db=>db.prepare('SELECT status,content FROM memories WHERE id=?').get(memory.id)).content,null);
     assert.equal(f.store.autoMemory.profile('original-person').facts[0].content,longLegacyFact);
     assert.equal([...longLegacyFact].length,24*'迁移前保留的旧画像事实'.length);
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 15);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 16);
     assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
     assert.equal(readdirSync(f.directory).some(name=>name.includes('.v5.')&&name.endsWith('.bak')),true);
     f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity'),undefined);assert.equal(f.store.autoMemory.conversationContext(f.conversation.id).messages.at(-1).text,'new');

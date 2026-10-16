@@ -52,3 +52,13 @@ systemctl disable --now mysql.service
 ## 更新与回退
 
 更新使用新的发布目录，完成构建和检查后停服务、备份数据，再切换 current 并启动。配置和数据不随发布包替换。若只有代码回退可兼容现有 schema，切回旧代码即可；schema 回退需要同一停机快照中的 SQLite 与 Pi JSONL 一起恢复，不能分别拼接。不要重新启动本机实例与服务器实例同时试用。
+
+### 旧计数队列退出
+
+升级到含schema v16的发布后，若仍有旧count任务阻塞，先停PA服务、备份整个 `/var/lib/pa` 及配置；在服务保持停止时，以pa用户运行维护命令：
+
+```bash
+sudo -u pa env PA_DATA_DIR=/var/lib/pa /opt/node-v24.15.0/bin/node /opt/pa/current/dist/memory-jobs-cli.js retire-count CONVERSATION_ID '旧计数任务退出执行，原文交85%滚动容量压缩'
+```
+
+此命令不需要模型/QQ凭证，不调用模型。只支持该会话首次rolling快照前的无租约queued/failed旧count任务；原行与旧搁置记录不变，新旁表保存退役原因和哈希。核对原文、任务和画像数据未变、retired数量及可执行队列为零后再启动服务。原文继续参与上下文，并在真实达到85%时进入新容量任务；不要把普通defer当作这次协议切换，否则会留下永久保留的原文缺口。
