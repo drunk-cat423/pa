@@ -67,7 +67,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -426,6 +426,9 @@ export class ConversationStore {
         to_revision INTEGER NOT NULL REFERENCES self_profile_revisions(revision), created_at TEXT NOT NULL,
         FOREIGN KEY (conversation_id,rule_key,rule_revision) REFERENCES room_rule_revisions(conversation_id,rule_key,revision),
         CHECK (to_revision > from_revision));`);
+      if (version < 13) this.db.exec(`CREATE TABLE auto_memory_job_deferrals (
+        job_id TEXT PRIMARY KEY REFERENCES auto_memory_jobs(id), reason TEXT NOT NULL, created_at TEXT NOT NULL,
+        input_hash TEXT, progress_hash TEXT);`);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');

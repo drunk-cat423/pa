@@ -143,6 +143,7 @@ export class BackgroundMemory {
   info() {
     const { summary, ...status } = this.store.status(this.conversationId);
     return { enabled: this.config.memory?.enabled === true, ...status, hasSummary: Boolean(summary),
+      ...(status.deferred ? { deferredRanges: this.store.deferredRanges(this.conversationId) } : {}),
       calls: this.budget.calls,
       ...(this.lastError ? { lastError: this.lastError } : {}) };
   }

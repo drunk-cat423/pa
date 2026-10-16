@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -77,6 +78,103 @@ test('capacity short batch and queued snapshot survive failures and process rest
     const retry=claim(f);assert.equal(retry.attempts,2);assert.deepEqual(retry.messageIds,batch.messageIds);
     f.store.autoMemory.commit(retry.id,retry.leaseToken,ignored(f,retry));
     assert.deepEqual(f.store.autoMemory.contextAfterCheckpoint(f.conversation.id).map(m=>m.text),['three']);
+  }finally{f.close();}
+});
+
+test('deferral preserves failed evidence and frozen input, releases later batches in order and retains the raw gap',()=>{
+  const f=fixture('private');try {
+    const jobs=[];
+    for(let i=0;i<3;i++) {
+      f.turn(`turn ${i}`);jobs.push(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity',1));
+    }
+    const first=claim(f),oldResult=ignored(f,first);
+    f.store.autoMemory.saveProgress(first.id,first.leaseToken,{chunk:1,topics:[],phase:'preserved'});
+    f.store.autoMemory.fail(first.id,first.leaseToken,'legacy failure');
+    assert.equal(claim(f),undefined);assert.equal(f.store.autoMemory.status(f.conversation.id).failed,1);
+    const snapshot=()=>inspect(f,db=>({
+      job:db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(first.id),
+      members:db.prepare('SELECT * FROM auto_memory_job_messages WHERE job_id=? ORDER BY ordinal').all(first.id),
+      messages:db.prepare('SELECT * FROM messages ORDER BY ingest_seq').all(),
+    }));
+    const before=snapshot();f.store.autoMemory.defer(first.id,'显式保留旧协议批次');
+    const deferral=inspect(f,db=>db.prepare('SELECT * FROM auto_memory_job_deferrals WHERE job_id=?').get(first.id));
+    const digest=value=>createHash('sha256').update(value).digest('hex');
+    assert.equal(deferral.input_hash,digest(before.job.input_json));assert.equal(deferral.progress_hash,digest(before.job.progress_json));
+    f.store.autoMemory.defer(first.id,'显式保留旧协议批次');
+    assert.deepEqual(inspect(f,db=>db.prepare('SELECT * FROM auto_memory_job_deferrals WHERE job_id=?').get(first.id)),deferral);
+    assert.deepEqual(snapshot(),before);
+    assert.throws(()=>f.store.autoMemory.defer(first.id,'rewrite reason'),/不能改写/);
+    assert.throws(()=>f.store.autoMemory.retry(first.id),/搁置/);
+    assert.throws(()=>f.store.autoMemory.commit(first.id,first.leaseToken,oldResult),/租约已失效/);
+    const ranges=[{startSeq:first.startSeq,endSeq:first.endSeq}];
+    assert.deepEqual(f.store.autoMemory.deferredRanges(f.conversation.id),ranges);
+    const listed=f.store.autoMemory.listJobs().find(job=>job.id===first.id);
+    assert.equal(listed.status,'failed');assert.equal(listed.deferred,true);assert.equal(listed.deferredReason,'显式保留旧协议批次');
+    assert.equal(listed.error,'legacy failure');assert.equal('input_json' in listed,false);
+    f.restart();
+    assert.deepEqual(f.store.autoMemory.deferredRanges(f.conversation.id),ranges);
+    assert.equal(f.store.autoMemory.status(f.conversation.id).deferred,1);assert.equal(f.store.autoMemory.status(f.conversation.id).failed,0);
+    const second=claim(f);assert.equal(second.id,jobs[1].id);assert.equal(claim(f),undefined);
+    assert.deepEqual(f.store.autoMemory.taskInput(second).deferredRanges,ranges);
+    // A newly reserved job during the second batch must stay behind the already frozen third batch.
+    f.turn('turn 3');const fourth=f.store.autoMemory.reserveBatch(f.conversation.id,'capacity',1);
+    f.store.autoMemory.commit(second.id,second.leaseToken,ignored(f,second,{continuationSummary:'after second'}));
+    assert.equal(f.store.autoMemory.status(f.conversation.id).checkpoint,0);
+    const third=claim(f);assert.equal(third.id,jobs[2].id);
+    assert.equal(f.store.autoMemory.taskInput(third).previousSummary,'after second');
+    f.store.autoMemory.commit(third.id,third.leaseToken,ignored(f,third,{continuationSummary:'after third'}));
+    assert.equal(f.store.autoMemory.status(f.conversation.id).checkpoint,0);
+    assert.equal(claim(f).id,fourth.id);
+    assert.deepEqual(f.store.autoMemory.contextAfterCheckpoint(f.conversation.id).map(m=>m.text),['turn 0','reply','turn 3','reply']);
+    assert.deepEqual(snapshot().job,before.job);assert.deepEqual(snapshot().members,before.members);
+    assert.deepEqual(snapshot().messages.slice(0,before.messages.length),before.messages);
+  }finally{f.close();}
+});
+
+test('deferral rejects queued, running, done, leased failed and unknown jobs',()=>{
+  const f=fixture();try {
+    f.inbound();const batch=f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');
+    assert.throws(()=>f.store.autoMemory.defer(batch.id,'queued'),/无租约的失败/);
+    assert.throws(()=>f.store.autoMemory.defer('missing','missing'),/无租约的失败/);
+    assert.throws(()=>f.store.autoMemory.defer(batch.id,' '),/原因无效/);
+    const worker=claim(f);
+    assert.throws(()=>f.store.autoMemory.defer(worker.id,'running'),/无租约的失败/);
+    f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker));
+    assert.throws(()=>f.store.autoMemory.defer(worker.id,'done'),/无租约的失败/);
+    f.inbound('next');f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const next=claim(f);
+    f.store.autoMemory.fail(next.id,next.leaseToken,'failed');
+    for(const field of ['lease_token','lease_owner','lease_until']) {
+      inspect(f,db=>db.prepare(`UPDATE auto_memory_jobs SET ${field}=? WHERE id=?`).run(field==='lease_until'?0:'retained',next.id));
+      assert.throws(()=>f.store.autoMemory.defer(next.id,'leased failure'),/无租约的失败/);
+      inspect(f,db=>db.prepare(`UPDATE auto_memory_jobs SET ${field}=NULL WHERE id=?`).run(next.id));
+    }
+    assert.equal(inspect(f,db=>db.prepare('SELECT count(*) AS n FROM auto_memory_job_deferrals').get().n),0);
+  }finally{f.close();}
+});
+
+test('v12 migration backs up the consistent original database before adding deferrals',()=>{
+  const f=fixture();try {
+    f.inbound('original before migration');f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const worker=claim(f);
+    f.store.autoMemory.saveProgress(worker.id,worker.leaseToken,{chunk:1});f.store.autoMemory.fail(worker.id,worker.leaseToken,'preserve');
+    const snapshot=db=>({
+      jobs:db.prepare('SELECT * FROM auto_memory_jobs ORDER BY rowid').all(),
+      members:db.prepare('SELECT * FROM auto_memory_job_messages ORDER BY ordinal').all(),
+      messages:db.prepare('SELECT * FROM messages ORDER BY ingest_seq').all(),
+    });
+    const original=inspect(f,snapshot);
+    f.store.close();inspect(f,db=>db.exec('DROP TABLE auto_memory_job_deferrals; PRAGMA user_version=12;'));f.restart();
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),13);
+    assert.deepEqual(inspect(f,snapshot),original);
+    const backups=readdirSync(f.directory).filter(name=>name.includes('.v12.')&&name.endsWith('.bak'));
+    assert.equal(backups.length,1);
+    const backup=new DatabaseSync(join(f.directory,backups[0]),{readOnly:true});try {
+      assert.equal(backup.prepare('PRAGMA user_version').get().user_version,12);
+      assert.deepEqual(snapshot(backup),original);
+      assert.equal(backup.prepare("SELECT name FROM sqlite_master WHERE name='auto_memory_job_deferrals'").get(),undefined);
+      assert.deepEqual(backup.prepare('PRAGMA foreign_key_check').all(),[]);
+    }finally{backup.close();}
+    f.store.autoMemory.defer(worker.id,'defer after migration');
+    assert.equal(f.store.autoMemory.status(f.conversation.id).deferred,1);
   }finally{f.close();}
 });
 
@@ -312,7 +410,7 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     assert.ok(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity'));
     assert.equal(f.store.externalMessage(f.conversation.id,old.eventId).id,old.existingMessageId);
     assert.equal(inspect(f,db=>db.prepare('SELECT status,content FROM memories WHERE id=?').get(memory.id)).content,null);
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 12);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 13);
     assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
     assert.equal(readdirSync(f.directory).some(name=>name.includes('.v5.')&&name.endsWith('.bak')),true);
     f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity').messageIds.length,1);

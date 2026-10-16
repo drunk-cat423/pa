@@ -56,6 +56,14 @@ async function fixture(t) {
   return { config, requests, setMode: value => { mode = value; } };
 }
 
+test('离线请求准备明确摘要缺口，不把搁置区间当作已整理内容', () => {
+  const prepared=prepareMemoryExtraction({...input,previousSummary:'已完成的后续话题',deferredRanges:[{startSeq:1,endSeq:80}]},100000);
+  assert.deepEqual(JSON.parse(prepared.userContent).deferredRanges,[{startSeq:1,endSeq:80}]);
+  assert.match(prepared.systemPrompt,/previousSummary只覆盖已完成部分/);
+  assert.match(prepared.systemPrompt,/不将缺口视为已整理/);
+  assert.doesNotMatch(prepareMemoryExtraction(input,100000).systemPrompt,/deferredRanges/);
+});
+
 test('uses local Pi model with no embedding interface; DeepSeek thinking stays disabled', async t => {
   const f = await fixture(t);
   const provider = createMemoryProvider(f.config);

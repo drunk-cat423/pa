@@ -272,7 +272,7 @@ export class AutoMemoryStore {
     if(!options.owner||!Number.isSafeInteger(options.leaseMs)||options.leaseMs<1) throw new Error('整理租约无效。');
     return this.atomic(()=>{
       const current=options.now??Date.now();
-      const row=this.db.prepare("SELECT * FROM auto_memory_jobs WHERE conversation_id=? AND status<>'done' ORDER BY rowid LIMIT 1").get(conversationId);
+      const row=this.nextPending(conversationId);
       if(!row||row.status==='failed'||(row.status==='running'&&Number(row.lease_until)>current)) return undefined;
       if (row.status === 'running') {
         this.db.prepare("UPDATE auto_memory_jobs SET status='failed',error=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?")
@@ -285,8 +285,13 @@ export class AutoMemoryStore {
       this.taskInput(job); return job;
     });
   }
+  private nextPending(conversationId:string): Record<string,unknown> | undefined {
+    return this.db.prepare(`SELECT j.* FROM auto_memory_jobs j WHERE j.conversation_id=? AND j.status<>'done'
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=j.id) ORDER BY j.rowid LIMIT 1`).get(conversationId);
+  }
   private active(jobId:string,leaseToken:string): Record<string,unknown> {
-    const row=this.db.prepare("SELECT * FROM auto_memory_jobs WHERE id=? AND status='running' AND lease_token=? AND lease_until>?").get(jobId,leaseToken,Date.now());
+    const row=this.db.prepare(`SELECT * FROM auto_memory_jobs WHERE id=? AND status='running' AND lease_token=? AND lease_until>?
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=auto_memory_jobs.id)`).get(jobId,leaseToken,Date.now());
     if(!row) throw new Error('整理租约已失效。'); return row;
   }
   private messages(ids: readonly string[]): AutoMemoryMessage[] {
@@ -356,7 +361,8 @@ export class AutoMemoryStore {
     const profileSources=this.messages([...new Set([...profiles.flatMap(p=>(p.pending??[]).map(item=>item.sourceMessageId)),
       ...profiles.flatMap(profile => profile.facts.flatMap(fact => fact.messageIds)),
       ...profileFragments.flatMap(fragment => fragment.messageIds)])]);
-    const input:AutoMemoryTaskInput={profileSources,profileFragments,...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),roomRules:this.roomRules(canonical.conversationId),job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
+    const deferredRanges=this.deferredRanges(canonical.conversationId);
+    const input:AutoMemoryTaskInput={profileSources,profileFragments,...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
     this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
     return input;
   }
@@ -413,7 +419,7 @@ export class AutoMemoryStore {
     this.atomic(()=>{
       const row=this.active(jobId,leaseToken); const job=this.job(row); const input=this.taskInput(job); assertCurrentMemoryProtocol(input); assertCurrentMemoryProtocol(extract); this.assertProfileEvidenceCurrent(input,extract); const owned=new Set(job.messageIds);
       if([...(input.profileSources??[]),...input.messages].some(m=>m.actorId!==undefined&&this.personForActor(m.actorId)!==m.personId)) throw new Error('人物绑定版本冲突，请重读后重试。');
-      const first=this.db.prepare("SELECT id FROM auto_memory_jobs WHERE conversation_id=? AND status<>'done' ORDER BY rowid LIMIT 1").get(job.conversationId);
+      const first=this.nextPending(job.conversationId);
       if(first?.id!==jobId) throw new Error('同房间整理必须按批次顺序提交。');
       if(!Array.isArray(extract.topics)||!Array.isArray(extract.fragments)||!Array.isArray(extract.profiles)) throw new Error('整理产物结构无效。');
       const sourceRooms = new Map([...input.messages,...(input.profileSources??[])].map(message=>[message.id,message.conversationId]));
@@ -511,7 +517,29 @@ export class AutoMemoryStore {
     this.atomic(()=>{this.active(jobId,leaseToken);this.db.prepare("UPDATE auto_memory_jobs SET status='failed',error=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?").run(error,jobId);});
   }
   retry(jobId:string): void {
-    if(this.db.prepare("UPDATE auto_memory_jobs SET status='queued',error=NULL WHERE id=? AND status='failed'").run(jobId).changes!==1) throw new Error('任务不处于失败状态。');
+    this.atomic(()=>{
+      if(this.db.prepare('SELECT job_id FROM auto_memory_job_deferrals WHERE job_id=?').get(jobId)) throw new Error('已搁置的整理任务不能重试。');
+      if(this.db.prepare("UPDATE auto_memory_jobs SET status='queued',error=NULL WHERE id=? AND status='failed'").run(jobId).changes!==1) throw new Error('任务不处于失败状态。');
+    });
+  }
+  defer(jobId:string,reason:string): void {
+    if(typeof reason!=='string'||!reason.trim()||reason.length>4000) throw new Error('整理搁置原因无效。');
+    this.atomic(()=>{
+      const row=this.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(jobId);
+      if(!row||row.status!=='failed'||row.lease_token!=null||row.lease_owner!=null||row.lease_until!=null) throw new Error('只能搁置无租约的失败整理任务。');
+      const existing=this.db.prepare('SELECT reason FROM auto_memory_job_deferrals WHERE job_id=?').get(jobId);
+      if(existing) {
+        if(existing.reason!==reason) throw new Error('整理任务已搁置，不能改写原搁置原因。');
+        return;
+      }
+      this.db.prepare('INSERT INTO auto_memory_job_deferrals(job_id,reason,created_at,input_hash,progress_hash) VALUES (?,?,?,?,?)')
+        .run(jobId,reason,timestamp(),row.input_json==null?null:hash(String(row.input_json)),row.progress_json==null?null:hash(String(row.progress_json)));
+    });
+  }
+  deferredRanges(conversationId:string): {startSeq:number;endSeq:number}[] {
+    return this.db.prepare(`SELECT j.start_seq,j.end_seq FROM auto_memory_jobs j JOIN auto_memory_job_deferrals d ON d.job_id=j.id
+      WHERE j.conversation_id=? ORDER BY j.start_seq,j.rowid`).all(conversationId)
+      .map(row=>({startSeq:Number(row.start_seq),endSeq:Number(row.end_seq)}));
   }
   renewLease(jobId:string,leaseToken:string,leaseMs:number):void {
     if(!Number.isSafeInteger(leaseMs)||leaseMs<1) throw new Error('整理租约时长无效。');
@@ -531,17 +559,19 @@ export class AutoMemoryStore {
   pendingConversations(): string[] {
     return this.db.prepare("SELECT DISTINCT conversation_id FROM auto_memory_jobs WHERE status IN ('queued','running')").all().map(r=>String(r.conversation_id));
   }
-  listJobs(limit=100): {id:string;conversationId:string;status:string;reason:string;attempts:number;error:string|null}[] {
+  listJobs(limit=100): {id:string;conversationId:string;status:string;reason:string;attempts:number;error:string|null;deferred?:true;deferredReason?:string}[] {
     if(!Number.isSafeInteger(limit)||limit<1||limit>1000) throw new Error('任务查询数量无效。');
-    return this.db.prepare(`SELECT id,conversation_id,status,reason,attempts,error
-      FROM auto_memory_jobs ORDER BY rowid DESC LIMIT ?`).all(limit)
+    return this.db.prepare(`SELECT j.id,j.conversation_id,j.status,j.reason,j.attempts,j.error,d.reason AS deferred_reason
+      FROM auto_memory_jobs j LEFT JOIN auto_memory_job_deferrals d ON d.job_id=j.id ORDER BY j.rowid DESC LIMIT ?`).all(limit)
       .map(r=>({id:String(r.id),conversationId:String(r.conversation_id),
-        status:String(r.status),reason:String(r.reason),attempts:Number(r.attempts),error:r.error==null?null:String(r.error)}));
+        status:String(r.status),reason:String(r.reason),attempts:Number(r.attempts),error:r.error==null?null:String(r.error),
+        ...(r.deferred_reason==null?{}:{deferred:true as const,deferredReason:String(r.deferred_reason)})}));
   }
-  status(conversationId:string): {queued:number;running:number;failed:number;completed:number;checkpoint:number;summary?:string} {
-    const cp=this.checkpoint(conversationId);const result={queued:0,running:0,failed:0,completed:0,checkpoint:Number(cp.completed_seq),...(cp.summary==null?{}:{summary:String(cp.summary)})};
-    for(const r of this.db.prepare('SELECT status,COUNT(*) AS count FROM auto_memory_jobs WHERE conversation_id=? GROUP BY status').all(conversationId)) {
-      const key=r.status==='done'?'completed':r.status as 'queued'|'running'|'failed';result[key]=Number(r.count);
+  status(conversationId:string): {queued:number;running:number;failed:number;deferred:number;completed:number;checkpoint:number;summary?:string} {
+    const cp=this.checkpoint(conversationId);const result={queued:0,running:0,failed:0,deferred:0,completed:0,checkpoint:Number(cp.completed_seq),...(cp.summary==null?{}:{summary:String(cp.summary)})};
+    for(const r of this.db.prepare(`SELECT CASE WHEN d.job_id IS NOT NULL THEN 'deferred' ELSE j.status END AS status,COUNT(*) AS count
+      FROM auto_memory_jobs j LEFT JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=? GROUP BY 1`).all(conversationId)) {
+      const key=r.status==='done'?'completed':r.status as 'queued'|'running'|'failed'|'deferred';result[key]=Number(r.count);
     } return result;
   }
   contextAfterCheckpoint(conversationId:string,excludeMessageId?:string): AutoMemoryMessage[] {

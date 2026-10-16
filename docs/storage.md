@@ -2,7 +2,9 @@
 
 SQLite pa.sqlite 保存权威原文、消息来源、运行和投递记录，以及记忆派生数据；Pi session.jsonl 保存模型上下文与审计条目。压缩仅改变活跃模型投影，原文保持完整。两者使用 run ID / Pi entry ID 对应，不能混合恢复不同时点的文件。
 
-## schema v12
+## schema v13
+
+v13增加`auto_memory_job_deferrals`旁表，按job_id保存显式搁置原因、时间、冻结输入及进度哈希。失败任务原行、成员、错误、原文及JSON不改写；领取和提交均排除搁置项，普通失败继续阻塞。`completed_seq`仍是连续已整理水位，不能越过搁置缺口；`summary_job_id`可能指向后续已完成批次，使用摘要时需同时标明`deferredRanges`。搁置项不能普通retry或迟到提交，不通过伪造done清除积压。
 
 Node 内置 node:sqlite，WAL、外键、FULL 同步及 busy timeout。升级旧库会在同目录创建 pa.sqlite.v版本.UUID.bak 一致性备份，再事务迁移。未知非空库、外键损坏或更高版本会停止打开。v11增加每轮准备回执、群规则修订、个人pending用途、Topic全文索引及向量调用标记，保留已有聊天、记忆、固定批次和计数水位。
 

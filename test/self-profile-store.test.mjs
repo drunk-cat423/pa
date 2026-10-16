@@ -318,7 +318,7 @@ test('v6 migration backs up the original database and preserves chats, tombstone
     });
     f.restart();
     inspect(f, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 12);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 13);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       for (const table of tables) assert.deepEqual(db.prepare(`SELECT rowid,* FROM ${table}`).all().map(r => ({ ...r })), before[table]);
     });

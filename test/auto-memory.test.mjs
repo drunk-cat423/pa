@@ -376,6 +376,66 @@ test('后台有限画像视图新增事实后保留超过200条的完整旧证�
   } finally { db.close(); }
 });
 
+test('私聊实际请求标明搁置摘要缺口并保留其原文，暂停时不调用整理模型', async t => {
+  const f=await fixture(t,()=>{throw Error('BACKGROUND_MUST_STAY_PAUSED');},{memory:{enabled:false,maxCalls:0,timeoutMs:5000}});
+  const h=f.harness();
+  await h.handle(f.message('private-gap-source','PRIVATE_GAP_RAW',{route:f.privateRoute}));
+  const db=f.db();
+  const id=db.prepare("SELECT c.id FROM conversations c JOIN rooms r ON r.id=c.room_id WHERE r.room_type='private'").get().id;
+  db.close();
+  const store=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
+  let job;
+  try {
+    store.autoMemory.reserveBatch(id,'capacity');
+    job=store.autoMemory.claimNext(id,{owner:'fixture',leaseMs:60000});
+    store.autoMemory.fail(job.id,job.leaseToken,'fixture failure');
+    store.autoMemory.defer(job.id,'operator deferral');
+  } finally {store.close();}
+  await h.handle(f.message('private-gap-next','CURRENT_PRIVATE_QUESTION',{route:f.privateRoute}));
+  const input=currentTurnInput(f.requests.at(-1));
+  assert.deepEqual(input.deferredRanges,[{startSeq:job.startSeq,endSeq:job.endSeq}]);
+  assert.ok(input.history.some(message=>message.text==='PRIVATE_GAP_RAW'));
+  const wire=JSON.stringify(f.requests.at(-1).messages);
+  assert.match(wire,/conversationSummary仅概括已完成部分，不能视为完整历史/);
+  assert.equal(f.inputs.length,0);
+});
+
+test('显式搁置不调模型；暂停与重启保留缺口，恢复调度只执行后续批次', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'pa-memory-deferred-worker-'));
+  const store = new ConversationStore(join(directory, 'store.sqlite'));
+  const conversation = store.ensureConversation('room', join(directory, 'session.jsonl'),
+    { channel: 'qq', accountId: 'a', roomId: 'g', roomType: 'group' });
+  const workers = [];
+  t.after(async () => { for (const worker of workers) await worker.close(); store.close(); await rm(directory, {recursive:true,force:true}); });
+  for (let i=0;i<150;i++) store.recordInbound(conversation.id, `message ${i}`, {eventId:String(i),senderId:'a',modelInputText:`message ${i}`});
+  while (store.autoMemory.reserveBatch(conversation.id,'count')) { /* freeze three batches */ }
+  const first = store.autoMemory.claimNext(conversation.id,{owner:'old',leaseMs:60000});
+  store.autoMemory.saveProgress(first.id,first.leaseToken,{preserved:'partial progress'});
+  store.autoMemory.fail(first.id,first.leaseToken,'[fixture] result unknown');
+  let calls=0;
+  const provider={extract:async input=>{
+    calls++;
+    assert.notEqual(input.job.id,first.id);
+    assert.deepEqual(input.deferredRanges,[{startSeq:first.startSeq,endSeq:first.endSeq}]);
+    return extracted(input);
+  }};
+  const paused=new BackgroundMemory({memory:{enabled:false,maxCalls:0,timeoutMs:5000},contextWindow:100000},store.autoMemory,conversation.id,provider);
+  workers.push(paused);
+  store.autoMemory.defer(first.id,'operator decision');
+  paused.start(); await paused.close();
+  assert.equal(calls,0);
+  assert.equal(paused.info().deferred,1);
+  const enabled=new BackgroundMemory({memory:{enabled:true,maxCalls:0,timeoutMs:5000},contextWindow:100000},store.autoMemory,conversation.id,provider);
+  workers.push(enabled); enabled.start(); await enabled.wait();
+  assert.equal(calls,2);
+  assert.equal(enabled.info().completed,2);
+  assert.equal(enabled.info().failed,0);
+  assert.equal(enabled.info().deferred,1);
+  assert.equal(enabled.info().checkpoint,0);
+  assert.deepEqual(store.autoMemory.contextAfterCheckpoint(conversation.id).map(m=>m.id),first.messageIds);
+  assert.throws(()=>store.autoMemory.retry(first.id),/搁置/);
+});
+
 test('等待截止时间独立于后台工作结束，超时后后台可以继续', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'pa-memory-wait-'));
   const store = new ConversationStore(join(directory, 'store.sqlite'));

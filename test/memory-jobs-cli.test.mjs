@@ -31,3 +31,26 @@ test('任务CLI离线状态不泄露原文，retry仅把失败批次重新排队
   assert.equal(store.autoMemory.status(conversation.id).queued, 1);
   assert.equal(store.autoMemory.status(conversation.id).completed, 0);
 });
+
+test('任务CLI显式defer保留失败状态，不带密钥且不清空输入进度，普通retry拒绝', async t => {
+  const directory=await mkdtemp(join(tmpdir(),'pa-jobs-defer-'));
+  const path=join(directory,'pa.sqlite');
+  const store=new ConversationStore(path);
+  t.after(async()=>{store.close();await rm(directory,{recursive:true,force:true});});
+  const conversation=store.ensureConversation('room',join(directory,'session.jsonl'),{channel:'qq',accountId:'a',roomId:'g',roomType:'group'});
+  store.recordInbound(conversation.id,'PRIVATE_RAW_TEXT',{eventId:'event',senderId:'a',modelInputText:'PRIVATE_RAW_TEXT'});
+  store.autoMemory.reserveBatch(conversation.id,'capacity');
+  const job=store.autoMemory.claimNext(conversation.id,{owner:'fixture',leaseMs:60000});
+  store.autoMemory.saveProgress(job.id,job.leaseToken,{privateProgress:'PRIVATE_PROGRESS'});
+  store.autoMemory.fail(job.id,job.leaseToken,'fixture_failure');
+  const run=args=>promisify(execFile)(process.execPath,[resolve('dist/memory-jobs-cli.js'),...args],{
+    env:{...process.env,PA_DATA_DIR:directory,PA_API_KEY:'',PA_MEMORY_ENABLED:'false'},
+  });
+  const result=await run(['defer',job.id,'保留旧批，等待单独补录']);
+  assert.doesNotMatch(result.stdout,/PRIVATE_RAW_TEXT|PRIVATE_PROGRESS/);
+  const output=JSON.parse(result.stdout);
+  assert.equal(output.deferred,job.id);assert.equal(output.jobs[0].status,'failed');assert.equal(output.jobs[0].deferred,true);
+  assert.equal(store.autoMemory.status(conversation.id).deferred,1);
+  assert.equal(store.autoMemory.status(conversation.id).completed,0);
+  await assert.rejects(run(['retry',job.id]),/搁置/);
+});

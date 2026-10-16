@@ -1,6 +1,7 @@
 export function downgradeSchema11(db) {
   db.exec(`
     PRAGMA foreign_keys=OFF;
+    DROP TABLE IF EXISTS auto_memory_job_deferrals;
     DROP TABLE IF EXISTS self_profile_reclassifications;
     DROP TRIGGER IF EXISTS index_topic_insert;
     DROP TRIGGER IF EXISTS index_topic_update;

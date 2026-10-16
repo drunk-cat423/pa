@@ -30,6 +30,7 @@ export interface AutoMemoryJob {
 export interface AutoMemoryTaskInput {
   job: AutoMemoryJob; roomType: 'private' | 'group'; messages: AutoMemoryMessage[];
   previousSummary?: string; profiles: PersonProfile[]; selfProfile?: SelfProfileSnapshot;
+  deferredRanges?: { startSeq: number; endSeq: number }[];
   selfProfileBudgetBytes?: number;
   profileSources?: AutoMemoryMessage[];
   excludedProfileSourceIds?: string[];
