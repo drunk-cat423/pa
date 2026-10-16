@@ -67,7 +67,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -429,6 +429,20 @@ export class ConversationStore {
       if (version < 13) this.db.exec(`CREATE TABLE auto_memory_job_deferrals (
         job_id TEXT PRIMARY KEY REFERENCES auto_memory_jobs(id), reason TEXT NOT NULL, created_at TEXT NOT NULL,
         input_hash TEXT, progress_hash TEXT);`);
+      if (version < 14) this.db.exec(`
+        CREATE TABLE person_profile_pending_results (
+          job_id TEXT NOT NULL REFERENCES auto_memory_jobs(id), pending_id TEXT NOT NULL,
+          person_id TEXT NOT NULL REFERENCES persons(id), source_message_id TEXT NOT NULL REFERENCES messages(id),
+          source_type TEXT NOT NULL CHECK(source_type IN ('self','third_party','inference')),
+          content_hash TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('merged','superseded','not_profile','deferred')),
+          profile_revision INTEGER NOT NULL, fact_index INTEGER, replacement_message_id TEXT REFERENCES messages(id), reason TEXT,
+          created_at TEXT NOT NULL, PRIMARY KEY(job_id,pending_id),
+          FOREIGN KEY(person_id,profile_revision) REFERENCES person_profile_revisions(person_id,revision));
+        CREATE INDEX profile_pending_results_person ON person_profile_pending_results(person_id,pending_id);
+        CREATE TABLE person_profile_revision_sources (
+          person_id TEXT NOT NULL, revision INTEGER NOT NULL, fact_index INTEGER NOT NULL,
+          message_id TEXT NOT NULL REFERENCES messages(id), PRIMARY KEY(person_id,revision,fact_index,message_id),
+          FOREIGN KEY(person_id,revision) REFERENCES person_profile_revisions(person_id,revision));`);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');

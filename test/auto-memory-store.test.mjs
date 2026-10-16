@@ -29,7 +29,9 @@ function fixture(roomType='group') {
 function claim(f){return f.store.autoMemory.claimNext(f.conversation.id,{owner:'worker',leaseMs:60000});}
 function ignored(f,job,extra={}) {
   const input=f.store.autoMemory.taskInput(job);
-  return {ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),topics:[],fragments:[],profiles:[],
+  const profiles=input.profileProtocol===2?input.profiles.filter(profile=>profile.pending?.length).map(profile=>({...profile,
+    pendingResults:profile.pending.map(item=>({pendingId:item.id,status:'deferred'}))})):[];
+  return {ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),topics:[],fragments:[],profiles,
     ...(input.roomType==='private'?{continuationSummary:'conversation decisions'}:{}),...extra};
 }
 function inspect(f,operation){const db=new DatabaseSync(f.path);try{return operation(db);}finally{db.close();}}
@@ -162,8 +164,8 @@ test('v12 migration backs up the consistent original database before adding defe
       messages:db.prepare('SELECT * FROM messages ORDER BY ingest_seq').all(),
     });
     const original=inspect(f,snapshot);
-    f.store.close();inspect(f,db=>db.exec('DROP TABLE auto_memory_job_deferrals; PRAGMA user_version=12;'));f.restart();
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),13);
+    f.store.close();inspect(f,db=>db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; DROP TABLE auto_memory_job_deferrals; PRAGMA user_version=12;'));f.restart();
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),14);
     assert.deepEqual(inspect(f,snapshot),original);
     const backups=readdirSync(f.directory).filter(name=>name.includes('.v12.')&&name.endsWith('.bak'));
     assert.equal(backups.length,1);
@@ -283,7 +285,8 @@ test('profile pending corrections captured after a batch stay pending for the ne
     assert.throws(()=>f.store.autoMemory.addProfilePending(person,bob.existingMessageId,'coffee','self'),/实际发送者/);
     f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const worker=claim(f),baseline=f.store.autoMemory.taskInput(worker).profiles.find(p=>p.personId===person);
     const correction=f.inbound('now water');f.store.autoMemory.addProfilePending(person,correction.existingMessageId,'water','self');
-    f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[baseline]}));
+    f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[{...baseline,
+      pendingResults:baseline.pending.map(item=>({pendingId:item.id,status:'deferred'}))}]}));
     assert.deepEqual(f.store.autoMemory.profile(person).facts,[]);
     assert.deepEqual(f.store.autoMemory.profile(person).pending.map(p=>p.content),['tea','water']);
   }finally{f.close();}
@@ -298,7 +301,8 @@ test('older batch cannot produce fields or consume a newer uncaptured pending co
     const worker=claim(f);const baseline=f.store.autoMemory.taskInput(worker).profiles[0];
     const stale={...baseline,facts:[{field:'diet',content:'tea',sourceType:'self',messageIds:[old.existingMessageId]}]};
     assert.throws(()=>f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[stale]})),/分类字段/);
-    f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[baseline]}));
+    f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[{...baseline,
+      pendingResults:baseline.pending.map(item=>({pendingId:item.id,status:'deferred'}))}]}));
     assert.equal(f.store.autoMemory.profileForActors(actor)[0].pending.at(-1).content,'water');
     assert.equal(f.store.autoMemory.profileForActors(actor)[0].pending.at(-1).content,'water');
   }finally{f.close();}
@@ -388,7 +392,14 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     inspect(f,db=>db.prepare('INSERT INTO primary_person_bindings VALUES (?,?,?,?,?,?)').run(f.route.channel,f.route.accountId,f.route.roomType,f.route.roomId,'alice','original-person'));
     f.store.configurePersons([{id:'original-person',bindings:[{route:f.route,senderId:'alice'}]}]);
     const memory=f.store.rememberMemory(f.conversation.id,{content:'old',sourceMessageId:old.existingMessageId}).memory;
-    inspect(f,db=>db.prepare("UPDATE memories SET subject_actor_id=?,person_id='original-person',scope_type='actor' WHERE id=?").run(actor,memory.id));
+    const profileSource=f.inbound('legacy profile evidence');
+    const legacyProfile=f.store.rememberMemory(f.conversation.id,{content:'legacy profile placeholder',sourceMessageId:profileSource.existingMessageId}).memory;
+    const longLegacyFact='迁移前保留的旧画像事实'.repeat(24);
+    inspect(f,db=>{
+      db.prepare("UPDATE memories SET subject_actor_id=?,person_id='original-person',scope_type='actor' WHERE id=?").run(actor,memory.id);
+      db.prepare("UPDATE memories SET content=?,subject_actor_id=?,writer_actor_id=?,person_id='original-person',scope_type='actor',profile_field='interests',profile_source_self=1 WHERE id=?")
+        .run(longLegacyFact,actor,actor,legacyProfile.id);
+    });
     f.store.close();
     inspect(f,db=>{
       downgradeSchema10(db);
@@ -402,7 +413,9 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
         DROP TABLE person_profile_revisions; DROP TABLE actor_person_bindings; DROP TABLE person_bindings; DROP TABLE persons;
         DROP TABLE self_profile_pending; DROP TABLE self_profile_revisions;
         DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity;
-        UPDATE memories SET content=NULL,status='deleted'; UPDATE memory_revisions SET content=NULL,status='deleted'; PRAGMA user_version=5;`);
+        PRAGMA user_version=5;`);
+      db.prepare("UPDATE memories SET content=NULL,status='deleted' WHERE id=?").run(memory.id);
+      db.prepare("UPDATE memory_revisions SET content=NULL,status='deleted' WHERE memory_id=?").run(memory.id);
     });
     f.restart();
     assert.equal(f.store.autoMemory.personForActor(actor),'original-person');
@@ -410,7 +423,9 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     assert.ok(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity'));
     assert.equal(f.store.externalMessage(f.conversation.id,old.eventId).id,old.existingMessageId);
     assert.equal(inspect(f,db=>db.prepare('SELECT status,content FROM memories WHERE id=?').get(memory.id)).content,null);
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 13);
+    assert.equal(f.store.autoMemory.profile('original-person').facts[0].content,longLegacyFact);
+    assert.equal([...longLegacyFact].length,24*'迁移前保留的旧画像事实'.length);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 14);
     assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
     assert.equal(readdirSync(f.directory).some(name=>name.includes('.v5.')&&name.endsWith('.bak')),true);
     f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity').messageIds.length,1);

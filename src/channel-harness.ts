@@ -153,7 +153,7 @@ export class ChannelHarness {
     if (this.closed) return 'ignored';
     if (!conversation.claimTask(taskId)) return 'duplicate';
     const sender = {
-      eventId: message.eventId, senderId: message.senderId, existingMessageId: source.id, sentAt: message.sentAt,
+      eventId: message.eventId, senderId: message.senderId, existingMessageId: source.id, taskId, sentAt: message.sentAt,
       ...(message.mentionedSenderIds ? { mentionedSenderIds: message.mentionedSenderIds } : {}),
       ...(message.senderName ? { senderName: message.senderName.slice(0, 100) } : {}),
       ...(message.quote ? { quote: message.quote } : {}),

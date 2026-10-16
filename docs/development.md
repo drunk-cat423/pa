@@ -8,11 +8,13 @@
 |---|---|
 | src/config.ts | 聊天与后台调用预算，不读取其他应用凭据 |
 | src/runtime.ts | 受限 Pi 会话、独立 ModelRuntime 工厂、最终输入容量估算、公开 API 重建投影 |
-| src/store.ts | schema v12、原文/run/投递、显式记忆、迁移备份、去重和上下文水位 |
+| src/store.ts | schema v14、原文/run/投递、显式记忆、迁移备份、去重和上下文水位 |
 | src/auto-memory-store.ts | 通用 person 绑定、固定批次、任务租约、子批次检查点、Topic/画像/关键词检索 |
 | src/self-profile-store.ts | 全局AI画像修订、带来源待整理建议、原子归档和并发版本检查 |
 | src/auto-memory.ts | 与聊天独立的后台调度、严格输出校验、显式失败重试、容量等待及 Topic 关键词检索 |
 | src/memory-provider.ts | 独立 Pi 画像/Topic 提取请求 |
+| src/profile-limits.ts / src/profile-pending.ts | 人物完整画像容量、处理回执及来源强度校验 |
+| src/diagnostics.ts / src/logs.ts / src/logs-cli.ts | 独立诊断索引、请求响应证据、任务查询及无模型的离线解析校验 |
 | src/conversation.ts | 原文与 Pi 关联恢复、按当前发送者/@对象构造上下文、画像预算和私聊续聊 |
 | src/channel-harness.ts | 先入库、按房间排队、参与判断、聊天预算、投递和启动后台恢复 |
 | src/channel-types.ts / src/qq-channel.ts | 标准化发送者与真实 mention 目标、QQ 收发/鉴权/重连 |
@@ -42,6 +44,8 @@ npm test
 - 既有 runtime/conversation/store/CLI：恢复、去重、原文、投递、资源隔离和明确纠正。
 
 Mock 只验证程序契约。真实模型的人物归属、提取质量、关键词检索以及实际 QQ @ 对象需独立联调。容量检查是带余量的估算，不等于供应商精确计数。
+
+模型及后台整理的诊断字段、存储边界和离线重放命令见 [统一日志](logging.md)。测试使用临时目录及本地 HTTP/注入响应，覆盖写失败阻止发出请求、响应先于校验保存、按任务关联、哈希校验与重放无业务写入。
 
 ## 当前完成与后续边界
 

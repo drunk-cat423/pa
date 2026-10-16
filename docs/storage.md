@@ -2,7 +2,9 @@
 
 SQLite pa.sqlite 保存权威原文、消息来源、运行和投递记录，以及记忆派生数据；Pi session.jsonl 保存模型上下文与审计条目。压缩仅改变活跃模型投影，原文保持完整。两者使用 run ID / Pi entry ID 对应，不能混合恢复不同时点的文件。
 
-## schema v13
+## schema v14
+
+v14新增 `person_profile_pending_results` 与 `person_profile_revision_sources`。前者按批次/pending保存无正文处理状态、原文ID、内容哈希和画像revision，后者保留每版事实的来源关联；都没有级联删除。新提交中画像写入、处理回执和已处理active pending物理移除同事务完成，deferred保留正文。旧已归档pending、原始聊天、冻结输入和所有旧画像版本不清理；迁移仍先一致性备份。人物当前画像的总量限制及协议版本见 [记忆说明](memory.md)。
 
 v13增加`auto_memory_job_deferrals`旁表，按job_id保存显式搁置原因、时间、冻结输入及进度哈希。失败任务原行、成员、错误、原文及JSON不改写；领取和提交均排除搁置项，普通失败继续阻塞。`completed_seq`仍是连续已整理水位，不能越过搁置缺口；`summary_job_id`可能指向后续已完成批次，使用摘要时需同时标明`deferredRanges`。搁置项不能普通retry或迟到提交，不通过伪造done清除积压。
 
@@ -19,6 +21,7 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 | memories / memory_revisions / memory_events / memory_uses | 既有显式记忆、版本、来源与使用审计；旧删除墓碑保留 |
 | persons / person_bindings / actor_person_bindings | 通用人物、明确路由身份绑定；兼容迁移 primary_person_bindings |
 | person_profile_revisions | 当前人物画像版本和事实证据，旧版本保留 |
+| person_profile_pending_results / person_profile_revision_sources | pending无正文处理回执、每版事实的完整来源关联 |
 | self_profile_revisions | AI全局自我画像及来源消息ID，内容或来源有变化时追加版本 |
 | self_profile_pending | 所有成员明确提出的AI画像建议、原消息ID、归档版本与时间；按来源幂等 |
 | self_profile_reclassifications | 旧AI画像待整理条目迁入原群规则的来源、目标规则版本、前后画像修订及时间；旧条目保留，活跃投影排除 |

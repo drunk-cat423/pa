@@ -430,7 +430,8 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
           let reply: string;
           try {
             reply = await runtime.prompt(modelInput, {
-              runId: run.id, ...(recalled.content ? { memoryContext: recalled.content } : {}), memoryRefs: recalled.refs,
+              runId: run.id, taskId: inputExternal?.taskId ?? run.id, conversationId: conversation.id,
+              ...(recalled.content ? { memoryContext: recalled.content } : {}), memoryRefs: recalled.refs,
               ...(inputExternal ? { companionTools: {
                 prepareTurn: (plan: import('./turn-plan.js').TurnPlan) => persist(()=>openedStore.prepareTurn(
                   conversation.id,run.inputMessageId,plan,policy,inputExternal.mentionedSenderIds,

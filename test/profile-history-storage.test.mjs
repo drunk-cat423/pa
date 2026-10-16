@@ -34,7 +34,10 @@ function addPending(f, conversationId, sourceId, _legacyCallId, target, content,
   return f.store.autoMemory.addProfilePending(f.store.autoMemory.ensureActorPerson(source.actor_id),sourceId,content,sourceType);
 }
 function batch(f) { f.store.autoMemory.reserveBatch(f.room.id,'capacity');return f.store.autoMemory.claimNext(f.room.id,{owner:'test',leaseMs:60000}); }
-function ignored(input,profiles=[]) {return {ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),topics:[],fragments:[],profiles,
+function ignored(input,profiles=[]) {
+  const deferred=input.profileProtocol===2&&profiles.length===0?input.profiles.filter(p=>p.pending?.length).map(p=>({...p,
+    pendingResults:p.pending.map(item=>({pendingId:item.id,status:'deferred'}))})):profiles;
+  return {ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),topics:[],fragments:[],profiles:deferred,
   ...(input.roomType==='private'?{continuationSummary:'继续对话'}:{})};}
 
 test('FTS Chinese words, source identities, before current boundary, actor and room isolation',()=>{
@@ -90,10 +93,13 @@ test('captured pending sources outside chat batch archive atomically and concurr
     f.inbound('稍后的一批聊天');job=batch(f);const input=f.store.autoMemory.taskInput(job);const p=input.profiles[0];
     assert.ok(!input.messages.some(m=>m.id===old.existingMessageId));assert.equal(input.profileSources[0].text,'我喜欢乌龙茶');
     const fresh=f.inbound('我还喜欢旅行','alias',other);addPending(f,other.id,fresh.existingMessageId,'fresh','sender','我还喜欢旅行','self');
-    const profile={personId:p.personId,baseVersion:p.baseVersion,facts:[{content:'喜欢乌龙茶',sourceType:'self',messageIds:[old.existingMessageId]}],pendingIds:[p.pending[0].id]};
+    const processedPendingId=p.pending[0].id;
+    const profile={personId:p.personId,baseVersion:p.baseVersion,facts:[{content:'喜欢乌龙茶',sourceType:'self',messageIds:[old.existingMessageId]}],
+      pendingResults:[{pendingId:p.pending[0].id,status:'merged',factIndex:0}]};
     const extract=validateExtract(ignored(input,[profile]),input);f.store.autoMemory.commit(job.id,job.leaseToken,extract);
     const current=f.store.autoMemory.profile('person');assert.equal(current.facts[0].content,'喜欢乌龙茶');assert.equal(current.pending.length,1);assert.equal(current.pending[0].sourceMessageId,fresh.existingMessageId);
-    assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM person_profile_pending WHERE archived_revision IS NOT NULL').get().n),1);
+    assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM person_profile_pending WHERE id=?').get(processedPendingId).n),0);
+    assert.equal(f.inspect(db=>db.prepare("SELECT count(*) n FROM person_profile_pending_results WHERE outcome='merged'").get().n),1);
   }finally{f.close();}
 });
 
@@ -103,11 +109,16 @@ test('pending IDs, person self evidence, other-person pending, assistant and fie
     addPending(f,f.room.id,alice.existingMessageId,'a','sender','我喜欢茶','self');addPending(f,f.room.id,bob.existingMessageId,'b','sender','我喜欢咖啡','self');
     let job=batch(f);f.store.autoMemory.commit(job.id,job.leaseToken,ignored(f.store.autoMemory.taskInput(job)));
     const assistant=f.turn('新的对话');job=batch(f);const input=f.store.autoMemory.taskInput(job);const p=input.profiles[0];
-    const attempt=(facts,pendingIds)=>ignored(input,[{personId:p.personId,baseVersion:p.baseVersion,facts,pendingIds}]);
+    const attempt=(facts,pendingResults)=>ignored(input,[{personId:p.personId,baseVersion:p.baseVersion,facts,pendingResults}]);
     const fact={content:'喜欢茶',sourceType:'self',messageIds:[alice.existingMessageId]};
-    for(const proposal of [attempt([fact],['not-captured']),attempt([{...fact,messageIds:[bob.existingMessageId]}],[]),attempt([{...fact,field:'diet'}],[]),attempt([{...fact,messageIds:[f.inspect(db=>db.prepare('SELECT response_message_id FROM agent_runs WHERE id=?').get(assistant.id).response_message_id)]}],[])]) {
+    for(const proposal of [attempt([fact],[{pendingId:'not-captured',status:'deferred'}]),
+      attempt([{...fact,messageIds:[bob.existingMessageId]}],[{pendingId:p.pending[0].id,status:'merged',factIndex:0}]),
+      attempt([{...fact,field:'diet'}],[{pendingId:p.pending[0].id,status:'deferred'}]),
+      attempt([{...fact,messageIds:[f.inspect(db=>db.prepare('SELECT response_message_id FROM agent_runs WHERE id=?').get(assistant.id).response_message_id)]}],
+        [{pendingId:p.pending[0].id,status:'deferred'}]),
+      attempt([fact],[])]) {
       assert.throws(()=>validateExtract(proposal,input));assert.throws(()=>f.store.autoMemory.commit(job.id,job.leaseToken,proposal));
-      assert.equal(f.store.autoMemory.profile(p.personId).baseVersion,0);assert.equal(f.store.autoMemory.status(f.room.id).completed,1);
+      assert.equal(f.store.autoMemory.profile(p.personId).baseVersion,1);assert.equal(f.store.autoMemory.status(f.room.id).completed,1);
     }
   }finally{f.close();}
 });
@@ -144,7 +155,7 @@ test('v8 migration backs up and preserves archived legacy field metadata, identi
     assert.equal(f.store.autoMemory.personForActor(actor),person);assert.equal(f.store.autoMemory.profile(person).facts[0].field,'diet');assert.equal(f.store.autoMemory.profile(person).pending.length,0);
     f.store.autoMemory.retry(job.id);const retried=f.store.autoMemory.claimNext(f.room.id,{owner:'retry',leaseMs:60000});assert.equal(f.store.autoMemory.taskInput(retried).profiles[0].pending,undefined);
     const current=f.inbound('查询历史');assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{query:'火锅'}).messages[0].id,old.existingMessageId);
-    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version), 13);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
+    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version), 14);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
   }finally{f.close();}
 });
 
@@ -170,7 +181,8 @@ test('cross-room archived-profile CAS rolls back topics and pending archival for
     f.inbound('在另一个群聊天','alias',other);
     const one=batch(f);const firstInput=f.store.autoMemory.taskInput(one);
     f.store.autoMemory.reserveBatch(other.id,'capacity');const two=f.store.autoMemory.claimNext(other.id,{owner:'other',leaseMs:60000});const secondInput=f.store.autoMemory.taskInput(two);
-    const profile=input=>({personId:'shared',baseVersion:input.profiles[0].baseVersion,facts:[{content:'喜欢绿茶',sourceType:'self',messageIds:[first.existingMessageId]}],pendingIds:[input.profiles[0].pending[0].id]});
+    const profile=input=>({personId:'shared',baseVersion:input.profiles[0].baseVersion,facts:[{content:'喜欢绿茶',sourceType:'self',messageIds:[first.existingMessageId]}],
+      pendingResults:[{pendingId:input.profiles[0].pending[0].id,status:'merged',factIndex:0}]});
     f.store.autoMemory.commit(one.id,one.leaseToken,ignored(firstInput,[profile(firstInput)]));
     const stale={...ignored(secondInput,[profile(secondInput)]),topics:[{summary:'另一个房间的话题',messageIds:secondInput.messages.map(m=>m.id)}]};
     assert.throws(()=>f.store.autoMemory.commit(two.id,two.leaseToken,stale),/版本冲突/);
@@ -186,15 +198,20 @@ test('background chunk splitting keeps captured pending evidence and archives on
     for(let i=0;i<4;i++) f.inbound('下一批'+i);
     let calls=0;const config={contextWindow:100000,memory:{enabled:true,maxCalls:10,timeoutMs:5000}};
     background=new BackgroundMemory(config,f.store.autoMemory,f.room.id,{extract:async input=>{
-      if(input.messages.length>2) throw new MemoryInputTooLargeError('split');
-      calls++;const p=input.profiles[0];const note=p.pending?.[0];
+      if(input.mode!=='profiles'&&input.messages.length>2) throw new MemoryInputTooLargeError('split');
+      calls++;
+      if(input.mode==='messages') return ignored(input);
+      const p=input.profiles[0];const note=p.pending?.[0];
       if(note) assert.equal(input.profileSources[0].text,'我喜欢阅读');
-      return ignored(input,[{personId:p.personId,baseVersion:p.baseVersion,
+      const resultProfile={personId:p.personId,baseVersion:p.baseVersion,
         facts:note?[{content:'喜欢阅读',sourceType:'self',messageIds:[note.sourceMessageId]}]:p.facts,
-        pendingIds:note?[note.id]:[]}]);
+        pendingResults:note?[{pendingId:note.id,status:'merged',factIndex:0}]:[]};
+      const proposal=input.mode==='profiles'?{profiles:[resultProfile]}:ignored(input,[resultProfile]);
+      validateExtract(proposal,input);
+      return proposal;
     }});
     background.start('capacity');await background.wait(undefined,3000);
-    assert.equal(calls,2);const p=f.store.autoMemory.profileForActors(f.store.findActor(f.room.id,'alice'))[0];
-    assert.equal(p.facts[0].content,'喜欢阅读');assert.equal(p.pending.length,0);assert.equal(p.baseVersion,1);
+    assert.equal(calls,3);const p=f.store.autoMemory.profileForActors(f.store.findActor(f.room.id,'alice'))[0];
+    assert.equal(p.facts[0].content,'喜欢阅读');assert.equal(p.pending.length,0);assert.equal(p.baseVersion,2);
   }finally{await background?.close();f.close();}
 });

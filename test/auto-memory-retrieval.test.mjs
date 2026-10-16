@@ -27,10 +27,16 @@ function fixture(t) {
       store.autoMemory.reserveBatch(conversation.id,'capacity');
       const job=store.autoMemory.claimNext(conversation.id,{owner:'test',leaseMs:60000});
       const input=store.autoMemory.taskInput(job);
+      assert.equal(input.profileProtocol,2);
       return {job,input, output:{topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id)}};
     },
     inspect(action) { const db=new DatabaseSync(path); db.function('history_tokens',{deterministic:true},value=>memoryWords(String(value??'')).join(' '));
       try { return action(db); } finally { db.close(); } }};
+}
+
+function currentProgress(input) {
+  return {version:2,remaining:[{messageIds:input.messages.map(message=>message.id),personIds:input.profiles.map(profile=>profile.personId)}],
+    profiles:input.profiles,extract:{topics:[],fragments:[],profiles:[],ignoredMessageIds:[]}};
 }
 
 test('Topic FTS migration backfills existing summaries, stays idempotent, and synchronizes updates', t => {
@@ -106,9 +112,14 @@ test('legacy personal-event pending stays stored but never enters profiles or ne
   const before=f.inspect(db=>db.prepare("SELECT * FROM person_profile_pending WHERE id='legacy-event'").get());
   const batch=f.batch(),profile=batch.input.profiles.find(item=>item.personId===person);
   assert.deepEqual(profile.pending.map(item=>item.content),['喜欢茶']);
-  batch.output.profiles=[{personId:person,baseVersion:0,facts:[{content:'喜欢茶',sourceType:'self',messageIds:[stableSource]}],pendingIds:[profile.pending[0].id]}];
+  const pendingId=profile.pending[0].id;
+  batch.output.profiles=[{personId:person,baseVersion:0,facts:[{content:'喜欢茶',sourceType:'self',messageIds:[stableSource]}],
+    pendingResults:[{pendingId,status:'merged',factIndex:0}]}];
   f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,validateExtract(batch.output,batch.input));f.restart();
   assert.deepEqual(f.store.autoMemory.profile(person).pending,[]);
+  assert.equal(f.inspect(db=>db.prepare('SELECT * FROM person_profile_pending WHERE id=?').get(pendingId)),undefined);
+  assert.deepEqual({...f.inspect(db=>db.prepare('SELECT pending_id,person_id,source_message_id,outcome,profile_revision,fact_index FROM person_profile_pending_results WHERE job_id=? AND pending_id=?').get(batch.job.id,pendingId))},
+    {pending_id:pendingId,person_id:person,source_message_id:stableSource,outcome:'merged',profile_revision:1,fact_index:0});
   assert.deepEqual(f.inspect(db=>db.prepare("SELECT * FROM person_profile_pending WHERE id='legacy-event'").get()),before);
   assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM person_fragments').get().n),0);
 });
@@ -125,12 +136,17 @@ test('a captured third-party target is organized even when only its recorder spo
       captured=input;
       const person=input.profiles.find(profile=>profile.personId===bob),pending=person.pending[0];
       return {topics:[],fragments:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
-        profiles:[{personId:bob,baseVersion:person.baseVersion,facts:[{content:'喜欢绘画',sourceType:'third_party',messageIds:[source]}],pendingIds:[pending.id]}]};
+        profiles:[{personId:bob,baseVersion:person.baseVersion,facts:[{content:'喜欢绘画',sourceType:'third_party',messageIds:[source]}],
+          pendingResults:[{pendingId:pending.id,status:'merged',factIndex:0}]}]};
     }});
   t.after(()=>worker.close());worker.start('capacity');await worker.wait(undefined,2000);
   assert.ok(captured.profiles.some(profile=>profile.personId===bob));
   assert.ok(!captured.messages.some(message=>message.personId===bob));
   assert.equal(f.store.autoMemory.profile(bob).facts[0].sourceType,'third_party');assert.equal(f.store.autoMemory.profile(bob).pending.length,0);
+  const pendingId=captured.profiles.find(profile=>profile.personId===bob).pending[0].id;
+  assert.equal(f.inspect(db=>db.prepare('SELECT * FROM person_profile_pending WHERE id=?').get(pendingId)),undefined);
+  assert.deepEqual({...f.inspect(db=>db.prepare('SELECT source_message_id,outcome,fact_index FROM person_profile_pending_results WHERE pending_id=?').get(pendingId))},
+    {source_message_id:source,outcome:'merged',fact_index:0});
 });
 
 test('room-scoped pending captured after an earlier batch is picked up without the target speaking again', t => {
@@ -145,30 +161,37 @@ test('room-scoped pending captured after an earlier batch is picked up without t
   const target=batch.input.profiles.find(profile=>profile.personId===bob);
   assert.equal(target.pending.length,1);assert.ok(batch.input.profileSources.some(message=>message.id===source));
   batch.output.profiles=[{personId:bob,baseVersion:target.baseVersion,
-    facts:[{content:'喜欢绘画',sourceType:'third_party',messageIds:[source]}],pendingIds:[target.pending[0].id]}];
+    facts:[{content:'喜欢绘画',sourceType:'third_party',messageIds:[source]}],pendingResults:[{pendingId:target.pending[0].id,status:'merged',factIndex:0}]}];
   f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,validateExtract(batch.output,batch.input));
   assert.equal(f.store.autoMemory.profile(bob).pending.length,0);
+  assert.equal(f.inspect(db=>db.prepare('SELECT * FROM person_profile_pending WHERE id=?').get(target.pending[0].id)),undefined);
+  assert.deepEqual({...f.inspect(db=>db.prepare('SELECT source_message_id,outcome,fact_index FROM person_profile_pending_results WHERE pending_id=?').get(target.pending[0].id))},
+    {source_message_id:source,outcome:'merged',fact_index:0});
 });
 
-test('explicit retry can archive legacy input and progress pending without a purpose property', async t => {
+test('explicit retry rejects legacy progress without a model call and preserves frozen input, progress and pending', async t => {
   const f=fixture(t);const source=f.inbound('我喜欢茶');
   const person=f.store.autoMemory.personForActor(f.store.findActor(f.conversation.id,'alice'));
   f.store.autoMemory.addProfilePending(person,source,'喜欢茶','self');
   const {job,input}=f.batch();
   for(const profile of input.profiles) for(const pending of profile.pending??[]) delete pending.purpose;
+  const pendingBefore=f.inspect(db=>db.prepare('SELECT * FROM person_profile_pending WHERE person_id=?').all(person));
   f.inspect(db=>db.prepare('UPDATE auto_memory_jobs SET input_json=?,progress_json=? WHERE id=?').run(JSON.stringify(input),JSON.stringify({
     remaining:[input.messages.map(message=>message.id)],profiles:input.profiles,
     extract:{topics:[],fragments:[],profiles:[],ignoredMessageIds:[]}}),job.id));
+  const frozen=f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id));
   f.store.autoMemory.fail(job.id,job.leaseToken,'legacy failed job');f.restart();f.store.autoMemory.retry(job.id);
+  let calls=0;
   const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:2,timeoutMs:1000}},
-    f.store.autoMemory,f.conversation.id,{extract:async captured=>{
-      const profile=captured.profiles.find(item=>item.personId===person);
-      assert.equal(profile.pending[0].purpose,undefined);
-      return {topics:[],fragments:[],ignoredMessageIds:[source],profiles:[{personId:person,baseVersion:profile.baseVersion,
-        facts:[{content:'喜欢茶',sourceType:'self',messageIds:[source]}],pendingIds:[profile.pending[0].id]}]};
-    }});
-  t.after(()=>worker.close());worker.start();await worker.wait(undefined,2000);
-  assert.equal(f.store.autoMemory.profile(person).pending.length,0);assert.equal(f.store.autoMemory.profile(person).facts[0].content,'喜欢茶');
+    f.store.autoMemory,f.conversation.id,{extract:async()=>{calls++;throw new Error('legacy progress must fail before extraction');}});
+  t.after(()=>worker.close());worker.start();await assert.rejects(worker.wait(undefined,2000),/失败/);
+  assert.equal(calls,0);assert.equal(worker.info().calls,0);
+  assert.match(f.store.autoMemory.listJobs()[0].error,/profile_protocol/);
+  assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id)),frozen);
+  assert.deepEqual(f.inspect(db=>db.prepare('SELECT * FROM person_profile_pending WHERE person_id=?').all(person)),pendingBefore);
+  assert.deepEqual(f.store.autoMemory.profile(person).facts,[]);
+  assert.equal(f.inspect(db=>db.prepare('SELECT text FROM messages WHERE id=?').get(source).text),'我喜欢茶');
+  assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM person_profile_pending_results WHERE job_id=?').get(job.id).n),0);
   assert.equal(f.store.autoMemory.listJobs()[0].attempts,2);
 });
 
@@ -211,8 +234,7 @@ test('deduplicated facts recalled through a Topic reveal only evidence from that
 
 for(const legacy of ['input','progress','proposal']) test('obsolete personal-event '+legacy+' fails explicitly and preserves frozen work', async t => {
   const f=fixture(t),source=f.inbound('旧事件'),{job,input}=f.batch();
-  const progress={remaining:[input.messages.map(item=>item.id)],profiles:input.profiles,
-    extract:{topics:[],fragments:[],profiles:[],ignoredMessageIds:[]}};
+  const progress=currentProgress(input);
   if(legacy==='input') input.profiles[0].pending=[{id:'old',content:'旧事件',sourceMessageId:source,sourceType:'self',purpose:'memory'}];
   if(legacy==='progress') progress.extract.memoryPending=[];
   f.inspect(db=>db.prepare('UPDATE auto_memory_jobs SET input_json=?,progress_json=? WHERE id=?').run(JSON.stringify(input),JSON.stringify(progress),job.id));
@@ -303,8 +325,7 @@ for(const sharedSource of [false,true]) test('archived event fragments cannot be
 for(const frozenPart of ['input-fragment','progress-profile','progress-fragment']) test('frozen '+frozenPart+' resolving to archived events fails without rewriting JSON',async t=>{
   const f=fixture(t),legacy=archivedPersonalEvent(f);f.inbound('新批次');const batch=f.batch();
   const input=structuredClone(batch.input);delete input.excludedProfileSourceIds;
-  const progress={remaining:[input.messages.map(message=>message.id)],profiles:input.profiles,
-    extract:{topics:[],fragments:[],profiles:[],ignoredMessageIds:[]}};
+  const progress=currentProgress(input);
   if(frozenPart==='input-fragment') {
     input.profileFragments=[legacy.event];
     input.profileSources=[f.inspect(db=>({...db.prepare('SELECT id,text FROM messages WHERE id=?').get(legacy.source),

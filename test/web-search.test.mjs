@@ -56,8 +56,8 @@ test('调用固定 DeepSeek 搜索端点，提取原生来源、引用片段和 
   assert.equal(result.sources[0].publishedAt, undefined);
   assert.deepEqual(result.usage, { inputTokens: 10, outputTokens: 4, cacheReadTokens: 3,
     cacheWriteTokens: 2, totalTokens: 19, serverSearches: 2 });
-  const dirs = await readdir(config.dataDir);
-  const ledgerText = await readFile(join(config.dataDir, dirs[0], 'search-attempts.jsonl'), 'utf8');
+  const budgetDir = createHash('sha256').update(`web-search-budget:${config.search.budgetId}`).digest('hex');
+  const ledgerText = await readFile(join(config.dataDir, budgetDir, 'search-attempts.jsonl'), 'utf8');
   const events = ledgerText.trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(events.map(event => event.type), ['reserved', 'completed']);
   assert.equal(events[0].query, '最新官方文档');
@@ -211,8 +211,8 @@ test('零配额不限累计请求与服务端搜索次数，仍记录账本且�
   assert.equal(payloads.length, 3);
   assert.equal(payloads[0].tools[0].max_uses, 1);
   assert.ok(payloads.slice(1).every(payload => !('max_uses' in payload.tools[0])));
-  const dirs = await readdir(capped.dataDir);
-  const events = (await readFile(join(capped.dataDir, dirs[0], 'search-attempts.jsonl'), 'utf8'))
+  const budgetDir = createHash('sha256').update(`web-search-budget:${capped.search.budgetId}`).digest('hex');
+  const events = (await readFile(join(capped.dataDir, budgetDir, 'search-attempts.jsonl'), 'utf8'))
     .trim().split('\n').map(line => JSON.parse(line));
   assert.equal(events.filter(event => event.type === 'reserved').length, 3);
   assert.equal(events.filter(event => event.type === 'completed').length, 3);
@@ -283,8 +283,8 @@ test('预留账本期间收到取消时不发送请求，仍记录消耗的预�
   await assert.rejects(searchDeepSeek(config, 'cancel before dispatch', signal,
     async () => { dispatched = true; return nativeResponse(); }), /已取消/);
   assert.equal(dispatched, false);
-  const dirs = await readdir(config.dataDir);
-  const events = (await readFile(join(config.dataDir, dirs[0], 'search-attempts.jsonl'), 'utf8'))
+  const budgetDir = createHash('sha256').update(`web-search-budget:${config.search.budgetId}`).digest('hex');
+  const events = (await readFile(join(config.dataDir, budgetDir, 'search-attempts.jsonl'), 'utf8'))
     .trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(events.map(event => event.type), ['reserved', 'failed']);
 });

@@ -12,10 +12,16 @@ export interface ProfileFact {
   expiresAt?: string | null;
 }
 export interface PersonProfilePending { id: string; content: string; sourceMessageId: string; sourceType: EvidenceType }
+export type ProfilePendingResult =
+  | { pendingId: string; status: 'merged'; factIndex: number }
+  | { pendingId: string; status: 'superseded'; replacementMessageId: string }
+  | { pendingId: string; status: 'not_profile'; reason: 'temporary' | 'not_personal' | 'insufficient_evidence' }
+  | { pendingId: string; status: 'deferred' };
 export interface PersonProfile {
   personId: string; baseVersion: number; facts: ProfileFact[];
   pending?: PersonProfilePending[];
   pendingIds?: string[];
+  pendingResults?: ProfilePendingResult[];
 }
 export interface AutoMemoryMessage {
   id: string; conversationId: string; actorId?: string; personId?: string;
@@ -28,6 +34,8 @@ export interface AutoMemoryJob {
   leaseToken?: string; leaseOwner?: string; leaseUntil?: number; error?: string;
 }
 export interface AutoMemoryTaskInput {
+  profileProtocol?: 2;
+  mode?: 'messages' | 'profiles';
   job: AutoMemoryJob; roomType: 'private' | 'group'; messages: AutoMemoryMessage[];
   previousSummary?: string; profiles: PersonProfile[]; selfProfile?: SelfProfileSnapshot;
   deferredRanges?: { startSeq: number; endSeq: number }[];

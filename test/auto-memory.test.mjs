@@ -22,6 +22,8 @@ function wait(signal, gate) {
   });
 }
 function extracted(input) {
+  if (input.mode === 'profiles') return { profiles: input.profiles.map(profile => ({ personId: profile.personId,
+    baseVersion: profile.baseVersion, facts: profile.facts, pendingResults: (profile.pending ?? []).map(pending => ({ pendingId: pending.id, status: 'deferred' })) })) };
   const ids = input.messages.filter(message => message.role === 'user').map(message => message.id);
   return { topics: ids.length ? [{ summary: '本批讨论了测试计划。', messageIds: ids }] : [],
     fragments: [], profiles: [], ignoredMessageIds: [],
@@ -324,7 +326,7 @@ test('长批次拆分检查点在失败重试后续接，不重复已成功的�
     if (input.messages.length > 20) throw new MemoryInputTooLargeError('fixture split');
     smallCalls++;
     if (smallCalls === 2 && !failed) { failed = true; throw new Error('fixture transient'); }
-    finished.push(input.messages.map(message => message.id));
+    if (input.mode !== 'profiles') finished.push(input.messages.map(message => message.id));
     return extracted(input);
   }, { memory: { enabled: true, maxCalls: 20, timeoutMs: 5000 } });
   const h = f.harness();
@@ -334,7 +336,7 @@ test('长批次拆分检查点在失败重试后续接，不重复已成功的�
   const next = f.harness(); await next.start(); await next.waitForMemory();
   assert.equal(next.info().memory.find(item=>item.conversation===channelConversationKey(f.route)).completed, 1);
   const ids = finished.flat(); assert.equal(ids.length, 50); assert.equal(new Set(ids).size, 50);
-  assert.equal(next.info().memory[0].calls, 5);
+  assert.equal(next.info().memory[0].calls, 9);
 });
 
 test('关闭中断的后台批次保留失败，只有显式重试后才继续整理', async t => {
@@ -354,11 +356,13 @@ test('关闭中断的后台批次保留失败，只有显式重试后才继续�
   assert.equal(next.info().memory.find(item => item.conversation === channelConversationKey(f.route)).completed, 1);
 });
 
-test('后台有限画像视图新增事实后保留超过200条的完整旧证据', async t => {
+test('后台提供完整旧画像并整体替换收敛结果，不再补回未返回的旧事实', async t => {
+  let observedFacts = 0;
   const f = await fixture(t, async input => {
     const result = extracted(input); const person = input.profiles[0];
-    result.profiles = [{ ...person, facts: [...person.facts.map(({field:_field,...fact})=>fact),
-      { content: '新兴趣是天文', sourceType: 'self', messageIds: [input.messages.find(m => m.role === 'user').id] }] }];
+    observedFacts = person.facts.length;
+    result.profiles = [{ personId: person.personId, baseVersion: person.baseVersion, facts: [
+      { content: '长期兴趣是天文', sourceType: 'self', messageIds: [person.facts[0].messageIds[0]] }] }];
     return result;
   }, { contextWindow: 50000 });
   const h = f.harness(); await h.handle(f.message('profile-base', '首次发言'));
@@ -372,7 +376,9 @@ test('后台有限画像视图新增事实后保留超过200条的完整旧证�
     for (let i = 1; i < 50; i++) await h.handle(f.message(`profile-${i}`, '天文记录'));
     await h.waitForMemory();
     const row = db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? ORDER BY revision DESC LIMIT 1').get(person);
-    assert.equal(JSON.parse(row.facts_json).length, 201);
+    assert.equal(observedFacts, 200);
+    assert.deepEqual(JSON.parse(row.facts_json), [{ content: '长期兴趣是天文', sourceType: 'self', messageIds: [source] }]);
+    assert.equal(JSON.parse(db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=1').get(person).facts_json).length, 200);
   } finally { db.close(); }
 });
 

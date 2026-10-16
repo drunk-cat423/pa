@@ -6,6 +6,7 @@ import type { PaConfig } from './config.js';
 import { acquireConversationLock } from './conversation-lock.js';
 import { requestTimeData } from './request-time.js';
 import { outputLengthGuidance } from './output-length.js';
+import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
 
 export interface WebSearchConfig {
   enabled: boolean;
@@ -314,7 +315,7 @@ async function withLedger<T>(directory: string, callback: (entries: LedgerEvent[
     };
     return await callback(entries, append);
   } catch (error) {
-    if (error instanceof WebSearchPersistenceError || error instanceof WebSearchError) throw error;
+    if (error instanceof WebSearchPersistenceError || error instanceof WebSearchError || error instanceof DiagnosticPersistenceError) throw error;
     throw new WebSearchPersistenceError();
   } finally { await handle?.close().catch(() => {}); }
 }
@@ -338,7 +339,7 @@ function checkedDateRange(range?: SearchDateRange): SearchDateRange | null {
 }
 
 export async function searchDeepSeek(config: PaConfig, query: string, signal?: AbortSignal, fetcher: typeof fetch = fetch,
-  dateRange?: SearchDateRange): Promise<WebSearchResult> {
+  dateRange?: SearchDateRange, diagnosticContext?: DiagnosticContext): Promise<WebSearchResult> {
   const search = (config as PaConfig & { search?: WebSearchConfig }).search;
   if (!search) throw new WebSearchError('网页搜索配置缺失。');
   validateConfig(search);
@@ -385,11 +386,23 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
       };
       await saveEvidence(lock.directory, attemptId, 'request', { endpoint: ENDPOINT, body }, config.apiKey);
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), search.timeoutMs);
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const onAbort = () => controller.abort();
       signal?.addEventListener('abort', onAbort, { once: true });
+      let diagnostics: DiagnosticLog | undefined;
+      let callId: string | undefined;
+      let phase = 'request';
+      let httpStatus: number | undefined;
       try {
         if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+        diagnostics = new DiagnosticLog(config.dataDir, [config.apiKey]);
+        const context = diagnosticContext ?? { traceId: attemptId };
+        // This captures bounded parsed JSON, not raw HTTP bytes or request headers.
+        callId = diagnostics.startCall({ ...context, kind: 'search', captureLevel: 'http-json',
+          provider: 'deepseek', model: search.model, phase }, { endpoint: ENDPOINT, body }, { maxResults: search.maxResults });
+        diagnostics.event(context, phase, 'search_reserved', { attemptId }, callId);
+        if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+        timer = setTimeout(() => controller.abort(), search.timeoutMs);
         let response: Response;
         try {
           response = await fetcher(ENDPOINT, {
@@ -401,16 +414,30 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
             body: JSON.stringify(body),
             signal: controller.signal,
           });
-        } catch {
+        } catch (error) {
+          if (error instanceof DiagnosticPersistenceError) throw error;
           throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求失败或超时。');
         }
         if (controller.signal.aborted) {
           throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求超时。');
         }
-        if (!response.ok) throw new WebSearchError(`DeepSeek 网页搜索请求失败（HTTP ${response.status}）。`);
+        if (!response.ok) {
+          phase = 'http'; httpStatus = response.status;
+          try {
+            const errorResponse = await readBoundedBody(response);
+            diagnostics.saveResponse(callId, errorResponse);
+          } catch (error) {
+            // Non-JSON and oversized error bodies stay bounded; retain the original HTTP failure.
+            if (error instanceof DiagnosticPersistenceError) throw error;
+          }
+          throw new WebSearchError(`DeepSeek 网页搜索请求失败（HTTP ${response.status}）。`);
+        }
+        phase = 'response';
         const rawResponse = await readBoundedBody(response);
+        diagnostics.saveResponse(callId, rawResponse);
         await saveEvidence(lock.directory, attemptId, 'response', rawResponse, config.apiKey);
         const safeResponse: unknown = JSON.parse(JSON.stringify(rawResponse).split(config.apiKey).join('[redacted]'));
+        phase = 'parse';
         const parsed = parseSearchResponse(safeResponse, search.maxResults);
         if (controller.signal.aborted) {
           throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求超时。');
@@ -419,10 +446,17 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
           searchedAt: clock.currentTime, timeZone: clock.timeZone, requestedDateRange,
           dateFilterApplied: false, verification: 'unverified',
         } };
+        phase = 'ledger';
         await append({ type: 'completed', attemptId, timestamp: new Date().toISOString(), sources: result.sources,
           usage: result.usage, ...(result.summary ? { summary: result.summary } : {}) });
+        diagnostics.finishCall(callId, 'completed', 'completed');
         return result;
       } catch (error) {
+        if (error instanceof DiagnosticPersistenceError) throw error;
+        if (callId) diagnostics!.finishCall(callId, phase === 'request' ? 'unknown' : 'failed', phase,
+          { failure: phase === 'request' ? 'search_request_failed' : phase === 'http' ? 'search_http_failed'
+            : phase === 'parse' ? 'search_parse_failed' : phase === 'response' ? 'search_response_failed' : 'search_persistence_failed',
+          ...(httpStatus === undefined ? {} : { httpStatus }) });
         if (error instanceof WebSearchPersistenceError) throw error;
         const safeReason = error instanceof WebSearchError ? error.message.slice(0, 200) : '网页搜索处理失败。';
         await append({ type: 'failed', attemptId, timestamp: new Date().toISOString(), reason: safeReason });

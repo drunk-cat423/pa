@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
-import { createMemoryProvider, MemoryInputTooLargeError, prepareMemoryExtraction } from '../dist/memory-provider.js';
+import { createMemoryProvider, MemoryInputTooLargeError, prepareMemoryExtraction, parseMemoryResponse } from '../dist/memory-provider.js';
 
 const output = {
   ignoredMessageIds: [], topics: [], fragments: [], profiles: [], continuationSummary: '继续讨论行程安排。',
@@ -25,7 +28,32 @@ test('pure offline request preparation omits worker leases and states the human-
   assert.match(prepared.systemPrompt,/不能新写为人物事实或 AI 自我画像/);
 });
 
+test('new profile preparation requests complete bounded replacement and typed pending decisions', () => {
+  const prepared = prepareMemoryExtraction({ ...input, profileProtocol: 2 }, 100000);
+  assert.match(prepared.systemPrompt, /facts 是该人的完整最终画像/);
+  assert.match(prepared.systemPrompt, /最多40条facts/);
+  assert.match(prepared.systemPrompt, /200个Unicode字符/);
+  assert.match(prepared.systemPrompt, /6000字节/);
+  assert.match(prepared.systemPrompt, /16000字节/);
+  assert.match(prepared.systemPrompt, /pendingResults/);
+  assert.doesNotMatch(prepared.systemPrompt, /"pendingIds"\?:string\[\]/);
+  assert.match(prepared.systemPrompt, /not_profile/);
+  assert.match(prepared.systemPrompt, /replacementMessageId/);
+  assert.doesNotMatch(prepared.systemPrompt, /未给出的旧事实由/);
+});
+
+test('profiles-only requests have no self result gate and explicitly disable message coverage', () => {
+  const profileInput = { ...input, profileProtocol: 2, mode: 'profiles', selfProfile: {} };
+  const prepared = prepareMemoryExtraction(profileInput, 100000);
+  assert.match(prepared.systemPrompt, /mode=profiles/);
+  assert.match(prepared.systemPrompt, /不执行消息覆盖/);
+  assert.doesNotMatch(prepared.systemPrompt, /本轮还必须输出 selfProfile/);
+  const result = { profiles: [] };
+  assert.deepEqual(parseMemoryResponse({ stopReason: 'stop', content: [{ type: 'text', text: JSON.stringify(result) }] }, profileInput), result);
+});
+
 async function fixture(t) {
+  const directory = await mkdtemp(join(tmpdir(), 'pa-memory-provider-'));
   const requests = [];
   let mode = 'success';
   const server = createServer(async (request, response) => {
@@ -35,6 +63,7 @@ async function fixture(t) {
     if (request.url !== '/v1/chat/completions') {
       response.writeHead(404); response.end(); return;
     }
+    if (mode === 'http-error') { response.writeHead(503); response.end('private provider rejection'); return; }
     const stopReason = mode === 'length' ? 'length' : 'stop';
     const content = mode === 'invalid-json' ? '{invalid json' : JSON.stringify(output);
     response.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -45,13 +74,14 @@ async function fixture(t) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
   const config = {
-    cwd: process.cwd(), dataDir: process.cwd(), provider: 'deepseek', model: 'deepseek-chat', apiKey: 'local-model-key',
+    cwd: directory, dataDir: directory, provider: 'deepseek', model: 'deepseek-chat', apiKey: 'local-model-key',
     baseUrl, contextWindow: 100_000, maxOutputTokens: 2048, timeoutMs: 5000,
     memory: { enabled: true, maxCalls: 10, timeoutMs: 5000 },
   };
   t.after(async () => {
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
   });
   return { config, requests, setMode: value => { mode = value; } };
 }
@@ -62,6 +92,21 @@ test('离线请求准备明确摘要缺口，不把搁置区间当作已整理�
   assert.match(prepared.systemPrompt,/previousSummary只覆盖已完成部分/);
   assert.match(prepared.systemPrompt,/不将缺口视为已整理/);
   assert.doesNotMatch(prepareMemoryExtraction(input,100000).systemPrompt,/deferredRanges/);
+});
+
+test('saved normalized responses parse offline without API credentials and retain all response failure gates', () => {
+  const message = { stopReason: 'stop', content: [{ type: 'text', text: JSON.stringify(output) }] };
+  assert.deepEqual(parseMemoryResponse(message, input), output);
+  assert.throws(() => parseMemoryResponse({ ...message, stopReason: 'length' }, input), /输出长度上限/);
+  assert.throws(() => parseMemoryResponse({ ...message, content: [{ type: 'text', text: '{broken' }] }, input), /不是有效 JSON/);
+  assert.throws(() => parseMemoryResponse({ ...message, stopReason: 'error', errorMessage: 'HTTP 503 secret-body' }, input), /请求未完成/);
+  assert.throws(() => parseMemoryResponse(message, { ...input, selfProfile: {} }), /缺少自我画像/);
+});
+
+test('SDK transport errors use zero automatic retries', async t => {
+  const f = await fixture(t); f.setMode('http-error');
+  await assert.rejects(createMemoryProvider(f.config).extract(input, new AbortController().signal), /请求未完成/);
+  assert.equal(f.requests.length, 1);
 });
 
 test('uses local Pi model with no embedding interface; DeepSeek thinking stays disabled', async t => {

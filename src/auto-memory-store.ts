@@ -4,6 +4,8 @@ import { MemoryError, type PrimaryPerson } from './memory-types.js';
 import type { AutoMemoryJob, AutoMemoryMessage, AutoMemoryReason, AutoMemoryTaskInput, PersonProfile, PersonProfilePending, ProfileFact, TopicRecord, ValidatedExtract } from './auto-memory-types.js';
 import { SelfProfileStore } from './self-profile-store.js';
 import { memoryWords } from './memory-text.js';
+import { assertProfileCapacity, profileCapacity } from './profile-limits.js';
+import { assertProfileEvidenceStrength, assertProfileProtocol, validateProfilePendingResults } from './profile-pending.js';
 
 const timestamp = () => new Date().toISOString();
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -216,7 +218,7 @@ export class AutoMemoryStore {
       const profile=this.profile(String(r.person_id));
       const current=profile.facts.find(f=>f.field===fact.field);
       if(!profile.facts.some(f=>sameFact(f,fact)) && (!current||this.evidenceSequence(fact.messageIds)>=this.evidenceSequence(current.messageIds))) {
-        this.writeProfile({...profile,facts:[...profile.facts.filter(old=>old.field!==fact.field),fact]},null);
+        this.writeProfile({...profile,facts:[...profile.facts.filter(old=>old.field!==fact.field),fact]},null,true);
       }
     }
   }
@@ -362,7 +364,7 @@ export class AutoMemoryStore {
       ...profiles.flatMap(profile => profile.facts.flatMap(fact => fact.messageIds)),
       ...profileFragments.flatMap(fragment => fragment.messageIds)])]);
     const deferredRanges=this.deferredRanges(canonical.conversationId);
-    const input:AutoMemoryTaskInput={profileSources,profileFragments,...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
+    const input:AutoMemoryTaskInput={profileProtocol:2,profileSources,profileFragments,...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
     this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
     return input;
   }
@@ -407,17 +409,37 @@ export class AutoMemoryStore {
         .run(randomUUID(),personId,content,sourceMessageId,sourceType,timestamp(),'profile');
     });
   }
-  private writeProfile(profile:PersonProfile,jobId:string|null): void {
+  private writeProfile(profile:PersonProfile,jobId:string|null,legacyMigration=false): void {
+    const facts=mergeProfileFacts(profile.facts);
+    if(legacyMigration&&Number(this.db.prepare('PRAGMA user_version').get()?.user_version)>=6) throw new Error('历史画像迁移阶段无效。');
+    if(!legacyMigration) assertProfileCapacity({...profile,baseVersion:profile.baseVersion+1,facts});
+    const previousRow=legacyMigration?undefined:this.db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=?')
+      .get(profile.personId,profile.baseVersion);
+    const previousFacts=previousRow?parse<ProfileFact[]>(previousRow.facts_json):[];
     const revision=profile.baseVersion+1;
     if(this.db.prepare('UPDATE persons SET revision=? WHERE id=? AND revision=?').run(revision,profile.personId,profile.baseVersion).changes!==1) throw new Error('人物画像版本冲突，请重读后重试。');
-    this.db.prepare('INSERT INTO person_profile_revisions VALUES (?,?,?,?,?)').run(profile.personId,revision,JSON.stringify(mergeProfileFacts(profile.facts)),jobId,timestamp());
+    this.db.prepare('INSERT INTO person_profile_revisions VALUES (?,?,?,?,?)').run(profile.personId,revision,JSON.stringify(facts),jobId,timestamp());
+    if(!legacyMigration) facts.forEach((fact,index)=>{
+      const sources=new Set(fact.messageIds);
+      previousFacts.forEach((old,oldIndex)=>{
+        // A single message may contain unrelated facts. Only identical facts inherit
+        // supplementary evidence; rewrites keep their prior evidence in the old revision.
+        if(sameFactContent(old,fact)) {
+          old.messageIds.forEach(messageId=>sources.add(messageId));
+          for(const row of this.db.prepare('SELECT message_id FROM person_profile_revision_sources WHERE person_id=? AND revision=? AND fact_index=?')
+            .all(profile.personId,profile.baseVersion,oldIndex)) sources.add(String(row.message_id));
+        }
+      });
+      sources.forEach(messageId=>this.db.prepare('INSERT OR IGNORE INTO person_profile_revision_sources VALUES (?,?,?,?)')
+        .run(profile.personId,revision,index,messageId));
+    });
   }
   private evidenceSequence(ids:readonly string[]):number {
     return ids.reduce((highest,id)=>Math.max(highest,Number(this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(id)?.ingest_seq??0)),0);
   }
   commit(jobId:string,leaseToken:string,extract:ValidatedExtract,selfBudget?:number): void {
     this.atomic(()=>{
-      const row=this.active(jobId,leaseToken); const job=this.job(row); const input=this.taskInput(job); assertCurrentMemoryProtocol(input); assertCurrentMemoryProtocol(extract); this.assertProfileEvidenceCurrent(input,extract); const owned=new Set(job.messageIds);
+      const row=this.active(jobId,leaseToken); const job=this.job(row); const input=this.taskInput(job); assertCurrentMemoryProtocol(input); assertProfileProtocol(input); assertCurrentMemoryProtocol(extract); this.assertProfileEvidenceCurrent(input,extract); const owned=new Set(job.messageIds);
       if([...(input.profileSources??[]),...input.messages].some(m=>m.actorId!==undefined&&this.personForActor(m.actorId)!==m.personId)) throw new Error('人物绑定版本冲突，请重读后重试。');
       const first=this.nextPending(job.conversationId);
       if(first?.id!==jobId) throw new Error('同房间整理必须按批次顺序提交。');
@@ -467,32 +489,51 @@ export class AutoMemoryStore {
         for(const fact of profile.facts) {
           content(fact.content);
           if(!['self','third_party','inference'].includes(fact.sourceType)||!Array.isArray(fact.messageIds)) throw new Error('画像事实证据无效。');
-          if(!baseline.facts.some(old=>sameFact(old,fact))) {
+          const inherited=baseline.facts.some(old=>sameFact(old,fact));
+          if(!inherited) {
+            assertProfileEvidenceStrength(fact,baseline,input);
             if(fact.field!==undefined) throw new Error('新画像事实不能输出旧分类字段。');
-            const captured=baseline.pending??[];
-            const priorIds = new Set([...(input.profileFragments ?? []).filter(fragment => fragment.personId === profile.personId).flatMap(fragment => fragment.messageIds),
-              ...baseline.facts.filter(old => sameFactContent(old, fact)).flatMap(old => old.messageIds)]);
-            const allowed=new Map([...input.messages,...(input.profileSources??[]).filter(message=>captured.some(item=>item.sourceMessageId===message.id)||priorIds.has(message.id)),
-              ...this.messages([...priorIds])].map(message=>[message.id,message]));
-            if(!fact.messageIds.length||new Set(fact.messageIds).size!==fact.messageIds.length
-              ||fact.messageIds.some(id=>!allowed.has(id)||allowed.get(id)!.role!=='user')
-              ||(fact.sourceType==='self'&&fact.messageIds.some(id=>allowed.get(id)!.personId!==profile.personId))) throw new Error('人物画像必须引用有效真人来源，且自述必须属于本人。');
           }
+          const captured=baseline.pending??[];
+          const priorIds = new Set([...(input.profileFragments ?? []).filter(fragment => fragment.personId === profile.personId).flatMap(fragment => fragment.messageIds),
+            ...baseline.facts.flatMap(old => old.messageIds)]);
+          const allowed=new Map([...input.messages,...(input.profileSources??[]).filter(message=>captured.some(item=>item.sourceMessageId===message.id)||priorIds.has(message.id)),
+            ...this.messages([...priorIds])].map(message=>[message.id,message]));
+          if(!fact.messageIds.length||new Set(fact.messageIds).size!==fact.messageIds.length
+            ||fact.messageIds.some(id=>!allowed.has(id)||allowed.get(id)!.role!=='user')
+            ||(fact.sourceType==='self'&&fact.messageIds.some(id=>allowed.get(id)!.personId!==profile.personId))) throw new Error('人物画像必须引用有效真人来源，且自述必须属于本人。');
         }
         const current=this.profile(profile.personId);
         if(current.baseVersion!==baseline.baseVersion||JSON.stringify(current.facts)!==JSON.stringify(baseline.facts)) throw new Error('人物画像版本冲突，请重读后重试。');
-        const pendingIds=profile.pendingIds??[];
-        if(!Array.isArray(pendingIds)||new Set(pendingIds).size!==pendingIds.length) throw new Error('待归档人物 ID 无效。');
-        for(const id of pendingIds) {
-          const captured=baseline.pending?.find(item=>item.id===id);
-          const live=current.pending?.find(item=>item.id===id);
-          if(!captured||!live||!samePending(captured,live)
-            ||!profile.facts.some(fact=>fact.messageIds.includes(captured.sourceMessageId))) throw new Error('只能归档已捕获且保留来源的待整理人物资料。');
+        const pendingResults=validateProfilePendingResults(profile,baseline,input);
+        for(const result of pendingResults) {
+          const captured=baseline.pending!.find(item=>item.id===result.pendingId)!;
+          const live=current.pending?.find(item=>item.id===result.pendingId);
+          if(!live||!samePending(captured,live)) throw new Error('只能处理本次捕获且未经改变的人物待整理条目。');
         }
+        // Validate the deduplicated final result, not just each model chunk.
+        assertProfileCapacity({...profile,facts:mergeProfileFacts(profile.facts)});
         this.writeProfile(profile,jobId);
-        for(const id of pendingIds) this.db.prepare('UPDATE person_profile_pending SET archived_revision=?,archived_at=? WHERE id=? AND person_id=? AND archived_revision IS NULL')
-          .run(profile.baseVersion+1,timestamp(),id,profile.personId);
+        for(const result of pendingResults) {
+          const captured=baseline.pending!.find(item=>item.id===result.pendingId)!;
+          const mergedFact=result.status==='merged'?profile.facts[result.factIndex]:undefined;
+          const normalizedIndex=mergedFact?mergeProfileFacts(profile.facts).findIndex(fact=>sameFactContent(fact,mergedFact)):null;
+          this.db.prepare(`INSERT INTO person_profile_pending_results
+            (job_id,pending_id,person_id,source_message_id,source_type,content_hash,outcome,profile_revision,fact_index,replacement_message_id,reason,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(jobId,captured.id,profile.personId,captured.sourceMessageId,captured.sourceType,hash(captured.content),result.status,
+            profile.baseVersion+1,normalizedIndex,result.status==='superseded'?result.replacementMessageId:null,result.status==='not_profile'?result.reason:null,timestamp());
+          if(result.status==='merged') this.db.prepare('INSERT OR IGNORE INTO person_profile_revision_sources VALUES (?,?,?,?)')
+            .run(profile.personId,profile.baseVersion+1,normalizedIndex!,captured.sourceMessageId);
+          if(result.status!=='deferred') {
+            // Internal acknowledged-queue cleanup only. Original messages, revisions and the receipt remain.
+            const removed=this.db.prepare("DELETE FROM person_profile_pending WHERE id=? AND person_id=? AND archived_revision IS NULL AND purpose='profile'")
+              .run(captured.id,profile.personId);
+            if(removed.changes!==1) throw new Error('人物待整理队列发生并发变更。');
+          }
+        }
       }
+      if(input.profiles.some(profile=>(profileCapacity(profile).needsConsolidation||profileCapacity(profile).exceedsLimits||(profile.pending?.length??0)>0)
+        &&!updated.has(profile.personId))) throw new Error('本批次遗漏了需要收敛或处理待整理条目的人物画像。');
       if (extract.selfProfile !== undefined) {
         if (input.selfProfile === undefined) throw new Error('自我档案产物缺少已捕获的输入快照。');
         this.selfProfile.commit(input.selfProfile, extract.selfProfile, input.messages, selfBudget);

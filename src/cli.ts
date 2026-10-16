@@ -13,6 +13,8 @@ const help = `pa — TypeScript 个人伙伴的本地对话入口
   npm start -- memory query [--query <关键词>] [--conversation <名称>]
   npm start -- memory correct --id <ID> --content <新内容> [--conversation <名称>]
   npm start -- check
+  npm start -- logs recent | task <任务ID> | job <批次ID> | call <调用ID> [--content]
+  npm start -- logs replay <调用ID> --offline
   npm start -- --help
 
 默认会话：local-owner。同名会话恢复 Pi 上下文，不同名称使用独立历史。
@@ -187,6 +189,11 @@ async function writeLine(text: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === 'logs') {
+    const { runLogsCli } = await import('./logs-cli.js');
+    process.exitCode = runLogsCli(process.argv.slice(3));
+    return;
+  }
   const options = parseArgs(process.argv.slice(2));
   if (options.command === 'help') { await writeLine(help); return; }
   if (options.command === 'memory') {

@@ -16,6 +16,7 @@ export interface ExternalRunInput {
   eventId: string;
   senderId: string;
   existingMessageId?: string;
+  taskId?: string;
   sentAt?: string;
   mentionedSenderIds?: string[];
   senderName?: string;

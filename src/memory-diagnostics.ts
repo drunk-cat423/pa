@@ -7,6 +7,14 @@ export class MemoryProviderError extends Error {
   }
 }
 
+export function memoryFailurePhase(error: unknown, fallback: string): string {
+  if (!(error instanceof MemoryProviderError)) return fallback;
+  if (error.code === 'model_json') return 'parse';
+  if (error.code === 'model_contract') return 'validate';
+  if (error.code === 'model_request') return 'request';
+  return 'response';
+}
+
 export function memoryFailure(error: unknown, phase: string): string {
   const message = error instanceof Error ? error.message : '';
   let code = 'unexpected';
@@ -18,6 +26,10 @@ export function memoryFailure(error: unknown, phase: string): string {
     detail = descriptions[error.code] + (error.httpStatus === undefined ? '' : ` HTTP ${error.httpStatus}。`);
   } else if (error instanceof Error && error.name === 'ObsoletePersonalMemoryError') {
     code = 'obsolete_personal_memory'; detail = '个人长期事件协议已过期；固定输入与进度已保留，需操作者处理。';
+  } else if (error instanceof Error && error.name === 'PersonProfileProtocolError') {
+    code = 'profile_protocol'; detail = '人物画像协议已变更；旧固定输入与进度已保留，需操作者处理。';
+  } else if (error instanceof Error && error.name === 'PersonProfileCapacityError') {
+    code = 'profile_capacity'; detail = '人物画像超过容量或格式限制；原文、版本和待整理条目保持不变。';
   } else if (error instanceof Error && error.name === 'MemoryInputTooLargeError') {
     code = 'input_too_large'; detail = '输入超出模型窗口，尚未提交模型。';
   } else if (/版本冲突|输入版本/.test(message)) {
