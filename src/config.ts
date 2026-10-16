@@ -24,9 +24,7 @@ export interface AutoMemoryConfig {
   /** 0 disables the per-start extraction call limit. */
   maxCalls: number;
   timeoutMs: number;
-  maxRetries: number;
   maxOutputTokens?: number;
-  embedding?: { url: string; model: string; apiKey: string; dimensions: number; maxCalls: number };
 }
 
 export function readDataDir(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string {
@@ -154,22 +152,7 @@ export function readAutoMemoryConfig(env: NodeJS.ProcessEnv): AutoMemoryConfig {
   const result: AutoMemoryConfig = { enabled: flag === 'true',
     maxCalls: memoryCallLimit(env),
     timeoutMs: positiveInteger(env, 'PA_MEMORY_TIMEOUT_MS', 120000),
-    maxRetries: positiveInteger(env, 'PA_MEMORY_MAX_RETRIES', 3),
     maxOutputTokens: positiveInteger(env, 'PA_MEMORY_MAX_OUTPUT_TOKENS', 8192) };
-  if (result.timeoutMs > 2147483647 || result.maxRetries > 10) throw new Error('后台记忆超时或重试配置超出范围。');
-  const url = env.PA_EMBEDDING_URL?.trim();
-  if (url) {
-    let parsed: URL;
-    try { parsed = new URL(url); } catch { throw new Error('PA_EMBEDDING_URL 无效。'); }
-    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
-      throw new Error('PA_EMBEDDING_URL 必须是无内嵌认证或查询参数的 HTTP(S) 地址。');
-    }
-    const model = env.PA_EMBEDDING_MODEL?.trim(), apiKey = env.PA_EMBEDDING_API_KEY?.trim();
-    if (!model || !apiKey) throw new Error('Embedding 需要显式模型和密钥。');
-    result.embedding = { url, model, apiKey,
-      dimensions: positiveInteger(env, 'PA_EMBEDDING_DIMENSIONS', 1024),
-      maxCalls: positiveInteger(env, 'PA_EMBEDDING_MAX_CALLS', 100) };
-    if (result.embedding.dimensions > 65536) throw new Error('Embedding 维度过大。');
-  }
+  if (result.timeoutMs > 2147483647) throw new Error('后台记忆超时配置超出范围。');
   return result;
 }

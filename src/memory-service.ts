@@ -3,7 +3,7 @@ import type { RecordedConversation } from './conversation.js';
 
 export type MemoryRequest = { type: 'admin'; text: string } | { type: 'unsupported_delete' };
 export interface MemorySource { id: string; actorId: string; senderId: string; text: string }
-const DENIED = '你没有记忆管理权限；自然语言的画像补充由对话工具处理。';
+const DENIED = '你没有记忆管理权限。';
 
 // Only explicit command syntax is routed locally. Natural language always enters Pi.
 export function parseMemoryRequest(input: string): MemoryRequest | undefined {
@@ -29,36 +29,32 @@ export function executeMemoryRequest(request: MemoryRequest, conversation: Recor
   if (request.type === 'unsupported_delete') return '不提供删除记忆操作；可以明确纠正，原文与历史版本保留。';
   if (!owner) return DENIED;
   let text = request.text;
-  if (/^(?:请)?记住本群/.test(text)) text = `/memory remember room ${text.replace(/^(?:请)?记住本群[：:\s]*/, '')}`;
   text = text.replace(/^\/remember\s+/i, '/memory remember room ')
     .replace(/^\/memories(?:\s|$)/i, '/memory query ')
     .replace(/^\/correct\s+/i, '/memory correct ');
   const match = text.match(/^\/memory(?:\s+(remember|query|correct))?(?:\s+([\s\S]*))?$/i);
-  if (!match || !match[1]) return '管理命令：/memory remember room 内容；/memory remember me 内容；/memory query [关键词]；/memory correct ID 内容。user:发送者ID 可替代 me 指定当前会话成员。';
+  if (!match || !match[1]) return '房间记忆命令：/memory remember room 内容；/memory query [关键词]；/memory correct ID 内容。';
   const action = match[1].toLowerCase();
   const args = (match[2] ?? '').trim();
   if (action === 'query') {
-    const selection = args.match(/^(me|room|user:\S+)(?:\s+(.*))?$/);
-    const target = selection?.[1];
-    const actor = target === 'room' ? null : target === 'me' ? source.actorId : target?.startsWith('user:') ? conversation.findActor(target.slice(5)) : undefined;
-    if (target?.startsWith('user:') && !actor) throw new MemoryError('当前群中没有已验证的该成员。');
-    const rows = conversation.queryMemories(selection ? selection[2] ?? '' : args, 20, actor, source.actorId);
+    const selection = args.match(/^(me|user:[^\s]*)(?:\s+|$)/);
+    if (selection) throw new MemoryError('显式记忆命令只管理房间记忆；人物画像请通过普通对话补充。');
+    const query = args.replace(/^room(?:\s+|$)/, '');
+    const rows = conversation.queryMemories(query, 20);
     return display(rows);
   }
   if (action === 'remember') {
     const parts = args.match(/^(room|me|user:\S+)\s+([\s\S]+)$/);
-    if (!parts) throw new MemoryError('请指定 room、me 或 user:发送者ID，以及内容。');
-    const actor = parts[1] === 'me' ? source.actorId : parts[1]!.startsWith('user:') ? conversation.findActor(parts[1]!.slice(5)) : undefined;
-    if (parts[1]!.startsWith('user:') && !actor) throw new MemoryError('当前群中没有已验证的该成员。');
-    const result = conversation.remember({ ...memoryContent(parts[2]!), sourceMessageId: source.id,
-      ...(actor ? { subjectActorId: actor } : {}) });
+    if (!parts) throw new MemoryError('房间记忆用法：remember room 内容。人物画像请通过普通对话补充。');
+    if (parts[1] !== 'room') throw new MemoryError('显式记忆命令只管理房间记忆；人物画像请通过普通对话补充。');
+    conversation.remember({ ...memoryContent(parts[2]!), sourceMessageId: source.id });
     return '记住了。';
   }
   const parts = args.match(/^(\S+)(?:\s+([\s\S]+))?$/);
   if (!parts) throw new MemoryError('请提供当前会话的记忆 ID。');
   if (action === 'correct') {
     if (!parts[2]) throw new MemoryError('请提供纠正后的内容。');
-    const result = conversation.correctMemory(parts[1]!, { ...memoryContent(parts[2]), sourceMessageId: source.id });
+    conversation.correctMemory(parts[1]!, { ...memoryContent(parts[2]), sourceMessageId: source.id });
     return '记住了。';
   }
   return '不提供删除记忆或偏好的操作；你可以明确纠正信息，我会保留原记录并更新当前内容。';
@@ -89,6 +85,6 @@ function memoryContent(input: string): MemoryInput {
 }
 
 export function safeProfileError(error: MemoryError): string {
-  if (/待整理.*(?:容量|上限|已满)/.test(error.message)) return '待整理自我画像容量已满，本次没有保存。请等待后台整理完成，或缩短建议后重试。';
+  if (/待整理.*(?:容量|上限|已满)/.test(error.message)) return '待整理记忆容量已满，本次没有保存。请等待后台整理完成，或缩短内容后重试。';
   return error.message.includes('版本') ? '信息版本已变化，请重新明确要更新的内容。' : '未完成记忆操作，请检查目标和内容；不会展示个人画像。';
 }

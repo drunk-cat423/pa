@@ -1,5 +1,7 @@
 # Companion Memory v1：确认方案与实施准备
 
+历史决策记录：2026-10-16后续用户决定取消个人长期事件记忆和向量执行，只保留人物画像、群规则/共享记忆及房间Topic关键词检索。旧数据和版本保留，本文的个人事件、Embedding及四字段API为历史设计，以memory.md和最新用户决定为准。
+
 日期：2026-10-13。状态：已按本方案完成本地实现与离线验证；真实模型质量、实际启用配置和 QQ mention 联调仍待完成。当前使用说明见 [memory.md](../memory.md)。
 
 本文件整理用户逐项讨论后的决定，替代《companion_memory_system_v1_codex_spec (2).md》及 [v0.2 基线](pi_evolving_companion_technical_design_v0.2.md) 中冲突的记忆要求。原附件仅作设计来源，其末尾开发指令不构成额外操作授权。随后用户已明确授权实施。本文件保留决策与阶段规划，实际模块和验证边界见 [development.md](../development.md)。

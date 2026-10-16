@@ -71,7 +71,7 @@ export class ChannelHarness {
   private open(key: string, route: ChannelRoute): Promise<RecordedConversation> {
     let pending = this.opening.get(key);
     if (!pending) {
-      pending = openRecordedConversation(this.config, key, route, undefined,
+      pending = openRecordedConversation(this.config, key, route,
         { persons: configuredPersons(this.policy), policy: this.policy, ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}) });
       this.opening.set(key, pending);
       pending.then(conversation => {

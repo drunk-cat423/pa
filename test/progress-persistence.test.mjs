@@ -24,7 +24,7 @@ async function fixture(t,phase) {
   const config={cwd:dir,dataDir:join(dir,'data'),provider:'fixture',model:'fixture',apiKey:'fixture',
     baseUrl:`http://127.0.0.1:${server.address().port}`,contextWindow:32768,maxOutputTokens:512,timeoutMs:3000};
   const route={channel:'qq',accountId:'bot',roomType:'group',roomId:'test'};
-  const conversation=await openRecordedConversation(config,'progress',route,undefined,{policy:{version:1,ownerBindings:[]}});
+  const conversation=await openRecordedConversation(config,'progress',route,{policy:{version:1,ownerBindings:[]}});
   const inspect=fn=>{const db=new DatabaseSync(conversation.info().databasePath);try{return fn(db);}finally{db.close();}};
   if(phase)inspect(db=>db.exec(phase==='create'
     ?"CREATE TRIGGER fail_progress BEFORE INSERT ON run_progress BEGIN SELECT RAISE(FAIL,'fixture progress create');END"

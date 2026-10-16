@@ -4,7 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { isDeepStrictEqual } from 'node:util';
 import { MemoryError } from './memory-types.js';
-import type { MemoryChange, MemoryDeletion, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, MemorySections, PrimaryPerson, ProfileField } from './memory-types.js';
+import type { MemoryChange, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, PrimaryPerson } from './memory-types.js';
 import type { ChannelRoute, ExternalRunInput, InboundMessage } from './channel-types.js';
 import { AutoMemoryStore, migrateAutoMemory, migrateMemoryRetrieval } from './auto-memory-store.js';
 import { migrateSelfProfile } from './self-profile-store.js';
@@ -69,7 +69,6 @@ export class DuplicateMessageError extends Error {
 
 const SCHEMA_VERSION = 12;
 const OWNER_ID = 'local-owner';
-const PROFILE_FIELDS = ['diet', 'preferred_name', 'interests', 'reply_style'];
 const historyTokens = memoryWords;
 
 export interface HistoryOptions {
@@ -145,7 +144,7 @@ function asMemory(row: Record<string, unknown>): MemoryRecord {
     createdAt: String(row.created_at), updatedAt: String(row.updated_at),
     ...(row.subject_actor_id == null ? {} : { subjectActorId: String(row.subject_actor_id) }),
     ...(row.writer_actor_id == null ? {} : { writerActorId: String(row.writer_actor_id) }),
-    ...(row.profile_field == null ? {} : { profileField: row.profile_field as ProfileField }),
+    ...(row.profile_field == null ? {} : { profileField: String(row.profile_field) }),
     ...(row.person_id == null ? {} : { personId: String(row.person_id) }),
     occurredAt: row.occurred_at == null ? null : String(row.occurred_at),
     expiresAt: row.expires_at == null ? null : String(row.expires_at),
@@ -157,8 +156,7 @@ function validateMemoryInput(input: MemoryInput): void {
   if ([...input.content].length > 4000) throw new MemoryError('记忆内容不能超过 4000 个 Unicode 字符。');
   if (input.kind !== undefined && !['fact', 'preference', 'episode'].includes(input.kind)) throw new MemoryError('记忆类型必须是 fact、preference 或 episode。');
   if (input.sourceMessageId !== undefined && (typeof input.sourceMessageId !== 'string' || !input.sourceMessageId)) throw new MemoryError('记忆来源消息 ID 无效。');
-  if (input.subjectActorId !== undefined && (typeof input.subjectActorId !== 'string' || !input.subjectActorId)) throw new MemoryError('记忆成员 ID 无效。');
-  if (input.profileField !== undefined && !PROFILE_FIELDS.includes(input.profileField)) throw new MemoryError('成员资料字段无效。');
+  if ('subjectActorId' in input || 'profileField' in input) throw new MemoryError('个人长期记忆已停用；人物画像请通过自然语言明确更新。');
   normalizeMemoryTime(input.occurredAt);
   normalizeMemoryTime(input.expiresAt);
 }
@@ -539,62 +537,6 @@ export class ConversationStore {
     `);
   }
 
-  configurePrimaryPerson(primary: PrimaryPerson | null): void {
-    if (primary !== null && (!primary || typeof primary.id !== 'string' || !primary.id.trim() || primary.id.length > 512
-      || !Array.isArray(primary.bindings))) throw new MemoryError('主要成员配置无效。');
-    const bindings = (primary?.bindings ?? []).map(binding => {
-      if (!binding || typeof binding.senderId !== 'string' || !binding.senderId || binding.senderId.length > 512 || !binding.route) {
-        throw new MemoryError('主要成员绑定无效。');
-      }
-      const route = conversationRoute('', binding.route);
-      if ([route.channel, route.accountId, route.roomId].some(value => value.length > 512)) throw new MemoryError('主要成员绑定无效。');
-      return { channel: route.channel, account: route.accountId, room_type: route.roomType, room_id: route.roomId, sender_id: binding.senderId, person_id: primary!.id };
-    });
-    const key = (binding: Record<string, unknown>) => JSON.stringify([binding.channel, binding.account, binding.room_type, binding.room_id, binding.sender_id, binding.person_id]);
-    if (new Set(bindings.map(key)).size !== bindings.length) throw new MemoryError('主要成员绑定不能重复。');
-    this.memoryTransaction(() => {
-      const old = this.db.prepare('SELECT * FROM primary_person_bindings').all();
-      if (JSON.stringify(old.map(key).sort()) === JSON.stringify(bindings.map(key).sort())) return;
-      const affected = new Set<string>();
-      for (const binding of [...old, ...bindings]) {
-        for (const row of this.db.prepare(`SELECT c.id FROM conversations c JOIN rooms r ON r.id = c.room_id
-          WHERE r.channel = ? AND r.account = ? AND r.room_type = ? AND r.external_chat_id = ?`)
-          .all(String(binding.channel), String(binding.account), String(binding.room_type), String(binding.room_id))) affected.add(String(row.id));
-      }
-      this.db.exec('DELETE FROM primary_person_bindings');
-      for (const binding of bindings) this.db.prepare(`INSERT INTO primary_person_bindings
-        (channel, account, room_type, room_id, sender_id, person_id) VALUES (?, ?, ?, ?, ?, ?)`)
-        .run(binding.channel, binding.account, binding.room_type, binding.room_id, binding.sender_id, binding.person_id);
-      // A prior person's rows retain their original identity after an account is rebound.
-      // Only actor-local records can be promoted by the current local configuration.
-      const candidates = this.db.prepare(`SELECT m.id, b.person_id FROM memories m
-        JOIN conversations c ON c.id = m.conversation_id JOIN rooms r ON r.id = c.room_id
-        JOIN actors a ON a.id = m.subject_actor_id AND a.room_id = c.room_id
-        JOIN primary_person_bindings b ON b.channel = r.channel AND b.account = r.account AND b.room_type = r.room_type
-          AND b.room_id = r.external_chat_id AND b.sender_id = a.external_user_id
-        WHERE m.person_id IS NULL AND m.scope_type = 'actor'
-        ORDER BY m.updated_at DESC, m.rowid DESC`).all();
-      // Temporarily remove the global uniqueness guard while choosing the latest self profile.
-      this.db.exec('DROP INDEX active_person_profile');
-      for (const row of candidates) this.db.prepare('UPDATE memories SET person_id = ? WHERE id = ?').run(String(row.person_id), String(row.id));
-      const profiles = this.db.prepare(`SELECT id, person_id, profile_field FROM memories
-        WHERE person_id IS NOT NULL AND status = 'active' AND is_current = 1 AND profile_field IS NOT NULL AND writer_actor_id = subject_actor_id
-        ORDER BY updated_at DESC, rowid DESC`).all();
-      const seen = new Set<string>();
-      for (const row of profiles) {
-        const profileKey = JSON.stringify([row.person_id, row.profile_field]);
-        if (seen.has(profileKey)) {
-          this.db.prepare('UPDATE memories SET is_current = 0 WHERE id = ?').run(String(row.id));
-          this.db.prepare("UPDATE memory_revisions SET status = 'superseded' WHERE memory_id = ? AND status = 'active'").run(String(row.id));
-        } else seen.add(profileKey);
-      }
-      this.db.exec(`CREATE UNIQUE INDEX active_person_profile ON memories(person_id, profile_field)
-        WHERE status = 'active' AND is_current = 1 AND person_id IS NOT NULL AND profile_field IS NOT NULL AND writer_actor_id = subject_actor_id`);
-      this.autoMemory.configurePersons(primary ? [primary] : []);
-      for (const conversationId of affected) this.requireContextReset(conversationId);
-    });
-  }
-
   configurePersons(persons: readonly PrimaryPerson[]): void {
     this.memoryTransaction(() => {
       const existing=this.db.prepare('SELECT * FROM person_bindings').all();
@@ -604,27 +546,6 @@ export class ConversationStore {
       this.autoMemory.configurePersons(persons);
       for (const row of this.db.prepare('SELECT id FROM conversations').all()) this.requireContextReset(String(row.id));
     });
-  }
-
-  private personForActor(conversationId: string, actorId: string | undefined): string | null {
-    if (actorId === undefined) return null;
-    const valid = this.db.prepare(`SELECT a.id FROM actors a JOIN conversations c ON c.id=?
-      WHERE a.id=? AND (a.kind='local-owner' OR a.room_id=c.room_id)`).get(conversationId,actorId);
-    return valid ? this.autoMemory.personForActor(actorId) ?? null : null;
-  }
-
-  private memoryScopeConversations(conversationId: string, personId: unknown): Set<string> {
-    const affected = new Set([conversationId]);
-    if (typeof personId === 'string') for (const row of this.db.prepare(`SELECT DISTINCT c.id FROM person_bindings b
-      JOIN rooms r ON r.channel=b.channel AND r.account=b.account AND r.room_type=b.room_type AND r.external_chat_id=b.room_id
-      JOIN conversations c ON c.room_id=r.id WHERE b.person_id=?
-      UNION SELECT c.id FROM actor_person_bindings b JOIN actors a ON a.id=b.actor_id JOIN conversations c ON c.room_id=a.room_id WHERE b.person_id=?`)
-      .all(personId,personId)) affected.add(String(row.id));
-    return affected;
-  }
-
-  private resetMemoryScopes(conversationId: string, personId: unknown): void {
-    for (const id of this.memoryScopeConversations(conversationId, personId)) this.requireContextReset(id);
   }
 
   refreshExpiredContext(conversationId: string): void {
@@ -637,9 +558,7 @@ export class ConversationStore {
         WHERE run.conversation_id = ? AND input.rowid > COALESCE(state.history_after_rowid, 0)
           AND memory.status = 'active' AND memory.is_current = 1 AND memory.expires_at IS NOT NULL AND memory.expires_at <= ?`)
         .all(conversationId, now());
-      const affected = new Set<string>();
-      for (const memory of expired) for (const id of this.memoryScopeConversations(conversationId, memory.person_id)) affected.add(id);
-      for (const id of affected) this.requireContextReset(id);
+      if (expired.length) this.requireContextReset(conversationId);
     });
   }
 
@@ -713,25 +632,21 @@ export class ConversationStore {
     return OWNER_ID;
   }
 
-  private requireMemoryActor(conversationId: string, actorId: string): void {
-    if (typeof actorId !== 'string' || !actorId || !this.db.prepare(`SELECT a.id FROM actors a
-      JOIN conversations c ON c.room_id = a.room_id WHERE c.id = ? AND a.id = ?`).get(conversationId, actorId)) {
-      throw new MemoryError('记忆成员必须属于当前会话。');
-    }
+  private supportsSharedMemory(conversationId: string): boolean {
+    const room=this.db.prepare('SELECT r.channel,r.room_type FROM conversations c JOIN rooms r ON r.id=c.room_id WHERE c.id=?').get(conversationId);
+    return room?.channel==='cli' || room?.room_type==='group';
   }
 
-  private findMemory(conversationId: string, id: string, actorId?: string): Record<string, unknown> {
-    const personId = this.personForActor(conversationId, actorId);
-    const row = this.db.prepare(`SELECT * FROM memories WHERE id = ? AND
-      ((conversation_id = ? AND (person_id IS NULL OR EXISTS (SELECT 1 FROM actor_person_bindings b
-        WHERE b.actor_id=memories.subject_actor_id AND b.person_id=memories.person_id))) OR (person_id IS NOT NULL AND person_id = ?))`)
-      .get(id, conversationId, personId);
-    if (!row) throw new MemoryError('记忆不存在。');
+  private findMemory(conversationId: string, id: string): Record<string, unknown> {
+    if (!this.supportsSharedMemory(conversationId)) throw new MemoryError('个人长期记忆已停用，私聊仅支持画像更新。');
+    const row = this.db.prepare(`SELECT * FROM memories WHERE id=? AND conversation_id=?
+      AND subject_actor_id IS NULL AND person_id IS NULL AND profile_field IS NULL`).get(id,conversationId);
+    if (!row) throw new MemoryError('群记忆不存在；个人长期记忆已停用。');
     return row;
   }
 
-  private requireCurrentMemory(conversationId: string, id: string, expectedRevision: number | undefined, actorId?: string): Record<string, unknown> {
-    const row = this.findMemory(conversationId, id, actorId);
+  private requireCurrentMemory(conversationId: string, id: string, expectedRevision: number | undefined): Record<string, unknown> {
+    const row = this.findMemory(conversationId, id);
     if (row.status === 'deleted') throw new MemoryError('记忆已删除。');
     if (row.is_current !== 1) throw new MemoryError('记忆已被更新的成员资料替代。');
     if (expectedRevision !== undefined && Number(row.revision) !== expectedRevision) throw new MemoryError('记忆版本已变化，请重新查询后重试。');
@@ -749,53 +664,19 @@ export class ConversationStore {
     validateMemoryInput(input);
     return this.memoryTransaction(() => {
       this.requireMemoryConversation(conversationId);
+      if (!this.supportsSharedMemory(conversationId)) throw new MemoryError('个人长期记忆已停用，私聊仅支持画像更新。');
       const writerActorId = this.validateMemorySource(conversationId, input.sourceMessageId);
-      if (input.subjectActorId !== undefined) this.requireMemoryActor(conversationId, input.subjectActorId);
-      if (input.profileField !== undefined && input.subjectActorId === undefined) throw new MemoryError('成员资料必须指定当前会话成员。');
-      const id = randomUUID();
-      const eventId = randomUUID();
-      const createdAt = now();
-      const personId = this.personForActor(conversationId, input.subjectActorId);
-      const occurredAt = normalizeMemoryTime(input.occurredAt);
-      const expiresAt = normalizeMemoryTime(input.expiresAt);
-      if (input.profileField !== undefined) {
-        const profileScope = this.actorMemoryScope(conversationId, input.subjectActorId);
-        const expired = this.db.prepare(`SELECT id FROM memories WHERE ${profileScope.sql} AND profile_field = ?
-          AND writer_actor_id = ? AND status = 'active' AND is_current = 1 AND expires_at IS NOT NULL AND expires_at <= ?`)
-          .all(...profileScope.parameters, input.profileField, writerActorId, createdAt);
-        // Global self profiles keep their original writer/subject pair across rooms.
-        if (personId !== null && writerActorId === input.subjectActorId) expired.push(...this.db.prepare(`SELECT id FROM memories
-          WHERE person_id = ? AND profile_field = ? AND writer_actor_id = subject_actor_id AND status = 'active'
-            AND is_current = 1 AND expires_at IS NOT NULL AND expires_at <= ?`).all(personId, input.profileField, createdAt));
-        for (const row of expired) {
-          this.db.prepare('UPDATE memories SET is_current = 0 WHERE id = ?').run(String(row.id));
-          this.db.prepare("UPDATE memory_revisions SET status = 'superseded' WHERE memory_id = ? AND status = 'active'").run(String(row.id));
-        }
-      }
-      this.db.prepare(`INSERT INTO memory_events (id, conversation_id, memory_id, action, revision, created_at, actor_id, source_message_id)
-        VALUES (?, ?, ?, 'remember', 1, ?, ?, ?)`).run(eventId, conversationId, id, createdAt, writerActorId, input.sourceMessageId ?? null);
-      this.db.prepare(`INSERT INTO memories (id, conversation_id, kind, content, revision, status, origin, source_event_id, source_message_id, created_at, updated_at,
-        subject_actor_id, writer_actor_id, profile_field, scope_type, person_id, occurred_at, expires_at, profile_source_self)
-        VALUES (?, ?, ?, ?, 1, 'active', 'explicit_user', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(id, conversationId, input.kind ?? 'fact', input.content, eventId, input.sourceMessageId ?? null, createdAt, createdAt,
-          input.subjectActorId ?? null, writerActorId, input.profileField ?? null, input.subjectActorId === undefined ? 'room' : 'actor', personId, occurredAt, expiresAt,
-          input.profileField !== undefined && input.sourceMessageId !== undefined && writerActorId === input.subjectActorId ? 1 : 0);
-      this.db.prepare(`INSERT INTO memory_revisions (memory_id, revision, content, status, source_event_id, source_message_id, created_at, occurred_at, expires_at)
-        VALUES (?, 1, ?, 'active', ?, ?, ?, ?, ?)`).run(id, input.content, eventId, input.sourceMessageId ?? null, createdAt, occurredAt, expiresAt);
-      if (personId !== null && input.sourceMessageId !== undefined && writerActorId === input.subjectActorId) {
-        this.autoMemory.updateExplicitProfile(personId, {content: input.content,
-          sourceType: 'third_party',
-          messageIds: [input.sourceMessageId], occurredAt, expiresAt});
-      }
-      if (personId !== null || input.profileField !== undefined) this.resetMemoryScopes(conversationId, personId);
-      return { memory: asMemory(this.db.prepare('SELECT * FROM memories WHERE id = ?').get(id)!), contextResetRequired: this.contextState(conversationId).required };
+      const id=randomUUID(), eventId=randomUUID(), createdAt=now();
+      const occurredAt=normalizeMemoryTime(input.occurredAt), expiresAt=normalizeMemoryTime(input.expiresAt);
+      this.db.prepare(`INSERT INTO memory_events (id,conversation_id,memory_id,action,revision,created_at,actor_id,source_message_id)
+        VALUES (?,?,?,'remember',1,?,?,?)`).run(eventId,conversationId,id,createdAt,writerActorId,input.sourceMessageId??null);
+      this.db.prepare(`INSERT INTO memories (id,conversation_id,kind,content,revision,status,origin,source_event_id,source_message_id,created_at,updated_at,
+        writer_actor_id,scope_type,occurred_at,expires_at) VALUES (?,?,?,?,1,'active','explicit_user',?,?,?,?,?,'room',?,?)`)
+        .run(id,conversationId,input.kind??'fact',input.content,eventId,input.sourceMessageId??null,createdAt,createdAt,writerActorId,occurredAt,expiresAt);
+      this.db.prepare(`INSERT INTO memory_revisions (memory_id,revision,content,status,source_event_id,source_message_id,created_at,occurred_at,expires_at)
+        VALUES (?,1,?,'active',?,?,?,?,?)`).run(id,input.content,eventId,input.sourceMessageId??null,createdAt,occurredAt,expiresAt);
+      return {memory:asMemory(this.findMemory(conversationId,id)),contextResetRequired:this.contextState(conversationId).required};
     });
-  }
-
-  private actorMemoryScope(conversationId: string, actorId?: string): { sql: string; parameters: (string | null)[] } {
-    if (actorId !== undefined) this.requireMemoryActor(conversationId, actorId);
-    return { sql: `scope_type = 'actor' AND ((conversation_id = ? AND subject_actor_id = ? AND person_id IS NULL)
-      OR (person_id IS NOT NULL AND person_id = ?))`, parameters: [conversationId, actorId ?? null, this.personForActor(conversationId, actorId)] };
   }
 
   private selectMemories(scope: string, parameters: (string | null)[], query: string, limit: number, at = now()): MemoryRecord[] {
@@ -804,112 +685,38 @@ export class ConversationStore {
       ORDER BY updated_at DESC, rowid DESC LIMIT ?`).all(...parameters, at, query, limit).map(asMemory);
   }
 
-  queryMemories(conversationId: string, query = '', limit = 20, subjectActorId?: string | null, viewerActorId?: string): MemoryRecord[] {
-    validateMemoryQuery(query, limit);
+  queryMemories(conversationId: string, query = '', limit = 20): MemoryRecord[] {
+    validateMemoryQuery(query,limit);
     this.requireMemoryConversation(conversationId);
-    if (viewerActorId !== undefined) this.requireMemoryActor(conversationId, viewerActorId);
-    if (subjectActorId === null) return this.selectMemories("conversation_id = ? AND scope_type = 'room' AND subject_actor_id IS NULL AND person_id IS NULL", [conversationId], query, limit);
-    if (subjectActorId !== undefined) {
-      const scope = this.actorMemoryScope(conversationId, subjectActorId);
-      return this.selectMemories(scope.sql, scope.parameters, query, limit);
-    }
-    if (viewerActorId === undefined) return this.selectMemories(`conversation_id = ? AND (person_id IS NULL OR EXISTS
-      (SELECT 1 FROM actor_person_bindings b WHERE b.actor_id=memories.subject_actor_id AND b.person_id=memories.person_id))`,[conversationId],query,limit);
-    return this.selectMemories('(conversation_id = ? AND person_id IS NULL) OR (person_id IS NOT NULL AND person_id = ?)',
-      [conversationId, this.personForActor(conversationId, viewerActorId)], query, limit);
-  }
-
-  recallMemories(conversationId: string, actorId?: string, query = '', limit = 20, profileFields?: readonly ProfileField[]): MemoryRecord[] {
-    validateMemoryQuery(query, limit);
-    if (actorId !== undefined) this.requireMemoryActor(conversationId, actorId);
-    if (profileFields !== undefined && (!Array.isArray(profileFields) || profileFields.some(field => !PROFILE_FIELDS.includes(field)))) {
-      throw new MemoryError('成员资料字段无效。');
-    }
-    const actorScope = this.actorMemoryScope(conversationId, actorId);
-    const profileScope = profileFields === undefined ? '' : ` AND writer_actor_id = subject_actor_id AND profile_source_self = 1 AND
-      ${profileFields.length > 0 ? `profile_field IN (${profileFields.map(() => '?').join(', ')})` : '0'}`;
-    return this.selectMemories(`(conversation_id = ? AND scope_type = 'room' AND subject_actor_id IS NULL AND person_id IS NULL)
-      OR (${actorScope.sql}${profileScope})`, [conversationId, ...actorScope.parameters, ...(profileFields ?? [])], query, limit);
-  }
-
-  recallMemorySections(conversationId: string, actorId?: string, profileFields: readonly ProfileField[] = [], query = '', at?: string): MemorySections {
-    validateMemoryQuery(query, 8);
-    this.requireMemoryConversation(conversationId);
-    if (!Array.isArray(profileFields) || profileFields.some(field => !PROFILE_FIELDS.includes(field))) throw new MemoryError('成员资料字段无效。');
-    const timestamp = at === undefined ? now() : normalizeMemoryTime(at)!;
-    const scope = this.actorMemoryScope(conversationId, actorId);
-    const block = (sql: string, parameters: (string | null)[], limit: number): MemoryRecord[] => {
-      const matched = this.selectMemories(sql, parameters, query, limit, timestamp);
-      return matched.length > 0 || query === '' ? matched : this.selectMemories(sql, parameters, '', limit, timestamp);
-    };
-    return {
-      roomMemories: block("conversation_id = ? AND scope_type = 'room' AND subject_actor_id IS NULL AND person_id IS NULL", [conversationId], 2),
-      personalMemories: block(`${scope.sql} AND profile_field IS NULL`, scope.parameters, 2),
-      profile: profileFields.length === 0 ? [] : block(`${scope.sql} AND writer_actor_id = subject_actor_id AND profile_source_self = 1
-        AND profile_field IN (${profileFields.map(() => '?').join(', ')})`, [...scope.parameters, ...profileFields], 4),
-    };
-  }
-
-  selfProfileMemory(conversationId: string, actorId: string, field: ProfileField): MemoryRecord | undefined {
-    this.requireMemoryActor(conversationId, actorId);
-    if (!PROFILE_FIELDS.includes(field)) throw new MemoryError('成员资料字段无效。');
-    const scope = this.actorMemoryScope(conversationId, actorId);
-    const rows = this.selectMemories(`${scope.sql} AND writer_actor_id = subject_actor_id AND profile_field = ?`, [...scope.parameters, field], '', 2);
-    if (rows.length > 1) throw new MemoryError('成员资料存在多条记录，拒绝猜测修改目标。');
-    return rows[0];
+    if (!this.supportsSharedMemory(conversationId)) return [];
+    return this.selectMemories(`conversation_id=? AND subject_actor_id IS NULL AND person_id IS NULL AND profile_field IS NULL
+      AND (scope_type='room' OR (scope_type='legacy' AND EXISTS (SELECT 1 FROM conversations c JOIN rooms r ON r.id=c.room_id WHERE c.id=memories.conversation_id AND r.channel='cli')))`,[conversationId],query,limit);
   }
 
   correctMemory(conversationId: string, id: string, input: MemoryInput, expectedRevision?: number): MemoryChange {
     validateMemoryInput(input);
     validateRevision(expectedRevision);
     return this.memoryTransaction(() => {
-      const actorId = this.validateMemorySource(conversationId, input.sourceMessageId);
-      const existing = this.requireCurrentMemory(conversationId, id, expectedRevision, input.sourceMessageId === undefined ? undefined : actorId);
-      if (input.subjectActorId !== undefined && input.subjectActorId !== existing.subject_actor_id) {
-        this.requireMemoryActor(conversationId, input.subjectActorId);
-        if (existing.person_id === null || input.subjectActorId !== actorId || this.personForActor(conversationId, input.subjectActorId) !== existing.person_id) {
-          throw new MemoryError('纠正记忆不能改变成员范围。');
-        }
+      const actorId=this.validateMemorySource(conversationId,input.sourceMessageId);
+      const existing=this.requireCurrentMemory(conversationId,id,expectedRevision);
+      if(input.sourceMessageId!==undefined && existing.source_message_id!=null) {
+        const incoming=this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(input.sourceMessageId);
+        const previous=this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(String(existing.source_message_id));
+        if(Number(incoming?.ingest_seq??0)<Number(previous?.ingest_seq??0))throw new MemoryError('较旧来源不能覆盖较新的明确记忆。');
       }
-      if (input.profileField !== undefined && input.profileField !== existing.profile_field) throw new MemoryError('纠正记忆不能改变成员资料字段。');
-      if (input.sourceMessageId !== undefined && existing.source_message_id != null) {
-        const incoming = this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(input.sourceMessageId);
-        const previous = this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(String(existing.source_message_id));
-        if (Number(incoming?.ingest_seq ?? 0) < Number(previous?.ingest_seq ?? 0)) throw new MemoryError('较旧来源不能覆盖较新的明确记忆。');
-      }
-      const revision = Number(existing.revision) + 1;
-      const eventId = randomUUID();
-      const updatedAt = now();
-      const occurredAt = input.occurredAt === undefined ? existing.occurred_at as string | null : normalizeMemoryTime(input.occurredAt);
-      const expiresAt = input.expiresAt === undefined ? existing.expires_at as string | null : normalizeMemoryTime(input.expiresAt);
-      const profileSourceSelf = existing.profile_field !== null && existing.writer_actor_id === existing.subject_actor_id
-        && input.sourceMessageId !== undefined && (actorId === existing.subject_actor_id
-          || (existing.person_id !== null && this.personForActor(conversationId, actorId) === existing.person_id)) ? 1 : 0;
-      this.db.prepare(`INSERT INTO memory_events (id, conversation_id, memory_id, action, revision, created_at, actor_id, source_message_id)
-        VALUES (?, ?, ?, 'correct', ?, ?, ?, ?)`).run(eventId, conversationId, id, revision, updatedAt, actorId, input.sourceMessageId ?? null);
-      this.db.prepare("UPDATE memory_revisions SET status = 'superseded' WHERE memory_id = ? AND status = 'active'").run(id);
-      this.db.prepare(`INSERT INTO memory_revisions (memory_id, revision, content, status, source_event_id, source_message_id, created_at, occurred_at, expires_at)
-        VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)`).run(id, revision, input.content, eventId, input.sourceMessageId ?? null, updatedAt, occurredAt, expiresAt);
-      this.db.prepare(`UPDATE memories SET kind = ?, content = ?, revision = ?, source_event_id = ?, source_message_id = ?, updated_at = ?, occurred_at = ?, expires_at = ?, profile_source_self = ?
-        WHERE id = ?`).run(input.kind ?? String(existing.kind), input.content, revision, eventId, input.sourceMessageId ?? null, updatedAt, occurredAt, expiresAt, profileSourceSelf, id);
-      if (typeof existing.person_id === 'string' && profileSourceSelf === 1) {
-        this.autoMemory.updateExplicitProfile(existing.person_id, {content: input.content,
-          sourceType: 'third_party', messageIds: [input.sourceMessageId!], occurredAt, expiresAt});
-      } else if (typeof existing.person_id === 'string' && existing.profile_field === null
-        && existing.writer_actor_id === existing.subject_actor_id && input.sourceMessageId !== undefined
-        && this.autoMemory.personForActor(actorId) === existing.person_id) {
-        this.autoMemory.updateExplicitProfile(existing.person_id, {content: input.content,
-          sourceType: 'third_party',
-          messageIds: [input.sourceMessageId], occurredAt, expiresAt},
-          existing.source_message_id === null ? undefined : String(existing.source_message_id));
-      }
-      this.resetMemoryScopes(conversationId, existing.person_id);
-      return { memory: asMemory(this.findMemory(conversationId, id, input.sourceMessageId === undefined ? undefined : actorId)), contextResetRequired: true };
+      const revision=Number(existing.revision)+1,eventId=randomUUID(),updatedAt=now();
+      const occurredAt=input.occurredAt===undefined?existing.occurred_at as string|null:normalizeMemoryTime(input.occurredAt);
+      const expiresAt=input.expiresAt===undefined?existing.expires_at as string|null:normalizeMemoryTime(input.expiresAt);
+      this.db.prepare(`INSERT INTO memory_events (id,conversation_id,memory_id,action,revision,created_at,actor_id,source_message_id)
+        VALUES (?,?,?,'correct',?,?,?,?)`).run(eventId,conversationId,id,revision,updatedAt,actorId,input.sourceMessageId??null);
+      this.db.prepare("UPDATE memory_revisions SET status='superseded' WHERE memory_id=? AND status='active'").run(id);
+      this.db.prepare(`INSERT INTO memory_revisions (memory_id,revision,content,status,source_event_id,source_message_id,created_at,occurred_at,expires_at)
+        VALUES (?,?,?,'active',?,?,?,?,?)`).run(id,revision,input.content,eventId,input.sourceMessageId??null,updatedAt,occurredAt,expiresAt);
+      this.db.prepare(`UPDATE memories SET kind=?,content=?,revision=?,source_event_id=?,source_message_id=?,updated_at=?,occurred_at=?,expires_at=? WHERE id=?`)
+        .run(input.kind??String(existing.kind),input.content,revision,eventId,input.sourceMessageId??null,updatedAt,occurredAt,expiresAt,id);
+      this.requireContextReset(conversationId);
+      return {memory:asMemory(this.findMemory(conversationId,id)),contextResetRequired:true};
     });
-  }
-
-  deleteMemory(_conversationId: string, _id: string, _expectedRevision?: number, _sourceMessageId?: string): MemoryDeletion {
-    throw new MemoryError('本版本不提供记忆删除操作；请通过纠正保留修订记录。');
   }
 
   contextState(conversationId: string): { required: boolean; generation: number } {
@@ -961,7 +768,7 @@ export class ConversationStore {
       if (!source) throw new MemoryError('本轮缺少有效来源。');
       const canonical = JSON.stringify({ intent:plan.intent,mode:plan.mode,
         ...(plan.progressText === undefined ? {} : {progressText:plan.progressText}),updates:plan.updates.map(u=>({target:u.target,
-        content:u.content,sourceType:u.sourceType??'third_party',senderId:u.senderId??null,key:u.key??null,purpose:u.purpose??'profile'})) });
+        content:u.content,sourceType:u.sourceType??'third_party',senderId:u.senderId??null,key:u.key??null})) });
       const previous = this.db.prepare('SELECT plan_json,receipt_json FROM turn_preparations WHERE source_message_id=?').get(sourceMessageId);
       if (previous) {
         if (previous.plan_json !== canonical) throw new MemoryError('本条消息已经完成准备，不能重复更改保存内容。');
@@ -983,7 +790,7 @@ export class ConversationStore {
           }
           this.autoMemory.addProfilePending(this.autoMemory.ensureActorPerson(subject),sourceMessageId,update.content,
             update.target==='mentioned_person'?'third_party':update.sourceType??'third_party',
-            {allowThirdParty:update.target==='mentioned_person',purpose:update.purpose??'profile'});
+            {allowThirdParty:update.target==='mentioned_person'});
           receipt.saved.push({target:update.target,status:'saved_pending'});
         } else if (update.target === 'ai_self') {
           this.autoMemory.selfProfile.addPending(sourceMessageId,update.content,selfBudget);
@@ -1005,36 +812,6 @@ export class ConversationStore {
       }
       this.db.prepare('INSERT INTO turn_preparations VALUES (?,?,?,?)').run(sourceMessageId,canonical,JSON.stringify(receipt),now());
       return receipt;
-    });
-  }
-
-  updateProfileFromTool(conversationId: string, sourceMessageId: string, callId: string,
-    target: 'sender' | 'ai_self', content: string, sourceType: 'self' | 'third_party' = 'third_party'): { saved: true; target: string } {
-    if (!['sender', 'ai_self'].includes(target) || !['self', 'third_party'].includes(sourceType)
-      || typeof callId !== 'string' || !callId.trim() || callId.length > 512
-      || typeof content !== 'string' || !content.trim()
-      || [...content].length > (target === 'sender' ? 4000 : 500)) throw new MemoryError('画像工具参数无效或内容超出上限。');
-    return this.memoryTransaction(() => {
-      const source = this.db.prepare(`SELECT m.text,m.actor_id FROM messages m JOIN actors a ON a.id=m.actor_id
-        JOIN conversations c ON c.id=m.conversation_id
-        WHERE m.id=? AND m.conversation_id=? AND m.role='user' AND (a.room_id=c.room_id OR a.kind='local-owner')`)
-        .get(sourceMessageId, conversationId);
-      if (!source || !String(source.text).normalize('NFKC').includes(content.normalize('NFKC'))) {
-        throw new MemoryError('画像内容必须是当前真人原文的连续摘录。');
-      }
-      const operation = JSON.stringify([target, sourceType]);
-      const receipt = this.db.prepare('SELECT * FROM profile_tool_receipts WHERE source_message_id=? AND call_id=?').get(sourceMessageId,callId);
-      if (receipt) {
-        if (receipt.conversation_id !== conversationId || receipt.source_message_id !== sourceMessageId
-          || receipt.operation !== operation || receipt.content !== content) throw new MemoryError('工具调用 ID 已绑定到其他来源或操作。');
-        return { saved: true, target };
-      }
-      if (target === 'sender') this.autoMemory.addProfilePending(this.autoMemory.ensureActorPerson(String(source.actor_id)),
-        sourceMessageId, content, sourceType);
-      else this.autoMemory.selfProfile.addPending(sourceMessageId, content);
-      this.db.prepare('INSERT INTO profile_tool_receipts VALUES (?,?,?,?,?,?)')
-        .run(callId, conversationId, sourceMessageId, operation, content, now());
-      return { saved: true, target };
     });
   }
 
@@ -1333,14 +1110,10 @@ export class ConversationStore {
       } else if (external && this.hasExternalMessage(conversationId, external.eventId)) throw new DuplicateMessageError();
       for (const ref of memoryRefs) {
         validateRevision(ref.revision);
-        const actorId = external ? this.findActor(conversationId, external.senderId) : undefined;
-        const memory = this.findMemory(conversationId, ref.id, actorId);
+        const memory = this.findMemory(conversationId, ref.id);
         if (memory.status === 'deleted') throw new MemoryError('记忆已删除。');
         if (memory.is_current !== 1 || (memory.expires_at !== null && String(memory.expires_at) <= createdAt)) throw new MemoryError('记忆已失效。');
-        if (external && memory.scope_type === 'actor' && (memory.person_id === null ? memory.subject_actor_id !== actorId
-          : memory.person_id !== this.personForActor(conversationId,actorId))) throw new MemoryError('记忆不存在。');
-        if (external && (memory.scope_type === 'legacy' || (memory.profile_field !== null
-          && (memory.writer_actor_id !== memory.subject_actor_id || memory.profile_source_self !== 1)))) throw new MemoryError('记忆不存在。');
+        if (external && memory.scope_type === 'legacy') throw new MemoryError('记忆不存在。');
         if (Number(memory.revision) !== ref.revision) throw new MemoryError('记忆版本已变化，请重新查询后重试。');
       }
       if (external?.existingMessageId === undefined) this.insertInbound(conversationId, inputMessageId, text, createdAt, external);
@@ -1416,12 +1189,6 @@ export class ConversationStore {
       m.text AS inputText, m.model_input_text AS modelInputText, r.status, r.provider, r.model, r.pi_session_file AS piSessionFile FROM agent_runs r
       JOIN messages m ON m.id = r.input_message_id WHERE r.conversation_id = ? AND r.status = 'running'
       ORDER BY r.started_at, r.rowid`).all(conversationId).map(row => asRun(row as Record<string, unknown>));
-  }
-
-  recordedSessionFiles(conversationId: string): string[] {
-    return this.db.prepare(`SELECT DISTINCT pi_session_file FROM agent_runs
-      WHERE conversation_id=? AND pi_session_file IS NOT NULL ORDER BY pi_session_file`).all(conversationId)
-      .map(row => String(row.pi_session_file));
   }
 
   recordedTaskSessions(conversationId: string): { piSessionFile: string; inputMessageId: string }[] {

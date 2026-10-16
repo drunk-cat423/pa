@@ -24,10 +24,10 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 | auto_memory_jobs / auto_memory_job_messages | 固定任务成员、状态、租约、输入快照和子批次进度 |
 | memory_topics / memory_topic_messages | Topic 正文、版本、hash 及全部原消息来源 |
 | person_fragments / person_fragment_messages | 人物片段、自述/转述/推断类型及消息来源 |
-| topic_embeddings | Topic 当前版本的模型、维度、输入版本、hash 与向量 |
-| memory_topic_fts | Topic摘要中文分词索引，和向量候选按RRF融合；不索引人物画像 |
-| topic_embedding_attempts | 调用前持久化的模型/输入版本标记，未知失败不自动重复调用 |
-| person_profile_pending | 同一人物的待处理原文，purpose区分稳定画像与长期事件；事件独立归档到片段/Topic |
+| topic_embeddings | 历史向量数据保留；当前无读写或派发入口 |
+| memory_topic_fts | Topic摘要中文分词FTS5/BM25索引；不索引人物画像 |
+| topic_embedding_attempts | 历史向量派发标记保留；当前不读取或派发 |
+| person_profile_pending | 同一人物的稳定画像补充；旧purpose=memory记录保留但不进入当前投影/归档 |
 | turn_preparations | 来源消息级准备计划和持久化回执；一条消息不能重复提交不同操作集合 |
 | room_rule_revisions | 本群术语、规则的key与修订、来源原文ID；和人物/AI画像分开 |
 
@@ -51,11 +51,11 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 
 群聊按真人消息计数，私聊按成功且已确认发送的完整问答计数。任务固定消息 ID 和序号，已占用消息不再次计入新批次；不能用最大序号差值代替数量。
 
-模型等待不持有写事务。提交事务同时验证租约、来源、人物版本和证据时序，并落地 Topic、人物片段、画像及私聊检查点。只有完整提交后才推进连续成功位置；Embedding 独立重试，不重复创建 Topic。
+模型等待不持有写事务。提交事务同时验证租约、来源、人物版本和证据时序，并落地 Topic、人物片段、画像及私聊检查点。只有完整提交后才推进连续成功位置；向量执行逻辑已移除，历史表保留。
 
-过长批次保存可恢复的子批次结果，显式重试续接已成功部分。画像冲突使旧提案失效，人工重试重新读取当前版本；普通失败不改写冻结输入。关闭中断、崩溃租约过期和未知调用均保留failed状态，需通过任务CLI明确重排，不静默重复付费。旧input/progress缺少purpose时按profile等价处理，不改写历史JSON。
+过长批次保存可恢复的子批次结果，显式重试续接已成功部分。画像冲突使旧提案失效，人工重试重新读取当前版本；普通失败不改写冻结输入。关闭中断、崩溃租约过期和未知调用均保留failed状态，需通过任务CLI明确重排，不静默重复付费。旧input/progress缺少purpose时按profile等价处理；包含个人memory协议时明确停止，不改写历史JSON。
 
-新批次捕获本房间已经落库的待整理条目，即使条目的来源在更早冻结批次中也能归档。purpose=memory的条目只由来源房间创建Topic，不能借人物共享把其他房间原文写进本群Topic；人物画像共享仍按既有规则。Topic召回关联片段时只返回该Topic自身消息ID。
+新批次捕获本房间已经落库的待整理条目，即使条目的来源在更早冻结批次中也能归档。旧个人事件协议不再执行或迁为画像；冻结JSON保留并报告过期诊断。人物画像共享仍按既有规则。Topic召回关联片段时只返回该Topic自身消息ID。
 
 自我画像合并和pending归档属于同一记忆提交事务。任务捕获全局版本及待整理ID，模型只能归档该快照内保留来源的条目；并发新增不归档。不同房间使用全局版本检查解决冲突。模型结果与提交时当前pending一起检查完整结构容量，超限或版本冲突保留原数据并重读重试。旧版在途任务缺少selfProfile输入时继续原流程，不伪造自我画像提案。
 

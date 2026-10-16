@@ -122,7 +122,7 @@ test('准备阶段记录持续画像原文；pending下轮可用且不串人', a
   const f = await fixture(t);
   const text = '我喜欢登山，你可以记下来';
   f.preparations.set(text, { intent: 'memory_update', mode: 'standard', updates: [
-    { target: 'sender', content: '我喜欢登山', sourceType: 'self', purpose: 'profile' },
+    { target: 'sender', content: '我喜欢登山', sourceType: 'self' },
   ] });
   f.plans.set(text, [{ answer: '记住了。' }]);
   f.onRequest(() => {
@@ -249,23 +249,4 @@ test('纯提问不写画像、模型失败不保存；显式管理保留鉴权�
   assert.equal(f.totalCalls(), 4);
   const audit = f.db(); try { assert.equal(audit.prepare('SELECT count(*) n FROM memories').get().n, 1); }
   finally { audit.close(); }
-});
-
-test('取消上下文准备中的embedding后不会继续请求聊天模型', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'pa-preparation-cancel-'));
-  const provider = { extract: async () => { throw new Error('not used'); },
-    embedding: { model: 'fixture', dimensions: 2, inputVersion: 1, embed: () => new Promise(() => {}) } };
-  const config = { cwd: directory, dataDir: directory, provider: 'fixture', model: 'fixture', apiKey: 'local',
-    baseUrl: 'http://127.0.0.1:1', contextWindow: 32768, maxOutputTokens: 512, timeoutMs: 5000,
-    memory: { enabled: true, maxCalls: 0, maxRetries: 1, timeoutMs: 5000,
-      embedding: { url: 'http://127.0.0.1:1', model: 'fixture', apiKey: 'local', dimensions: 2, maxCalls: 10 } },
-    loop: { maxModelCalls: 6, maxToolCalls: 8 } };
-  const conversation = await openRecordedConversation(config, 'cancel', undefined, undefined, { memoryProvider: provider });
-  t.after(async () => { await conversation.close(); await rm(directory, { recursive: true, force: true }); });
-  const pending = conversation.prompt('取消准备阶段');
-  const rejected = assert.rejects(pending, error => error.kind === 'cancelled');
-  await new Promise(resolve => setTimeout(resolve, 10));
-  await conversation.abort();
-  await rejected;
-  assert.equal(conversation.info().messageCount, 0);
 });

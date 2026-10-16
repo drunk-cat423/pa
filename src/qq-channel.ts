@@ -253,7 +253,7 @@ export class QQChannel {
       this.rejectStart = reject;
     });
     this.startupTimer = this.scheduleTimeout(() => this.stopWithStatus('QQ 启动超时'), 30_000);
-    void this.connect(false).catch(() => this.scheduleReconnect());
+    void this.connect().catch(() => this.scheduleReconnect());
     return this.startPromise;
   }
 
@@ -310,7 +310,7 @@ export class QQChannel {
     this.resolveStart = undefined;
   }
 
-  private async connect(resume: boolean): Promise<void> {
+  private async connect(): Promise<void> {
     if (this.closed) return;
     const token = await this.getToken();
     if (this.closed) return;
@@ -329,7 +329,6 @@ export class QQChannel {
     socket.addEventListener('error', () => { if (socket === this.socket) this.scheduleReconnect(); });
     socket.addEventListener('close', () => { if (socket === this.socket) this.scheduleReconnect(); });
     socket.addEventListener('open', () => { /* Gateway sends HELLO after the connection opens. */ });
-    void resume;
   }
 
   private async handlePayload(socket: QQSocket, payload: unknown): Promise<void> {
@@ -444,7 +443,7 @@ export class QQChannel {
     this.reconnectTimer = this.scheduleTimeout(() => {
       this.reconnectTimer = undefined;
       this.reconnecting = false;
-      void this.connect(resume).catch(() => this.scheduleReconnect(resume));
+      void this.connect().catch(() => this.scheduleReconnect(resume));
     }, delay);
   }
 

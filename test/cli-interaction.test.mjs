@@ -76,6 +76,9 @@ test('实际 CLI 多轮输入、管理指令、退出及重启恢复', { timeout
   assert.match(first, /伙伴 > alpha\|beta/);
   assert.match(first, /"tools": \[\]/);
   assert.match(first, /"messageCount": 4/);
+  const admin = await run(['--conversation', 'admin'], '/memory remember room 群内约定\n/memory remember me 私人画像\n/memory query\n/exit\n');
+  assert.match(admin, /群内约定/);
+  assert.doesNotMatch(admin, /私人画像/);
   const resumed = await run(['--conversation', 'owner', '--message', 'gamma']);
   assert.match(resumed, /alpha\|beta\|gamma/);
   const other = await run(['--conversation', 'another', '--message', 'delta']);

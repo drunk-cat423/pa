@@ -62,7 +62,7 @@ for (const scenario of [
   const conversation = store.ensureConversation('room', join(directory, 'session.jsonl'),
     { channel: 'qq', accountId: 'a', roomId: 'g', roomType: 'group' });
   let calls = 0;
-  const background = new BackgroundMemory({ memory: { enabled: true, maxCalls: scenario.limit, timeoutMs: 5000, maxRetries: 3 }, contextWindow: 100000 },
+  const background = new BackgroundMemory({ memory: { enabled: true, maxCalls: scenario.limit, timeoutMs: 5000 }, contextWindow: 100000 },
     store.autoMemory, conversation.id, { extract: async input => {
       calls++;
       if (calls <= scenario.failures) throw new Error('fixture failure');
@@ -106,7 +106,7 @@ async function fixture(t, extract = async input => extracted(input), overrides =
   const config = { cwd: directory, dataDir: join(directory, 'data'), provider: 'deepseek', model: 'fixture',
     apiKey: 'fixture-key', baseUrl: `http://127.0.0.1:${server.address().port}`, contextWindow: 1000000,
     maxOutputTokens: 256, timeoutMs: 10000,
-    memory: { enabled: true, maxCalls: 100, maxRetries: 1, timeoutMs: 10000 }, ...overrides };
+    memory: { enabled: true, maxCalls: 100, timeoutMs: 10000 }, ...overrides };
   const route = { channel: 'qq', accountId: 'bot', roomType: 'group', roomId: 'g1' };
   const other = { ...route, roomId: 'g2' };
   const privateRoute = { ...route, roomType: 'private', roomId: 'private-a' };
@@ -326,7 +326,7 @@ test('长批次拆分检查点在失败重试后续接，不重复已成功的�
     if (smallCalls === 2 && !failed) { failed = true; throw new Error('fixture transient'); }
     finished.push(input.messages.map(message => message.id));
     return extracted(input);
-  }, { memory: { enabled: true, maxCalls: 20, maxRetries: 2, timeoutMs: 5000 } });
+  }, { memory: { enabled: true, maxCalls: 20, timeoutMs: 5000 } });
   const h = f.harness();
   for (let i = 0; i < 50; i++) await h.handle(f.message(`split-${i}`, `批次消息${i}`));
   await assert.rejects(h.waitForMemory(), /失败/);
@@ -382,7 +382,7 @@ test('等待截止时间独立于后台工作结束，超时后后台可以继�
   const conversation = store.ensureConversation('room', join(directory, 'session.jsonl'), { channel: 'qq', accountId: 'a', roomId: 'g', roomType: 'group' });
   for (let i = 0; i < 50; i++) store.recordInbound(conversation.id, 'hello', { eventId: String(i), senderId: 'a', modelInputText: 'hello' });
   const gate = deferred();
-  const background = new BackgroundMemory({ memory: { enabled: true, maxCalls: 10, timeoutMs: 5000, maxRetries: 1 }, contextWindow: 100000 },
+  const background = new BackgroundMemory({ memory: { enabled: true, maxCalls: 10, timeoutMs: 5000}, contextWindow: 100000 },
     store.autoMemory, conversation.id, { extract: async (input, signal) => { await wait(signal, gate.promise); return extracted(input); } });
   t.after(async () => { gate.resolve(); await background.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
   background.start();

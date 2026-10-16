@@ -4,12 +4,34 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { parseMemoryRequest } from '../dist/memory-service.js';
+import { executeMemoryRequest, parseMemoryRequest } from '../dist/memory-service.js';
 
 test('显式删除命令本地拒绝，自然语言不走规则路由', () => {
   assert.equal(parseMemoryRequest('/forget memory-id').type, 'unsupported_delete');
   assert.equal(parseMemoryRequest('/memory delete memory-id').type, 'unsupported_delete');
   assert.equal(parseMemoryRequest('请忘掉我的饮食偏好'), undefined);
+});
+
+test('显式管理命令只允许房间记忆，人物画像继续交给普通对话', () => {
+  const calls = [];
+  const conversation = {
+    remember: input => { calls.push(['remember', input]); return {}; },
+    queryMemories: (...args) => { calls.push(['query', ...args]); return []; },
+    correctMemory: (...args) => { calls.push(['correct', ...args]); return {}; },
+  };
+  const source = { id: 'source', actorId: 'actor', senderId: 'sender', text: 'message' };
+  const run = text => executeMemoryRequest({ type: 'admin', text }, conversation, source, true);
+
+  assert.equal(run('/memory remember room 群内约定'), '记住了。');
+  assert.deepEqual(calls[0], ['remember', { content: '群内约定', sourceMessageId: 'source' }]);
+  run('/memory query room 约定');
+  assert.deepEqual(calls[1], ['query', '约定', 20]);
+  for (const command of ['/memory remember me 我的饮食', '/memory remember user:someone 画像',
+    '/memory query me 饮食', '/memory query user:someone 饮食']) {
+    assert.throws(() => run(command), /只管理房间记忆/);
+  }
+  assert.equal(calls.length, 2);
+  assert.equal(parseMemoryRequest('我最近开始喜欢喝乌龙茶'), undefined);
 });
 
 test('实际离线 CLI 记住、查询和纠正；旧删除命令被拒绝且内容保留', async t => {

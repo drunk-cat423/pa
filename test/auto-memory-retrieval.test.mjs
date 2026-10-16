@@ -30,50 +30,44 @@ function fixture(t) {
       return {job,input, output:{topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id)}};
     },
     inspect(action) { const db=new DatabaseSync(path); db.function('history_tokens',{deterministic:true},value=>memoryWords(String(value??'')).join(' '));
-      try { return action(db); } finally { db.close(); } },
-  };
+      try { return action(db); } finally { db.close(); } }};
 }
 
 test('Topic FTS migration backfills existing summaries, stays idempotent, and synchronizes updates', t => {
   const f=fixture(t); const id=f.inbound('讨论递归改进的方案');
   const {job,output}=f.batch(); output.topics=[{summary:'递归改进与智能体方案',messageIds:[id]}];
   f.store.autoMemory.commit(job.id,job.leaseToken,output);
-  const topic=f.store.autoMemory.pendingTopics()[0];
+  const topic=f.store.autoMemory.searchTopics(f.conversation.id,{text:'递归改进'}).topics[0];
   f.inspect(db=>{
     db.exec('DROP TRIGGER index_topic_insert; DROP TRIGGER index_topic_update; DROP TRIGGER index_topic_delete; DROP TABLE memory_topic_fts');
     migrateMemoryRetrieval(db); migrateMemoryRetrieval(db);
     assert.equal(db.prepare('SELECT COUNT(*) n FROM memory_topic_fts').get().n,1);
   });
-  assert.equal(f.store.autoMemory.searchTopicsHybrid(f.conversation.id,{text:'递归改进'}).topics[0].id,topic.id);
+  assert.equal(f.store.autoMemory.searchTopics(f.conversation.id,{text:'递归改进'}).topics[0].id,topic.id);
   f.inspect(db=>db.prepare('UPDATE memory_topics SET summary=? WHERE id=?').run('深圳旅行计划',topic.id));
-  assert.equal(f.store.autoMemory.searchTopicsHybrid(f.conversation.id,{text:'递归改进'}).topics.length,0);
-  assert.equal(f.store.autoMemory.searchTopicsHybrid(f.conversation.id,{text:'深圳旅行'}).topics[0].id,topic.id);
+  assert.equal(f.store.autoMemory.searchTopics(f.conversation.id,{text:'递归改进'}).topics.length,0);
+  assert.equal(f.store.autoMemory.searchTopics(f.conversation.id,{text:'深圳旅行'}).topics[0].id,topic.id);
 });
 
-test('Topic fusion filters conversation candidates first and lexical recall survives missing or failed embeddings', async t => {
-  const f=fixture(t); const id=f.inbound('测试计划'); const {job,output}=f.batch();
+test('Topic BM25 search is room scoped and retrieval performs no model request', async t => {
+  const f=fixture(t),id=f.inbound('测试计划'),{job,output}=f.batch();
   output.topics=[{summary:'杭州茶叶旅行',messageIds:[id]},{summary:'北京编程聚会',messageIds:[id]}];
   f.store.autoMemory.commit(job.id,job.leaseToken,output);
-  const topics=f.store.autoMemory.pendingTopics();
-  const meta={model:'e',dimensions:2,inputVersion:1};
-  for(const topic of topics) f.store.autoMemory.saveEmbedding(topic.id,{...meta,topicVersion:topic.version,contentHash:topic.contentHash,
-    vector:topic.summary.includes('杭州')?[0,1]:[1,0]});
-  const lexical=f.store.autoMemory.searchTopicsHybrid(f.conversation.id,{text:'杭州茶叶'});
-  assert.equal(lexical.topics[0].summary,'杭州茶叶旅行');
-  const hybrid=f.store.autoMemory.searchTopicsHybrid(f.conversation.id,{text:'杭州茶叶',embedding:{...meta,vector:[1,0]}});
-  assert.equal(hybrid.topics[0].summary,'杭州茶叶旅行');
-  assert.equal(f.store.autoMemory.searchTopicsHybrid('foreign-room',{text:'杭州',embedding:{...meta,vector:[1,0]}}).topics.length,0);
-  const config={contextWindow:100000,memory:{enabled:true,maxCalls:10,timeoutMs:100,maxRetries:3}};
-  const noEmbedding=new BackgroundMemory(config,f.store.autoMemory,f.conversation.id,{extract:async()=>{throw new Error('unused');}});
-  t.after(()=>noEmbedding.close());
-  assert.equal((await noEmbedding.retrieve('杭州茶叶')).topics[0].summary,'杭州茶叶旅行');
-  const failing=new BackgroundMemory({...config,memory:{...config.memory}},f.store.autoMemory,f.conversation.id,
-    {extract:async()=>{},embedding:{...meta,embed:async()=>{throw new Error('provider failure');}}});
-  t.after(()=>failing.close());
-  assert.equal((await failing.retrieve('杭州茶叶')).status,'ready');
-  assert.equal((await failing.retrieve('杭州茶叶')).topics[0].summary,'杭州茶叶旅行');
+  const result=f.store.autoMemory.searchTopics(f.conversation.id,{text:'杭州茶叶'});
+  assert.equal(result.status,'ready');assert.equal(result.topics[0].summary,'杭州茶叶旅行');
+  assert.ok(result.topics[0].score>0);
+  assert.deepEqual(f.store.autoMemory.searchTopics('foreign-room',{text:'杭州'}).topics,[]);
+  assert.deepEqual(f.store.autoMemory.searchTopics(f.conversation.id,{text:'不存在'}).topics,[]);
+  assert.deepEqual(f.store.autoMemory.searchTopics(f.conversation.id,{text:''}).topics,[]);
+  assert.throws(()=>f.store.autoMemory.searchTopics(f.conversation.id,{text:'杭州',limit:0}),/参数/);
+  let calls=0;
+  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:10,timeoutMs:100}},
+    f.store.autoMemory,f.conversation.id,{extract:async()=>{calls++;throw new Error('unused');}});
+  t.after(()=>worker.close());
+  assert.equal((await worker.retrieve('杭州茶叶')).topics[0].summary,'杭州茶叶旅行');
+  assert.equal(calls,0);assert.equal(worker.info().calls,0);
   const controller=new AbortController();controller.abort();
-  assert.equal((await failing.retrieve('杭州茶叶',controller.signal)).status,'unavailable');
+  assert.equal((await worker.retrieve('杭州茶叶',controller.signal)).status,'unavailable');
 });
 
 test('same-person atomic facts merge evidence, keep other people isolated, and corrections retain history', t => {
@@ -102,27 +96,21 @@ test('same-person atomic facts merge evidence, keep other people isolated, and c
   assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM person_fragment_messages').get().n),3);
 });
 
-test('memory-purpose pending is archived with atomic evidence without becoming a resident profile', t => {
-  const f=fixture(t); const source=f.inbound('我今年去过杭州'); const actor=f.store.findActor(f.conversation.id,'alice');
-  const person=f.store.autoMemory.personForActor(actor);
-  f.store.autoMemory.addProfilePending(person,source,'今年去过杭州','self',{purpose:'memory'});
-  let batch=f.batch(); f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,batch.output); // pending predates next batch
-  const next=f.inbound('接着讨论'); batch=f.batch(); const pending=batch.input.profiles.find(p=>p.personId===person).pending[0];
-  assert.ok(batch.input.profileSources.some(message=>message.id===source));
-  batch.output.topics=[{summary:'今年去杭州的经历',messageIds:[source]}];
-  batch.output.fragments=[{personId:person,content:'今年去过杭州',sourceType:'self',messageIds:[source],topicIndex:0}];
-  batch.output.memoryPending=[{personId:person,pendingIds:[pending.id]}];
-  const wrong={...batch.output,memoryPending:undefined,profiles:[{personId:person,baseVersion:0,facts:[],pendingIds:[pending.id]}]};
-  assert.throws(()=>validateExtract(wrong,batch.input),/归档/);
-  const eventAsProfile={...batch.output,profiles:[{personId:person,baseVersion:0,facts:[{content:'今年去过杭州',sourceType:'self',messageIds:[source]}]}]};
-  assert.throws(()=>validateExtract(eventAsProfile,batch.input),/不能写入人物画像/);
-  assert.throws(()=>f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,eventAsProfile),/不能写入人物画像/);
-  f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,validateExtract(batch.output,batch.input));
-  assert.deepEqual(f.store.autoMemory.profile(person).facts,[]);assert.deepEqual(f.store.autoMemory.profile(person).pending,[]);
-  assert.equal(f.store.autoMemory.searchTopicsHybrid(f.conversation.id,{text:'杭州经历'}).topics.length,1);
-  const recalled=f.store.autoMemory.searchTopicsHybrid(f.conversation.id,{text:'杭州经历'}).topics[0];
-  assert.equal(recalled.facts[0].content,'今年去过杭州');assert.deepEqual(recalled.facts[0].messageIds,[source]);
-  assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM messages WHERE id IN (?,?)').get(source,next).n),2);
+test('legacy personal-event pending stays stored but never enters profiles or new batches', t => {
+  const f=fixture(t),source=f.inbound('我今年去过杭州'),stableSource=f.inbound('我喜欢茶');
+  const person=f.store.autoMemory.personForActor(f.store.findActor(f.conversation.id,'alice'));
+  assert.throws(()=>f.store.autoMemory.addProfilePending(person,source,'今年去过杭州','self',{purpose:'memory'}),/仅支持画像/);
+  f.store.autoMemory.addProfilePending(person,stableSource,'喜欢茶','self');
+  f.inspect(db=>db.prepare("INSERT INTO person_profile_pending(id,person_id,content,source_message_id,source_type,created_at,purpose) VALUES ('legacy-event',?,?,?,'self',?,'memory')")
+    .run(person,'今年去过杭州',source,new Date().toISOString()));
+  const before=f.inspect(db=>db.prepare("SELECT * FROM person_profile_pending WHERE id='legacy-event'").get());
+  const batch=f.batch(),profile=batch.input.profiles.find(item=>item.personId===person);
+  assert.deepEqual(profile.pending.map(item=>item.content),['喜欢茶']);
+  batch.output.profiles=[{personId:person,baseVersion:0,facts:[{content:'喜欢茶',sourceType:'self',messageIds:[stableSource]}],pendingIds:[profile.pending[0].id]}];
+  f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,validateExtract(batch.output,batch.input));f.restart();
+  assert.deepEqual(f.store.autoMemory.profile(person).pending,[]);
+  assert.deepEqual(f.inspect(db=>db.prepare("SELECT * FROM person_profile_pending WHERE id='legacy-event'").get()),before);
+  assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM person_fragments').get().n),0);
 });
 
 test('a captured third-party target is organized even when only its recorder spoke in this batch', async t => {
@@ -132,7 +120,7 @@ test('a captured third-party target is organized even when only its recorder spo
   const source=f.inbound('小乙喜欢绘画','owner');
   f.store.autoMemory.addProfilePending(bob,source,'喜欢绘画','third_party',{allowThirdParty:true});
   let captured;
-  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:2,maxRetries:3,timeoutMs:1000}},
+  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:2,timeoutMs:1000}},
     f.store.autoMemory,f.conversation.id,{extract:async input=>{
       captured=input;
       const person=input.profiles.find(profile=>profile.personId===bob),pending=person.pending[0];
@@ -170,10 +158,9 @@ test('explicit retry can archive legacy input and progress pending without a pur
   for(const profile of input.profiles) for(const pending of profile.pending??[]) delete pending.purpose;
   f.inspect(db=>db.prepare('UPDATE auto_memory_jobs SET input_json=?,progress_json=? WHERE id=?').run(JSON.stringify(input),JSON.stringify({
     remaining:[input.messages.map(message=>message.id)],profiles:input.profiles,
-    extract:{topics:[],fragments:[],profiles:[],ignoredMessageIds:[]},
-  }),job.id));
+    extract:{topics:[],fragments:[],profiles:[],ignoredMessageIds:[]}}),job.id));
   f.store.autoMemory.fail(job.id,job.leaseToken,'legacy failed job');f.restart();f.store.autoMemory.retry(job.id);
-  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:2,maxRetries:3,timeoutMs:1000}},
+  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:2,timeoutMs:1000}},
     f.store.autoMemory,f.conversation.id,{extract:async captured=>{
       const profile=captured.profiles.find(item=>item.personId===person);
       assert.equal(profile.pending[0].purpose,undefined);
@@ -185,16 +172,19 @@ test('explicit retry can archive legacy input and progress pending without a pur
   assert.equal(f.store.autoMemory.listJobs()[0].attempts,2);
 });
 
-test('embedding dispatch markers survive restart and prevent automatic repeats of unknown results', t => {
-  const f=fixture(t); const id=f.inbound('杭州茶叶'); const {job,output}=f.batch();
+test('removed embedding APIs leave historical vectors and attempts unchanged on reopen', t => {
+  const f=fixture(t),id=f.inbound('杭州茶叶'),{job,output}=f.batch();
   output.topics=[{summary:'杭州茶叶',messageIds:[id]}];f.store.autoMemory.commit(job.id,job.leaseToken,output);
-  const topic=f.store.autoMemory.pendingTopics()[0], meta={model:'e',dimensions:2,inputVersion:1};
-  assert.equal(f.store.autoMemory.beginTopicEmbedding(topic,meta),true);
-  assert.equal(f.store.autoMemory.beginTopicEmbedding(topic,meta),false);
-  f.restart(); assert.equal(f.store.autoMemory.pendingTopicsForConversation(f.conversation.id,meta).length,0);
-  assert.equal(f.store.autoMemory.searchTopicsHybrid(f.conversation.id,{text:'杭州'}).topics.length,1);
-  f.store.autoMemory.retryTopicEmbedding(topic.id);
-  assert.equal(f.store.autoMemory.pendingTopicsForConversation(f.conversation.id,meta).length,1);
+  const topic=f.store.autoMemory.searchTopics(f.conversation.id,{text:'杭州'}).topics[0];
+  f.inspect(db=>{
+    db.prepare('INSERT INTO topic_embeddings VALUES (?,?,?,?,?,?,?,?)').run(topic.id,'old-model',2,1,topic.version,topic.contentHash,'[1,0]','old-time');
+    db.prepare('INSERT INTO topic_embedding_attempts VALUES (?,?,?,?,?,?,?,?)').run(topic.id,'old-model',2,1,topic.version,topic.contentHash,'unknown-result','old-time');
+  });
+  const before=f.inspect(db=>({vectors:db.prepare('SELECT * FROM topic_embeddings').all(),attempts:db.prepare('SELECT * FROM topic_embedding_attempts').all()}));
+  f.restart();
+  for(const method of ['pendingTopics','pendingTopicsForConversation','beginTopicEmbedding','saveEmbedding','retryTopicEmbedding','searchTopicsHybrid']) assert.equal(f.store.autoMemory[method],undefined);
+  assert.equal(f.store.autoMemory.searchTopics(f.conversation.id,{text:'杭州'}).topics.length,1);
+  assert.deepEqual(f.inspect(db=>({vectors:db.prepare('SELECT * FROM topic_embeddings').all(),attempts:db.prepare('SELECT * FROM topic_embedding_attempts').all()})),before);
 });
 
 test('deduplicated facts recalled through a Topic reveal only evidence from that Topic room', t => {
@@ -213,39 +203,35 @@ test('deduplicated facts recalled through a Topic reveal only evidence from that
   f.store.autoMemory.commit(job.id,job.leaseToken,{topics:[{summary:'喝茶偏好',messageIds:[sourceTwo]}],
     fragments:[{personId:'same-person',content:'喜欢茶',sourceType:'self',messageIds:[sourceTwo],topicIndex:0}],profiles:[],ignoredMessageIds:[]});
   assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM person_fragments').get().n),1);
-  const here=f.store.autoMemory.searchTopicsHybrid(f.conversation.id,{text:'喝茶偏好'}).topics;
-  const there=f.store.autoMemory.searchTopicsHybrid(foreign.id,{text:'喝茶偏好'}).topics;
+  const here=f.store.autoMemory.searchTopics(f.conversation.id,{text:'喝茶偏好'}).topics;
+  const there=f.store.autoMemory.searchTopics(foreign.id,{text:'喝茶偏好'}).topics;
   assert.equal(here.length,1);assert.equal(there.length,1);
   assert.deepEqual(here[0].facts[0].messageIds,[sourceOne]);assert.deepEqual(there[0].facts[0].messageIds,[sourceTwo]);
 });
 
-test('foreign memory pending cannot become a local Topic even when shared profile sources contain its original text', t => {
-  const f=fixture(t),one={channel:'qq',accountId:'test',roomType:'group',roomId:'one'},two={...one,roomId:'two'};
-  f.store.configurePersons([{id:'same-person',bindings:[{route:one,senderId:'alice'},{route:two,senderId:'alice'}]}]);
-  const foreign=f.store.ensureConversation('foreign','/foreign.jsonl',two);
-  f.store.recordInbound(foreign.id,'我喜欢茶，也去过杭州',{eventId:'foreign',senderId:'alice',modelInputText:'原始内容'});
-  const source=f.store.externalMessage(foreign.id,'foreign').id;
-  f.store.autoMemory.addProfilePending('same-person',source,'去过杭州','self',{purpose:'memory'});
-  f.store.autoMemory.addProfilePending('same-person',source,'喜欢茶','self',{purpose:'profile'});
-  f.inbound('本房间新消息');const batch=f.batch();
-  assert.equal(batch.input.profiles[0].pending.length,1);assert.equal(batch.input.profiles[0].pending[0].purpose,'profile');
-  assert.ok(batch.input.profileSources.some(message=>message.id===source));
-  const allPending=f.store.autoMemory.profile('same-person').pending;
-  // Also fence a previously frozen or forged snapshot that still captured the foreign memory entry.
-  batch.input.profiles[0].pending=allPending;
-  f.inspect(db=>db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=?').run(JSON.stringify(batch.input),batch.job.id));
-  const invalid={...batch.output,topics:[{summary:'外房间杭州事件',messageIds:[source]}]};
-  assert.throws(()=>validateExtract(invalid,batch.input),/输入以外|当前会话/);
-  assert.throws(()=>f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,invalid),/固定批次|当前会话/);
-  assert.equal(f.store.autoMemory.profile('same-person').pending.length,2);
-  f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,batch.output);
-  assert.equal(f.store.autoMemory.profile('same-person').pending.length,2);
+for(const legacy of ['input','progress','proposal']) test('obsolete personal-event '+legacy+' fails explicitly and preserves frozen work', async t => {
+  const f=fixture(t),source=f.inbound('旧事件'),{job,input}=f.batch();
+  const progress={remaining:[input.messages.map(item=>item.id)],profiles:input.profiles,
+    extract:{topics:[],fragments:[],profiles:[],ignoredMessageIds:[]}};
+  if(legacy==='input') input.profiles[0].pending=[{id:'old',content:'旧事件',sourceMessageId:source,sourceType:'self',purpose:'memory'}];
+  if(legacy==='progress') progress.extract.memoryPending=[];
+  f.inspect(db=>db.prepare('UPDATE auto_memory_jobs SET input_json=?,progress_json=? WHERE id=?').run(JSON.stringify(input),JSON.stringify(progress),job.id));
+  const frozen=f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id));
+  f.store.autoMemory.fail(job.id,job.leaseToken,'prior failure');f.store.autoMemory.retry(job.id);
+  let calls=0;
+  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:2,timeoutMs:500}},
+    f.store.autoMemory,f.conversation.id,{extract:async()=>{calls++;return {topics:[],fragments:[],profiles:[],ignoredMessageIds:[source],memoryArchives:[]};}});
+  t.after(()=>worker.close());worker.start();await assert.rejects(worker.wait(undefined,1000),/失败/);
+  assert.equal(calls,legacy==='proposal'?1:0);
+  assert.match(f.store.autoMemory.listJobs()[0].error,/obsolete_personal_memory/);
+  assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id)),frozen);
+  assert.deepEqual(f.store.autoMemory.profile(input.profiles[0].personId).facts,[]);
 });
 
 test('failed extraction records safe phase diagnostics, preserves its batch, and never retries implicitly', async t => {
   const f=fixture(t); for(let i=0;i<100;i++)f.inbound(`真人消息${i}`);
   let calls=0;
-  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:20,maxRetries:3,timeoutMs:200}},
+  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:20,timeoutMs:200}},
     f.store.autoMemory,f.conversation.id,{extract:async()=>{calls++;throw new Error('Bearer sk-secret 原始用户机密内容');}});
   t.after(()=>worker.close()); worker.start(); await assert.rejects(worker.wait(undefined,2000),/失败/);
   assert.equal(calls,1);assert.equal(f.store.autoMemory.status(f.conversation.id).failed,1);assert.equal(f.store.autoMemory.status(f.conversation.id).queued,1);
@@ -259,4 +245,80 @@ test('assistant ignored IDs fail during validation before commit instead of beco
   const input={roomType:'group',messages:[{id:'u',role:'user',personId:'alice'},{id:'a',role:'assistant'}],profiles:[]};
   assert.throws(()=>validateExtract({topics:[],fragments:[],profiles:[],ignoredMessageIds:['u','a']},input),/只能引用真人/);
   assert.doesNotThrow(()=>validateExtract({topics:[],fragments:[],profiles:[],ignoredMessageIds:['u']},input));
+});
+
+test('private fragments require stable profile evidence while room Topics may retain continuation context', t => {
+  const f=fixture(t),room=f.store.ensureConversation('private','/private.jsonl',{channel:'qq',accountId:'test',roomType:'private',roomId:'private'});
+  f.store.recordInbound(room.id,'我今天去了杭州',{eventId:'private-source',senderId:'alice',modelInputText:'今天去了杭州'});
+  const source=f.store.externalMessage(room.id,'private-source').id;
+  f.store.autoMemory.reserveBatch(room.id,'capacity');const job=f.store.autoMemory.claimNext(room.id,{owner:'test',leaseMs:60000}),input=f.store.autoMemory.taskInput(job);
+  const person=input.profiles[0].personId,fragment={personId:person,content:'今天去了杭州',sourceType:'self',messageIds:[source]};
+  const output={topics:[{summary:'杭州行程',messageIds:[source]}],fragments:[fragment],profiles:[],ignoredMessageIds:[],continuationSummary:'接着讨论杭州行程'};
+  assert.throws(()=>validateExtract(output,input),/只能保存稳定画像证据/);
+  assert.throws(()=>f.store.autoMemory.commit(job.id,job.leaseToken,output),/只能保存稳定画像证据/);
+  output.fragments=[];f.store.autoMemory.commit(job.id,job.leaseToken,validateExtract(output,input));
+  assert.equal(f.store.autoMemory.searchTopics(room.id,{text:'杭州'}).topics.length,1);
+  assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM person_fragments').get().n),0);
+});
+
+function archivedPersonalEvent(f, withStableProfile=false) {
+  const source=f.inbound('我喜欢茶，去年去了杭州'),first=f.batch(),person=first.input.profiles[0].personId;
+  const stable={content:'喜欢茶',sourceType:'self',messageIds:[source]};
+  const event={personId:person,content:'去年去了杭州',sourceType:'self',messageIds:[source],topicIndex:0};
+  first.output.topics=[{summary:'杭州旅行讨论',messageIds:[source]}];first.output.fragments=[event];
+  first.output.profiles=[{personId:person,baseVersion:0,facts:withStableProfile?[stable]:[]}];
+  f.store.autoMemory.commit(first.job.id,first.job.leaseToken,first.output);
+  // Model a completed pre-removal archive with its original purpose and FK to the retained revision.
+  f.inspect(db=>db.prepare("INSERT INTO person_profile_pending(id,person_id,content,source_message_id,source_type,created_at,archived_revision,archived_at,purpose) VALUES ('archived-event',?,?,?,'self',?,1,?,'memory')")
+    .run(person,event.content,source,'legacy-created','legacy-archived'));
+  if(withStableProfile) f.store.autoMemory.addProfilePending(person,source,'喜欢茶','self');
+  return {source,person,stable,event};
+}
+
+for(const sharedSource of [false,true]) test('archived event fragments cannot become new profiles'+(sharedSource?' even with a same-source profile':''), t=>{
+  const f=fixture(t),legacy=archivedPersonalEvent(f,sharedSource);
+  const before=f.inspect(db=>({pending:db.prepare('SELECT * FROM person_profile_pending').all(),fragments:db.prepare('SELECT * FROM person_fragments').all(),
+    sources:db.prepare('SELECT * FROM person_fragment_messages').all(),revisions:db.prepare('SELECT * FROM person_profile_revisions').all()}));
+  f.restart();f.inbound('继续聊');const batch=f.batch(),profile=batch.input.profiles.find(item=>item.personId===legacy.person);
+  assert.deepEqual(batch.input.profileFragments,[]);assert.deepEqual(profile.pending,[]);
+  assert.deepEqual(batch.input.excludedProfileSourceIds,[legacy.source]);
+  assert.deepEqual(profile.facts,sharedSource?[legacy.stable]:[]);
+  const malicious={...batch.output,profiles:[{personId:legacy.person,baseVersion:profile.baseVersion,
+    facts:[...profile.facts,{content:legacy.event.content,sourceType:'self',messageIds:[legacy.source]}]}]};
+  assert.throws(()=>validateExtract(malicious,batch.input),/协议已过期/);
+  assert.throws(()=>f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,malicious),/协议已过期/);
+  // Commit independently resolves original purpose rows even when frozen metadata is absent.
+  const tampered={...batch.input};delete tampered.excludedProfileSourceIds;
+  f.inspect(db=>db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=?').run(JSON.stringify(tampered),batch.job.id));
+  assert.throws(()=>f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,malicious),/协议已过期/);
+  const recalled=f.store.autoMemory.searchTopics(f.conversation.id,{text:'杭州'}).topics[0];
+  assert.equal(recalled.facts[0].content,legacy.event.content);assert.deepEqual(recalled.facts[0].messageIds,[legacy.source]);
+  batch.output.profiles=[{personId:legacy.person,baseVersion:profile.baseVersion,facts:profile.facts}];
+  f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,validateExtract(batch.output,batch.input));
+  const after=f.inspect(db=>({pending:db.prepare('SELECT * FROM person_profile_pending').all(),fragments:db.prepare('SELECT * FROM person_fragments').all(),
+    sources:db.prepare('SELECT * FROM person_fragment_messages').all(),revisions:db.prepare('SELECT * FROM person_profile_revisions WHERE revision=1').all()}));
+  assert.deepEqual(after,before);assert.deepEqual(f.store.autoMemory.profile(legacy.person).facts,sharedSource?[legacy.stable]:[]);
+});
+
+for(const frozenPart of ['input-fragment','progress-profile','progress-fragment']) test('frozen '+frozenPart+' resolving to archived events fails without rewriting JSON',async t=>{
+  const f=fixture(t),legacy=archivedPersonalEvent(f);f.inbound('新批次');const batch=f.batch();
+  const input=structuredClone(batch.input);delete input.excludedProfileSourceIds;
+  const progress={remaining:[input.messages.map(message=>message.id)],profiles:input.profiles,
+    extract:{topics:[],fragments:[],profiles:[],ignoredMessageIds:[]}};
+  if(frozenPart==='input-fragment') {
+    input.profileFragments=[legacy.event];
+    input.profileSources=[f.inspect(db=>({...db.prepare('SELECT id,text FROM messages WHERE id=?').get(legacy.source),
+      role:'user',personId:legacy.person,conversationId:f.conversation.id}))];
+  }
+  if(frozenPart==='progress-profile') progress.profiles=[{...input.profiles[0],facts:[{content:legacy.event.content,sourceType:'self',messageIds:[legacy.source]}]}];
+  if(frozenPart==='progress-fragment') progress.extract.fragments=[legacy.event];
+  f.inspect(db=>db.prepare('UPDATE auto_memory_jobs SET input_json=?,progress_json=? WHERE id=?').run(JSON.stringify(input),JSON.stringify(progress),batch.job.id));
+  const before=f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(batch.job.id));
+  f.store.autoMemory.fail(batch.job.id,batch.job.leaseToken,'previous failure');f.store.autoMemory.retry(batch.job.id);
+  let calls=0;const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:2,timeoutMs:500}},
+    f.store.autoMemory,f.conversation.id,{extract:async()=>{calls++;return batch.output;}});
+  t.after(()=>worker.close());worker.start();await assert.rejects(worker.wait(undefined,1000),/失败/);
+  assert.equal(calls,0);assert.match(f.store.autoMemory.listJobs()[0].error,/obsolete_personal_memory/);
+  assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(batch.job.id)),before);
+  assert.deepEqual(f.store.autoMemory.profile(legacy.person).facts,[]);
 });

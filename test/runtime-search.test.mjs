@@ -15,11 +15,12 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
     const chunks = []; for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString()); requests.push(body);
     response.writeHead(200, { 'content-type': 'text/event-stream' });
-    const search = requests.length === 1 && body.tools?.some(tool => tool.function.name === 'web_search');
-    const delta = search ? { role: 'assistant', tool_calls: [{ index: 0, id: 'call_search_1', type: 'function',
+    const preparing=body.tool_choice?.function?.name==='prepare_turn';
+    const search = !preparing && body.tools?.some(tool => tool.function.name === 'web_search') && requests.filter(r=>r.tools?.some(tool=>tool.function.name==='web_search')).length===1;
+    const delta = preparing ? {role:'assistant',tool_calls:[{index:0,id:'prepare-'+requests.length,type:'function',function:{name:'prepare_turn',arguments:JSON.stringify({intent:'question',mode:'standard',updates:[]})}}]} : search ? { role: 'assistant', tool_calls: [{ index: 0, id: 'call_search_1', type: 'function',
       function: { name: 'web_search', arguments: JSON.stringify({ query: 'SQLite 官方文档', startDate: '2026-10-08', endDate: '2026-10-15' }) } }] } : { role: 'assistant', content: '检索完成' };
     for (const choices of [[{ index: 0, delta, finish_reason: null }],
-      [{ index: 0, delta: {}, finish_reason: search ? 'tool_calls' : 'stop' }]]) {
+      [{ index: 0, delta: {}, finish_reason: preparing || search ? 'tool_calls' : 'stop' }]]) {
       response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1,
         model: 'test', choices })}\n\n`);
     }
@@ -52,16 +53,17 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
     modelInputText: '请搜索 SQLite 官方文档' });
   assert.match(reply.text, /检索完成/);
   assert.equal(reply.referenceUrls, undefined);
-  assert.equal(requests.length, 2);
-  assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['update_profile', 'read_history', 'answer_in_depth', 'web_search', 'web_fetch']);
-  assert.equal(requests[0].tool_choice, 'auto');
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['prepare_turn']);
+  assert.deepEqual(requests[0].tool_choice,{type:'function',function:{name:'prepare_turn'}});
+  assert.deepEqual(requests[1].tools.map(tool=>tool.function.name),['read_history','web_search','web_fetch']);
   assert.equal(requests[1].tool_choice, 'auto');
-  assert.equal(requests[1].messages.filter(message => message.role === 'tool').length, 1);
+  assert.equal(requests[2].messages.filter(message => message.role === 'tool').length, 2);
   assert.equal(nativeQueries.length, 1);
   const searchInput = nativeQueries[0].messages[0].content[0].text;
   assert.ok(searchInput.endsWith('Perform a web search for the query: SQLite 官方文档'));
   assert.deepEqual(JSON.parse(searchInput.split('\n')[1]).requestedDateRange, { startDate: '2026-10-08', endDate: '2026-10-15' });
-  const toolText = requests[1].messages.find(message => message.role === 'tool').content;
+  const toolText = requests[2].messages.findLast(message => message.role === 'tool').content;
   const toolOutput = JSON.parse(toolText.slice(toolText.lastIndexOf('\n') + 1));
   assert.deepEqual(toolOutput.freshness.requestedDateRange, { startDate: '2026-10-08', endDate: '2026-10-15' });
   assert.equal(toolOutput.freshness.dateFilterApplied, false);
@@ -78,11 +80,11 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
   const reopened = await openRecordedConversation(config, 'group-search', route); opened.push(reopened);
   const normal = await reopened.prompt('你好', { eventId: 'evt2', senderId: 'user', modelInputText: '你好' });
   reopened.acknowledge(normal.deliveryId, 'sent', 'reply2');
-  assert.equal(requests.length, 3);
-  assert.ok(requests[2].tools.some(tool => tool.function.name === 'web_search'));
+  assert.equal(requests.length, 5);
+  assert.ok(requests[4].tools.some(tool => tool.function.name === 'web_search'));
   assert.equal(nativeQueries.length, 1);
   const cli = await openConversation(config, 'cli'); opened.push(cli);
   await cli.prompt('搜索 SQLite', { searchQuery: 'SQLite' });
-  assert.ok(!requests[3].tools?.length);
+  assert.ok(!requests[5].tools?.length);
   assert.equal(nativeQueries.length, 1);
 });

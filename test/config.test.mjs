@@ -124,3 +124,10 @@ test('CLI check 只检查格式，无请求也不输出密钥', () => {
   assert.ok(!result.stdout.includes(valid.PA_API_KEY));
   assert.ok(!result.stderr.includes(valid.PA_API_KEY));
 });
+
+test('removed embedding and retry environment variables do not produce active configuration', () => {
+  const config=readConfig({...valid,PA_EMBEDDING_URL:'invalid retired url',PA_EMBEDDING_MODEL:'old',PA_EMBEDDING_API_KEY:'old-secret',PA_MEMORY_MAX_RETRIES:'nonsense'});
+  assert.equal(Object.hasOwn(config.memory,'embedding'),false);
+  assert.equal(Object.hasOwn(config.memory,'maxRetries'),false);
+  assert.ok(!JSON.stringify(config).includes('old-secret'));
+});

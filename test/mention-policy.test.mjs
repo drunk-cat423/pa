@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { configuredPersons, isMemoryOwner, isPrimaryPerson, validateHarnessPolicy } from '../dist/harness-policy.js';
+import { configuredPersons, isMemoryOwner, validateHarnessPolicy } from '../dist/harness-policy.js';
 
 const route = { channel: 'qq', accountId: 'app', roomId: 'group', roomType: 'group' };
 const binding = { route, senderId: 'member-openid' };
@@ -15,7 +15,6 @@ test('configured persons merge legacy primaryPerson while owner authority remain
     persons: [{ id: 'managed-person', bindings: [otherBinding] }],
   });
   assert.deepEqual(configuredPersons(policy).map(person => person.id), ['legacy-primary', 'managed-person']);
-  assert.equal(isPrimaryPerson(policy, message), true);
   assert.equal(isMemoryOwner(policy, message), false);
 });
 

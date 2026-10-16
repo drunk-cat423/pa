@@ -73,7 +73,6 @@ test('独立Pi会话允许同房间多运行，canonical仍独占，同一Pi文�
   assert.equal(messages.find(message => message.id === first.messageId).piSessionFile, '/pi/task-first.jsonl');
   assert.equal(messages.find(message => message.id === delivery.messageId).piSessionFile, '/pi/task-first.jsonl');
   assert.equal(messages.find(message => message.id === canonical.inputMessageId).piSessionFile, undefined);
-  assert.deepEqual(f.store.recordedSessionFiles(f.conversation.id), ['/pi/task-first.jsonl', '/pi/task-second.jsonl']);
   assert.deepEqual(f.store.recordedTaskSessions(f.conversation.id), [
     { piSessionFile: '/pi/task-first.jsonl', inputMessageId: first.messageId },
     { piSessionFile: '/pi/task-second.jsonl', inputMessageId: second.messageId },

@@ -4,7 +4,7 @@ import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
-import {openConversation,RequestError} from '../dist/runtime.js';
+import {openConversation,RequestError,estimateContext} from '../dist/runtime.js';
 import {MemoryError} from '../dist/memory-types.js';
 import {ConversationStore} from '../dist/store.js';
 
@@ -29,7 +29,7 @@ async function fixture(t,respond,overrides={}) {
 }
 const plan=(updates=[],mode='casual')=>({intent:updates.length?'memory_update':'social',mode,updates});
 const prepare=p=>[{name:'prepare_turn',args:p}];
-const tools=overrides=>({updateProfile:()=>{throw Error('must not bypass preparation');},readHistory:()=>[],...overrides});
+const tools=overrides=>({readHistory:()=>[],...overrides});
 
 test('每轮强制一次结构化判断，持久化完成后才调用回答，模式只控制表达',async t=>{
   let saved=false;
@@ -45,10 +45,10 @@ test('每轮强制一次结构化判断，持久化完成后才调用回答，�
   assert.match(JSON.stringify(f.requests[1].messages),/本轮采用专业回答/);
 });
 
-test('准备阶段与answer_in_depth共享单轮进度额度且先等待保存回执',async t=>{
+test('准备阶段先等待保存回执，回答后读取历史共享单轮进度额度',async t=>{
   const p={...plan([], 'casual'),progressText:'我先理清问题。'},order=[];
   const f=await fixture(t,(_body,n)=>n===1?prepare(p):n===2?[
-    {name:'answer_in_depth',args:{reason:'需要仔细推导'}},
+    {name:'read_history',args:{query:'此前证据'}},
   ]:'深入回答正文。');
   const answer=await f.runtime.prompt('深入分析这个问题',{runId:'progress-once',companionTools:tools({
     prepareTurn:got=>{assert.deepEqual(got,p);order.push('saved');return {prepared:true,mode:got.mode,saved:[]};},
@@ -108,4 +108,41 @@ test('准备参数不合法或被输出上限截断时不保存、不自动再�
     await assert.rejects(f.runtime.prompt('你好',{runId:'run',companionTools:tools({prepareTurn:()=>{writes++;return {prepared:true,mode:'casual',saved:[]};}})}),RequestError);
     assert.equal(writes,0);assert.equal(f.requests.length,1);
   }
+});
+
+
+test('渠道估算同时覆盖准备和回答请求，工具和指令按实际阶段投影',async t=>{
+  for(const mode of ['casual','standard','professional']) {
+    const p=plan([],mode);
+    const f=await fixture(t,(_body,n)=>n===1?prepare(p):'已完成。');
+    const text='解释当前问题',memoryContext='仅供当前问题参考的背景。';
+    const cli=f.runtime.estimate(text,memoryContext);
+    const estimate=f.runtime.estimate(text,memoryContext,{channel:true});
+    assert.ok(estimate.inputTokens>cli.inputTokens);
+    assert.equal(estimate.fits,true);
+    await f.runtime.prompt(text,{runId:'estimate-'+mode,memoryContext,companionTools:tools({
+      prepareTurn:got=>({prepared:true,mode:got.mode,saved:[]}),
+    })});
+    for(const body of f.requests) {
+      const actual=estimateContext(body,32768,512);
+      assert.ok(estimate.inputTokens>=actual.inputTokens, JSON.stringify({mode,estimate,actual}));
+    }
+    const first=JSON.stringify(f.requests[0]);
+    assert.equal(first.split('本轮先完成prepare_turn，再回答').length-1,1);
+    const second=JSON.stringify(f.requests[1]);
+    assert.doesNotMatch(second,/本轮先完成prepare_turn，再回答/);
+    for(const body of f.requests) {
+      const prompt=body.messages.filter(m=>m.role==='system').map(m=>m.content).join('');
+      assert.equal(prompt.split('画像用于调整交流方式').length-1,1);
+      assert.equal(prompt.split('硬上限为512 tokens').length-1,1);
+    }
+  }
+});
+
+test('发送前窗口错误保留真实原因，不覆盖为缺少prepare协议',async t=>{
+  const f=await fixture(t,()=>'',{contextWindow:2000});
+  await assert.rejects(f.runtime.prompt('x'.repeat(2500),{runId:'too-large',companionTools:tools({
+    prepareTurn:p=>({prepared:true,mode:p.mode,saved:[]}),
+  })}),/最终请求超过上下文窗口/);
+  assert.equal(f.requests.length,0);
 });

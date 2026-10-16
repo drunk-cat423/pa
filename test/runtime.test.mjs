@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
-import { openConversation } from '../dist/runtime.js';
+import { estimateContext, openConversation } from '../dist/runtime.js';
 
 const runtimeUrl = pathToFileURL(join(import.meta.dirname, '../dist/runtime.js')).href;
 
@@ -122,7 +122,7 @@ test('真实 Pi SDK 多轮持久化、进程重启恢复与不同会话隔离', 
     assert.ok(!request.body.tools || request.body.tools.length === 0);
     assert.ok(request.body.max_tokens <= 512 || request.body.max_completion_tokens <= 512);
     const system = request.body.messages.filter((message) => message.role === 'system').map((message) => message.content).join('\n');
-    assert.match(system, /不假造记忆/);
+    assert.match(system, /不虚构记忆/);
     assert.doesNotMatch(system, /expert coding assistant|Pi documentation/);
   }
 });
@@ -305,4 +305,21 @@ test('内置模型的输出上限也传入真实 SDK 的 HTTP 请求', async (t)
   assert.equal(result.answer, 'reply:capped');
   assert.equal(f.requests.length, 1);
   assert.equal(f.requests[0].body.max_tokens ?? f.requests[0].body.max_completion_tokens, 37);
+});
+
+
+test('32768窗口512输出可接纳20584 ASCII，CLI预估和实际请求都不包含准备或工具', async t => {
+  const f = await fixture(t);
+  const runtime = await f.conversation('ascii-regression');
+  const text = 'x'.repeat(20584);
+  const estimate = runtime.estimate(text);
+  assert.equal(estimate.fits, true);
+  assert.equal(await runtime.prompt(text), 'reply:' + text);
+  const request = f.requests[0].body;
+  const actual = estimateContext(request, f.config.contextWindow, f.config.maxOutputTokens);
+  assert.ok(estimate.inputTokens >= actual.inputTokens, JSON.stringify({estimate,actual,messages:request.messages.map(m=>({role:m.role,length:JSON.stringify(m.content).length})),keys:Object.keys(request)}));
+  assert.ok(estimate.inputTokens - actual.inputTokens < 512);
+  assert.ok(!request.tools?.length);
+  assert.equal(request.tool_choice, 'none');
+  assert.doesNotMatch(JSON.stringify(request), /prepare_turn|update_profile|answer_in_depth/);
 });

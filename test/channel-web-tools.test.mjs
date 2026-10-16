@@ -95,7 +95,7 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.equal(nativeSearch.length, 1);
   assert.equal(pageRequests.length, 1);
   assert.equal(pageRequests[0].url, 'https://example.com/search-source');
-  assert.match(requests[0].messages.find(message => message.role === 'system').content, /不展示来源网址或列参考链接/);
+  assert.match(requests[0].tools.find(tool => tool.function.name === 'web_search').function.description, /不向用户展示来源网址或参考链接/);
   assert.equal(requests[0].tool_choice, 'auto');
   assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['read_history', 'web_search', 'web_fetch']);
   assert.ok(nativeSearch[0].messages[0].content[0].text.endsWith('Perform a web search for the query: 与 example.com search-source 有关的资料'));
@@ -103,6 +103,7 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.match(JSON.stringify(requests[1].messages.filter(message => message.role === 'tool')), /SUMMARY_MARKER/);
   assert.match(JSON.stringify(requests[1].messages.filter(message => message.role === 'tool')), /https:\/\/example.com\/search-source/);
   assert.match(JSON.stringify(requests[2].messages.filter(message => message.role === 'tool')), /PAGE_MARKER/);
+  assert.match(JSON.stringify(requests[2].messages.filter(message => message.role === 'tool')), /最终回答不展示来源网址或参考链接/);
   assert.ok(sent.length > 1);
   assert.doesNotMatch(sent.map(part => part.text).join(''), /参考链接|https?:\/\//);
   assert.ok(sent.every(part => [...part.text].length <= 500));

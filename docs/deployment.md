@@ -11,7 +11,7 @@ PA 使用 Node.js 24.15.0、Pi SDK 和本地 SQLite，不需要 MySQL、Web 端�
 | 数据与 Pi JSONL | `/var/lib/pa`，pa 用户所有、700 |
 | 服务 | `pa.service`，模板见 `scripts/deployment/pa.service` |
 
-代码、配置和数据分开。systemd 以 `pa` 用户运行，通过 EnvironmentFile 注入配置；`PA_DATA_DIR=/var/lib/pa`。服务只发起 QQ/模型 HTTPS 和 QQ WSS 出站，不需要新增安全组入站端口。保留本机已验证的机器人凭证、群白名单和模型预算；语义召回仍需单独配置 Embedding。
+代码、配置和数据分开。systemd 以 `pa` 用户运行，通过 EnvironmentFile 注入配置；`PA_DATA_DIR=/var/lib/pa`。服务只发起 QQ/模型 HTTPS 和 QQ WSS 出站，不需要新增安全组入站端口。保留本机已验证的机器人凭证、群白名单和模型预算；Topic当前仅使用关键词检索，不再读取Embedding配置，旧向量数据保留。
 
 ## 首次发布与数据迁移
 

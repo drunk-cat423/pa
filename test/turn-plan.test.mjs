@@ -78,12 +78,13 @@ test('规则纠正保留旧版本、不同群和私聊相互隔离',t=>{
     plan([{target:'room_rule',key:'pa',content:'pa代表personal agent'}]),policy),/只能在对应群聊/);
 });
 
-test('个人事件保留memory用途，普通成员仍可建议AI全局称呼',t=>{
+test('个人事件协议拒绝写入，普通成员仍可单独建议AI全局称呼',t=>{
   const f=fixture(t),id=f.input('记住我买了电脑；你叫初号机','member');
-  const r=f.store.prepareTurn(f.group.id,id,plan([{target:'sender',purpose:'memory',content:'我买了电脑',sourceType:'self'},
-    {target:'ai_self',content:'你叫初号机'}]),f.policy);
-  assert.equal(r.saved.length,2);
-  assert.equal(f.store.autoMemory.profile(f.store.identityCard(f.group.id,'member',f.policy).personId).pending[0].purpose,'memory');
+  assert.throws(()=>f.store.prepareTurn(f.group.id,id,plan([{target:'sender',purpose:'memory',content:'我买了电脑',sourceType:'self'},
+    {target:'ai_self',content:'你叫初号机'}]),f.policy),/条目无效/);
+  assert.equal(f.store.autoMemory.selfProfile.snapshot().pending.length,0);
+  const r=f.store.prepareTurn(f.group.id,id,plan([{target:'ai_self',content:'你叫初号机'}]),f.policy);
+  assert.equal(r.saved.length,1);
 });
 
 test('准备协议不能接受伪造来源或任意工具权限字段',t=>{

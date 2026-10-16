@@ -102,7 +102,7 @@ test('chunk progress and input snapshot survive retry and reclaim; clearing rere
     f.store.autoMemory.fail(original.id,original.leaseToken,'offline');f.restart();f.store.autoMemory.retry(original.id);
     const retried=claim(f);assert.deepEqual(f.store.autoMemory.loadProgress(retried.id,retried.leaseToken),{chunk:1,topics:[]});
     assert.equal(f.store.autoMemory.taskInput(retried).job.leaseToken,retried.leaseToken);
-    f.store.rememberMemory(f.conversation.id,{content:'new self fact',sourceMessageId:source.existingMessageId,subjectActorId:actor,profileField:'diet'});
+    f.store.autoMemory.addProfilePending(f.store.autoMemory.personForActor(actor),source.existingMessageId,'new self fact','self');
     assert.deepEqual(f.store.autoMemory.taskInput(retried).profiles,before.profiles);
     f.store.autoMemory.clearProgress(retried.id,retried.leaseToken);
     assert.equal(f.store.autoMemory.loadProgress(retried.id,retried.leaseToken),undefined);
@@ -134,18 +134,15 @@ test('private count uses 50 complete sent turns, failures and current prompt rem
   }finally{f.close();}
 });
 
-test('same-room owner management retains access while conversation refs stay person isolated',()=>{
+test('shared room records remain separate from stable personal profiles',()=>{
   const f=fixture();try {
-    const self=f.inbound('self');const actor=f.store.findActor(f.conversation.id,'alice');
-    const memory=f.store.rememberMemory(f.conversation.id,{content:'tea',sourceMessageId:self.existingMessageId,subjectActorId:actor,profileField:'diet'}).memory;
+    const self=f.inbound('self'),actor=f.store.findActor(f.conversation.id,'alice');
+    const memory=f.store.rememberMemory(f.conversation.id,{content:'group agreement',sourceMessageId:self.existingMessageId}).memory;
     const owner=f.inbound('owner correction','owner');
-    assert.equal(f.store.queryMemories(f.conversation.id).length,1);
-    f.store.correctMemory(f.conversation.id,memory.id,{content:'owner-only evaluation',sourceMessageId:owner.existingMessageId},1);
-    assert.equal(f.store.autoMemory.profileForActors(actor)[0].facts.length,0);
-    assert.throws(()=>f.store.beginRun(f.conversation.id,'owner correction','p','m',[{id:memory.id,revision:2}],owner),/记忆不存在/);
-    const latest=f.inbound('water');
-    f.store.correctMemory(f.conversation.id,memory.id,{content:'water',sourceMessageId:latest.existingMessageId},2);
-    assert.equal(f.store.autoMemory.profileForActors(actor)[0].pending.at(-1).content,'water');
+    f.store.correctMemory(f.conversation.id,memory.id,{content:'corrected group agreement',sourceMessageId:owner.existingMessageId},1);
+    assert.equal(f.store.queryMemories(f.conversation.id)[0].content,'corrected group agreement');
+    assert.deepEqual(f.store.autoMemory.profileForActors(actor)[0].facts,[]);
+    assert.deepEqual(f.store.autoMemory.profileForActors(actor)[0].pending,[]);
   }finally{f.close();}
 });
 
@@ -171,30 +168,26 @@ test('unbound actors are isolated and configured multiple people share only expl
       {id:'bob-person',bindings:[{route:f.route,senderId:'bob'}]}]);
     assert.equal(f.store.autoMemory.personForActor(a),f.store.autoMemory.personForActor(alias));
     assert.notEqual(f.store.autoMemory.personForActor(a),f.store.autoMemory.personForActor(b));
-    f.store.rememberMemory(f.conversation.id,{content:'tea',subjectActorId:a,sourceMessageId:alice.existingMessageId,profileField:'diet'});
-    f.store.rememberMemory(f.conversation.id,{content:'sports',subjectActorId:b,sourceMessageId:bob.existingMessageId,profileField:'interests'});
+    f.store.autoMemory.addProfilePending('alice-person',alice.existingMessageId,'tea','self');
+    f.store.autoMemory.addProfilePending('bob-person',bob.existingMessageId,'sports','self');
     assert.equal(f.store.autoMemory.profileForActors(alias).length,1);
     assert.equal(f.store.autoMemory.profileForActors(alias)[0].pending[0].content,'tea');
     assert.deepEqual(f.store.autoMemory.profileForActors(a,[b,b]).map(p=>p.personId),['alice-person','bob-person']);
-    assert.throws(()=>f.store.deleteMemory(f.conversation.id,'anything'),/不提供记忆删除/);
+    assert.equal(f.store.deleteMemory,undefined);
   }finally{f.close();}
 });
 
-test('explicit corrections remain pending and third-party subjects do not enter the sender unified profile',()=>{
+test('profile pending corrections captured after a batch stay pending for the next batch',()=>{
   const f=fixture();try {
-    const source=f.inbound('I drink tea');const actor=f.store.findActor(f.conversation.id,'alice');const person=f.store.autoMemory.personForActor(actor);
-    const memory=f.store.rememberMemory(f.conversation.id,{content:'tea',sourceMessageId:source.existingMessageId,subjectActorId:actor,profileField:'diet'}).memory;
+    const source=f.inbound('I drink tea'),actor=f.store.findActor(f.conversation.id,'alice'),person=f.store.autoMemory.personForActor(actor);
+    f.store.autoMemory.addProfilePending(person,source.existingMessageId,'tea','self');
     const bob=f.inbound('Alice likes coffee','bob');
-    f.store.rememberMemory(f.conversation.id,{content:'coffee',sourceMessageId:bob.existingMessageId,subjectActorId:actor,profileField:'interests'});
-    assert.equal(f.store.autoMemory.profile(person).facts.length,0);
-    assert.equal(f.store.autoMemory.profile(person).pending.length,1);
-    f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const worker=claim(f);const baseline=f.store.autoMemory.taskInput(worker).profiles.find(p=>p.personId===person);
-    const correction=f.inbound('now water');f.store.correctMemory(f.conversation.id,memory.id,{content:'water',sourceMessageId:correction.existingMessageId},1);
-    const extract=ignored(f,worker,{profiles:[baseline]});
-    f.store.autoMemory.commit(worker.id,worker.leaseToken,extract);
-    assert.equal(f.store.autoMemory.profile(person).facts.length,0);
+    assert.throws(()=>f.store.autoMemory.addProfilePending(person,bob.existingMessageId,'coffee','self'),/实际发送者/);
+    f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const worker=claim(f),baseline=f.store.autoMemory.taskInput(worker).profiles.find(p=>p.personId===person);
+    const correction=f.inbound('now water');f.store.autoMemory.addProfilePending(person,correction.existingMessageId,'water','self');
+    f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[baseline]}));
+    assert.deepEqual(f.store.autoMemory.profile(person).facts,[]);
     assert.deepEqual(f.store.autoMemory.profile(person).pending.map(p=>p.content),['tea','water']);
-    assert.equal(f.store.autoMemory.status(f.conversation.id).completed,1);
   }finally{f.close();}
 });
 
@@ -203,14 +196,12 @@ test('older batch cannot produce fields or consume a newer uncaptured pending co
     let old;for(let i=0;i<50;i++)old=f.inbound(`old tea statement ${i}`);
     f.store.autoMemory.reserveBatch(f.conversation.id,'count');
     const latest=f.inbound('now water');const actor=f.store.findActor(f.conversation.id,'alice');
-    f.store.rememberMemory(f.conversation.id,{content:'water',sourceMessageId:latest.existingMessageId,subjectActorId:actor,profileField:'diet'});
+    f.store.autoMemory.addProfilePending(f.store.autoMemory.personForActor(actor),latest.existingMessageId,'water','self');
     const worker=claim(f);const baseline=f.store.autoMemory.taskInput(worker).profiles[0];
     const stale={...baseline,facts:[{field:'diet',content:'tea',sourceType:'self',messageIds:[old.existingMessageId]}]};
     assert.throws(()=>f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[stale]})),/分类字段/);
     f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[baseline]}));
     assert.equal(f.store.autoMemory.profileForActors(actor)[0].pending.at(-1).content,'water');
-    const memory=f.store.queryMemories(f.conversation.id,'water')[0];
-    assert.throws(()=>f.store.correctMemory(f.conversation.id,memory.id,{content:'old correction',sourceMessageId:old.existingMessageId},1),/较旧来源/);
     assert.equal(f.store.autoMemory.profileForActors(actor)[0].pending.at(-1).content,'water');
   }finally{f.close();}
 });
@@ -239,7 +230,7 @@ test('confirmed binding carries independent automatic profile and fences in-flig
   }finally{f.close();}
 });
 
-test('atomic Topic, person evidence, profile and current-only scoped vector search',()=>{
+test('atomic Topic, person evidence, profile and room-scoped keyword search',()=>{
   const f=fixture();try {
     const source=f.inbound('I enjoy tea');const actor=f.store.findActor(f.conversation.id,'alice');const person=f.store.autoMemory.personForActor(actor);
     f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const worker=claim(f);
@@ -247,19 +238,11 @@ test('atomic Topic, person evidence, profile and current-only scoped vector sear
       fragments:[{personId:person,content:'tea',sourceType:'self',messageIds:[source.existingMessageId],topicIndex:0}],
       profiles:[{personId:person,baseVersion:0,facts:[{content:'tea',sourceType:'self',messageIds:[source.existingMessageId]}]}]});
     f.store.autoMemory.commit(worker.id,worker.leaseToken,extract);
-    const topic=f.store.autoMemory.pendingTopics()[0];assert.equal(topic.summary,'Tea discussion');
-    const embedding={model:'local-test',dimensions:2,inputVersion:1,topicVersion:1,contentHash:topic.contentHash,vector:[1,0]};
-    assert.equal(f.store.autoMemory.searchTopics(f.conversation.id,{...embedding}).status,'unavailable');
-    assert.throws(()=>f.store.autoMemory.saveEmbedding(topic.id,{...embedding,vector:[1]}),/维度/);
-    assert.throws(()=>f.store.autoMemory.saveEmbedding(topic.id,{...embedding,contentHash:'bad'}),/版本已变化/);
-    f.store.autoMemory.saveEmbedding(topic.id,embedding);assert.equal(f.store.autoMemory.pendingTopics().length,0);
-    assert.equal(f.store.autoMemory.pendingTopicsForConversation(f.conversation.id,embedding).length,0);
-    assert.equal(f.store.autoMemory.pendingTopicsForConversation(f.conversation.id,{...embedding,model:'new-model'}).length,1);
-    assert.equal(f.store.autoMemory.pendingTopicsForConversation('another-room',embedding).length,0);
-    assert.equal(f.store.autoMemory.searchTopics(f.conversation.id,embedding).topics[0].score,1);
-    assert.equal(f.store.autoMemory.searchTopics('another-room',embedding).status,'unavailable');
-    assert.equal(f.store.autoMemory.searchTopics(f.conversation.id,{...embedding,model:'other'}).status,'unavailable');
-    assert.equal(inspect(f,db=>db.prepare('SELECT COUNT(*) AS n FROM topic_embeddings').get().n),1);
+    const result=f.store.autoMemory.searchTopics(f.conversation.id,{text:'Tea'});
+    assert.equal(result.status,'ready');assert.equal(result.topics[0].summary,'Tea discussion');
+    assert.equal(result.topics[0].facts[0].personId,person);assert.ok(result.topics[0].score>0);
+    assert.deepEqual(f.store.autoMemory.searchTopics('another-room',{text:'Tea'}).topics,[]);
+    assert.equal(inspect(f,db=>db.prepare('SELECT COUNT(*) AS n FROM topic_embeddings').get().n),0);
     assert.equal(inspect(f,db=>db.prepare('SELECT COUNT(*) AS n FROM person_profile_revisions').get().n),1);
   }finally{f.close();}
 });
@@ -272,7 +255,7 @@ test('commit rejects omitted messages, foreign evidence and false self claims wi
     assert.throws(()=>f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{topics:[{summary:'bad',messageIds:['foreign']}]})),/固定批次/);
     assert.throws(()=>f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{topics:[{summary:'valid',messageIds:[alice.existingMessageId]}],
       fragments:[{personId:person,content:'wrong',sourceType:'self',messageIds:[bob.existingMessageId]}]})),/身份不匹配/);
-    assert.equal(f.store.autoMemory.pendingTopics().length,0);assert.equal(f.store.autoMemory.status(f.conversation.id).completed,0);
+    assert.equal(inspect(f,db=>db.prepare('SELECT COUNT(*) AS n FROM memory_topics').get().n),0);assert.equal(f.store.autoMemory.status(f.conversation.id).completed,0);
   }finally{f.close();}
 });
 
@@ -304,8 +287,10 @@ test('CLI model projection is persisted separately from original user text for r
 test('v5 incremental migration preserves original IDs, tombstones, primary identity and snapshots legacy watermark',()=>{
   const f=fixture();try {
     const old=f.inbound('legacy');const actor=f.store.findActor(f.conversation.id,'alice');
-    f.store.configurePrimaryPerson({id:'original-person',bindings:[{route:f.route,senderId:'alice'}]});
-    const memory=f.store.rememberMemory(f.conversation.id,{content:'old',sourceMessageId:old.existingMessageId,subjectActorId:actor}).memory;
+    inspect(f,db=>db.prepare('INSERT INTO primary_person_bindings VALUES (?,?,?,?,?,?)').run(f.route.channel,f.route.accountId,f.route.roomType,f.route.roomId,'alice','original-person'));
+    f.store.configurePersons([{id:'original-person',bindings:[{route:f.route,senderId:'alice'}]}]);
+    const memory=f.store.rememberMemory(f.conversation.id,{content:'old',sourceMessageId:old.existingMessageId}).memory;
+    inspect(f,db=>db.prepare("UPDATE memories SET subject_actor_id=?,person_id='original-person',scope_type='actor' WHERE id=?").run(actor,memory.id));
     f.store.close();
     inspect(f,db=>{
       downgradeSchema10(db);
@@ -331,5 +316,30 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
     assert.equal(readdirSync(f.directory).some(name=>name.includes('.v5.')&&name.endsWith('.bak')),true);
     f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity').messageIds.length,1);
+  }finally{f.close();}
+});
+
+test('confirmed binding migrates archived fragments and Topic facts, retaining all historical evidence',()=>{
+  const f=fixture();try {
+    const source=f.inbound('我喜欢茶'),actor=f.store.findActor(f.conversation.id,'alice'),oldPerson=f.store.autoMemory.personForActor(actor);
+    f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const first=claim(f);
+    const fact={content:'喜欢茶',sourceType:'self',messageIds:[source.existingMessageId]};
+    f.store.autoMemory.commit(first.id,first.leaseToken,ignored(f,first,{topics:[{summary:'喝茶讨论',messageIds:fact.messageIds}],
+      fragments:[{personId:oldPerson,...fact,topicIndex:0}],profiles:[{personId:oldPerson,baseVersion:0,facts:[fact]}]}));
+    const before=inspect(f,db=>({fragment:db.prepare('SELECT * FROM person_fragments').get(),sources:db.prepare('SELECT * FROM person_fragment_messages').all(),
+      revisions:db.prepare('SELECT * FROM person_profile_revisions WHERE person_id=?').all(oldPerson),raw:db.prepare('SELECT * FROM messages').all()}));
+    f.store.configurePersons([{id:'confirmed',bindings:[{route:f.route,senderId:'alice'}]}]);
+    assert.deepEqual({...inspect(f,db=>db.prepare('SELECT * FROM person_fragments').get())},{...before.fragment,person_id:'confirmed'});
+    assert.deepEqual(inspect(f,db=>db.prepare('SELECT * FROM person_fragment_messages').all()),before.sources);
+    assert.deepEqual(inspect(f,db=>db.prepare('SELECT * FROM person_profile_revisions WHERE person_id=?').all(oldPerson)),before.revisions);
+    assert.deepEqual(inspect(f,db=>db.prepare('SELECT * FROM messages').all()),before.raw);
+    assert.equal(f.store.autoMemory.searchTopics(f.conversation.id,{text:'喝茶'}).topics[0].facts[0].personId,'confirmed');
+    f.inbound('继续讨论');f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const next=claim(f),input=f.store.autoMemory.taskInput(next);
+    assert.equal(input.profileFragments[0].personId,'confirmed');assert.equal(input.profileSources.find(m=>m.id===source.existingMessageId).personId,'confirmed');
+    f.store.autoMemory.commit(next.id,next.leaseToken,ignored(f,next));
+    f.store.configurePersons([{id:'different-confirmed',bindings:[{route:f.route,senderId:'alice'}]}]);
+    assert.equal(inspect(f,db=>db.prepare('SELECT person_id FROM person_fragments').get().person_id),'confirmed');
+    assert.deepEqual(f.store.autoMemory.profile('different-confirmed').facts,[]);
+    assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
   }finally{f.close();}
 });

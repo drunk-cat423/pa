@@ -23,7 +23,6 @@ export interface ExternalRunInput {
   quote?: MessageQuote;
   responseFormat?: 'plain_text';
   messageKind?: 'chat' | 'memory';
-  profileFields?: import('./memory-types.js').ProfileField[];
 }
 
 export interface InboundMessage {

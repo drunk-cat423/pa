@@ -9,15 +9,15 @@ const help = `pa — TypeScript 个人伙伴的本地对话入口
 用法：
   npm start -- [chat] [--conversation <名称>] [--message <内容>]
   npm start -- history [--conversation <名称>] [--limit <1-200>]
-  npm start -- memory remember --content <内容> [--conversation <名称>]
+  npm start -- memory remember --content <房间记忆> [--conversation <名称>]
   npm start -- memory query [--query <关键词>] [--conversation <名称>]
   npm start -- memory correct --id <ID> --content <新内容> [--conversation <名称>]
   npm start -- check
   npm start -- --help
 
 默认会话：local-owner。同名会话恢复 Pi 上下文，不同名称使用独立历史。
-交互指令：/help、/info、/history、/remember 内容、/memories [关键词]、/correct ID 新内容、/exit。
-SQLite 保存原文、显式记忆与人物画像；PA_MEMORY_ENABLED=true 时启用独立后台整理。
+交互指令：/help、/info、/history、/memory remember room 内容、/memory query [关键词]、/memory correct ID 新内容、/exit。
+SQLite 保存原文、房间记忆与人物画像；PA_MEMORY_ENABLED=true 时启用独立后台整理。
 history 和 memory 指令无须模型密钥，不请求模型；不提供删除操作。
 memory remember/correct 可选 --kind fact|preference|episode、--source-message-id <来源用户消息ID>。
 memory correct 可选 --expected-revision <版本>；query 可选 --limit <1-200>。
@@ -134,7 +134,25 @@ function performMemory(target: MemoryAccess, options: Options): unknown {
 
 function interactiveMemory(line: string, conversationId: string): Options | undefined {
   let args: string[] | undefined;
-  if (/^\/remember(?:\s|$)/.test(line)) args = ['remember', '--content', line.slice('/remember'.length).trimStart()];
+  if (/^\/memory(?:\s|$)/i.test(line)) {
+    const match = /^\/memory\s+(remember|query|correct)(?:\s+([\s\S]*))?$/i.exec(line);
+    if (!match) throw new MemoryError('房间记忆命令：/memory remember room 内容；/memory query [关键词]；/memory correct ID 新内容。');
+    const action = match[1]!.toLowerCase();
+    const rest = (match[2] ?? '').trim();
+    if (action === 'remember') {
+      const parts = /^room\s+([\s\S]+)$/i.exec(rest);
+      if (!parts) throw new MemoryError('显式记忆命令只管理房间记忆；人物画像请通过普通对话补充。');
+      args = ['remember', '--content', parts[1]!];
+    } else if (action === 'query') {
+      if (/^(?:me|user:[^\s]*)(?:\s|$)/i.test(rest)) throw new MemoryError('显式记忆命令只管理房间记忆；人物画像请通过普通对话补充。');
+      args = ['query', ...(rest ? ['--query', rest.replace(/^room(?:\s+|$)/i, '')] : [])];
+    } else {
+      const parts = /^(\S+)\s+([\s\S]+)$/.exec(rest);
+      if (!parts) throw new MemoryError('用法：/memory correct ID 新内容。');
+      args = ['correct', '--id', parts[1]!, '--content', parts[2]!];
+    }
+  }
+  else if (/^\/remember(?:\s|$)/.test(line)) args = ['remember', '--content', line.slice('/remember'.length).trimStart()];
   else if (/^\/memories(?:\s|$)/.test(line)) {
     const query = line.slice('/memories'.length).trim();
     args = ['query', ...(query ? ['--query', query] : [])];
@@ -232,7 +250,7 @@ async function main(): Promise<void> {
       if (interrupted) break;
       const command = line.trim();
       if (command === '/exit') break;
-      if (command === '/help') await writeLine('直接输入消息。/info、/history、/remember 内容、/memories [关键词]、/correct ID 新内容、/exit。');
+      if (command === '/help') await writeLine('直接输入消息。/info、/history、/memory remember room 内容、/memory query [关键词]、/memory correct ID 新内容、/exit。');
       else if (command === '/info') await writeLine(JSON.stringify(runtime.info(), null, 2));
       else if (command === '/history') await writeLine(JSON.stringify(runtime.history(20), null, 2));
       else if (command) {

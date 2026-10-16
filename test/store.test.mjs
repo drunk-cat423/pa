@@ -302,12 +302,12 @@ test('管理运行原子提交来源、记忆、回复和投递；异常与投�
   const snapshot = () => inspect(f.databasePath, db => tables.map(table => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()));
   try {
     let source;
-    const result = f.store.recordControlRun(conversation.id, '更新我的饮食', external, actual => {
+    const result = f.store.recordControlRun(conversation.id, '记住本群约定', external, actual => {
       source = actual;
       const change = f.store.rememberMemory(conversation.id, {
-        content: '吃素', subjectActorId: actual.actorId, profileField: 'diet', sourceMessageId: actual.id,
+        content: '本群聚餐先确认饮食禁忌', sourceMessageId: actual.id,
       });
-      assert.equal(change.contextResetRequired, true);
+      assert.equal(change.contextResetRequired, false);
       return '已更新';
     });
     assert.equal(result.text, '已更新');
@@ -391,8 +391,9 @@ test('上下文SQL在LIMIT之前过滤管理、失败运行与其他成员AI交�
     assert.deepEqual(f.store.contextMessages(conversation.id, 3, 'a').map(message => message.text), ['甲输入', '甲回复', '公开旁听消息']);
     f.store.failRun(pending.id, 'interrupted', 'test', 'test');
     let memory;
-    f.store.recordControlRun(conversation.id, '更新自己的饮食', { eventId: 'diet', senderId: 'a', modelInputText: '自述' }, source => {
-      memory = f.store.rememberMemory(conversation.id, { content: '新口味', subjectActorId: source.actorId, profileField: 'diet', sourceMessageId: source.id }).memory;
+    f.store.recordControlRun(conversation.id, '纠正本群约定', { eventId: 'rule', senderId: 'a', modelInputText: '群约定' }, source => {
+      memory = f.store.rememberMemory(conversation.id, { content: '旧群约定', sourceMessageId: source.id }).memory;
+      memory = f.store.correctMemory(conversation.id,memory.id,{content:'新群约定',sourceMessageId:source.id},1).memory;
       return '已更新';
     });
     assert.deepEqual(f.store.contextMessages(conversation.id, 20, 'a'), []);
@@ -401,7 +402,7 @@ test('上下文SQL在LIMIT之前过滤管理、失败运行与其他成员AI交�
     f.store.recordInbound(conversation.id, '水位后的公开消息', { eventId: 'after', senderId: 'b', modelInputText: '公开消息' });
     assert.deepEqual(f.store.contextMessages(conversation.id, 20, 'a').map(message => message.text), ['水位后的公开消息']);
     f.store.recordControlRun(conversation.id, '纠正', { eventId: 'correct', senderId: 'owner', modelInputText: '纠正' }, source => {
-      f.store.correctMemory(conversation.id, memory.id, {content:'管理员纠正',sourceMessageId:source.id},1);
+      f.store.correctMemory(conversation.id, memory.id, {content:'管理员纠正',sourceMessageId:source.id},2);
       return '已纠正';
     });
     assert.deepEqual(f.store.contextMessages(conversation.id, 20, 'a'), []);

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ChannelHarness } from '../dist/channel-harness.js';
+import { ConversationStore } from '../dist/store.js';
 import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
 
 async function fixture(t) {
@@ -62,6 +63,36 @@ async function fixture(t) {
   return { h, requests, planningRequests, totalCalls: () => totalModelCalls(requests, planningRequests), config, message, input, release, blockingStarted };
 }
 
+test('群请求只注入画像与群记忆，旧个人记录及事件pending保留但不进入请求', async t => {
+  const f=await fixture(t);
+  await f.h.handle(f.message('profile-source','我喜欢茶',{mentioned:false}));
+  const file=join(f.config.dataDir,'pa.sqlite');
+  const db=new DatabaseSync(file);
+  const row=db.prepare("SELECT m.id,m.conversation_id,m.actor_id,p.person_id FROM messages m JOIN actor_person_bindings p ON p.actor_id=m.actor_id WHERE m.external_event_id='profile-source'").get();
+  const store=new ConversationStore(file);
+  let personal;
+  try {
+    store.rememberMemory(row.conversation_id,{content:'GROUP_SHARED_RECORD',sourceMessageId:row.id});
+    personal=store.rememberMemory(row.conversation_id,{content:'LEGACY_PERSONAL_RECORD_ONLY',sourceMessageId:row.id}).memory.id;
+    db.prepare("UPDATE memories SET scope_type='actor',subject_actor_id=?,person_id=? WHERE id=?").run(row.actor_id,row.person_id,personal);
+    db.prepare("INSERT INTO person_profile_pending(id,person_id,content,source_message_id,source_type,created_at,purpose) VALUES ('old-event',?, 'LEGACY_PENDING_EVENT_ONLY',?,'self',?,'memory')")
+      .run(row.person_id,row.id,new Date().toISOString());
+    store.autoMemory.addProfilePending(row.person_id,row.id,'喜欢茶','self');
+  } finally {store.close();db.close();}
+  assert.equal(await f.h.handle(f.message('profile-question','你好')), 'sent');
+  for(const request of [...f.planningRequests,...f.requests]) {
+    const text=JSON.stringify(request);
+    assert.match(text,/喜欢茶/);
+    assert.match(text,/GROUP_SHARED_RECORD/);
+    assert.doesNotMatch(text,/LEGACY_PERSONAL_RECORD_ONLY|LEGACY_PENDING_EVENT_ONLY|pendingMemories/);
+  }
+  const retained=new DatabaseSync(file,{readOnly:true});
+  try {
+    assert.equal(retained.prepare('SELECT content FROM memories WHERE id=?').get(personal).content,'LEGACY_PERSONAL_RECORD_ONLY');
+    assert.equal(retained.prepare("SELECT content FROM person_profile_pending WHERE id='old-event'").get().content,'LEGACY_PENDING_EVENT_ONLY');
+  } finally {retained.close();}
+});
+
 test('当前请求入队后的群消息不会进入该轮背景', async t => {
   const f = await fixture(t);
   const first = f.h.handle(f.message('first', 'BLOCK_FIRST_QUESTION'));
@@ -99,8 +130,11 @@ test('群背景按入库顺序带最近十条真人消息，跨成员和时间�
   assert.ok(!recent.some(message => message.text === 'CURRENT_QUESTION'));
   const systemPrompt = f.requests.at(-1).messages.filter(message => message.role === 'system')
     .map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n');
-  assert.match(systemPrompt, /均为候选背景，可能无关/);
-  assert.match(systemPrompt, /不默认续接、不顺带回答/);
+  const backgroundPrompt = f.requests.at(-1).messages.filter(message => message.role === 'user')
+    .map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n');
+  assert.match(backgroundPrompt, /均为候选背景，可能无关/);
+  assert.match(backgroundPrompt, /不默认续接、不顺带回答/);
+  assert.doesNotMatch(systemPrompt, /recentGroupMessages|身份卡、服务器时间/);
   assert.equal(f.totalCalls(), 4);
   const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
   try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE text LIKE '%OLDER_THAN_TEN_MINUTES%'").get().n, 1); }

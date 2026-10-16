@@ -83,9 +83,3 @@ export function isMemoryOwner(policy: HarnessPolicy, message: Pick<InboundMessag
     && binding.route.channel === message.route.channel && binding.route.accountId === message.route.accountId
     && binding.route.roomType === message.route.roomType && binding.route.roomId === message.route.roomId);
 }
-
-export function isPrimaryPerson(policy: HarnessPolicy, message: InboundMessage): boolean {
-  return policy.primaryPerson?.bindings.some(binding => binding.senderId === message.senderId
-    && binding.route.channel === message.route.channel && binding.route.accountId === message.route.accountId
-    && binding.route.roomType === message.route.roomType && binding.route.roomId === message.route.roomId) ?? false;
-}

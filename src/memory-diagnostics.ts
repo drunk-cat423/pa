@@ -16,6 +16,8 @@ export function memoryFailure(error: unknown, phase: string): string {
     const descriptions = { model_length: '模型输出截断。', model_request: '模型请求未完成，调用结果可能未知。',
       model_empty: '模型未返回正文。', model_json: '模型正文不是有效JSON。', model_contract: '模型返回结构不符合约定。' };
     detail = descriptions[error.code] + (error.httpStatus === undefined ? '' : ` HTTP ${error.httpStatus}。`);
+  } else if (error instanceof Error && error.name === 'ObsoletePersonalMemoryError') {
+    code = 'obsolete_personal_memory'; detail = '个人长期事件协议已过期；固定输入与进度已保留，需操作者处理。';
   } else if (error instanceof Error && error.name === 'MemoryInputTooLargeError') {
     code = 'input_too_large'; detail = '输入超出模型窗口，尚未提交模型。';
   } else if (/版本冲突|输入版本/.test(message)) {
