@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { PaConfig } from './config.js';
-import { sameFact, type AutoMemoryStore } from './auto-memory-store.js';
+import { mergeProfileFacts, sameFact, sameFactContent, type AutoMemoryStore } from './auto-memory-store.js';
 import type { AutoMemoryJob, AutoMemoryTaskInput, ValidatedExtract, PersonProfile, ProfileFact } from './auto-memory-types.js';
 import { createMemoryProvider, MemoryInputTooLargeError, type MemoryProvider } from './memory-provider.js';
 import { selfProfileBudget, validateSelfProfileProposal } from './self-profile-store.js';
+import { memoryFailure } from './memory-diagnostics.js';
 
 type Budget = { calls: number; embeddingCalls: number };
 const budgets = new WeakMap<PaConfig, Budget>();
@@ -20,12 +21,15 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
     || !Array.isArray(value.profiles) || !Array.isArray(value.ignoredMessageIds)) throw new Error('记忆输出必须包含结构化数组。');
   const messages = new Map(input.messages.map(message => [message.id, message]));
   const people = new Map(input.profiles.map(profile => [profile.personId, profile]));
+  const conversationId = input.job?.conversationId ?? input.messages[0]?.conversationId;
+  const memorySourceIds = new Set(input.profiles.flatMap(profile => (profile.pending ?? []).filter(item => item.purpose === 'memory').map(item => item.sourceMessageId)));
+  const topicSources = new Map([...input.messages, ...(input.profileSources ?? []).filter(message => memorySourceIds.has(message.id)&&message.conversationId===conversationId)].map(message => [message.id,message]));
   function text(v: unknown, max = 16000): asserts v is string {
     if (typeof v !== 'string' || !v.trim() || v.length > max) throw new Error('记忆输出正文无效。');
   }
-  function ids(v: unknown, allowEmpty = false): asserts v is string[] {
+  function ids(v: unknown, allowEmpty = false, sources = messages): asserts v is string[] {
     if (!Array.isArray(v) || (!allowEmpty && !v.length) || new Set(v).size !== v.length
-      || v.some(id => typeof id !== 'string' || !messages.has(id))) throw new Error('记忆输出引用了输入以外的消息。');
+      || v.some(id => typeof id !== 'string' || !sources.has(id))) throw new Error('记忆输出引用了输入以外的消息。');
   }
   function fact(v: unknown, personId: string, profileFact = false): void {
     if (!record(v)) throw new Error('人物事实无效。');
@@ -37,8 +41,16 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
     }
     const inherited = profileFact && Array.isArray(v.messageIds) && people.get(personId)?.facts.some(old => sameFact(old, v as unknown as ProfileFact));
     if (inherited) return;
-    const captured = profileFact ? people.get(personId)?.pending ?? [] : [];
-    const allowed = new Map([...input.messages,...(input.profileSources ?? []).filter(message => captured.some(item => item.sourceMessageId === message.id))]
+    if (profileFact && Array.isArray(v.messageIds) && v.messageIds.some(id =>
+      (people.get(personId)?.pending ?? []).some(item => item.purpose === 'memory' && item.sourceMessageId === id)
+      && !(people.get(personId)?.pending ?? []).some(item => item.purpose !== 'memory' && item.sourceMessageId === id))) {
+      throw new Error('长期事件待整理来源不能写入人物画像。');
+    }
+    const captured = (people.get(personId)?.pending ?? []).filter(item => profileFact ? item.purpose !== 'memory' : item.purpose === 'memory'
+      && (input.profileSources??[]).some(message=>message.id===item.sourceMessageId&&message.conversationId===conversationId));
+    const priorIds = new Set(profileFact ? [...(input.profileFragments ?? []).filter(fragment => fragment.personId === personId).flatMap(fragment => fragment.messageIds),
+      ...(people.get(personId)?.facts ?? []).filter(old => sameFactContent(old, v as unknown as ProfileFact)).flatMap(old => old.messageIds)] : []);
+    const allowed = new Map([...input.messages,...(input.profileSources ?? []).filter(message => captured.some(item => item.sourceMessageId === message.id)||priorIds.has(message.id))]
       .map(message => [message.id,message]));
     if (!Array.isArray(v.messageIds) || !v.messageIds.length || new Set(v.messageIds).size !== v.messageIds.length
       || v.messageIds.some(id => typeof id !== 'string' || !allowed.has(id) || allowed.get(id)!.role !== 'user')) throw new Error('人物事实必须引用有效原始真人消息。');
@@ -50,7 +62,8 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
   if (value.topics.length > 100 || value.fragments.length > 200 || value.profiles.length > people.size) throw new Error('记忆输出数量过大。');
   for (const topic of value.topics) {
     if (!record(topic)) throw new Error('Topic无效。');
-    text(topic.summary); ids(topic.messageIds);
+    text(topic.summary); ids(topic.messageIds, false, topicSources);
+    if (topic.messageIds.some(id=>topicSources.get(id)?.conversationId!==conversationId)) throw new Error('Topic来源必须属于当前会话。');
   }
   for (const fragment of value.fragments) {
     if (!record(fragment) || typeof fragment.personId !== 'string' || !people.has(fragment.personId)) throw new Error('人物片段身份无效。');
@@ -68,10 +81,25 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
     if (profile.pendingIds !== undefined && (!Array.isArray(profile.pendingIds) || new Set(profile.pendingIds).size !== profile.pendingIds.length
       || profile.pendingIds.some(id => {
         const pending = people.get(profile.personId as string)!.pending?.find(item => item.id === id);
-        return !pending || !(profile.facts as ProfileFact[]).some(item => item.messageIds.includes(pending.sourceMessageId));
+        return !pending || pending.purpose === 'memory' || !(profile.facts as ProfileFact[]).some(item => item.messageIds.includes(pending.sourceMessageId));
       }))) throw new Error('只能归档已捕获且保留来源的人物待整理条目。');
   }
+  const archivedMemoryPeople = new Set<string>();
+  if (value.memoryPending !== undefined) {
+    if (!Array.isArray(value.memoryPending)) throw new Error('长期事件归档列表无效。');
+    for (const archive of value.memoryPending) {
+      if (!record(archive) || typeof archive.personId !== 'string' || !people.has(archive.personId) || archivedMemoryPeople.has(archive.personId)
+        || !Array.isArray(archive.pendingIds) || new Set(archive.pendingIds).size !== archive.pendingIds.length) throw new Error('长期事件归档身份或ID无效。');
+      archivedMemoryPeople.add(archive.personId);
+      if (archive.pendingIds.some(id => {
+        const pending = people.get(archive.personId as string)!.pending?.find(item => item.id === id);
+        return !pending || pending.purpose !== 'memory' || !topicSources.has(pending.sourceMessageId) || !(value.fragments as ValidatedExtract['fragments'])
+          .some(fragment => fragment.personId === archive.personId && fragment.messageIds.includes(pending.sourceMessageId));
+      })) throw new Error('长期事件归档必须在原子片段保留已捕获的来源。');
+    }
+  }
   ids(value.ignoredMessageIds, true);
+  if (value.ignoredMessageIds.some(id => messages.get(id)?.role !== 'user')) throw new Error('忽略项只能引用真人消息。');
   const covered = new Set([...value.ignoredMessageIds,
     ...value.topics.flatMap(topic => (topic as { messageIds: string[] }).messageIds),
     ...value.fragments.flatMap(fragment => (fragment as { messageIds: string[] }).messageIds)]);
@@ -82,7 +110,8 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
     if (!input.selfProfile) throw new Error('自我画像缺少输入快照。');
     validateSelfProfileProposal(value.selfProfile, input.selfProfile, input.messages, input.selfProfileBudgetBytes);
   }
-  return value as unknown as ValidatedExtract;
+  const result = value as unknown as ValidatedExtract;
+  return { ...result, profiles: result.profiles.map(profile => ({ ...profile, facts: mergeProfileFacts(profile.facts) })) };
 }
 
 interface Progress {
@@ -130,7 +159,7 @@ export class BackgroundMemory {
     if (reason === 'capacity') this.store.reserveBatch(this.conversationId, reason, 50, excludeMessageId);
     else while (this.store.reserveBatch(this.conversationId, reason, 50, excludeMessageId)) { /* reserve immutable batches */ }
     if (!this.work) {
-      this.work = this.run().catch(() => { this.lastError = '后台持久化或任务状态异常。'; })
+      this.work = this.run().catch(error => { this.lastError = memoryFailure(error, 'worker'); })
         .finally(() => {
           this.work = undefined;
           if (!this.closed) {
@@ -188,6 +217,7 @@ export class BackgroundMemory {
       const job = this.store.claimNext(this.conversationId, { owner: this.owner, leaseMs: setting.timeoutMs + 10000 });
       if (!job) return;
       const lease = job.leaseToken!;
+      let phase = 'input';
       try {
         if (setting.maxCalls > 0 && this.budget.calls >= setting.maxCalls) throw new Error('budget');
         const input: AutoMemoryTaskInput = { ...this.store.taskInput(job), selfProfileBudgetBytes: selfProfileBudget(this.config.contextWindow) };
@@ -198,6 +228,7 @@ export class BackgroundMemory {
           const ids = new Set(progress.remaining[0]!);
           const chunkMessages = input.messages.filter(message => ids.has(message.id));
           const people = new Set(chunkMessages.flatMap(message => message.personId ? [message.personId] : []));
+          for (const profile of progress.profiles) if (profile.pending?.length) people.add(profile.personId);
           const profileView = progress.profiles.filter(profile => people.has(profile.personId))
             .map(profile => ({ ...profile, facts: [] as ProfileFact[] }));
           const profileBudget = Math.min(20000, Math.floor(this.config.contextWindow / 5));
@@ -210,7 +241,10 @@ export class BackgroundMemory {
           }
           const chunk: AutoMemoryTaskInput = { ...input,
             messages: chunkMessages, profiles: profileView,
-            profileSources: (input.profileSources ?? []).filter(message=>profileView.some(profile=>(profile.pending??[]).some(item=>item.sourceMessageId===message.id))),
+            profileFragments: (input.profileFragments ?? []).filter(fragment => people.has(fragment.personId)),
+            profileSources: (input.profileSources ?? []).filter(message=>profileView.some(profile=>(profile.pending??[]).some(item=>item.sourceMessageId===message.id)
+              || profile.facts.some(fact => fact.messageIds.includes(message.id)))
+              || (input.profileFragments ?? []).some(fragment => people.has(fragment.personId) && fragment.messageIds.includes(message.id))),
             ...(progress.summary ? { previousSummary: progress.summary } : {}) };
           if (input.selfProfile && progress.extract.selfProfile) {
             const previous = progress.extract.selfProfile;
@@ -219,7 +253,11 @@ export class BackgroundMemory {
               pending: input.selfProfile.pending.filter(item => !previous.pendingIds.includes(item.id)) };
           }
           let result: ValidatedExtract;
-          try { result = validateExtract(await this.request('extract', signal => this.provider.extract(chunk, signal)), chunk); }
+          try {
+            phase = 'extract';
+            const proposal = await this.request('extract', signal => this.provider.extract(chunk, signal));
+            phase = 'validate'; result = validateExtract(proposal, chunk);
+          }
           catch (error) {
             if (!(error instanceof MemoryInputTooLargeError) || chunk.messages.length < 2) throw error;
             let split = Math.floor(chunk.messages.length / 2);
@@ -235,12 +273,19 @@ export class BackgroundMemory {
           progress.extract.fragments.push(...result.fragments.map(fragment => ({ ...fragment,
             ...(fragment.topicIndex === undefined ? {} : { topicIndex: fragment.topicIndex + offset }) })));
           progress.extract.ignoredMessageIds.push(...result.ignoredMessageIds);
+          for (const archived of result.memoryPending ?? []) {
+            const previous = progress.extract.memoryPending?.find(item => item.personId === archived.personId);
+            const merged = { personId: archived.personId, pendingIds: [...new Set([...(previous?.pendingIds ?? []), ...archived.pendingIds])] };
+            progress.extract.memoryPending = [...(progress.extract.memoryPending ?? []).filter(item => item.personId !== archived.personId),merged];
+            progress.profiles = progress.profiles.map(profile => profile.personId === archived.personId
+              ? { ...profile, pending: (profile.pending ?? []).filter(item => !merged.pendingIds.includes(item.id)) } : profile);
+          }
           for (const profile of result.profiles) {
             const original = progress.profiles.find(old => old.personId === profile.personId)!;
             const viewed = profileView.find(old => old.personId === profile.personId)!;
             const unseen = original.facts.filter(fact => !viewed.facts.some(old => sameFact(old, fact))
               && !profile.facts.some(next => sameFact(next, fact)));
-            profile.facts = [...unseen, ...profile.facts];
+            profile.facts = mergeProfileFacts([...unseen, ...profile.facts]);
             profile.pendingIds = [...new Set([...(progress.extract.profiles.find(old=>old.personId===profile.personId)?.pendingIds ?? []),...(profile.pendingIds ?? [])])];
             profile.pending = (original.pending ?? []).filter(item=>!profile.pendingIds!.includes(item.id));
             progress.profiles = progress.profiles.map(old => old.personId === profile.personId ? profile : old);
@@ -260,19 +305,21 @@ export class BackgroundMemory {
             progress.extract.selfProfile = mergedSelf;
           }
           progress.remaining.shift();
-          this.store.saveProgress(job.id, lease, progress);
+          phase = 'checkpoint'; this.store.saveProgress(job.id, lease, progress);
         }
-        this.store.commit(job.id, lease, validateExtract(progress.extract, input, true), input.selfProfileBudgetBytes);
+        phase = 'validate';
+        const completed = validateExtract(progress.extract, input, true);
+        phase = 'commit';
+        this.store.commit(job.id, lease, completed, input.selfProfileBudgetBytes);
         this.lastError = undefined;
         this.startEmbeddings();
       } catch (error) {
-        this.lastError = this.closed ? '后台整理已取消。' : '后台整理失败；原文和批次已保留，可检查并重试。';
+        this.lastError = `后台整理失败；${memoryFailure(error, phase)}`;
         const conflict = error instanceof Error && /版本冲突|输入版本/.test(error.message);
         if (conflict) this.store.clearProgress(job.id, lease);
-        this.store.fail(job.id, lease, conflict ? 'profile_conflict' : this.lastError);
-        if (this.closed) { this.store.retry(job.id); return; }
-        if (job.attempts < setting.maxRetries && (setting.maxCalls === 0 || this.budget.calls < setting.maxCalls)) this.store.retry(job.id);
-        else return;
+        this.store.fail(job.id, lease, this.lastError);
+        // A failed/aborted request may have been billed or completed upstream. Only explicit retry may call again.
+        return;
       }
     }
   }
@@ -297,9 +344,16 @@ export class BackgroundMemory {
     this.embeddingWork = (async () => {
       for (const topic of this.store.pendingTopicsForConversation(this.conversationId, embedding)) {
         if (this.closed) return;
-        const vector = await this.request('embedding', signal => embedding.embed(topic.summary, signal));
-        this.store.saveEmbedding(topic.id, { model: embedding.model, dimensions: embedding.dimensions,
-          inputVersion: embedding.inputVersion, vector, topicVersion: topic.version, contentHash: topic.contentHash });
+        // Persist before dispatch so a crash cannot silently repeat an unknown paid request.
+        if (!this.store.beginTopicEmbedding(topic, embedding)) continue;
+        try {
+          const vector = await this.request('embedding', signal => embedding.embed(topic.summary, signal));
+          this.store.saveEmbedding(topic.id, { model: embedding.model, dimensions: embedding.dimensions,
+            inputVersion: embedding.inputVersion, vector, topicVersion: topic.version, contentHash: topic.contentHash });
+        } catch (error) {
+          this.store.failTopicEmbedding(topic.id, memoryFailure(error, 'embedding'));
+          throw error;
+        }
       }
       this.embeddingError = undefined;
     })().catch(() => { this.embeddingError = 'failed_or_budget_exhausted'; })
@@ -308,7 +362,9 @@ export class BackgroundMemory {
 
   async retrieve(query: string, signal?: AbortSignal) {
     const embedding = this.provider.embedding;
-    if (!this.config.memory?.enabled || !embedding || signal?.aborted) return { status: 'unavailable' as const, topics: [] };
+    if (!this.config.memory?.enabled || signal?.aborted) return { status: 'unavailable' as const, topics: [] };
+    const lexical = () => this.store.searchTopicsHybrid(this.conversationId, { text: query, limit: 5 });
+    if (!embedding) return lexical();
     let onAbort: (()=>void) | undefined;
     try {
       const request = this.request('embedding', internalSignal => embedding.embed(query,
@@ -319,9 +375,9 @@ export class BackgroundMemory {
         if(signal.aborted) onAbort();
       })]) : await request;
       if (signal?.aborted) return { status: 'unavailable' as const, topics: [] };
-      return this.store.searchTopics(this.conversationId, { model: embedding.model, dimensions: embedding.dimensions,
-        inputVersion: embedding.inputVersion, vector, limit: 5 });
-    } catch { this.embeddingError = 'failed_or_budget_exhausted'; return { status: 'unavailable' as const, topics: [] }; }
+      return this.store.searchTopicsHybrid(this.conversationId, { text: query, embedding: { model: embedding.model, dimensions: embedding.dimensions,
+        inputVersion: embedding.inputVersion, vector }, limit: 5 });
+    } catch { this.embeddingError = 'failed_or_budget_exhausted'; return signal?.aborted ? { status: 'unavailable' as const, topics: [] } : lexical(); }
     finally { if (signal && onAbort) signal.removeEventListener('abort',onAbort); }
   }
 

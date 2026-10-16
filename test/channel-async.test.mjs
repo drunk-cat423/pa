@@ -8,6 +8,7 @@ import test from 'node:test';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
 import { openRecordedConversation } from '../dist/conversation.js';
 import { ConversationStore } from '../dist/store.js';
+import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
 
 async function until(predicate, description) {
   const deadline = Date.now() + 5000;
@@ -25,12 +26,23 @@ function currentInput(body) {
 
 async function fixture(t, maxConcurrent = 2) {
   const directory = await mkdtemp(join(tmpdir(), 'pa-channel-async-'));
-  const requests = [], sent = [], plans = new Map(), gates = [], harnesses = [], errors = [];
+  const requests = [], planningRequests = [], sent = [], plans = new Map(), preparations = new Map(), gates = [], harnesses = [], errors = [];
   let send = async (_message, index) => ({ status: 'sent', externalMessageId: `out-${index}` });
   const server = createServer(async (request, response) => {
     try {
       let raw = ''; for await (const chunk of request) raw += chunk;
       const body = JSON.parse(raw), input = currentInput(body);
+      if (isPreparationRequest(body)) {
+        planningRequests.push({ body, input });
+        const delta = preparationDelta(`prepare-${planningRequests.length}`, preparations.get(input.currentMessage.eventId));
+        response.writeHead(200, { 'content-type': 'text/event-stream' });
+        for (const [value, finish] of [[delta, null], [{}, 'tool_calls']]) {
+          response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1,
+            model: 'fixture', choices: [{ index: 0, delta: value, finish_reason: finish }] })}\n\n`);
+        }
+        response.end('data: [DONE]\n\n');
+        return;
+      }
       requests.push({ body, input });
       const step = plans.get(input.currentMessage.eventId)?.shift() ?? { answer: `回答：${input.currentMessage.text}` };
       if (step.gate) await step.gate.promise;
@@ -88,7 +100,7 @@ async function fixture(t, maxConcurrent = 2) {
     await rm(directory, { recursive: true, force: true });
     assert.deepEqual(errors, []);
   });
-  return { config, route, other, requests, sent, plans, inspect, gate, harness, message, tasks,
+  return { config, route, other, requests, planningRequests, totalCalls: () => totalModelCalls(requests, planningRequests), sent, plans, preparations, inspect, gate, harness, message, tasks,
     send: operation => { send = operation; } };
 }
 
@@ -110,6 +122,7 @@ test('同群两问独立运行，第三问排队，另一人无需等待阻塞�
   assert.equal(f.tasks().find(task => task.eventId === 'a').status, 'running');
   assert.deepEqual(f.requests.map(request => request.input.currentMessage.senderId), ['alice', 'bob', 'carol']);
   assert.deepEqual(f.requests.map(request => request.input.currentMessage.text), ['甲的问题', '乙的问题', '丙的问题']);
+  assert.equal(f.totalCalls(), 6);
   a.release();
   assert.equal(await first, 'sent');
   const tasks = f.tasks();
@@ -139,6 +152,7 @@ test('有限预算排空所有已接受的模型与投递，不提前取消并�
   await draining;
   assert.equal(h.info().calls, 2);
   assert.equal(f.requests.length, 2);
+  assert.equal(f.totalCalls(), 4);
 });
 
 test('并发上限可设为一，模型结束即释放槽位，发送阻塞不占计算额度', async t => {
@@ -158,6 +172,7 @@ test('并发上限可设为一，模型结束即释放槽位，发送阻塞不�
   model.release();
   await until(() => f.tasks().filter(task => task.status === 'completed').length === 3, '发送仍阻塞时后两问完成模型');
   assert.equal(f.requests.length, 3);
+  assert.equal(f.totalCalls(), 6);
   assert.equal(f.sent.length, 1);
   assert.equal(h.info().computing, 0);
   assert.deepEqual(f.sent[0].persisted.map(row => [row.status, row.delivery_mode, row.reply_slot]), [['sending', 'passive', 1]]);
@@ -165,11 +180,12 @@ test('并发上限可设为一，模型结束即释放槽位，发送阻塞不�
   assert.deepEqual(await Promise.all([first, second, third]), ['sent', 'sent', 'sent']);
 });
 
-test('同群长回答各段连续发送，其它回答和专业进度不能插入批次', async t => {
+test('同群长回答各段连续发送，其它回答按队列顺序完成', async t => {
   const f = await fixture(t), output = f.gate(), h = f.harness();
   const answer = '甲'.repeat(450) + '乙'.repeat(450) + '丙'.repeat(200);
   f.plans.set('long', [{ answer }]);
-  f.plans.set('depth', [{ tool: 'answer_in_depth' }, { answer: '专业最终回答' }]);
+  f.preparations.set('depth', { intent: 'question', mode: 'professional', progressText: '我仔细分析一下。', updates: [] });
+  f.plans.set('depth', [{ answer: '专业最终回答' }]);
   f.send(async (message, index) => {
     if (message.replyToMessageId === 'long' && message.partIndex === 0) await output.promise;
     return { status: 'sent', externalMessageId: `out-${index}` };
@@ -177,8 +193,7 @@ test('同群长回答各段连续发送，其它回答和专业进度不能插�
   const first = h.handle(f.message('long', '长问题'));
   await until(() => f.sent.length === 1, '第一段进入发送');
   const depth = h.handle(f.message('depth', '深入推导', { senderId: 'bob' }));
-  await until(() => f.inspect(db => db.prepare("SELECT count(*) n FROM run_progress WHERE status='pending'").get().n) === 1,
-    '专业进度等待输出队列');
+  await until(() => f.tasks().find(task => task.eventId === 'depth')?.status === 'completed', '专业回答等待输出队列');
   const normal = h.handle(f.message('normal', '普通问题', { senderId: 'carol' }));
   await until(() => f.tasks().find(task => task.eventId === 'normal')?.status === 'completed', '其它回答等待输出');
   assert.equal(f.sent.length, 1);
@@ -187,31 +202,42 @@ test('同群长回答各段连续发送，其它回答和专业进度不能插�
   const firstBatch = f.sent.slice(0, 3);
   assert.ok(firstBatch.every(message => message.replyToMessageId === 'long'));
   assert.equal(firstBatch.map(message => message.text).join(''), answer);
-  assert.equal(f.sent[3].text, '我仔细分析一下。');
-  assert.ok(f.sent.slice(4).some(message => message.text === '回答：普通问题'));
-  assert.ok(f.sent.slice(4).some(message => message.text === '专业最终回答'));
+  assert.ok(f.sent.slice(3).some(message => message.text === '回答：普通问题'));
+  assert.ok(f.sent.slice(3).some(message => message.text === '专业最终回答'));
+  assert.ok(f.planningRequests.some(request => request.input.currentMessage.eventId === 'depth'));
+  assert.equal(f.inspect(db => JSON.parse(db.prepare(`SELECT p.plan_json FROM turn_preparations p
+    JOIN messages m ON m.id=p.source_message_id WHERE m.external_event_id='depth'`).get().plan_json).mode), 'professional');
+  assert.equal(f.sent.filter(message => message.text === '我仔细分析一下。').length, 0);
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM run_progress').get().n), 0);
+  assert.equal(f.totalCalls(), 6);
 });
 
-test('过期问题主动投递先持久化模式，超时不重发，结果只由本人同房间领取且不请求模型', async t => {
+test('过期问题主动投递完整回答，超时不重发且结果只由本人同房间领取', async t => {
   const f = await fixture(t), h = f.harness();
-  f.plans.set('expired', [{ tool: 'answer_in_depth' }, { answer: '可领取的完整回答' }]);
+  f.preparations.set('expired', { intent: 'question', mode: 'professional', progressText: '我仔细分析一下。', updates: [] });
+  f.plans.set('expired', [{ answer: '可领取的完整回答' }]);
   f.send(async (message, index) => {
     if (message.text.includes('可领取的完整回答')) throw Object.assign(new Error('transport timeout'), { code: 'ETIMEDOUT' });
     return { status: 'sent', externalMessageId: `out-${index}` };
   });
   assert.equal(await h.handle(f.message('expired', '旧问题', { sentAt: new Date(Date.now() - 300_001).toISOString() })), 'uncertain');
-  assert.equal(f.sent.length, 2);
-  assert.ok(f.sent.every(message => message.deliveryMode === 'active' && !Object.hasOwn(message, 'replyToMessageId')));
-  assert.ok(f.sent.every(message => message.persisted.some(row => row.status === 'sending' && row.delivery_mode === 'active' && row.reply_slot === null)));
-  assert.match(f.sent[1].text, /回复 甲 · [0-9a-f]{8}\n问题：旧问题/);
+  assert.equal(f.sent.length, 1);
+  assert.doesNotMatch(f.sent[0].text, /我仔细分析一下/);
+  assert.equal(f.sent[0].deliveryMode, 'active');
+  assert.equal(Object.hasOwn(f.sent[0], 'replyToMessageId'), false);
+  assert.ok(f.sent[0].persisted.some(row => row.status === 'sending' && row.delivery_mode === 'active' && row.reply_slot === null));
+  assert.match(f.sent[0].text, /回复 甲 · [0-9a-f]{8}\n问题：旧问题/);
   const task = f.tasks().find(task => task.eventId === 'expired');
+  assert.equal(f.totalCalls(), 2);
   assert.equal(task.status, 'completed');
-  const modelCalls = f.requests.length, attempts = f.sent.length;
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM run_progress').get().n), 0);
+  const modelCalls = f.requests.length, totalCalls = f.totalCalls(), attempts = f.sent.length;
   await h.close();
   const reopened = f.harness();
   await reopened.start();
   assert.equal(await reopened.handle(f.message('expired', '旧问题')), 'duplicate');
   assert.equal(f.requests.length, modelCalls);
+  assert.equal(f.totalCalls(), totalCalls);
   assert.equal(f.sent.length, attempts);
   f.send(async (_message, index) => ({ status: 'sent', externalMessageId: `result-${index}` }));
   await reopened.handle(f.message('bob-result', `/result ${task.id}`, { senderId: 'bob' }));
@@ -253,6 +279,7 @@ test('重启仅恢复未运行queued任务，已有running审计但无完整Pi�
   await reopened.start();
   await until(() => f.tasks().find(task => task.eventId === 'queued')?.status === 'completed' && f.sent.length === 1, '重启恢复queued');
   assert.deepEqual(f.requests.map(request => request.input.currentMessage.eventId), ['queued']);
+  assert.equal(f.totalCalls(), 2);
   assert.equal(f.tasks().find(task => task.eventId === 'running').status, 'interrupted');
   assert.equal(await reopened.handle(f.message('running', '进程退出前的问题')), 'duplicate');
   await reopened.close();
@@ -279,6 +306,7 @@ test('close取消模型并保留尚未运行的queued，重启只执行保留任
   await reopened.start();
   await until(() => f.tasks().find(task => task.eventId === 'queued')?.status === 'completed' && f.sent.length === 1, '重新执行queued');
   assert.deepEqual(f.requests.map(request => request.input.currentMessage.eventId), ['running', 'queued']);
+  assert.equal(f.totalCalls(), 4);
   assert.doesNotMatch(f.sent[0].text, /不得投递/);
 });
 
@@ -303,4 +331,27 @@ test('问题等待输出队列期间被动窗口到期，发送时改为主动�
   assert.equal(Object.hasOwn(f.sent[1], 'replyToMessageId'), false);
   assert.match(f.sent[1].text, /问题：队列中的问题/);
   assert.deepEqual(f.sent[1].persisted.map(row => [row.delivery_mode, row.reply_slot]), [['active', null]]);
+});
+
+test('关闭期间等待在途进度发送及回执落库，不继续请求正文或写入已关闭数据库', async t => {
+  const f = await fixture(t), gate = f.gate(), h = f.harness();
+  f.preparations.set('close-progress', { intent: 'question', mode: 'standard',
+    progressText: '我整理一下。', updates: [] });
+  f.send(async (_message, index) => {
+    await gate.promise;
+    return { status: 'sent', externalMessageId: `progress-${index}` };
+  });
+
+  const processing = h.handle(f.message('close-progress', 'close-during-progress'));
+  await until(() => f.sent.length === 1 && f.sent[0].text === '我整理一下。', '进度进入传输');
+  assert.deepEqual(f.sent[0].persisted.map(row => [row.status, row.delivery_mode, row.reply_slot]), [['sending', 'passive', 1]]);
+
+  const closing = h.close();
+  gate.release();
+  await closing;
+  await processing;
+
+  assert.deepEqual(f.sent.map(message => message.text), ['我整理一下。']);
+  assert.equal(f.totalCalls(), 1);
+  assert.equal(f.inspect(db => db.prepare('SELECT status FROM run_progress').get().status), 'sent');
 });

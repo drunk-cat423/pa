@@ -9,13 +9,28 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ChannelHarness } from '../dist/channel-harness.js';
+import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
 
 test('搜索及后续网页核验不附网址，单独读取网页仍保留来源，实际工具参数与投递落库', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'pa-channel-web-'));
-  const requests = [], sent = [], nativeSearch = [], pageRequests = [], dnsRequests = [];
+  const requests = [], planningRequests = [], sent = [], nativeSearch = [], pageRequests = [], dnsRequests = [];
   const server = createServer(async (request, response) => {
     let text = ''; for await (const chunk of request) text += chunk;
-    const body = JSON.parse(text); requests.push(body);
+    const body = JSON.parse(text);
+    if (isPreparationRequest(body)) {
+      planningRequests.push(body);
+      const delta = preparationDelta(`prepare-${planningRequests.length}`, planningRequests.length === 1
+        ? { intent: 'research', mode: 'professional', progressText: '我先查找并核对资料。', updates: [] }
+        : { intent: 'question', mode: 'casual', updates: [] });
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const choices of [[{ index: 0, delta, finish_reason: null }], [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]]) {
+        response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1,
+          model: 'test', choices })}\n\n`);
+      }
+      response.end('data: [DONE]\n\n');
+      return;
+    }
+    requests.push(body);
     const tool = requests.length === 1 ? 'web_search' : [2, 4].includes(requests.length) ? 'web_fetch' : undefined;
     const argumentsText = JSON.stringify(tool === 'web_search' ? { query: '与 example.com search-source 有关的资料' }
       : { url: requests.length === 2 ? 'https://example.com/search-source' : 'https://example.com/article' });
@@ -72,7 +87,7 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   let event = 0;
   const harness = new ChannelHarness(config, [route], { send: async message => {
     sent.push(message); return { status: 'sent', externalMessageId: 'part-' + sent.length };
-  } }, 0);
+  } }, 0, { version: 1, ownerBindings: [] });
   t.after(async () => { globalThis.fetch = originalFetch; await harness.close();
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); });
   const message = (text, mentioned = true) => ({ route, eventId: 'evt' + ++event, senderId: 'user', text, mentioned, sentAt: new Date().toISOString() });
@@ -82,7 +97,7 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.equal(pageRequests[0].url, 'https://example.com/search-source');
   assert.match(requests[0].messages.find(message => message.role === 'system').content, /不展示来源网址或列参考链接/);
   assert.equal(requests[0].tool_choice, 'auto');
-  assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['update_profile', 'read_history', 'answer_in_depth', 'web_search', 'web_fetch']);
+  assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['read_history', 'web_search', 'web_fetch']);
   assert.ok(nativeSearch[0].messages[0].content[0].text.endsWith('Perform a web search for the query: 与 example.com search-source 有关的资料'));
   assert.deepEqual(requests[0].tools.find(tool => tool.function.name === 'web_search').function.parameters.required, ['query']);
   assert.match(JSON.stringify(requests[1].messages.filter(message => message.role === 'tool')), /SUMMARY_MARKER/);
@@ -97,18 +112,24 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.equal(pageRequests.length, 2);
   assert.equal(dnsRequests.length, 4);
   assert.equal(requests[3].tool_choice, 'auto');
-  assert.deepEqual(requests[3].tools.map(tool => tool.function.name), ['update_profile', 'read_history', 'answer_in_depth', 'web_search', 'web_fetch']);
+  assert.deepEqual(requests[3].tools.map(tool => tool.function.name), ['read_history', 'web_search', 'web_fetch']);
   assert.equal(pageRequests[1].url, 'https://example.com/article');
   assert.deepEqual(requests[3].tools.find(tool => tool.function.name === 'web_fetch').function.parameters.required, ['url']);
   assert.match(JSON.stringify(requests[4].messages.filter(message => message.role === 'tool')), /PAGE_MARKER/);
   assert.match(sent.slice(previousSends).map(part => part.text).join(''), /\[参考链接\]\nhttps:\/\/example.com\/article$/);
+  assert.equal(totalModelCalls(requests, planningRequests), 7);
   assert.equal(await harness.handle(message('https://example.com/no-mention', false)), 'observed');
   assert.equal(pageRequests.length, 2);
   await harness.close();
   const database = new DatabaseSync(join(config.dataDir, 'pa.sqlite'), { readOnly: true });
   try {
     const parts = database.prepare('SELECT text, status, external_message_id FROM delivery_parts ORDER BY rowid').all();
-    assert.deepEqual(parts.map(part => part.text), sent.map(part => part.text));
+    const progress = database.prepare('SELECT text, status, external_message_id FROM run_progress ORDER BY rowid').all();
+    assert.deepEqual(progress.map(item => item.text), ['我先查找并核对资料。', '我看一下链接里的内容。']);
+    assert.ok(progress.every(item => item.status === 'sent' && item.external_message_id));
+    const progressIds = new Set(progress.map(item => item.external_message_id));
+    const replySent = sent.filter((_message, index) => !progressIds.has('part-' + (index + 1)));
+    assert.deepEqual(parts.map(part => part.text), replySent.map(part => part.text));
     assert.ok(parts.every(part => part.status === 'sent' && part.external_message_id));
     assert.doesNotMatch(parts.map(part => part.text).join(''), /https:\/\/example.com\/search-source/);
     assert.match(parts.map(part => part.text).join(''), /https:\/\/example.com\/article/);

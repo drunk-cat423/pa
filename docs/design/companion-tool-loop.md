@@ -1,91 +1,32 @@
 # PA 当前架构与系统流程
 
-依据当前 QQ 正式服务实现绘制；图中的任务并发、投递和记忆流程均对应实际代码。提供 [SVG 矢量图](companion-tool-loop.svg)、[PNG 预览](companion-tool-loop.png) 和 [Mermaid 源文件](companion-tool-loop.mmd)。
+2026-10-16 的本地实现。旧 SVG/PNG/Mermaid 保留为准备阶段引入前的历史图，不作为本次协议的当前图示；运行边界见下文。
 
 自然语言统一交给 Pi Agent Loop；程序只识别显式管理命令，不匹配“记住”“续问”“搜索”等语义前缀。用户消息先保存并去重，工具写入只能使用当前运行绑定的真人来源。
 
-```mermaid
----
-config:
-  theme: base
-  markdownAutoWrap: false
-  themeVariables:
-    fontFamily: Microsoft YaHei, Noto Sans CJK SC, sans-serif
-    fontSize: 16px
-    primaryTextColor: '#17324d'
-    lineColor: '#60778e'
-  flowchart:
-    htmlLabels: false
-    curve: linear
-    nodeSpacing: 35
-    rankSpacing: 45
-    wrappingWidth: 360
-    useMaxWidth: false
----
-flowchart TD
-  subgraph INPUT["QQ 接入与任务调度"]
-    A["QQ Gateway READY 后恢复任务<br/>接收群聊 / 私聊消息"] --> B["适配器规范化事件<br/>白名单、发送者 ID、事件去重<br/>SQLite 保存原文"]
-    B --> C{"群内真实 @<br/>或允许的私聊？"}
-    C -->|否| OBS["仅保存观察，不调用聊天模型"]
-    C -->|是| TASK["SQLite 持久任务队列<br/>默认并发 2；超额等待"]
-    TASK --> CMD{"显式命令？"}
-    CMD -->|"/memory 等"| ADMIN["本地管理鉴权与执行<br/>保存控制回复，不调用模型"]
-    CMD -->|"/result"| RESULT["领取本人在当前房间的模型结果<br/>保存控制回复，不调用模型"]
-    CMD -->|自然语言| CTX["模型任务使用独立 Pi 会话<br/>组装身份、画像、历史、引用<br/>Topic 召回仅在 Embedding 配置后可用"]
-    CTX --> CAP{"完整上下文含预留输出<br/>是否能装入模型窗口？"}
-    CAP -->|不能| WAIT["等待后台整理并重新组装<br/>仍超限或整理失败则结束本次请求"]
-    WAIT -->|整理成功后| CTX
-  end
 
-  subgraph AGENT["Pi 工具循环：最多 6 次模型请求 / 8 次工具执行"]
-    LLM["调用 LLM<br/>默认轻松简短；专业模式严谨分析<br/>最后一次请求关闭工具，预留收尾"] --> CHOICE{"模型是否请求工具？"}
-    CHOICE -->|否| SAVE["核对 Pi 运行标记与 entry ID<br/>SQLite 保存最终答案、投递与任务结果<br/>释放计算槽，允许下一问开始"]
-    CHOICE -->|是| TOOL["程序核验工具、参数、身份与次数<br/>update_profile → 原文保存为未归档画像<br/>read_history → 本房间 FTS5 / BM25，最多 10 条<br/>web_search / web_fetch → 公开资料与内部来源<br/>answer_in_depth → 专业提示与一次短进度"]
-    TOOL --> TOOLRESULT["工具结果及错误交回 Pi<br/>同一任务继承证据、身份和剩余次数<br/>专业模式禁重复切换及画像写入"]
-    TOOLRESULT --> LLM
-    TOOL -. "短进度也走发送队列" .-> PROGRESS["保存 run_progress<br/>不作为人物事实证据"]
-  end
 
-  subgraph DELIVERY["QQ 投递：计算并行，同房间完整回答依次发送"]
-    SAVE --> OUT["同房间发送队列<br/>转纯文本，约 500 字符分段<br/>搜索回答不附来源网址 / 参考链接"]
-    ADMIN --> OUT
-    RESULT --> OUT
-    PROGRESS --> QUEUE["等待本房间正在发送的回答完成"]
-    QUEUE --> MODE
-    OUT --> MODE{"临发送判断<br/>仍在 5 分钟被动窗口且槽位足够？"}
-    MODE -->|是| PASS["被动回复：带原消息 ID<br/>进度与正文共用最多 5 个槽位"]
-    MODE -->|否| ACTIVE["主动发送：不带原消息 ID / msg_seq<br/>最终答案附昵称、问题摘要与任务编号"]
-    PASS --> INTENT["发送前持久化模式、槽位与发送意图"]
-    ACTIVE --> INTENT
-    INTENT --> SEND["QQ REST API 投递<br/>逐段保存真实回执；同一回答连续发送"]
-    SEND --> ACK{"投递结果？"}
-    ACK -->|确认成功| SENT["完成当前批次发送<br/>最终答案可通过 /result 再领取"]
-    ACK -->|拒绝或未知| HOLD["停止当前批次剩余发送<br/>保留已完成模型结果<br/>不自动重发；可用 /result 领取"]
-  end
+## 统一的每轮协议
 
-  subgraph MEMORY["独立后台记忆：同房间按序整理，聊天可继续"]
-    TRIGGER["群聊 50 条真人聊天 / 私聊 50 轮完整已发送问答<br/>或组装上下文含预留输出达到窗口 85%"] --> SNAP["捕获固定消息 ID、最后序号和画像快照<br/>持久任务、租约及分块进度"]
-    SNAP --> EXTRACT["后台 LLM 提炼话题与人物 / AI 自身画像<br/>私聊额外生成续聊摘要；无独立群摘要"]
-    EXTRACT --> COMMIT["核验来源、版本与租约<br/>事务提交画像、Topic、已处理 pending 和检查点<br/>原文保留；在途新增仍为未归档"]
-    COMMIT --> RECALL["下次请求注入新画像与私聊摘要<br/>可选：Topic 向量化与语义召回<br/>未配置 Embedding 时压缩仍可用"]
-  end
-  CAP -->|能| LLM
-  B -. "数量触发；仅在记忆启用时" .-> TRIGGER
-  SENT -. "确认发送后检查私聊轮数" .-> TRIGGER
-  CTX -. "达到 85% 则异步触发" .-> TRIGGER
-  WAIT -. "超硬上限需等待" .-> TRIGGER
+1. 规范化渠道事件、去重、原文落库；仅响应真实@或允许私聊。显式管理命令继续由程序鉴权。
+2. 按真实发送者和本条真实@构造身份卡；按确认person读取画像及未归档个人记忆，本群规则独立读取。按当前房间混合召回Topic，保留来源。
+3. 第一模型请求只能调用prepare_turn，返回intent、mode、updates；无长期更新时updates为空。普通用户只可更新本人资料、建议AI全局画像；群规则、群共享记忆和第三方记录由ownerBindings独立授权。
+4. 应用核验原文连续摘录、目标身份、范围及容量；一个SQLite事务提交所有动作及来源消息级幂等回执。一项失败则全部回滚。
+5. 同一Pi循环读取实际回执，按casual/standard/professional提示回答。此阶段关闭prepare_turn、update_profile和answer_in_depth，仍可查询授权历史及网络工具。
+6. 固定每轮6次模型请求/8次工具预算，包含准备成本，最后一次预留回答。正常无外部工具的对话是2次模型请求；模型没有按准备协议返回时不能绕过保存阶段直接发送。
+7. 核对Pi标记与SQLite关联后保存答案并投递；回复生成、资料保存、平台接受各自记录。准备成功后的回答失败不回滚已保存资料。
 
-  classDef input fill:#eaf2ff,stroke:#648bb4,color:#17324d
-  classDef agent fill:#e7f5ef,stroke:#4f9279,color:#163d31
-  classDef output fill:#fff3df,stroke:#c79545,color:#5f421b
-  classDef memory fill:#f0ebfa,stroke:#9780b9,color:#4c3a6c
-  classDef guard fill:#fff8d9,stroke:#c39c3c,color:#53441d
-  class A,B,OBS,TASK,ADMIN,RESULT,CTX,WAIT input
-  class LLM,SAVE,TOOL,TOOLRESULT,PROGRESS agent
-  class OUT,QUEUE,PASS,ACTIVE,INTENT,SEND,SENT,HOLD output
-  class TRIGGER,SNAP,EXTRACT,COMMIT,RECALL memory
-  class C,CMD,CAP,CHOICE,MODE,ACK guard
+准备示例（实际身份由应用提供，模型不能设置权限）：
+
+```json
+{"intent":"memory_update","mode":"standard","updates":[{"target":"room_rule","key":"pa","content":"本群pa代表personal agent"},{"target":"ai_self","content":"你现在就叫初号机"}]}
 ```
+
+支持target=sender/mentioned_person/ai_self/room_rule/room_memory。人物条目purpose=profile用于稳定画像，purpose=memory用于长期事件；该区分由模型判断，不要求用户记命令。准备工具返回saved或saved_pending才可确认保存，不能把pending说成已归档。可选progressText用于预计耗时较久时的一句等待提示（单行最多60字符），复用准备阶段生成，不增加模型调用，也不是保存成功确认。对没有回执的常见肯定保存话术还有狭窄的发送检查；该检查跳过否定、条件和引语，不声称是通用自然语言语义证明。
+
+当前强制准备验证的是OpenAI兼容协议（包括现用DeepSeek），其它模型协议未接通时明确拒绝。未携带prepare回调的底层CLI/历史测试接口保留原工具循环，不作为生产渠道绕过入口。
+
+画像是软约束：用来选措辞、建议、例子和风格，不反复说出用户标签或内部记录。casual通常一两句自然接话，standard直接回答再补必要解释，professional仅对复杂或明确要求深入的问题展开；模式不修改权限或预算。
 
 ## 模块与存储边界
 
@@ -97,15 +38,17 @@ flowchart TD
 | Pi 模型循环 | [runtime.ts](../../src/runtime.ts) | 每个渠道模型任务使用独立 Pi JSONL 与锁；SQLite 通过 run marker、entry ID 和 session 路径核对转录，不能混用不同任务的条目。 |
 | 后台记忆 | [auto-memory.ts](../../src/auto-memory.ts)、[auto-memory-store.ts](../../src/auto-memory-store.ts)、[self-profile-store.ts](../../src/self-profile-store.ts) | SQLite 保存固定批次、租约、分块进度、人物与 AI 画像、Topic 和整理检查点；私聊另有续聊摘要。 |
 
-队列只保证本机器人各回答的分段不互相插入，群友自己的消息仍可能出现。图中的“同房间发送”覆盖进度与最终答案；图中的“默认并发2”只限制前台任务，不把后台记忆整理塞进同一队列。
+队列只保证本机器人各回答的分段不互相插入，群友自己的消息仍可能出现。同房间发送队列覆盖进度与最终答案；默认并发2只限制前台任务，不把后台记忆整理塞进同一队列。
 
-本地 CLI 是验证与离线管理入口，复用 Pi 和 SQLite，按 conversation 使用独占会话；其工具白名单为空，不经过 QQ 任务及投递队列。图中不把尚未实现的 Telegram、Web UI 或客户端协议合并转发画成现有能力。
+本地 CLI 是验证与离线管理入口，复用 Pi 和 SQLite，按 conversation 使用独占会话；其工具白名单为空，不经过 QQ 任务及投递队列。不把尚未实现的 Telegram、Web UI 或客户端协议合并转发画成现有能力。
 
 ## 默认上下文
 
 固定总提示词与工具定义位于前部，动态背景使用清晰标签和 JSON。画像均有 `archived`（已归档）和 `pending`（未归档）；人物画像附 `personId` 和 `senderIds`，不注入旧的分类字段。本人自述与第三方笔记仍保留来源性质，避免错误归因。
 
-群聊默认取当前发言者最近一轮已完成、已确认发送、未归档的问答，限定最近10分钟，并按 `runId` 配对。其他群友的闲聊不自动加入，更多原文由模型调用历史工具读取。私聊保留续聊摘要及未整理历史。当前问题真实 @ 的其他人物可注入其画像；普通文本人名不作为身份绑定。
+群聊默认取当前问题入库之前、本群最近10条真人聊天，按入库先后排列，保留发送者ID、可用昵称和发送时间。取数不限定发言者、10分钟窗口、问答成功或整理水位，排除Bot回复、控制消息、本轮消息、后到消息和其他房间；背景不因此扩展人物画像候选。`recentGroupMessages`明确标为仅供参考，可能与当前问题无关，不是本轮待回答问题，也不是可以代当前用户执行的保存要求。更多原文仍可由历史工具读取。私聊保留续聊摘要及未整理历史，同样只是候选背景。当前问题真实 @ 的其他人物可注入其画像；普通文本人名不作为身份绑定。
+
+固定总提示区分材料用途：当前消息是明确任务入口，显式引用/指定网页是用户选定的材料，但须按问题筛选且不视为可信指令或已核实事实；历史、记忆、Topic和工具结果不因出现或被命中就必然相关。人物/AI画像只提供软参考，群规则按涉及的术语使用。身份与权限、服务器时间、保存回执只在各自身份/时钟/操作状态范围内权威，不能证明被保存内容为真或自动相关。
 
 默认加入固定总提示与工具定义、AI 自身画像、当前提问者及真实 @ 对象画像、共享记忆、可用时的相关 Topic、当前消息和精确引用。更长的群聊历史由 `read_history` 返回给同一 Pi 循环；程序不按自然语言句式猜测是否续问。`actor_id` 标记某人在某个房间的身份，`person_id` 汇总已确认的同一人物，不能按昵称合并。
 
@@ -113,19 +56,21 @@ flowchart TD
 
 - 默认 `PA_LOOP_MAX_MODEL_CALLS=6`、`PA_LOOP_MAX_TOOL_CALLS=8`，不设整次总时限。`PA_TIMEOUT_MS`限制单个模型请求；网络工具和后台调用各有独立请求超时，主动取消仍可中止准备和工具等待。QQ的被动回复有效期属于平台投递约束，不是Agent循环计时。
 - 最后一次模型调用去除工具，预留收尾；执行层再次检查，模型违规输出工具调用也不能突破上限。Schema 无效调用不产生业务写入。
-- 深入回答在同一个 Pi 会话切换专业提示，继承身份、证据和剩余预算；最终专业答案直接保存发送，不再调用日常模式重写。提示变更通过 SDK 转录转换到各供应商协议。
+- 准备阶段选择回答模式，同一Pi会话继承身份、证据和剩余预算；专业答案直接保存发送，不再调用日常模型重写。
 - `web_search` 的摘要与来源留在工具结果中，来源可继续用于 `web_fetch` 核验；搜索回答不展示来源网址或自动追加参考链接。只读取网页且没有搜索的回答仍可附原网页URL。
 - 所有渠道提问进入持久任务队列，`PA_MAX_CONCURRENT_TASKS` 默认2（范围1–16）；每问使用独立 Pi 转录和锁，SQL、人物画像和后台整理仍按真实房间与人物关联。计算完成就释放计算槽，等待发送不会占着它。每房间的发送队列一次发送整条回答，进度也经过这条队列；不同房间可以同时发送。
-- QQ 的进度提示独立保存在 `run_progress`，不是人物证据。被动回复窗口内优先用原消息ID与下一个回复序号，进度和正文合计最多5个槽位；过期、槽位不足或完整答案需要超过剩余槽位时主动发送（不带 `msg_id`/`msg_seq`）。主动长答仍按500字符分段。临发送时重新判断窗口，发送前记录模式与槽位。拒绝或未知投递立即停止，不自动重发。
+- 等待提示已接入prepare_turn后的专业/资料查找流程，也可由progressText指定；普通短答不默认发送，准备回执有错误时不自动发。真正调用web_search/web_fetch时也可提示，每轮统一最多尝试一次，不依赖旧answer_in_depth工具；群聊与私聊共用此机制。research只代表意图，默认短句不假称已经搜索或取得结果。
+- 等待提示只在房间输出空闲、harness未关闭且被动窗口仍有效时准入；检查到队列占位之间不异步让出。忙或过期直接跳过，不创建进度记录、不占回复槽，后续工具也不补发迟到提示，保持同群正文段不穿插。已准入的短提示仍等待其发送回执；若这次transport慢，会占当前计算槽，但不会在旧正文队列后等待。进度create/start/ack持久化失败停止会话，不能降为普通网络失败。
+- QQ 的进度提示独立保存在 `run_progress`，不是聊天原文或人物证据，也不计入整理条数/轮数。窗口内使用原消息ID和下一个回复序号，进度与正文合计最多5个槽位。正文过期、槽位不足或完整答案超过剩余槽位时主动发送（不带 `msg_id`/`msg_seq`），仍按500字符分段。临发送时重新判断窗口，发送前记录模式与槽位；正文拒绝或未知投递停止，不自动重发。
 - `/result` 或 `/result 任务编号` 可领取当前房间中本人已完成的结果，不调用模型。主动答案附昵称、问题摘要和任务短编号。重启继续尚未开始模型处理的 queued；已有运行的失败、中断和未知投递不自动重跑，完成答案仍可领取。主动发送可能受QQ权限或平台额度限制，代码不绕过这些限制。
 - 当前使用腾讯官方群/私聊消息接口，公开契约没有截图中的“合并转发聊天记录”消息结构。[官方发送文档](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/send-receive/send.md)与[NapCat合并转发接口](https://napneko.github.io/onebot/api)属于不同接入方式；本次没有切换QQ客户端协议。
-- 画像工具按真实来源消息和工具调用ID幂等，不能选择其他人物作为写入目标。只有工具成功提交后模型才能确认保存；之后模型请求失败也不回滚已提交画像。
-- SQLite schema10迁移先备份，既有事实保留为已归档；历史分类元数据保留在旧审计记录，新画像和新产物不分类。后台只归档捕获且实际处理的 pending，跨房间版本检查避免旧任务覆盖新画像。
+- prepare回执按真实来源消息与完整操作集合幂等；管理者可按当前明确指向记录其他已知人物，始终标为第三方陈述，不根据名字合并身份。
+- SQLite schema12迁移先备份；v11建立分离的群规则等结构，v12补上历史误分类的迁移审计。既有事实和旧画像版本保留，明确维护计划可将未归档术语转入原群规则，不改写原消息或旧pending。历史分类元数据保留在旧审计记录，新画像和新产物不分类。后台只归档捕获且实际处理的 pending，跨房间版本检查避免旧任务覆盖新画像；已迁移来源不得重新写入AI画像，旧产物失效后等待显式重试读取新资料。
 
 FTS5 索引覆盖原始消息，包括已经整理的历史。写入和索引维护在 SQLite 事务内；中文使用 Node 内置 `Intl.Segmenter` 分词，不增加运行依赖。BM25 是关键词排序，模型可以改写查询补检；不把它描述成向量语义检索。
 
 ## 验证范围
 
-Mermaid 源文件与本文代码块一致，SVG 和 PNG 由同一源文件渲染并实际预览。图表示当前已实现流程；可选 Topic 向量召回需要另外配置 Embedding，不表示生产环境已启用它。
+旧流程图不含本次prepare协议；本次验证使用临时SQLite、本地HTTP和真实Pi SDK。Topic向量需要配置Embedding，未配置仍可关键词召回，不表示生产已经启用向量。
 
 保留与身份、迁移、并发归档、事务、去重、取消、循环上限及QQ投递有关的检查。移除旧语义前缀、画像分类和独立判断/确认流程的测试，使用本地HTTP模拟模型工具协议及真实 Pi SDK/SQLite 验证整合；这些测试不证明真实模型的语义判断质量。

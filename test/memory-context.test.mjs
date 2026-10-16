@@ -58,7 +58,7 @@ async function fixture(t) {
 }
 
 function memoryMessages(request) {
-  return request.messages.filter(message => JSON.stringify(message.content).includes('已保存的背景数据'));
+  return request.messages.filter(message => JSON.stringify(message.content).includes('已保存的候选背景数据'));
 }
 
 function recalledItems(message) {

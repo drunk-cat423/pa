@@ -9,17 +9,28 @@ import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { PersistenceError } from '../dist/conversation.js';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
 import { readQQSettings } from '../dist/qq-config.js';
+import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
 
 async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-output' }, reply = '群聊回复') {
   const directory = await mkdtemp(join(tmpdir(), 'pa-channel-'));
-  const requests = [], sent = [], harnesses = [];
+  const requests = [], planningRequests = [], sent = [], harnesses = [];
   const server = createServer(async (request, response) => {
     let body = '';
     for await (const chunk of request) body += chunk;
     const payload = JSON.parse(body);
+    if (isPreparationRequest(payload)) {
+      planningRequests.push({ path: request.url, body: payload });
+      const delta = preparationDelta(`prepare-${planningRequests.length}`);
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const choices of [
+        [{ index: 0, delta, finish_reason: null }],
+        [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+      ]) response.write(`data: ${JSON.stringify({ id: 'fixture-response', object: 'chat.completion.chunk', created: 1, model: 'deepseek-flash', choices })}\n\n`);
+      response.end('data: [DONE]\n\n');
+      return;
+    }
     requests.push({ path: request.url, body: payload });
-    const lastUser = payload.messages.filter(message => message.role === 'user').at(-1);
-    if (JSON.stringify(lastUser?.content).includes('MODEL_FAILURE')) {
+    if (currentInput({ body: payload }).input.currentMessage.text.includes('MODEL_FAILURE')) {
       response.writeHead(400, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: { message: 'fixture rejection', type: 'invalid_request_error' } }));
       return;
@@ -50,10 +61,11 @@ async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-ou
     await new Promise(resolve => server.close(resolve));
     await rm(directory, { recursive: true, force: true });
   });
-  return { config, directory, route, other, requests, sent, harness, message };
+  return { config, directory, route, other, requests, planningRequests,
+    totalCalls: () => totalModelCalls(requests, planningRequests), sent, harness, message };
 }
 
-test('长回复格式化后每段500 Unicode字符，完整落库且仅一次模型调用', async t => {
+test('长回复格式化后每段500 Unicode字符，完整落库且计入准备与回答请求', async t => {
   const original = '**开头**\n\n' + ('你好😀。'.repeat(290)) + '\nhttps://example.com/reference';
   const f = await fixture(t, (message, index) => {
     const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
@@ -68,6 +80,8 @@ test('长回复格式化后每段500 Unicode字符，完整落库且仅一次模
   const h = f.harness();
   assert.equal(await h.handle(f.message('long', '请长回复')), 'sent');
   assert.equal(f.requests.length, 1);
+  assert.equal(f.planningRequests.length, 1);
+  assert.equal(f.totalCalls(), 2);
   assert.ok(f.sent.length > 1 && f.sent.length <= 5);
   assert.ok(f.sent.every(message => [...message.text].length <= 500 && message.plainText));
   assert.deepEqual(f.sent.map(message => message.partIndex), f.sent.map((_, index) => index));
@@ -147,6 +161,7 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
   assert.equal(await h.handle(f.message('one', '刚才群里说的爬山，建议怎么准备？')), 'sent');
   assert.equal(await h.handle(f.message('one', '重复事件')), 'duplicate');
   assert.equal(f.requests.length, 1);
+  assert.equal(f.totalCalls(), 2);
   const request = f.requests[0];
   assert.equal(request.path, '/chat/completions');
   assert.equal(request.body.model, 'deepseek-flash');
@@ -156,7 +171,10 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
   const text = typeof user.content === 'string' ? user.content : user.content.map(p => p.text).join('');
   const input = JSON.parse(text.slice(text.lastIndexOf('\n') + 1));
   assert.equal(input.currentMessage.senderId, 'member-A');
-  assert.deepEqual(input.recentDialogueWithCurrentSender, []);
+  assert.deepEqual(input.recentGroupMessages.map(({ role, senderId, text }) => ({ role, senderId, text })), [
+    { role: 'user', senderId: 'member-B', text: '周末准备爬山' },
+  ]);
+  assert.ok(!Object.hasOwn(input, 'recentDialogueWithCurrentSender'));
   assert.equal(await h.handle(f.message('two', '我更喜欢海边', { senderId: 'member-C' })), 'sent');
   assert.equal(await h.handle(f.message('one', '另外一个群', { route: f.other })), 'sent');
   const otherBody = JSON.stringify(f.requests.at(-1).body);
@@ -175,6 +193,7 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
   assert.equal(await reopened.handle(f.message('one', '重启后的重复事件')), 'duplicate');
   assert.equal(await reopened.handle(f.message('background', '背景重复', { mentioned: false })), 'duplicate');
   assert.equal(f.requests.length, 3);
+  assert.equal(f.totalCalls(), 6);
 });
 
 function currentInput(request) {
@@ -260,6 +279,7 @@ test('未知投递不重发，模型失败消耗预算且重启不重复收费',
   const reopened = f.harness();
   assert.equal(await reopened.handle(f.message('failure', 'MODEL_FAILURE')), 'duplicate');
   assert.equal(f.requests.length, 2);
+  assert.equal(f.totalCalls(), 4);
 });
 
 test('不限次数模式超过三轮继续响应，普通消息不调用，单轮模型失败后新@可继续', async t => {
@@ -270,12 +290,14 @@ test('不限次数模式超过三轮继续响应，普通消息不调用，单�
   }
   assert.equal(await h.handle(f.message('background', '普通群消息', { mentioned: false })), 'observed');
   assert.equal(f.requests.length, 4);
+  assert.equal(f.totalCalls(), 8);
   assert.equal(await h.handle(f.message('failure', 'MODEL_FAILURE')), 'failed');
   assert.equal(await h.handle(f.message('failure', 'MODEL_FAILURE')), 'duplicate');
   assert.equal(await h.handle(f.message('after-failure', '继续交流')), 'sent');
   assert.equal(h.info().calls, 6); assert.equal(h.info().maxCalls, 0);
   assert.equal(h.info().memory[0].enabled, false);
   assert.equal(f.requests.length, 6);
+  assert.equal(f.totalCalls(), 12);
   assert.equal(f.sent.length, 5);
 });
 
@@ -329,9 +351,11 @@ test('私聊无需@，未允许用户不落库；同ID的群和不同私聊不�
   assert.ok(!JSON.stringify(f.requests.at(-1).body).includes('PRIVATE_A_SECRET'));
   assert.equal(await h.handle(f.message('group-background', 'GROUP_BACKGROUND', { mentioned: false })), 'observed');
   assert.equal(f.requests.length, 3);
+  assert.equal(f.totalCalls(), 6);
   assert.equal(await h.handle(f.message('group-question', '群问题')), 'sent');
   assert.ok(!JSON.stringify(f.requests.at(-1).body).includes('PRIVATE_A_SECRET'));
   assert.equal(await h.handle(f.message('private-3', '私聊继续', options(privateA))), 'sent');
+  assert.equal(f.totalCalls(), 10);
   assert.ok(!JSON.stringify(f.requests.at(-1).body).includes('GROUP_BACKGROUND'));
   assert.equal(f.sent[0].route.roomType, 'private');
   const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });

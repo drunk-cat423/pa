@@ -1,7 +1,23 @@
-// Remove schema 10 additions when a migration test needs to model an older database.
-export function downgradeSchema10(db) {
+export function downgradeSchema11(db) {
   db.exec(`
     PRAGMA foreign_keys=OFF;
+    DROP TABLE IF EXISTS self_profile_reclassifications;
+    DROP TRIGGER IF EXISTS index_topic_insert;
+    DROP TRIGGER IF EXISTS index_topic_update;
+    DROP TRIGGER IF EXISTS index_topic_delete;
+    DROP TABLE IF EXISTS memory_topic_fts;
+    DROP TABLE IF EXISTS turn_preparations;
+    DROP TABLE IF EXISTS room_rule_revisions;
+    DROP TABLE IF EXISTS topic_embedding_attempts;
+    DROP INDEX IF EXISTS person_fragment_identity_content;
+    ALTER TABLE person_profile_pending DROP COLUMN purpose;
+  `);
+}
+
+// Remove schema 10 additions when a migration test needs to model an older database.
+export function downgradeSchema10(db) {
+  downgradeSchema11(db);
+  db.exec(`
     DROP TABLE channel_tasks;
     DROP INDEX message_conversation_identity;
     DROP INDEX one_running_run_per_session;

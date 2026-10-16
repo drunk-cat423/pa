@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
+import { downgradeSchema11 } from './fixtures/legacy-schema.mjs';
 
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'pa-delivery-parts-'));
@@ -89,6 +90,7 @@ test('v7 migration creates a consistent backup and preserves legacy replies and 
   f.store.ackDelivery(f.deliveryId, 'sent', 'legacy-id');
   f.store.close();
   f.inspect(db => {
+    downgradeSchema11(db);
     db.exec(`DROP TRIGGER history_message_insert; DROP TRIGGER history_message_update; DROP TRIGGER history_message_delete;
       DROP TABLE message_history_fts; DROP TABLE run_progress; DROP TABLE profile_tool_receipts; DROP TABLE person_profile_pending;
       DROP TABLE channel_tasks; DROP INDEX message_conversation_identity;
@@ -98,7 +100,7 @@ test('v7 migration creates a consistent backup and preserves legacy replies and 
       DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity; PRAGMA user_version=7;`);
   });
   f.reopen();
-  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 10);
+  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 12);
   assert.deepEqual(f.store.quotedMessage(f.a.id, 'legacy-id'), { role: 'assistant', text: '**完整原文**' });
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM messages').get().n), 2);
   const backups = readdirSync(f.directory).filter(name => name.includes('.v7.') && name.endsWith('.bak'));

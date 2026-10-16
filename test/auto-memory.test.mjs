@@ -28,10 +28,34 @@ function extracted(input) {
     ...(input.roomType === 'private' ? { continuationSummary: '已经讨论测试计划，下一步继续执行。' } : {}) };
 }
 
+function currentMessageText(body) {
+  const user = body.messages.filter(message => message.role === 'user').at(-1);
+  if (!user) return '';
+  const content = typeof user.content === 'string' ? user.content : user.content.map(part => part.text ?? '').join('');
+  try { return JSON.parse(content.slice(content.lastIndexOf('\n') + 1)).currentMessage?.text ?? content; }
+  catch { return content; }
+}
+
+function backgroundPayload(body) {
+  const message = body.messages.filter(item => item.role === 'user').findLast(item => {
+    const content = typeof item.content === 'string' ? item.content : item.content.map(part => part.text ?? '').join('');
+    return content.includes('已保存的候选背景数据');
+  });
+  assert.ok(message, 'request should carry its bounded background payload');
+  const content = typeof message.content === 'string' ? message.content : message.content.map(part => part.text ?? '').join('');
+  return JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
+}
+
+function currentTurnInput(body) {
+  const message = body.messages.filter(item => item.role === 'user').at(-1);
+  const content = typeof message.content === 'string' ? message.content : message.content.map(part => part.text ?? '').join('');
+  return JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
+}
+
 for (const scenario of [
   { name: '不限整理次数超过20次仍继续，失败重试也可恢复', limit: 0, rounds: 21, failures: 1, calls: 22, completed: 21 },
   { name: '有限整理预算仍阻止超过上限的调用', limit: 1, rounds: 2, failures: 0, calls: 1, completed: 1 },
-  { name: '不限总次数仍保留每个任务的三次失败重试上限', limit: 0, rounds: 1, failures: Infinity, calls: 3, completed: 0 },
+  { name: '不限总次数也不自动重试结果未知的调用', limit: 0, rounds: 1, failures: Infinity, calls: 1, completed: 0 },
 ]) test(scenario.name, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'pa-memory-limit-'));
   const store = new ConversationStore(join(directory, 'store.sqlite'));
@@ -48,7 +72,13 @@ for (const scenario of [
   for (let i = 0; i < scenario.rounds; i++) {
     store.recordInbound(conversation.id, 'hello', { eventId: String(i), senderId: 'a', modelInputText: 'hello' });
     background.start('capacity');
-    if (i < scenario.completed) await background.wait(undefined, 3000);
+    if (i < scenario.completed) {
+      if (i === 0 && scenario.failures) {
+        await assert.rejects(background.wait(undefined, 3000), /失败/);
+        background.retry(store.autoMemory.listJobs()[0].id);
+      }
+      await background.wait(undefined, 3000);
+    }
     else await assert.rejects(background.wait(undefined, 3000), /失败/);
   }
   assert.equal(calls, scenario.calls);
@@ -63,7 +93,7 @@ async function fixture(t, extract = async input => extracted(input), overrides =
   const server = createServer(async (request, response) => {
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); requests.push(body);
-    if (JSON.stringify(body.messages.at(-1)).includes('BLOCK_CHAT')) { chatStarted.resolve(); await chatGate.promise; }
+    if (currentMessageText(body).includes('BLOCK_CHAT')) { chatStarted.resolve(); await chatGate.promise; }
     const reply = companionReply(body,'继续讨论');
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const choices of [
@@ -96,6 +126,11 @@ async function fixture(t, extract = async input => extracted(input), overrides =
     await rm(directory, { recursive: true, force: true });
   });
   return { config, route, other, privateRoute, requests, sent, inputs, harness, message, chatGate, chatStarted,
+    retryFailed: () => {
+      const store = new ConversationStore(join(config.dataDir, 'pa.sqlite'));
+      try { for (const job of store.autoMemory.listJobs()) if (job.status === 'failed') store.autoMemory.retry(job.id); }
+      finally { store.close(); }
+    },
     db: () => new DatabaseSync(join(config.dataDir, 'pa.sqlite')) };
 }
 
@@ -107,7 +142,8 @@ test('第50条固定批次后台等待时，新提问仍完成；第51条归下�
   assert.equal(f.inputs.length, 0);
   await h.handle(f.message('m50', '消息50')); await started.promise;
   assert.equal(await h.handle(f.message('m51', '此时仍可回答吗', { mentioned: true })), 'sent');
-  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length, 1);
+  assert.equal(f.requests.length, 2);
   assert.equal(f.inputs[0].messages.filter(m => m.role === 'user').length, 50);
   assert.ok(!f.inputs[0].messages.some(m => m.text === '此时仍可回答吗'));
   gate.resolve(); await h.waitForMemory();
@@ -137,7 +173,7 @@ test('私聊完整50轮后压缩，下一轮使用摘要与新问题；原文保
   await h.waitForMemory();
   assert.equal(f.inputs.length, 1);
   assert.equal(f.inputs[0].messages.filter(m => m.role === 'user').length, 50);
-  assert.match(JSON.stringify(f.requests[48]), /私聊第1轮/);
+  assert.match(JSON.stringify(f.requests.filter(request=>request.messages.at(-1)?.role==='tool')[48]), /私聊第1轮/);
   assert.equal(await h.handle(f.message('p51', '新的问题', { route: f.privateRoute })), 'sent');
   assert.match(JSON.stringify(f.requests.at(-1)), /已经讨论测试计划/);
   assert.doesNotMatch(JSON.stringify(f.requests.at(-1)), /私聊第1轮/);
@@ -153,25 +189,25 @@ test('私聊完整50轮后压缩，下一轮使用摘要与新问题；原文保
 
 test('不足50轮到容量阈值仍整理，硬上限等待完成后重建请求', async t => {
   const gate = deferred(), started = deferred();
-  const f = await fixture(t, async (input, signal) => { started.resolve(); await wait(signal, gate.promise); return extracted(input); }, { contextWindow: 10000 });
+  const f = await fixture(t, async (input, signal) => { started.resolve(); await wait(signal, gate.promise); return extracted(input); }, { contextWindow: 20000 });
   const h = f.harness();
-  for (let i = 1; i <= 3; i++) {
-    const pending = h.handle(f.message(`capacity${i}`, `${i}:` + 'x'.repeat(2500), { route: f.privateRoute }));
+  for (let i = 1; i <= 8; i++) {
+    const pending = h.handle(f.message(`capacity${i}`, `${i}:` + 'x'.repeat(3500), { route: f.privateRoute }));
     const state = await Promise.race([pending.then(result => ({ result })), new Promise(resolve => setTimeout(() => resolve({ waiting: true }), 1500))]);
     if (state.waiting) {
-      await started.promise; const before = f.requests.length;
-      gate.resolve(); assert.equal(await pending, 'sent'); assert.equal(f.requests.length, before + 1);
+      await started.promise; const before = f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length;
+      gate.resolve(); assert.equal(await pending, 'sent'); assert.equal(f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length, before + 1);
       await h.waitForMemory(); assert.ok(f.inputs[0].messages.filter(m => m.role === 'user').length < 50); return;
     }
     assert.equal(state.result, 'sent');
   }
-  const pending = h.handle(f.message('capacity4', '4:' + 'x'.repeat(2500), { route: f.privateRoute }));
+  const pending = h.handle(f.message('capacity9', '9:' + 'x'.repeat(3500), { route: f.privateRoute }));
   await started.promise;
   let finished = false; void pending.then(() => { finished = true; });
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.equal(finished, false);
-  const before = f.requests.length; gate.resolve();
-  assert.equal(await pending, 'sent'); assert.equal(f.requests.length, before + 1);
+  const before = f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length; gate.resolve();
+  assert.equal(await pending, 'sent'); assert.equal(f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length, before + 1);
   await h.waitForMemory(); assert.ok(f.inputs[0].messages.length < 100);
 });
 
@@ -188,13 +224,17 @@ test('仅发送者及真实@对象画像，绑定人物私聊自述可在群使�
   assert.equal(await h.handle(f.message('pref-a', '记住我喜欢登山', { route: f.privateRoute })), 'sent');
   assert.equal(await h.handle(f.message('pref-b', '记住我喜欢绘画', { senderId: 'b', mentioned: true })), 'sent');
   assert.equal(await h.handle(f.message('ask-no-at', '和小B玩什么', { mentioned: true })), 'sent');
-  assert.match(JSON.stringify(f.requests.at(-1)), /登山/);
-  assert.doesNotMatch(JSON.stringify(f.requests.at(-1)), /绘画/);
+  const noAtInput = backgroundPayload(f.requests.at(-1));
+  assert.ok(noAtInput.profiles.some(profile => profile.senderIds.includes('a')));
+  assert.ok(!noAtInput.profiles.some(profile => profile.personId === 'person-b' || profile.senderIds.includes('b')));
+  assert.ok(!JSON.stringify(noAtInput.profiles).includes('绘画'));
+  assert.ok(currentTurnInput(f.requests.at(-1)).recentGroupMessages
+    .some(message => message.senderId === 'b' && message.text.includes('绘画')));
   assert.equal(await h.handle(f.message('ask-at', '和被提及的人玩什么', { mentioned: true, mentionedSenderIds: ['b', 'b'] })), 'sent');
-  const last = JSON.stringify(f.requests.at(-1)); assert.match(last, /登山/); assert.match(last, /绘画/);
-  assert.match(last, /senderIds/);
-  const projection = f.requests.at(-1).messages.map(message => JSON.stringify(message)).join('');
-  assert.ok(projection.includes('senderIds'));
+  const mentionedProfiles = backgroundPayload(f.requests.at(-1)).profiles;
+  assert.ok(mentionedProfiles.some(profile => profile.senderIds.includes('a')));
+  assert.ok(mentionedProfiles.some(profile => profile.senderIds.includes('b')
+    && JSON.stringify(profile).includes('绘画')));
 });
 
 test('模型提案不可伪造人物/消息，自述不能引用其他人', () => {
@@ -227,7 +267,7 @@ test('快速连发私聊独立计算，不将尚未完成的回复伪作历史',
 });
 
 test('群聊容量批次整理保留原文且不创建群摘要', async t => {
-  const f = await fixture(t, undefined, { contextWindow: 7000 }); const h = f.harness();
+  const f = await fixture(t, undefined, { contextWindow: 32768 }); const h = f.harness();
   for (let i = 1; i <= 4; i++) await h.handle(f.message(`g${i}`, `${i}:` + 'g'.repeat(2000)));
   const store=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
   try {
@@ -237,13 +277,16 @@ test('群聊容量批次整理保留原文且不创建群摘要', async t => {
   await h.waitForMemory();
   assert.equal(await h.handle(f.message('g-question', '刚才群里讨论了什么？', { mentioned: true })), 'sent');
   assert.equal(f.inputs[0].roomType, 'group'); assert.ok(f.inputs[0].messages.length < 50);
-  assert.doesNotMatch(JSON.stringify(f.requests.at(-1)), /gggggggggg/);
+  const recent = JSON.parse(f.requests.at(-1).messages.filter(message => message.role === 'user').at(-1).content
+    .map(part => part.text ?? '').join('').split('\n').at(-1)).recentGroupMessages;
+  assert.equal(recent.length, 4);
+  assert.ok(recent.every(message => message.text.includes('gggggggggg')));
   assert.equal(h.info().memory[0].summary, undefined);
 });
 
 test('超大画像按预算选择完整事实，普通短问题仍可回答且数据库保留完整画像', async t => {
   // Leave room for fixed response guidance while keeping the profile far larger than the window.
-  const contextWindow = 8000;
+  const contextWindow = 40000;
   const f = await fixture(t, undefined, { contextWindow }); const h = f.harness();
   await h.handle(f.message('seed', '首次发言'));
   const db = f.db();
@@ -254,7 +297,7 @@ test('超大画像按预算选择完整事实，普通短问题仍可回答且�
     db.prepare('INSERT INTO person_profile_revisions VALUES (?,1,?,NULL,?)').run(person, JSON.stringify(facts), new Date().toISOString());
     assert.equal(await h.handle(f.message('short', '你好', { mentioned: true })), 'sent');
     assert.ok(Buffer.byteLength(JSON.stringify(f.requests.at(-1)), 'utf8') < contextWindow);
-    const background = f.requests.at(-1).messages.find(message => JSON.stringify(message.content).includes('已保存的背景数据'));
+    const background = f.requests.at(-1).messages.find(message => JSON.stringify(message.content).includes('已保存的候选背景数据'));
     const content = typeof background?.content === 'string' ? background.content : background?.content.map(part => part.text ?? '').join('');
     assert.ok(content);
     const payload = JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
@@ -286,13 +329,15 @@ test('长批次拆分检查点在失败重试后续接，不重复已成功的�
   }, { memory: { enabled: true, maxCalls: 20, maxRetries: 2, timeoutMs: 5000 } });
   const h = f.harness();
   for (let i = 0; i < 50; i++) await h.handle(f.message(`split-${i}`, `批次消息${i}`));
-  await h.waitForMemory();
-  assert.equal(h.info().memory[0].completed, 1);
+  await assert.rejects(h.waitForMemory(), /失败/);
+  await h.close(); f.retryFailed();
+  const next = f.harness(); await next.start(); await next.waitForMemory();
+  assert.equal(next.info().memory.find(item=>item.conversation===channelConversationKey(f.route)).completed, 1);
   const ids = finished.flat(); assert.equal(ids.length, 50); assert.equal(new Set(ids).size, 50);
-  assert.equal(h.info().memory[0].calls, 5);
+  assert.equal(next.info().memory[0].calls, 5);
 });
 
-test('关闭中断的后台批次重新排队，重启无需新消息也继续整理', async t => {
+test('关闭中断的后台批次保留失败，只有显式重试后才继续整理', async t => {
   let calls = 0; const started = deferred();
   const f = await fixture(t, async (input, signal) => {
     calls++;
@@ -302,6 +347,8 @@ test('关闭中断的后台批次重新排队，重启无需新消息也继续�
   const h = f.harness();
   for (let i = 0; i < 50; i++) await h.handle(f.message(`resume-${i}`, `继续${i}`));
   await started.promise; await h.close();
+  const stopped = f.harness(); await stopped.start(); await assert.rejects(stopped.waitForMemory(), /失败/);
+  assert.equal(calls,1); await stopped.close(); f.retryFailed();
   const next = f.harness(); await next.start(); await next.waitForMemory();
   assert.equal(calls, 2);
   assert.equal(next.info().memory.find(item => item.conversation === channelConversationKey(f.route)).completed, 1);

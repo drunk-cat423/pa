@@ -80,10 +80,13 @@ test('capacity short batch and queued snapshot survive failures and process rest
   }finally{f.close();}
 });
 
-test('expired worker cannot submit after a reclaimed lease',()=>{
+test('expired worker is failed without automatic recall; explicit retry fences the old lease',()=>{
   const f=fixture();try {
     f.inbound();f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const old=claim(f);const result=ignored(f,old);
     inspect(f,db=>db.prepare('UPDATE auto_memory_jobs SET lease_until=0 WHERE id=?').run(old.id));
+    assert.equal(claim(f),undefined);
+    assert.match(f.store.autoMemory.listJobs()[0].error,/interrupted/);
+    f.store.autoMemory.retry(old.id);
     const replacement=claim(f);assert.notEqual(replacement.leaseToken,old.leaseToken);
     assert.throws(()=>f.store.autoMemory.commit(old.id,old.leaseToken,result),/租约已失效/);
     f.store.autoMemory.commit(replacement.id,replacement.leaseToken,ignored(f,replacement));
@@ -324,7 +327,7 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     assert.ok(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity'));
     assert.equal(f.store.externalMessage(f.conversation.id,old.eventId).id,old.existingMessageId);
     assert.equal(inspect(f,db=>db.prepare('SELECT status,content FROM memories WHERE id=?').get(memory.id)).content,null);
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),10);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 12);
     assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
     assert.equal(readdirSync(f.directory).some(name=>name.includes('.v5.')&&name.endsWith('.bak')),true);
     f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity').messageIds.length,1);

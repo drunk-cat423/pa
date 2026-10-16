@@ -81,7 +81,8 @@ export class SelfProfileStore {
       const current = this.db.prepare('SELECT * FROM self_profile_revisions ORDER BY revision DESC LIMIT 1').get()!;
       return { baseVersion: Number(current.revision), content: String(current.content),
         sourceMessageIds: JSON.parse(String(current.source_message_ids_json)) as string[],
-        pending: this.db.prepare('SELECT id,content,source_message_id FROM self_profile_pending WHERE archived_revision IS NULL ORDER BY rowid')
+        pending: this.db.prepare(`SELECT id,content,source_message_id FROM self_profile_pending p WHERE archived_revision IS NULL
+          AND NOT EXISTS (SELECT 1 FROM self_profile_reclassifications r WHERE r.pending_id=p.id) ORDER BY rowid`)
           .all().map(row => ({ id: String(row.id), content: String(row.content), sourceMessageId: String(row.source_message_id) })) };
     });
   }
@@ -97,7 +98,8 @@ export class SelfProfileStore {
     this.transaction(() => {
       if (!this.humanSource(sourceMessageId)) throw new MemoryError('自我建议必须来自原始真人消息。');
       if (this.db.prepare('SELECT id FROM self_profile_pending WHERE source_message_id=? AND content=?').get(sourceMessageId,content)) return;
-      const bytes = Number(this.db.prepare('SELECT COALESCE(SUM(length(CAST(content AS BLOB))),0) AS bytes FROM self_profile_pending WHERE archived_revision IS NULL').get()!.bytes);
+      const bytes = Number(this.db.prepare(`SELECT COALESCE(SUM(length(CAST(content AS BLOB))),0) AS bytes FROM self_profile_pending p
+        WHERE archived_revision IS NULL AND NOT EXISTS (SELECT 1 FROM self_profile_reclassifications r WHERE r.pending_id=p.id)`).get()!.bytes);
       if (bytes + Buffer.byteLength(content, 'utf8') > 12000) throw new MemoryError('待整理自我建议已达到 12000 字节上限。');
       const id = randomUUID();
       const next = this.snapshot();
@@ -114,6 +116,9 @@ export class SelfProfileStore {
   commit(snapshot: SelfProfileSnapshot, proposal: SelfProfileProposal, batchMessages: readonly AutoMemoryMessage[], maxBytes = 20000): void {
     this.transaction(() => {
       validateSelfProfileProposal(proposal, snapshot, batchMessages, maxBytes);
+      if (proposal.sourceMessageIds.some(id => this.db.prepare('SELECT 1 FROM self_profile_reclassifications WHERE source_message_id=?').get(id))) {
+        throw new Error('自我画像输入版本已失效：该来源已迁入群规则，不能重新写入AI画像。');
+      }
       const current = this.db.prepare('SELECT * FROM self_profile_revisions ORDER BY revision DESC LIMIT 1').get()!;
       if (Number(current.revision) !== snapshot.baseVersion) throw new Error('全局自我档案版本冲突，请重读后重试。');
       const currentSources = JSON.parse(String(current.source_message_ids_json)) as string[];

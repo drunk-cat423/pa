@@ -6,8 +6,12 @@ import { isDeepStrictEqual } from 'node:util';
 import { MemoryError } from './memory-types.js';
 import type { MemoryChange, MemoryDeletion, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, MemorySections, PrimaryPerson, ProfileField } from './memory-types.js';
 import type { ChannelRoute, ExternalRunInput, InboundMessage } from './channel-types.js';
-import { AutoMemoryStore, migrateAutoMemory } from './auto-memory-store.js';
+import { AutoMemoryStore, migrateAutoMemory, migrateMemoryRetrieval } from './auto-memory-store.js';
 import { migrateSelfProfile } from './self-profile-store.js';
+import { memoryWords } from './memory-text.js';
+import { validateTurnPlan, type TurnPlan, type TurnReceipt } from './turn-plan.js';
+import { isMemoryOwner, type HarnessPolicy } from './harness-policy.js';
+import { reclassifySelfProfileTerms, type SelfProfileTermMove } from './self-profile-reclassification.js';
 
 export interface ConversationRecord {
   id: string;
@@ -63,14 +67,10 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 12;
 const OWNER_ID = 'local-owner';
 const PROFILE_FIELDS = ['diet', 'preferred_name', 'interests', 'reply_style'];
-const historySegmenter = new Intl.Segmenter('zh', { granularity: 'word' });
-function historyTokens(text: string): string[] {
-  return [...historySegmenter.segment(text.normalize('NFKC').toLocaleLowerCase('zh'))]
-    .filter(segment => segment.isWordLike).map(segment => segment.segment);
-}
+const historyTokens = memoryWords;
 
 export interface HistoryOptions {
   query?: string; scope?: 'sender' | 'room'; senderId?: string; before?: string; after?: string; limit?: number;
@@ -409,6 +409,25 @@ export class ConversationStore {
         ALTER TABLE delivery_parts ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'passive' CHECK (delivery_mode IN ('passive','active'));
         ALTER TABLE delivery_parts ADD COLUMN reply_slot INTEGER CHECK (reply_slot IS NULL OR reply_slot >= 1);
       `);
+      if (version < 11) {
+        this.db.exec(`CREATE TABLE turn_preparations (
+          source_message_id TEXT PRIMARY KEY REFERENCES messages(id), plan_json TEXT NOT NULL,
+          receipt_json TEXT NOT NULL, created_at TEXT NOT NULL);
+          CREATE TABLE room_rule_revisions (
+            conversation_id TEXT NOT NULL REFERENCES conversations(id), rule_key TEXT NOT NULL,
+            revision INTEGER NOT NULL, content TEXT NOT NULL, source_message_id TEXT NOT NULL REFERENCES messages(id),
+            created_at TEXT NOT NULL, PRIMARY KEY(conversation_id,rule_key,revision));
+          ALTER TABLE person_profile_pending ADD COLUMN purpose TEXT NOT NULL DEFAULT 'profile' CHECK(purpose IN ('profile','memory'));`);
+        migrateMemoryRetrieval(this.db);
+      }
+      if (version < 12) this.db.exec(`CREATE TABLE self_profile_reclassifications (
+        pending_id TEXT PRIMARY KEY REFERENCES self_profile_pending(id),
+        source_message_id TEXT NOT NULL REFERENCES messages(id),
+        conversation_id TEXT NOT NULL, rule_key TEXT NOT NULL, rule_revision INTEGER NOT NULL,
+        from_revision INTEGER NOT NULL REFERENCES self_profile_revisions(revision),
+        to_revision INTEGER NOT NULL REFERENCES self_profile_revisions(revision), created_at TEXT NOT NULL,
+        FOREIGN KEY (conversation_id,rule_key,rule_revision) REFERENCES room_rule_revisions(conversation_id,rule_key,revision),
+        CHECK (to_revision > from_revision));`);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
@@ -903,6 +922,90 @@ export class ConversationStore {
     if (!Number.isSafeInteger(generation) || generation < 0) throw new MemoryError('上下文代次必须是非负整数。');
     this.requireMemoryConversation(conversationId);
     this.db.prepare('UPDATE memory_context_state SET reset_required = 0 WHERE conversation_id = ? AND generation = ?').run(conversationId, generation);
+  }
+
+  identityCard(conversationId: string, senderId: string, policy: HarnessPolicy): {
+    senderId: string; personId?: string; displayName?: string; isMaintainer: boolean;
+  } {
+    const row = this.db.prepare(`SELECT a.id, ap.person_id,
+      (SELECT sender_name FROM messages WHERE actor_id=a.id AND sender_name IS NOT NULL ORDER BY ingest_seq DESC LIMIT 1) AS name,
+      r.channel,r.account,r.room_type,r.external_chat_id
+      FROM conversations c JOIN rooms r ON r.id=c.room_id JOIN actors a ON a.room_id=r.id
+      LEFT JOIN actor_person_bindings ap ON ap.actor_id=a.id WHERE c.id=? AND a.external_user_id=?`).get(conversationId,senderId);
+    if (!row) return { senderId, isMaintainer: false };
+    return { senderId, ...(row.person_id ? { personId: String(row.person_id) } : {}),
+      ...(row.name ? { displayName: String(row.name).slice(0,100) } : {}),
+      isMaintainer: isMemoryOwner(policy, { route: { channel: String(row.channel), accountId: String(row.account),
+        roomType: row.room_type as 'group' | 'private', roomId: String(row.external_chat_id) }, senderId }) };
+  }
+
+  roomRules(conversationId: string): { key: string; content: string }[] {
+    this.requireMemoryConversation(conversationId);
+    return this.autoMemory.roomRules(conversationId);
+  }
+
+  reclassifySelfProfileTerms(moves: readonly SelfProfileTermMove[], policy: HarnessPolicy, expectedVersion: number): {
+    revision: number; moved: number;
+  } {
+    return this.memoryTransaction(() => reclassifySelfProfileTerms(this.db,
+      this.autoMemory.selfProfile.snapshot(), moves, policy, expectedVersion));
+  }
+
+  prepareTurn(conversationId: string, sourceMessageId: string, proposed: TurnPlan, policy: HarnessPolicy,
+    mentionedSenderIds: readonly string[] = [], selfBudget?: number): TurnReceipt {
+    const plan = validateTurnPlan(proposed);
+    return this.memoryTransaction(() => {
+      const source = this.db.prepare(`SELECT m.text,m.actor_id,a.external_user_id,r.room_type FROM messages m
+        JOIN conversations c ON c.id=m.conversation_id JOIN rooms r ON r.id=c.room_id JOIN actors a ON a.id=m.actor_id
+        WHERE m.id=? AND m.conversation_id=? AND m.role='user' AND a.room_id=c.room_id`).get(sourceMessageId,conversationId);
+      if (!source) throw new MemoryError('本轮缺少有效来源。');
+      const canonical = JSON.stringify({ intent:plan.intent,mode:plan.mode,
+        ...(plan.progressText === undefined ? {} : {progressText:plan.progressText}),updates:plan.updates.map(u=>({target:u.target,
+        content:u.content,sourceType:u.sourceType??'third_party',senderId:u.senderId??null,key:u.key??null,purpose:u.purpose??'profile'})) });
+      const previous = this.db.prepare('SELECT plan_json,receipt_json FROM turn_preparations WHERE source_message_id=?').get(sourceMessageId);
+      if (previous) {
+        if (previous.plan_json !== canonical) throw new MemoryError('本条消息已经完成准备，不能重复更改保存内容。');
+        return JSON.parse(String(previous.receipt_json)) as TurnReceipt;
+      }
+      const current = this.identityCard(conversationId,String(source.external_user_id),policy);
+      const receipt: TurnReceipt = {prepared:true,mode:plan.mode,saved:[]};
+      for (const update of plan.updates) {
+        if (!String(source.text).includes(update.content)) throw new MemoryError('保存内容必须连续摘录当前消息原文。');
+        if (['mentioned_person','room_rule','room_memory'].includes(update.target) && !current.isMaintainer) {
+          throw new MemoryError('你没有管理其他人物或群规则、群记忆的权限；本批内容均未保存。');
+        }
+        if (['room_rule','room_memory'].includes(update.target) && source.room_type !== 'group') throw new MemoryError('群规则和群记忆只能在对应群聊中设置。');
+        if (update.target === 'sender' || update.target === 'mentioned_person') {
+          const subject = update.target === 'sender' ? String(source.actor_id) : this.findActor(conversationId,update.senderId!);
+          if (!subject || (update.target === 'mentioned_person' && !mentionedSenderIds.includes(update.senderId!)
+            && !String(source.text).includes(`<@${update.senderId}>`) && !String(source.text).includes(`<@!${update.senderId}>`))) {
+            throw new MemoryError('请在当前消息明确 @ 要记录的已知群成员。');
+          }
+          this.autoMemory.addProfilePending(this.autoMemory.ensureActorPerson(subject),sourceMessageId,update.content,
+            update.target==='mentioned_person'?'third_party':update.sourceType??'third_party',
+            {allowThirdParty:update.target==='mentioned_person',purpose:update.purpose??'profile'});
+          receipt.saved.push({target:update.target,status:'saved_pending'});
+        } else if (update.target === 'ai_self') {
+          this.autoMemory.selfProfile.addPending(sourceMessageId,update.content,selfBudget);
+          receipt.saved.push({target:update.target,status:'saved_pending'});
+        } else if (update.target === 'room_rule') {
+          const key=update.key!.normalize('NFKC').trim().toLocaleLowerCase('zh');
+          const old=this.db.prepare('SELECT revision,content FROM room_rule_revisions WHERE conversation_id=? AND rule_key=? ORDER BY revision DESC LIMIT 1').get(conversationId,key);
+          if (old?.content !== update.content) this.db.prepare('INSERT INTO room_rule_revisions VALUES (?,?,?,?,?,?)')
+            .run(conversationId,key,Number(old?.revision??0)+1,update.content,sourceMessageId,now());
+          const rules=this.roomRules(conversationId);
+          if(rules.length>50 || Buffer.byteLength(JSON.stringify(rules))>12000) throw new MemoryError('本群规则容量已满，请精简或纠正已有约定。');
+          receipt.saved.push({target:update.target,status:'saved'});
+        } else {
+          const duplicate=this.db.prepare(`SELECT id FROM memories WHERE conversation_id=? AND scope_type='room'
+            AND status='active' AND is_current=1 AND content=?`).get(conversationId,update.content);
+          if(!duplicate)this.rememberMemory(conversationId,{content:update.content,kind:'fact',sourceMessageId});
+          receipt.saved.push({target:update.target,status:'saved'});
+        }
+      }
+      this.db.prepare('INSERT INTO turn_preparations VALUES (?,?,?,?)').run(sourceMessageId,canonical,JSON.stringify(receipt),now());
+      return receipt;
+    });
   }
 
   updateProfileFromTool(conversationId: string, sourceMessageId: string, callId: string,
@@ -1430,6 +1533,25 @@ export class ConversationStore {
       WHERE room.channel = ? AND room.account = ? AND room.room_type = ? AND room.external_chat_id = ?
       ORDER BY m.ingest_seq DESC LIMIT ?
     `).all(selected.channel, selected.accountId, selected.roomType, selected.roomId, limit) as Array<Record<string, unknown>>;
+    return rows.reverse().map(asMessage);
+  }
+
+  recentHumanMessages(conversationId: string, limit = 10, beforeMessageId?: string): MessageRecord[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10) throw new Error('群聊背景条数必须在1到10之间。');
+    this.requireMemoryConversation(conversationId);
+    const boundary = beforeMessageId === undefined ? undefined
+      : this.db.prepare('SELECT ingest_seq FROM messages WHERE id=? AND conversation_id=?').get(beforeMessageId, conversationId);
+    if (beforeMessageId !== undefined && !boundary) throw new Error('历史边界消息必须属于当前会话。');
+    // This is raw background, independent of answer/delivery status or memory checkpoints.
+    // Filter before LIMIT so assistant replies and control messages never displace human chat.
+    const rows = this.db.prepare(`SELECT m.id,m.conversation_id AS conversationId,m.role,m.text,
+      m.created_at AS createdAt,m.pi_entry_id AS piEntryId,NULL AS runStatus,NULL AS deliveryStatus,
+      m.external_event_id AS eventId,a.external_user_id AS senderId,m.sender_name AS senderName,
+      m.actor_id AS actorId,m.message_kind AS messageKind,m.ingest_seq AS ingestSeq,m.sent_at AS sentAt
+      FROM messages m JOIN conversations c ON c.id=m.conversation_id JOIN actors a ON a.id=m.actor_id AND a.room_id=c.room_id
+      WHERE m.conversation_id=? AND m.role='user' AND m.message_kind='chat'
+        AND (? IS NULL OR m.ingest_seq<?)
+      ORDER BY m.ingest_seq DESC LIMIT ?`).all(conversationId, boundary?.ingest_seq ?? null, boundary?.ingest_seq ?? null, limit);
     return rows.reverse().map(asMessage);
   }
 

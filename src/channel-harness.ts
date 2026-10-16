@@ -72,7 +72,7 @@ export class ChannelHarness {
     let pending = this.opening.get(key);
     if (!pending) {
       pending = openRecordedConversation(this.config, key, route, undefined,
-        { persons: configuredPersons(this.policy), ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}) });
+        { persons: configuredPersons(this.policy), policy: this.policy, ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}) });
       this.opening.set(key, pending);
       pending.then(conversation => {
         this.conversations.set(key, conversation);
@@ -138,7 +138,9 @@ export class ChannelHarness {
   private output<T>(route: ChannelRoute, operation: () => Promise<T>): Promise<T> {
     const key = channelConversationKey(route);
     const sending = (this.outputs.get(key) ?? Promise.resolve()).then(operation);
-    this.outputs.set(key, sending.catch(() => {}));
+    const settled = sending.catch(() => {});
+    this.outputs.set(key, settled);
+    void settled.then(() => { if (this.outputs.get(key) === settled) this.outputs.delete(key); });
     return sending;
   }
 
@@ -193,10 +195,12 @@ export class ChannelHarness {
           if (this.closed) return { status: 'uncertain' };
           try { return await this.transport.send({ route: message.route, deliveryMode: mode,
             ...(mode === 'passive' ? { replyToMessageId: message.eventId } : {}),
-            text: progress.text, partIndex, ...(message.route.channel === 'qq' ? { plainText: true } : {}) }); }
+            text: message.route.channel === 'qq' ? toPlainText(progress.text) : progress.text,
+            partIndex, ...(message.route.channel === 'qq' ? { plainText: true } : {}) }); }
           catch { return { status: 'uncertain' }; }
         });
-      });
+      }, () => !this.closed && this.passiveAvailable(message, replyOffset)
+        && !this.outputs.has(channelConversationKey(message.route)));
     } catch (error) {
       if (error instanceof DuplicateMessageError) { this.calls--; conversation.finishTask(taskId, 'interrupted'); return 'duplicate'; }
       if (error instanceof RequestError) { conversation.finishTask(taskId, this.closed ? 'interrupted' : 'failed'); return 'failed'; }

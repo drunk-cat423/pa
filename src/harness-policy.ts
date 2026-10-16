@@ -78,7 +78,7 @@ export async function loadHarnessPolicy(dataDir: string): Promise<HarnessPolicy>
   return validateHarnessPolicy(JSON.parse(await readFile(path, 'utf8')));
 }
 
-export function isMemoryOwner(policy: HarnessPolicy, message: InboundMessage): boolean {
+export function isMemoryOwner(policy: HarnessPolicy, message: Pick<InboundMessage, 'route' | 'senderId'>): boolean {
   return policy.ownerBindings.some(binding => binding.senderId === message.senderId
     && binding.route.channel === message.route.channel && binding.route.accountId === message.route.accountId
     && binding.route.roomType === message.route.roomType && binding.route.roomId === message.route.roomId);

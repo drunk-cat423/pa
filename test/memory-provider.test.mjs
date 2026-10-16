@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import test from 'node:test';
-import { createMemoryProvider, MemoryInputTooLargeError } from '../dist/memory-provider.js';
+import { createMemoryProvider, MemoryInputTooLargeError, prepareMemoryExtraction } from '../dist/memory-provider.js';
 
 const output = {
   ignoredMessageIds: [], topics: [], fragments: [], profiles: [], continuationSummary: '继续讨论行程安排。',
@@ -14,6 +14,16 @@ const input = {
     ingestSeq: 1, createdAt: '2026-10-13T00:00:00.000Z' }],
   profiles: [],
 };
+
+test('pure offline request preparation omits worker leases and states the human-only coverage contract', () => {
+  const prepared=prepareMemoryExtraction({...input,job:{...input.job,leaseToken:'private-worker-lease'},
+    profiles:[{personId:'alice',baseVersion:1,facts:[{field:'diet',content:'喜欢茶',sourceType:'self',messageIds:['old']}]}],
+    roomRules:[{key:'rsi',content:'术语约定'}]},100000);
+  assert.doesNotMatch(prepared.userContent,/private-worker-lease|"job"|"field"/);
+  assert.match(prepared.userContent,/message-1|roomRules/);
+  assert.match(prepared.systemPrompt,/忽略项只能列 user/);
+  assert.match(prepared.systemPrompt,/不能新写为人物事实或 AI 自我画像/);
+});
 
 async function fixture(t) {
   const requests = [];

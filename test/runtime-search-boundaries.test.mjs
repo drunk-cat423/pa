@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { openRecordedConversation, PersistenceError } from '../dist/conversation.js';
-import { openConversation } from '../dist/runtime.js';
+import { estimateContext, openConversation } from '../dist/runtime.js';
 
 async function harness(t, { repeatedToolCall = false, truncatedSummary = false } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-search-boundary-'));
@@ -94,11 +94,40 @@ test('长工具结果裁剪仍先保留摘要截断标记，不自动续搜或�
 });
 
 test('搜索结果使最终主模型请求超过上下文时不再发送第二个主模型请求', async t => {
+  const calibration = await harness(t);
+  const calibrationRuntime = await openConversation(calibration.config, 'calibration', { enableSearch: true });
+  const emptyEstimate = calibrationRuntime.estimate('搜索', '');
+  await calibrationRuntime.prompt('搜索', { runId: 'probe', memoryContext: '' });
+  const calibrationFirst = estimateContext(calibration.requests[0], calibration.config.contextWindow, calibration.config.maxOutputTokens);
+  const calibrationSecond = estimateContext(calibration.requests[1], calibration.config.contextWindow, calibration.config.maxOutputTokens);
+  const resultGrowth = calibrationSecond.inputTokens - calibrationFirst.inputTokens;
+  assert.ok(resultGrowth > 0, 'mock search results should enlarge the follow-up request');
+  await calibrationRuntime.close();
+
   const fixture = await harness(t);
   const runtime = await openConversation(fixture.config, 'final-context-limit', { enableSearch: true });
   try {
-    await assert.rejects(runtime.prompt('搜索', { runId: 'context', memoryContext: 'x'.repeat(27_000) }));
+    // Match the direct runtime estimate to a real empty-payload request, then
+    // leave less room than the independently measured mock search-result growth.
+    const estimateOffset = calibrationFirst.inputTokens - emptyEstimate.inputTokens;
+    const headroom = Math.max(1, Math.floor(resultGrowth / 2));
+    let low = 0, high = fixture.config.contextWindow;
+    while (low + 1 < high) {
+      const middle = Math.floor((low + high) / 2);
+      const estimate = runtime.estimate('搜索', 'x'.repeat(middle));
+      const used = estimate.inputTokens + estimate.reservedOutputTokens + estimate.safetyTokens;
+      if (used + estimateOffset <= fixture.config.contextWindow - headroom) low = middle;
+      else high = middle;
+    }
+    const memoryContext = 'x'.repeat(low);
+    const initialEstimate = runtime.estimate('搜索', memoryContext);
+    assert.ok(initialEstimate.inputTokens + initialEstimate.reservedOutputTokens + initialEstimate.safetyTokens
+      + estimateOffset <= fixture.config.contextWindow);
+    assert.ok(fixture.config.contextWindow - initialEstimate.inputTokens
+      - initialEstimate.reservedOutputTokens - initialEstimate.safetyTokens - estimateOffset < resultGrowth);
+    await assert.rejects(runtime.prompt('搜索', { runId: 'context', memoryContext }));
     assert.equal(fixture.requests.length, 1);
+    assert.equal(estimateContext(fixture.requests[0], fixture.config.contextWindow, fixture.config.maxOutputTokens).fits, true);
     assert.equal(fixture.requests[0].tool_choice, 'auto');
     assert.equal(fixture.nativeCalls.length, 1);
   } finally { await runtime.close(); }

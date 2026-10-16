@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { MemoryError, type PrimaryPerson } from './memory-types.js';
-import type { AutoMemoryJob, AutoMemoryMessage, AutoMemoryReason, AutoMemoryTaskInput, PersonProfile, ProfileFact, TopicEmbedding, TopicRecord, TopicSearch, ValidatedExtract } from './auto-memory-types.js';
+import type { AutoMemoryJob, AutoMemoryMessage, AutoMemoryReason, AutoMemoryTaskInput, PersonProfile, PersonProfilePending, ProfileFact, TopicEmbedding, TopicRecord, TopicSearch, ValidatedExtract } from './auto-memory-types.js';
 import { SelfProfileStore } from './self-profile-store.js';
+import { memoryWords } from './memory-text.js';
 
 const timestamp = () => new Date().toISOString();
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -10,6 +11,49 @@ const parse = <T>(value: unknown): T => JSON.parse(String(value)) as T;
 export const sameFact = (a:ProfileFact,b:ProfileFact) => a.content===b.content && a.sourceType===b.sourceType
   && (a.occurredAt??null)===(b.occurredAt??null) && (a.expiresAt??null)===(b.expiresAt??null)
   && JSON.stringify([...a.messageIds].sort())===JSON.stringify([...b.messageIds].sort());
+export const sameFactContent = (a: ProfileFact, b: ProfileFact) => a.content.normalize('NFKC').trim() === b.content.normalize('NFKC').trim()
+  && a.sourceType === b.sourceType && (a.occurredAt ?? null) === (b.occurredAt ?? null)
+  && (a.expiresAt ?? null) === (b.expiresAt ?? null);
+
+/** Called separately for each person; exact facts may share evidence, never identities or inferred meanings. */
+export function mergeProfileFacts(facts: readonly ProfileFact[]): ProfileFact[] {
+  const merged: ProfileFact[] = [];
+  for (const fact of facts) {
+    const existing = merged.find(old => sameFactContent(old, fact));
+    if (existing) existing.messageIds = [...new Set([...existing.messageIds, ...fact.messageIds])];
+    else merged.push({ ...fact, messageIds: [...fact.messageIds] });
+  }
+  return merged;
+}
+
+const samePending = (a: PersonProfilePending, b: PersonProfilePending) => a.id === b.id && a.content === b.content
+  && a.sourceMessageId === b.sourceMessageId && a.sourceType === b.sourceType
+  && (a.purpose ?? 'profile') === (b.purpose ?? 'profile');
+
+/** Topic-only lexical index. The same SQL tokenizer is registered for every store connection. */
+export function migrateMemoryRetrieval(db: DatabaseSync): void {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS memory_topic_fts USING fts5(topic_id UNINDEXED, tokens, tokenize='unicode61');
+    INSERT INTO memory_topic_fts(topic_id,tokens)
+      SELECT id,history_tokens(summary) FROM memory_topics t
+      WHERE NOT EXISTS(SELECT 1 FROM memory_topic_fts f WHERE f.topic_id=t.id);
+    CREATE TRIGGER IF NOT EXISTS index_topic_insert AFTER INSERT ON memory_topics BEGIN
+      INSERT INTO memory_topic_fts(topic_id,tokens) VALUES (NEW.id,history_tokens(NEW.summary));
+    END;
+    CREATE TRIGGER IF NOT EXISTS index_topic_update AFTER UPDATE OF summary ON memory_topics BEGIN
+      DELETE FROM memory_topic_fts WHERE topic_id=OLD.id;
+      INSERT INTO memory_topic_fts(topic_id,tokens) VALUES (NEW.id,history_tokens(NEW.summary));
+    END;
+    CREATE TRIGGER IF NOT EXISTS index_topic_delete AFTER DELETE ON memory_topics BEGIN
+      DELETE FROM memory_topic_fts WHERE topic_id=OLD.id;
+    END;
+    CREATE INDEX IF NOT EXISTS person_fragment_identity_content ON person_fragments(person_id,source_type,content);
+    CREATE TABLE IF NOT EXISTS topic_embedding_attempts (
+      topic_id TEXT PRIMARY KEY REFERENCES memory_topics(id), model TEXT NOT NULL, dimensions INTEGER NOT NULL,
+      input_version INTEGER NOT NULL, topic_version INTEGER NOT NULL, content_hash TEXT NOT NULL,
+      error TEXT, created_at TEXT NOT NULL);
+  `);
+}
 
 /** Called inside the conversation store's migration transaction. */
 export function migrateAutoMemory(db: DatabaseSync): void {
@@ -213,6 +257,11 @@ export class AutoMemoryStore {
       const current=options.now??Date.now();
       const row=this.db.prepare("SELECT * FROM auto_memory_jobs WHERE conversation_id=? AND status<>'done' ORDER BY rowid LIMIT 1").get(conversationId);
       if(!row||row.status==='failed'||(row.status==='running'&&Number(row.lease_until)>current)) return undefined;
+      if (row.status === 'running') {
+        this.db.prepare("UPDATE auto_memory_jobs SET status='failed',error=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?")
+          .run('[interrupted] phase=recover; 先前调用结果未知，固定批次和检查点保留，需显式重试。', String(row.id));
+        return undefined;
+      }
       this.db.prepare(`UPDATE auto_memory_jobs SET status='running',attempts=attempts+1,lease_token=?,lease_owner=?,lease_until=?,error=NULL WHERE id=?`)
         .run(randomUUID(),options.owner,current+options.leaseMs,String(row.id));
       const job=this.job(this.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(String(row.id))!);
@@ -241,13 +290,19 @@ export class AutoMemoryStore {
     const facts=row?parse<ProfileFact[]>(row.facts_json):[];
     const at=timestamp();
     const pending = this.db.prepare("SELECT name FROM sqlite_master WHERE name='person_profile_pending'").get()
-      ? this.db.prepare('SELECT id,content,source_message_id,source_type FROM person_profile_pending WHERE person_id=? AND archived_revision IS NULL ORDER BY rowid').all(personId)
-        .map(row=>({id:String(row.id),content:String(row.content),sourceMessageId:String(row.source_message_id),sourceType:row.source_type as ProfileFact['sourceType']})) : [];
+      ? this.db.prepare('SELECT id,content,source_message_id,source_type,purpose FROM person_profile_pending WHERE person_id=? AND archived_revision IS NULL ORDER BY rowid').all(personId)
+        .map(row=>({id:String(row.id),content:String(row.content),sourceMessageId:String(row.source_message_id),sourceType:row.source_type as ProfileFact['sourceType'],purpose:row.purpose as 'profile'|'memory'})) : [];
     return {personId,baseVersion,facts:facts.filter(f=>!f.expiresAt||f.expiresAt>at),pending};
   }
   profileForActors(currentActorId:string,mentionedActorIds:readonly string[]=[]): PersonProfile[] {
     const people=new Set([currentActorId,...mentionedActorIds].map(id=>this.personForActor(id)).filter((id):id is string=>id!==undefined));
     return [...people].map(id=>this.profile(id));
+  }
+  roomRules(conversationId:string): {key:string;content:string}[] {
+    if(this.roomType(conversationId)!=='group') return [];
+    return this.db.prepare(`SELECT rule_key,content FROM room_rule_revisions v WHERE conversation_id=?
+      AND revision=(SELECT max(revision) FROM room_rule_revisions n WHERE n.conversation_id=v.conversation_id AND n.rule_key=v.rule_key)
+      ORDER BY created_at,rule_key`).all(conversationId).map(r=>({key:String(r.rule_key),content:String(r.content)}));
   }
   taskInput(job:AutoMemoryJob): AutoMemoryTaskInput {
     if(!job.leaseToken) throw new Error('整理任务尚未领取。');
@@ -255,24 +310,52 @@ export class AutoMemoryStore {
     if(row.input_json!==null) return {...parse<AutoMemoryTaskInput>(row.input_json),job:this.job(row)};
     const canonical=this.job(row); const messages=this.messages(canonical.messageIds); const cp=this.checkpoint(canonical.conversationId);
     const people=new Set(messages.flatMap(m=>m.personId?[m.personId]:[]));
-    const profiles=[...people].map(p=>this.profile(p));
-    const profileSources=this.messages([...new Set(profiles.flatMap(p=>(p.pending??[]).map(item=>item.sourceMessageId)))]);
-    const input:AutoMemoryTaskInput={profileSources,job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
+    for (const pending of this.db.prepare(`SELECT DISTINCT p.person_id FROM person_profile_pending p
+      JOIN messages source ON source.id=p.source_message_id
+      WHERE source.conversation_id=? AND source.ingest_seq<=? AND p.archived_revision IS NULL`)
+      .all(canonical.conversationId,canonical.endSeq)) people.add(String(pending.person_id));
+    const localMemoryPending = new Set(this.db.prepare(`SELECT p.id FROM person_profile_pending p JOIN messages source ON source.id=p.source_message_id
+      WHERE p.archived_revision IS NULL AND p.purpose='memory' AND source.conversation_id=?`).all(canonical.conversationId).map(row => String(row.id)));
+    const profiles=[...people].map(p=>{
+      const profile=this.profile(p);
+      return {...profile,pending:(profile.pending??[]).filter(item=>item.purpose!=='memory'||localMemoryPending.has(item.id))};
+    });
+    const profileFragments: NonNullable<AutoMemoryTaskInput['profileFragments']> = [];
+    let fragmentBytes = 0;
+    for (const personId of people) for (const fragment of this.db.prepare(`SELECT id,content,source_type FROM person_fragments
+      WHERE person_id=? ORDER BY rowid DESC LIMIT 200`).all(personId)) {
+      const item = { personId, content: String(fragment.content), sourceType: fragment.source_type as ProfileFact['sourceType'],
+        messageIds: this.db.prepare('SELECT message_id FROM person_fragment_messages WHERE fragment_id=? ORDER BY message_id')
+          .all(String(fragment.id)).map(row => String(row.message_id)) };
+      const bytes = Buffer.byteLength(JSON.stringify(item));
+      if (fragmentBytes + bytes > 12000) continue;
+      fragmentBytes += bytes; profileFragments.push(item);
+    }
+    const profileSources=this.messages([...new Set([...profiles.flatMap(p=>(p.pending??[]).map(item=>item.sourceMessageId)),
+      ...profiles.flatMap(profile => profile.facts.flatMap(fact => fact.messageIds)),
+      ...profileFragments.flatMap(fragment => fragment.messageIds)])]);
+    const input:AutoMemoryTaskInput={profileSources,profileFragments,roomRules:this.roomRules(canonical.conversationId),job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
     this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
     return input;
   }
-  addProfilePending(personId:string,sourceMessageId:string,content:string,sourceType:ProfileFact['sourceType']='third_party'): void {
+  addProfilePending(personId:string,sourceMessageId:string,content:string,sourceType:ProfileFact['sourceType']='third_party',
+    options: { allowThirdParty?: boolean; purpose?: 'profile'|'memory' } = {}): void {
     if(typeof content!=='string'||!content.trim()||[...content].length>4000||!['self','third_party','inference'].includes(sourceType)) throw new MemoryError('待整理人物内容无效。');
     this.atomic(()=>{
-      const source=this.db.prepare("SELECT actor_id FROM messages WHERE id=? AND role='user' AND actor_id IS NOT NULL").get(sourceMessageId);
-      if(!source||this.personForActor(String(source.actor_id))!==personId) throw new MemoryError('待整理资料必须属于实际发送者。');
+      const source=this.db.prepare("SELECT actor_id,conversation_id FROM messages WHERE id=? AND role='user' AND actor_id IS NOT NULL").get(sourceMessageId);
+      const purpose=options.purpose??'profile';
+      if (!['profile','memory'].includes(purpose)) throw new MemoryError('待整理资料用途无效。');
+      const samePerson = source && this.personForActor(String(source.actor_id))===personId;
+      const sameRoom = source && this.db.prepare(`SELECT a.id FROM actors a JOIN actor_person_bindings b ON b.actor_id=a.id
+        JOIN conversations c ON c.room_id=a.room_id WHERE c.id=? AND b.person_id=? LIMIT 1`).get(String(source.conversation_id),personId);
+      if(!source||(!samePerson&&!(options.allowThirdParty===true&&sourceType==='third_party'&&sameRoom))) throw new MemoryError('待整理资料必须属于实际发送者或同房间明确第三方。');
       const profile=this.profile(personId);
-      if((profile.pending??[]).some(item=>item.sourceMessageId===sourceMessageId&&item.content===content&&item.sourceType===sourceType)) return;
+      if((profile.pending??[]).some(item=>item.sourceMessageId===sourceMessageId&&item.content===content&&item.sourceType===sourceType&&(item.purpose??'profile')===purpose)) return;
       const pending=profile.pending??[];
       if(pending.length>=100||pending.reduce((bytes,item)=>bytes+Buffer.byteLength(item.content),0)+Buffer.byteLength(content)>12000
         ||Buffer.byteLength(JSON.stringify({personId,baseVersion:profile.baseVersion,pending:[...pending,{id:randomUUID(),content,sourceMessageId,sourceType}]}))>20000) throw new MemoryError('待整理人物画像容量已满，请等待归档或缩短内容。');
-      this.db.prepare('INSERT INTO person_profile_pending(id,person_id,content,source_message_id,source_type,created_at) VALUES (?,?,?,?,?,?)')
-        .run(randomUUID(),personId,content,sourceMessageId,sourceType,timestamp());
+      this.db.prepare('INSERT INTO person_profile_pending(id,person_id,content,source_message_id,source_type,created_at,purpose) VALUES (?,?,?,?,?,?,?)')
+        .run(randomUUID(),personId,content,sourceMessageId,sourceType,timestamp(),purpose);
     });
   }
   updateExplicitProfile(personId:string,fact:ProfileFact,_previousMessageId?:string): void {
@@ -286,7 +369,7 @@ export class AutoMemoryStore {
   private writeProfile(profile:PersonProfile,jobId:string|null): void {
     const revision=profile.baseVersion+1;
     if(this.db.prepare('UPDATE persons SET revision=? WHERE id=? AND revision=?').run(revision,profile.personId,profile.baseVersion).changes!==1) throw new Error('人物画像版本冲突，请重读后重试。');
-    this.db.prepare('INSERT INTO person_profile_revisions VALUES (?,?,?,?,?)').run(profile.personId,revision,JSON.stringify(profile.facts),jobId,timestamp());
+    this.db.prepare('INSERT INTO person_profile_revisions VALUES (?,?,?,?,?)').run(profile.personId,revision,JSON.stringify(mergeProfileFacts(profile.facts)),jobId,timestamp());
   }
   private evidenceSequence(ids:readonly string[]):number {
     return ids.reduce((highest,id)=>Math.max(highest,Number(this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(id)?.ingest_seq??0)),0);
@@ -298,11 +381,16 @@ export class AutoMemoryStore {
       const first=this.db.prepare("SELECT id FROM auto_memory_jobs WHERE conversation_id=? AND status<>'done' ORDER BY rowid LIMIT 1").get(job.conversationId);
       if(first?.id!==jobId) throw new Error('同房间整理必须按批次顺序提交。');
       if(!Array.isArray(extract.topics)||!Array.isArray(extract.fragments)||!Array.isArray(extract.profiles)) throw new Error('整理产物结构无效。');
+      const sourceRooms = new Map([...input.messages,...(input.profileSources??[])].map(message=>[message.id,message.conversationId]));
+      const memoryPending = input.profiles.flatMap(profile => (profile.pending ?? []).filter(item => item.purpose === 'memory' && sourceRooms.get(item.sourceMessageId)===job.conversationId)
+        .map(item => ({ ...item, personId: profile.personId })));
       const evidence=(ids:string[],sourceType?:string,personId?:string)=>{
-        if(!Array.isArray(ids)||!ids.length||new Set(ids).size!==ids.length||ids.some(id=>!owned.has(id))) throw new Error('整理证据必须属于固定批次。');
+        const pendingSources = new Set(memoryPending.filter(item => personId === undefined || item.personId === personId).map(item => item.sourceMessageId));
+        const sources = new Map([...input.messages, ...(input.profileSources ?? []).filter(message => pendingSources.has(message.id))].map(message => [message.id,message]));
+        if(!Array.isArray(ids)||!ids.length||new Set(ids).size!==ids.length||ids.some(id=>!owned.has(id)&&!pendingSources.has(id))) throw new Error('整理证据必须属于固定批次或已捕获的长期事件。');
         if(sourceType!==undefined&&!['self','third_party','inference'].includes(sourceType)) throw new Error('证据类型无效。');
-        if(sourceType!==undefined&&ids.some(id=>!input.messages.some(m=>m.id===id&&m.role==='user'))) throw new Error('Bot回复不能作为人物事实的原始证据。');
-        if(sourceType==='self'&&ids.some(id=>input.messages.some(m=>m.id===id&&m.role==='user'&&m.personId!==personId))) throw new Error('自述证据身份不匹配。');
+        if(sourceType!==undefined&&ids.some(id=>sources.get(id)?.role!=='user')) throw new Error('Bot回复不能作为人物事实的原始证据。');
+        if(sourceType==='self'&&ids.some(id=>sources.get(id)?.personId!==personId)) throw new Error('自述证据身份不匹配。');
       };
       const content=(s:string)=>{if(typeof s!=='string'||!s.trim()||s.length>32000) throw new Error('整理正文无效。');};
       if(!Array.isArray(extract.ignoredMessageIds)||new Set(extract.ignoredMessageIds).size!==extract.ignoredMessageIds.length
@@ -313,6 +401,7 @@ export class AutoMemoryStore {
       else if(extract.continuationSummary!==undefined) throw new Error('群聊不能提交私聊续聊摘要。');
       const topicIds=extract.topics.map(topic=>{
         content(topic.summary);evidence(topic.messageIds);const id=randomUUID();
+        if (topic.messageIds.some(messageId=>sourceRooms.get(messageId)!==job.conversationId)) throw new Error('Topic来源必须属于当前会话。');
         this.db.prepare('INSERT INTO memory_topics(id,conversation_id,job_id,summary,content_hash,created_at) VALUES (?,?,?,?,?,?)').run(id,job.conversationId,jobId,topic.summary,hash(topic.summary),timestamp());
         topic.messageIds.forEach(messageId=>this.db.prepare('INSERT INTO memory_topic_messages VALUES (?,?)').run(id,messageId)); return id;
       });
@@ -321,8 +410,11 @@ export class AutoMemoryStore {
         content(fragment.content);evidence(fragment.messageIds,fragment.sourceType,fragment.personId);
         if(!input.profiles.some(p=>p.personId===fragment.personId)) throw new Error('人物片段目标不属于本批次人物。');
         if(fragment.topicIndex!==undefined&&(!Number.isSafeInteger(fragment.topicIndex)||!topicIds[fragment.topicIndex])) throw new Error('人物片段Topic关联无效。');
-        const id=randomUUID();this.db.prepare('INSERT INTO person_fragments VALUES (?,?,?,?,?,?,?)').run(id,fragment.personId,jobId,fragment.topicIndex===undefined?null:topicIds[fragment.topicIndex]!,fragment.content,fragment.sourceType,timestamp());
-        fragment.messageIds.forEach(messageId=>this.db.prepare('INSERT INTO person_fragment_messages VALUES (?,?)').run(id,messageId));
+        const existing = this.db.prepare('SELECT id,content FROM person_fragments WHERE person_id=? AND source_type=?')
+          .all(fragment.personId,fragment.sourceType).find(row => String(row.content).normalize('NFKC').trim() === fragment.content.normalize('NFKC').trim());
+        const id = existing ? String(existing.id) : randomUUID();
+        if (!existing) this.db.prepare('INSERT INTO person_fragments VALUES (?,?,?,?,?,?,?)').run(id,fragment.personId,jobId,fragment.topicIndex===undefined?null:topicIds[fragment.topicIndex]!,fragment.content,fragment.sourceType,timestamp());
+        fragment.messageIds.forEach(messageId=>this.db.prepare('INSERT OR IGNORE INTO person_fragment_messages VALUES (?,?)').run(id,messageId));
       }
       const updated=new Set<string>();
       for(const profile of extract.profiles) {
@@ -333,9 +425,14 @@ export class AutoMemoryStore {
           content(fact.content);
           if(!['self','third_party','inference'].includes(fact.sourceType)||!Array.isArray(fact.messageIds)) throw new Error('画像事实证据无效。');
           if(!baseline.facts.some(old=>sameFact(old,fact))) {
+            if (fact.messageIds.some(id => (baseline.pending ?? []).some(item => item.purpose === 'memory' && item.sourceMessageId === id)
+              && !(baseline.pending ?? []).some(item => item.purpose !== 'memory' && item.sourceMessageId === id))) throw new Error('长期事件待整理来源不能写入人物画像。');
             if(fact.field!==undefined) throw new Error('新画像事实不能输出旧分类字段。');
-            const captured=baseline.pending??[];
-            const allowed=new Map([...input.messages,...(input.profileSources??[]).filter(message=>captured.some(item=>item.sourceMessageId===message.id))].map(message=>[message.id,message]));
+            const captured=(baseline.pending??[]).filter(item => item.purpose !== 'memory');
+            const priorIds = new Set([...(input.profileFragments ?? []).filter(fragment => fragment.personId === profile.personId).flatMap(fragment => fragment.messageIds),
+              ...baseline.facts.filter(old => sameFactContent(old, fact)).flatMap(old => old.messageIds)]);
+            const allowed=new Map([...input.messages,...(input.profileSources??[]).filter(message=>captured.some(item=>item.sourceMessageId===message.id)||priorIds.has(message.id)),
+              ...this.messages([...priorIds])].map(message=>[message.id,message]));
             if(!fact.messageIds.length||new Set(fact.messageIds).size!==fact.messageIds.length
               ||fact.messageIds.some(id=>!allowed.has(id)||allowed.get(id)!.role!=='user')
               ||(fact.sourceType==='self'&&fact.messageIds.some(id=>allowed.get(id)!.personId!==profile.personId))) throw new Error('人物画像必须引用有效真人来源，且自述必须属于本人。');
@@ -348,12 +445,36 @@ export class AutoMemoryStore {
         for(const id of pendingIds) {
           const captured=baseline.pending?.find(item=>item.id===id);
           const live=current.pending?.find(item=>item.id===id);
-          if(!captured||!live||JSON.stringify(captured)!==JSON.stringify(live)
+          if(!captured||captured.purpose==='memory'||!live||!samePending(captured,live)
             ||!profile.facts.some(fact=>fact.messageIds.includes(captured.sourceMessageId))) throw new Error('只能归档已捕获且保留来源的待整理人物资料。');
         }
         this.writeProfile(profile,jobId);
         for(const id of pendingIds) this.db.prepare('UPDATE person_profile_pending SET archived_revision=?,archived_at=? WHERE id=? AND person_id=? AND archived_revision IS NULL')
           .run(profile.baseVersion+1,timestamp(),id,profile.personId);
+      }
+      const memoryPeople = new Set<string>();
+      if (extract.memoryPending !== undefined && !Array.isArray(extract.memoryPending)) throw new Error('长期事件归档列表无效。');
+      for (const archive of extract.memoryPending ?? []) {
+        const baseline = input.profiles.find(profile => profile.personId === archive.personId);
+        if (!baseline || memoryPeople.has(archive.personId) || !Array.isArray(archive.pendingIds)
+          || new Set(archive.pendingIds).size !== archive.pendingIds.length) throw new Error('长期事件归档身份或ID无效。');
+        memoryPeople.add(archive.personId);
+        let current = this.profile(archive.personId);
+        for (const id of archive.pendingIds) {
+          const captured = baseline.pending?.find(item => item.id === id && item.purpose === 'memory');
+          const live = current.pending?.find(item => item.id === id);
+          if (!captured || sourceRooms.get(captured.sourceMessageId)!==job.conversationId || !live || !samePending(captured,live)
+            || !extract.fragments.some(fragment => fragment.personId===archive.personId && fragment.messageIds.includes(captured.sourceMessageId))) {
+            throw new Error('长期事件归档必须保留已捕获原子片段来源。');
+          }
+        }
+        if (!archive.pendingIds.length) continue;
+        if (!updated.has(archive.personId)) {
+          if (current.baseVersion!==baseline.baseVersion || JSON.stringify(current.facts)!==JSON.stringify(baseline.facts)) throw new Error('人物画像版本冲突，请重读后重试。');
+          this.writeProfile(current,jobId); current = this.profile(archive.personId);
+        }
+        for (const id of archive.pendingIds) this.db.prepare('UPDATE person_profile_pending SET archived_revision=?,archived_at=? WHERE id=? AND person_id=? AND archived_revision IS NULL')
+          .run(current.baseVersion,timestamp(),id,archive.personId);
       }
       if (extract.selfProfile !== undefined) {
         if (input.selfProfile === undefined) throw new Error('自我档案产物缺少已捕获的输入快照。');
@@ -433,7 +554,23 @@ export class AutoMemoryStore {
       ||!Number.isSafeInteger(limit)||limit<1) throw new Error('Topic向量配置无效。');
     return this.db.prepare(`SELECT t.* FROM memory_topics t LEFT JOIN topic_embeddings e ON e.topic_id=t.id WHERE t.conversation_id=?
       AND (e.topic_id IS NULL OR e.content_hash<>t.content_hash OR e.topic_version<>t.version OR e.model<>? OR e.dimensions<>? OR e.input_version<>?)
-      ORDER BY t.rowid LIMIT ?`).all(conversationId,meta.model,meta.dimensions,meta.inputVersion,limit).map(r=>this.topic(r));
+      AND NOT EXISTS(SELECT 1 FROM topic_embedding_attempts a WHERE a.topic_id=t.id AND a.model=? AND a.dimensions=?
+        AND a.input_version=? AND a.topic_version=t.version AND a.content_hash=t.content_hash)
+      ORDER BY t.rowid LIMIT ?`).all(conversationId,meta.model,meta.dimensions,meta.inputVersion,meta.model,meta.dimensions,meta.inputVersion,limit).map(r=>this.topic(r));
+  }
+  beginTopicEmbedding(topic: TopicRecord, meta: {model:string;dimensions:number;inputVersion:number}): boolean {
+    return this.db.prepare(`INSERT INTO topic_embedding_attempts VALUES (?,?,?,?,?,?,NULL,?) ON CONFLICT(topic_id) DO UPDATE SET
+      model=excluded.model,dimensions=excluded.dimensions,input_version=excluded.input_version,topic_version=excluded.topic_version,
+      content_hash=excluded.content_hash,error=NULL,created_at=excluded.created_at
+      WHERE model<>excluded.model OR dimensions<>excluded.dimensions OR input_version<>excluded.input_version
+        OR topic_version<>excluded.topic_version OR content_hash<>excluded.content_hash`)
+      .run(topic.id,meta.model,meta.dimensions,meta.inputVersion,topic.version,topic.contentHash,timestamp()).changes === 1;
+  }
+  failTopicEmbedding(topicId: string, diagnostic: string): void {
+    this.db.prepare('UPDATE topic_embedding_attempts SET error=? WHERE topic_id=?').run(diagnostic,topicId);
+  }
+  retryTopicEmbedding(topicId: string): void {
+    this.db.prepare('DELETE FROM topic_embedding_attempts WHERE topic_id=?').run(topicId);
   }
   private vector(vector:number[],dimensions:number):void {
     if(!Number.isSafeInteger(dimensions)||dimensions<1||!Array.isArray(vector)||vector.length!==dimensions||vector.some(v=>!Number.isFinite(v))||!vector.some(v=>v!==0)) throw new Error('Topic向量维度或数值无效。');
@@ -447,6 +584,7 @@ export class AutoMemoryStore {
       this.db.prepare(`INSERT INTO topic_embeddings VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(topic_id) DO UPDATE SET model=excluded.model,dimensions=excluded.dimensions,
         input_version=excluded.input_version,topic_version=excluded.topic_version,content_hash=excluded.content_hash,vector_json=excluded.vector_json,updated_at=excluded.updated_at`)
         .run(topicId,embedding.model,embedding.dimensions,embedding.inputVersion,embedding.topicVersion,embedding.contentHash,JSON.stringify(embedding.vector),timestamp());
+      this.db.prepare('DELETE FROM topic_embedding_attempts WHERE topic_id=?').run(topicId);
     });
   }
   searchTopics(conversationId:string,query:TopicSearch): {status:'ready'|'unavailable';topics:(TopicRecord&{score:number})[]} {
@@ -459,5 +597,38 @@ export class AutoMemoryStore {
     const topics=rows.map(r=>{const vector=parse<number[]>(r.vector_json);this.vector(vector,query.dimensions);
       return {...this.topic(r),score:vector.reduce((sum,value,i)=>sum+value*query.vector[i]!,0)/(Math.hypot(...vector)*norm)};}).sort((a,b)=>b.score-a.score).slice(0,limit);
     return {status:rows.length?'ready':'unavailable',topics};
+  }
+  searchTopicsHybrid(conversationId: string, query: { text: string; embedding?: TopicSearch; limit?: number }):
+    { status: 'ready'; topics: (TopicRecord & { score: number })[] } {
+    const limit = query.limit ?? 5;
+    if (typeof query.text !== 'string' || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('Topic查询参数无效。');
+    const candidates = Math.min(100, Math.max(20, limit * 4));
+    const words = [...new Set(memoryWords(query.text.slice(0, 8000)))].slice(0, 64);
+    const match = words.map(word => `"${word.replaceAll('"', '""')}"`).join(' OR ');
+    // Filter both candidate lists by conversation before either is limited or fused.
+    const lexical = match ? this.db.prepare(`SELECT t.*,bm25(memory_topic_fts) AS lexical_score
+      FROM memory_topic_fts JOIN memory_topics t ON t.id=memory_topic_fts.topic_id
+      WHERE t.conversation_id=? AND memory_topic_fts MATCH ?
+      ORDER BY lexical_score,t.id LIMIT ?`).all(conversationId,match,candidates).map(row => this.topic(row)) : [];
+    const semantic = query.embedding ? this.searchTopics(conversationId, { ...query.embedding, limit: candidates }).topics : [];
+    const fused = new Map<string, TopicRecord & { score: number }>();
+    for (const list of [lexical, semantic]) list.forEach((topic, index) => {
+      const existing = fused.get(topic.id);
+      const score = (existing?.score ?? 0) + 1 / (60 + index + 1);
+      fused.set(topic.id, { ...topic, score });
+    });
+    const topics = [...fused.values()].sort((a,b) => b.score-a.score || a.id.localeCompare(b.id)).slice(0,limit).map(topic => {
+      const facts = this.db.prepare(`SELECT DISTINCT f.id,f.person_id,f.content,f.source_type FROM person_fragments f
+        JOIN person_fragment_messages fm ON fm.fragment_id=f.id JOIN memory_topic_messages tm ON tm.message_id=fm.message_id
+        JOIN memory_topics scoped ON scoped.id=tm.topic_id WHERE scoped.id=? AND scoped.conversation_id=?
+        ORDER BY f.created_at DESC,f.id LIMIT 5`).all(topic.id,conversationId).map(row => ({
+          personId: String(row.person_id), content: String(row.content), sourceType: row.source_type as ProfileFact['sourceType'],
+          messageIds: this.db.prepare(`SELECT fm.message_id FROM person_fragment_messages fm
+            JOIN memory_topic_messages tm ON tm.message_id=fm.message_id WHERE fm.fragment_id=? AND tm.topic_id=? ORDER BY fm.message_id`)
+            .all(String(row.id),topic.id).map(message => String(message.message_id)),
+        }));
+      return { ...topic, facts };
+    });
+    return { status: 'ready', topics };
   }
 }

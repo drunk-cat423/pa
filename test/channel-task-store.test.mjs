@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
+import { downgradeSchema11 } from './fixtures/legacy-schema.mjs';
 
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'pa-channel-task-'));
@@ -226,7 +227,7 @@ test('真实v9迁移先备份，保留原文、已确认分段和旧canonical运
   f.store.ackDeliveryPart(f.conversation.id, result.deliveryId, 0, 'sent', 'old-external');
   const pendingRun = f.store.beginRun(f.other.id, 'canonical进行中', 'p', 'm', [], { eventId: 'unfinished', senderId: 'alice', modelInputText: 'canonical进行中' });
   f.store.close();
-  f.inspect(db => db.exec(`
+  f.inspect(db => { downgradeSchema11(db); db.exec(`
     DROP TABLE channel_tasks; DROP INDEX message_conversation_identity;
     DROP INDEX one_running_run_per_session; DROP INDEX one_running_run_per_conversation;
     ALTER TABLE agent_runs DROP COLUMN pi_session_file;
@@ -234,7 +235,7 @@ test('真实v9迁移先备份，保留原文、已确认分段和旧canonical运
     ALTER TABLE delivery_parts DROP COLUMN delivery_mode; ALTER TABLE delivery_parts DROP COLUMN reply_slot;
     ALTER TABLE run_progress DROP COLUMN delivery_mode; ALTER TABLE run_progress DROP COLUMN reply_slot;
     PRAGMA user_version=9;
-  `));
+  `); });
   f.reopen();
   const backups = readdirSync(f.directory).filter(name => name.includes('.v9.') && name.endsWith('.bak'));
   assert.equal(backups.length, 1);
@@ -245,7 +246,7 @@ test('真实v9迁移先备份，保留原文、已确认分段和旧canonical运
     assert.deepEqual(backup.prepare('PRAGMA foreign_key_check').all(), []);
     assert.equal(backup.prepare("SELECT name FROM pragma_table_info('agent_runs') WHERE name='pi_session_file'").get(), undefined);
   } finally { backup.close(); }
-  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 10);
+  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 12);
   assert.deepEqual(f.store.unfinishedRuns(f.other.id), [pendingRun]);
   assert.equal(f.store.quotedMessage(f.conversation.id, 'old-external').text, '原有已发送文本');
   assert.equal(f.inspect(db => db.prepare('SELECT text FROM messages WHERE id=?').get(result.messageId).text), '**原始答案**');

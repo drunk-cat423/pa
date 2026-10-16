@@ -11,7 +11,7 @@ export interface ProfileFact {
   occurredAt?: string | null;
   expiresAt?: string | null;
 }
-export interface PersonProfilePending { id: string; content: string; sourceMessageId: string; sourceType: EvidenceType }
+export interface PersonProfilePending { id: string; content: string; sourceMessageId: string; sourceType: EvidenceType; purpose?: 'profile' | 'memory' }
 export interface PersonProfile {
   personId: string; baseVersion: number; facts: ProfileFact[];
   pending?: PersonProfilePending[];
@@ -32,17 +32,21 @@ export interface AutoMemoryTaskInput {
   previousSummary?: string; profiles: PersonProfile[]; selfProfile?: SelfProfileSnapshot;
   selfProfileBudgetBytes?: number;
   profileSources?: AutoMemoryMessage[];
+  profileFragments?: { personId: string; content: string; sourceType: EvidenceType; messageIds: string[] }[];
+  roomRules?: readonly { key: string; content: string }[];
 }
 export interface ValidatedExtract {
   ignoredMessageIds: string[];
   topics: { summary: string; messageIds: string[] }[];
   fragments: { personId: string; content: string; sourceType: EvidenceType; messageIds: string[]; topicIndex?: number }[];
   profiles: PersonProfile[];
+  memoryPending?: { personId: string; pendingIds: string[] }[];
   continuationSummary?: string;
   selfProfile?: SelfProfileProposal;
 }
 export interface TopicRecord {
   id: string; conversationId: string; jobId: string; summary: string; version: number; contentHash: string; messageIds: string[];
+  facts?: { personId: string; content: string; sourceType: EvidenceType; messageIds: string[] }[];
 }
 export interface TopicEmbedding {
   model: string; dimensions: number; inputVersion: number; topicVersion: number; contentHash: string; vector: number[];
