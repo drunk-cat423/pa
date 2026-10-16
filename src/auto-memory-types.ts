@@ -25,6 +25,7 @@ export interface PersonProfile {
 }
 export interface AutoMemoryMessage {
   id: string; conversationId: string; actorId?: string; personId?: string;
+  contextSeq?: number; senderId?: string; senderName?: string; replyToSenderId?: string; replyToMessageId?: string;
   role: 'user' | 'assistant'; text: string; ingestSeq: number; createdAt: string; sentAt?: string;
   runStatus?: string; deliveryStatus?: string; turnInputSeq?: number;
 }
@@ -34,6 +35,7 @@ export interface AutoMemoryJob {
   leaseToken?: string; leaseOwner?: string; leaseUntil?: number; error?: string;
 }
 export interface AutoMemoryTaskInput {
+  contextProtocol?: 1;
   profileProtocol?: 2;
   mode?: 'messages' | 'profiles';
   job: AutoMemoryJob; roomType: 'private' | 'group'; messages: AutoMemoryMessage[];

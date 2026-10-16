@@ -23,7 +23,7 @@ async function fixture(t, mode = 'success') {
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); requests.push(body);
     const input = JSON.parse(body.messages.findLast(message => message.role === 'user').content);
-    const output = { topics: [], fragments: [], profiles: [],
+    const output = { ...(input.contextProtocol===1?{continuationSummary:"继续对话"}:{}), topics: [], fragments: [], profiles: [],
       ignoredMessageIds: mode === 'coverage' ? [] : input.messages.filter(message => message.role === 'user').map(message => message.id),
       ...(input.selfProfile ? { selfProfile: { baseVersion: input.selfProfile.baseVersion,
         content: input.selfProfile.content, sourceMessageIds: input.selfProfile.sourceMessageIds, pendingIds: [] } } : {}) };
@@ -103,7 +103,7 @@ for (const failure of ['validate', 'commit']) test(`worker ${failure} failure ke
 test('paused background and injected fake providers preserve scheduling while only real SDK calls create call records', async t => {
   const f = await fixture(t); let calls = 0;
   const provider = { extract: async input => {
-    calls++; return { topics: [], fragments: [], profiles: [], ignoredMessageIds: input.messages.map(message => message.id) };
+    calls++; return { continuationSummary:"继续对话", topics: [], fragments: [], profiles: [], ignoredMessageIds: input.messages.map(message => message.id) };
   } };
   const paused = f.worker({ memory: { ...f.config.memory, enabled: false } }, provider);
   paused.start('capacity'); await paused.close(); assert.equal(calls, 0); assert.equal(f.requests.length, 0);

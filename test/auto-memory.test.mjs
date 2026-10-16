@@ -11,6 +11,7 @@ import { BackgroundMemory, validateExtract } from '../dist/auto-memory.js';
 import { ConversationStore } from '../dist/store.js';
 import { estimateContext } from '../dist/runtime.js';
 import { MemoryInputTooLargeError } from '../dist/memory-provider.js';
+import { conversationContext } from './fixtures/conversation-context.mjs';
 
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 function wait(signal, gate) {
@@ -27,7 +28,8 @@ function extracted(input) {
   const ids = input.messages.filter(message => message.role === 'user').map(message => message.id);
   return { topics: ids.length ? [{ summary: '本批讨论了测试计划。', messageIds: ids }] : [],
     fragments: [], profiles: [], ignoredMessageIds: [],
-    ...(input.roomType === 'private' ? { continuationSummary: '已经讨论测试计划，下一步继续执行。' } : {}) };
+    ...(input.roomType === 'private' || input.contextProtocol === 1
+      ? { continuationSummary: '已经讨论测试计划，下一步继续执行。' } : {}) };
 }
 
 function currentMessageText(body) {
@@ -44,12 +46,6 @@ function backgroundPayload(body) {
     return content.includes('已保存的候选背景数据');
   });
   assert.ok(message, 'request should carry its bounded background payload');
-  const content = typeof message.content === 'string' ? message.content : message.content.map(part => part.text ?? '').join('');
-  return JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
-}
-
-function currentTurnInput(body) {
-  const message = body.messages.filter(item => item.role === 'user').at(-1);
   const content = typeof message.content === 'string' ? message.content : message.content.map(part => part.text ?? '').join('');
   return JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
 }
@@ -128,6 +124,18 @@ async function fixture(t, extract = async input => extracted(input), overrides =
     await rm(directory, { recursive: true, force: true });
   });
   return { config, route, other, privateRoute, requests, sent, inputs, harness, message, chatGate, chatStarted,
+    reserveCapacity(route) {
+      const db = new DatabaseSync(join(config.dataDir, 'pa.sqlite'));
+      let conversationId;
+      try {
+        conversationId = db.prepare(`SELECT c.id FROM conversations c JOIN rooms r ON r.id=c.room_id
+          WHERE r.channel=? AND r.account=? AND r.external_chat_id=? AND r.room_type=?`)
+          .get(route.channel, route.accountId, route.roomId, route.roomType).id;
+      } finally { db.close(); }
+      const store = new ConversationStore(join(config.dataDir, 'pa.sqlite'));
+      try { return store.autoMemory.reserveBatch(conversationId, 'capacity'); }
+      finally { store.close(); }
+    },
     retryFailed: () => {
       const store = new ConversationStore(join(config.dataDir, 'pa.sqlite'));
       try { for (const job of store.autoMemory.listJobs()) if (job.status === 'failed') store.autoMemory.retry(job.id); }
@@ -136,22 +144,26 @@ async function fixture(t, extract = async input => extracted(input), overrides =
     db: () => new DatabaseSync(join(config.dataDir, 'pa.sqlite')) };
 }
 
-test('第50条固定批次后台等待时，新提问仍完成；第51条归下一批', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, async (input, signal) => { started.resolve(); await wait(signal, gate.promise); return extracted(input); });
+test('群消息超过60条也不按消息数自动压缩', async t => {
+  const f = await fixture(t);
   const h = f.harness();
-  for (let i = 1; i <= 49; i++) await h.handle(f.message(`m${i}`, `消息${i}`));
+  for (let i = 1; i <= 61; i++) await h.handle(f.message(`g${i}`, `群消息${i}`));
+  await h.waitForMemory();
   assert.equal(f.inputs.length, 0);
-  await h.handle(f.message('m50', '消息50')); await started.promise;
-  assert.equal(await h.handle(f.message('m51', '此时仍可回答吗', { mentioned: true })), 'sent');
-  assert.equal(f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length, 1);
-  assert.equal(f.requests.length, 2);
-  assert.equal(f.inputs[0].messages.filter(m => m.role === 'user').length, 50);
-  assert.ok(!f.inputs[0].messages.some(m => m.text === '此时仍可回答吗'));
-  gate.resolve(); await h.waitForMemory();
-  assert.equal(h.info().memory[0].completed, 1);
+  assert.equal(h.info().memory.reduce((sum, item) => sum + item.completed, 0), 0);
   const db = f.db();
-  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE role='user'").get().n, 51); }
+  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE role='user'").get().n, 61); }
+  finally { db.close(); }
+});
+
+test('私聊完成50轮且容量较低时不按轮数自动压缩', { timeout: 60_000 }, async t => {
+  const f = await fixture(t); const h = f.harness();
+  for (let i = 1; i <= 50; i++) assert.equal(await h.handle(f.message(`p${i}`, `私聊第${i}轮`, { route: f.privateRoute })), 'sent');
+  await h.waitForMemory();
+  assert.equal(f.inputs.length, 0);
+  assert.equal(h.info().memory.find(item => item.conversation === channelConversationKey(f.privateRoute)).completed, 0);
+  const db = f.db();
+  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages m JOIN conversations c ON c.id=m.conversation_id JOIN rooms r ON r.id=c.room_id WHERE m.role='user' AND r.room_type='private'").get().n, 50); }
   finally { db.close(); }
 });
 
@@ -169,48 +181,40 @@ test('聊天阻塞时继续入站持久化，不同房间仍能回复，同房�
   assert.doesNotMatch(JSON.stringify(f.requests[0]), /排队的问题|后台观察/);
 });
 
-test('私聊完整50轮后压缩，下一轮使用摘要与新问题；原文保留并可重开', async t => {
-  const f = await fixture(t); const h = f.harness();
-  for (let i = 1; i <= 50; i++) assert.equal(await h.handle(f.message(`p${i}`, `私聊第${i}轮`, { route: f.privateRoute })), 'sent');
-  await h.waitForMemory();
-  assert.equal(f.inputs.length, 1);
-  assert.equal(f.inputs[0].messages.filter(m => m.role === 'user').length, 50);
-  assert.match(JSON.stringify(f.requests.filter(request=>request.messages.at(-1)?.role==='tool')[48]), /私聊第1轮/);
-  assert.equal(await h.handle(f.message('p51', '新的问题', { route: f.privateRoute })), 'sent');
-  assert.match(JSON.stringify(f.requests.at(-1)), /已经讨论测试计划/);
-  assert.doesNotMatch(JSON.stringify(f.requests.at(-1)), /私聊第1轮/);
-  const db = f.db();
-  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE role='user'").get().n, 51); }
-  finally { db.close(); }
-  await h.close();
-  const reopened = f.harness();
-  assert.equal(await reopened.handle(f.message('p52', '重开后继续', { route: f.privateRoute })), 'sent');
-  assert.match(JSON.stringify(f.requests.at(-1)), /已经讨论测试计划/);
-  assert.equal(f.inputs.length, 1);
-});
-
-test('不足50轮到容量阈值仍整理，硬上限等待完成后重建请求', async t => {
+test('最终上下文达到85%才整理；摘要与检查点后消息跨新轮和重启继续', async t => {
   const gate = deferred(), started = deferred();
-  const f = await fixture(t, async (input, signal) => { started.resolve(); await wait(signal, gate.promise); return extracted(input); }, { contextWindow: 20000 });
+  let extractionStarted = false;
+  const f = await fixture(t, async (input, signal) => { extractionStarted = true; started.resolve(); await wait(signal, gate.promise); return extracted(input); }, { contextWindow: 20000 });
   const h = f.harness();
-  for (let i = 1; i <= 8; i++) {
-    const pending = h.handle(f.message(`capacity${i}`, `${i}:` + 'x'.repeat(3500), { route: f.privateRoute }));
-    const state = await Promise.race([pending.then(result => ({ result })), new Promise(resolve => setTimeout(() => resolve({ waiting: true }), 1500))]);
-    if (state.waiting) {
-      await started.promise; const before = f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length;
-      gate.resolve(); assert.equal(await pending, 'sent'); assert.equal(f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length, before + 1);
-      await h.waitForMemory(); assert.ok(f.inputs[0].messages.filter(m => m.role === 'user').length < 50); return;
-    }
+  let pending;
+  for (let i = 1; i <= 10 && !extractionStarted; i++) {
+    pending = h.handle(f.message(`capacity${i}`, `${i}:` + 'x'.repeat(3500), { route: f.privateRoute }));
+    const state = await Promise.race([pending.then(result => ({ result })), started.promise.then(() => ({ started: true }))]);
+    if (state.started) break;
     assert.equal(state.result, 'sent');
   }
-  const pending = h.handle(f.message('capacity9', '9:' + 'x'.repeat(3500), { route: f.privateRoute }));
+  assert.ok(extractionStarted, 'the measured final request should cross the 85% threshold');
   await started.promise;
   let finished = false; void pending.then(() => { finished = true; });
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.equal(finished, false);
   const before = f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length; gate.resolve();
   assert.equal(await pending, 'sent'); assert.equal(f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length, before + 1);
-  await h.waitForMemory(); assert.ok(f.inputs[0].messages.length < 100);
+  await h.waitForMemory(); assert.equal(f.inputs[0].contextProtocol, 1);
+  assert.equal(await h.handle(f.message('capacity-follow-up', 'CAPACITY_FOLLOW_UP', { route: f.privateRoute })), 'sent');
+  let context = conversationContext(f.requests.at(-1));
+  assert.equal(context.summary.continuationSummary, '已经讨论测试计划，下一步继续执行。');
+  assert.ok(context.summary.checkpoint > 0);
+  assert.equal(await h.handle(f.message('capacity-tail-check', 'CAPACITY_TAIL_CHECK', { route: f.privateRoute })), 'sent');
+  context = conversationContext(f.requests.at(-1));
+  assert.ok(context.messages.some(message => message.text === 'CAPACITY_FOLLOW_UP'));
+  await h.close();
+  const reopened = f.harness();
+  assert.equal(await reopened.handle(f.message('capacity-reopened', 'CAPACITY_AFTER_RESTART', { route: f.privateRoute })), 'sent');
+  context = conversationContext(f.requests.at(-1));
+  assert.equal(context.summary.continuationSummary, '已经讨论测试计划，下一步继续执行。');
+  assert.ok(context.messages.some(message => message.text === 'CAPACITY_FOLLOW_UP'));
+  assert.ok(!context.messages.some(message => message.text === 'CAPACITY_AFTER_RESTART'));
 });
 
 test('单条不可容纳输入不死循环，不发送超限模型请求', async t => {
@@ -230,7 +234,7 @@ test('仅发送者及真实@对象画像，绑定人物私聊自述可在群使�
   assert.ok(noAtInput.profiles.some(profile => profile.senderIds.includes('a')));
   assert.ok(!noAtInput.profiles.some(profile => profile.personId === 'person-b' || profile.senderIds.includes('b')));
   assert.ok(!JSON.stringify(noAtInput.profiles).includes('绘画'));
-  assert.ok(currentTurnInput(f.requests.at(-1)).recentGroupMessages
+  assert.ok(conversationContext(f.requests.at(-1)).messages
     .some(message => message.senderId === 'b' && message.text.includes('绘画')));
   assert.equal(await h.handle(f.message('ask-at', '和被提及的人玩什么', { mentioned: true, mentionedSenderIds: ['b', 'b'] })), 'sent');
   const mentionedProfiles = backgroundPayload(f.requests.at(-1)).profiles;
@@ -268,7 +272,7 @@ test('快速连发私聊独立计算，不将尚未完成的回复伪作历史',
   assert.match(input, /BLOCK_CHAT/); assert.doesNotMatch(input, /继续讨论/); assert.match(input, /继续上一轮/);
 });
 
-test('群聊容量批次整理保留原文且不创建群摘要', async t => {
+test('群容量压缩标记新协议、创建群摘要且数据库保留原文', async t => {
   const f = await fixture(t, undefined, { contextWindow: 32768 }); const h = f.harness();
   for (let i = 1; i <= 4; i++) await h.handle(f.message(`g${i}`, `${i}:` + 'g'.repeat(2000)));
   const store=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
@@ -279,11 +283,12 @@ test('群聊容量批次整理保留原文且不创建群摘要', async t => {
   await h.waitForMemory();
   assert.equal(await h.handle(f.message('g-question', '刚才群里讨论了什么？', { mentioned: true })), 'sent');
   assert.equal(f.inputs[0].roomType, 'group'); assert.ok(f.inputs[0].messages.length < 50);
-  const recent = JSON.parse(f.requests.at(-1).messages.filter(message => message.role === 'user').at(-1).content
-    .map(part => part.text ?? '').join('').split('\n').at(-1)).recentGroupMessages;
-  assert.equal(recent.length, 4);
-  assert.ok(recent.every(message => message.text.includes('gggggggggg')));
-  assert.equal(h.info().memory[0].summary, undefined);
+  assert.ok(f.inputs.some(input => input.roomType === 'group' && input.contextProtocol === 1));
+  const db=f.db();
+  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE text LIKE '%gggggggggg%' AND role='user'").get().n, 4); }
+  finally { db.close(); }
+  const context=conversationContext(f.requests.at(-1));
+  assert.ok(context.summary.continuationSummary);
 });
 
 test('超大画像按预算选择完整事实，普通短问题仍可回答且数据库保留完整画像', async t => {
@@ -331,6 +336,7 @@ test('长批次拆分检查点在失败重试后续接，不重复已成功的�
   }, { memory: { enabled: true, maxCalls: 20, timeoutMs: 5000 } });
   const h = f.harness();
   for (let i = 0; i < 50; i++) await h.handle(f.message(`split-${i}`, `批次消息${i}`));
+  assert.ok(f.reserveCapacity(f.route)); h.start();
   await assert.rejects(h.waitForMemory(), /失败/);
   await h.close(); f.retryFailed();
   const next = f.harness(); await next.start(); await next.waitForMemory();
@@ -348,6 +354,7 @@ test('关闭中断的后台批次保留失败，只有显式重试后才继续�
   });
   const h = f.harness();
   for (let i = 0; i < 50; i++) await h.handle(f.message(`resume-${i}`, `继续${i}`));
+  assert.ok(f.reserveCapacity(f.route)); h.start();
   await started.promise; await h.close();
   const stopped = f.harness(); await stopped.start(); await assert.rejects(stopped.waitForMemory(), /失败/);
   assert.equal(calls,1); await stopped.close(); f.retryFailed();
@@ -374,6 +381,7 @@ test('后台提供完整旧画像并整体替换收敛结果，不再补回未�
     db.prepare('UPDATE persons SET revision=1 WHERE id=?').run(person);
     db.prepare('INSERT INTO person_profile_revisions VALUES (?,1,?,NULL,?)').run(person, JSON.stringify(facts), new Date().toISOString());
     for (let i = 1; i < 50; i++) await h.handle(f.message(`profile-${i}`, '天文记录'));
+    assert.ok(f.reserveCapacity(f.route)); h.start();
     await h.waitForMemory();
     const row = db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? ORDER BY revision DESC LIMIT 1').get(person);
     assert.equal(observedFacts, 200);
@@ -398,11 +406,11 @@ test('私聊实际请求标明搁置摘要缺口并保留其原文，暂停时�
     store.autoMemory.defer(job.id,'operator deferral');
   } finally {store.close();}
   await h.handle(f.message('private-gap-next','CURRENT_PRIVATE_QUESTION',{route:f.privateRoute}));
-  const input=currentTurnInput(f.requests.at(-1));
-  assert.deepEqual(input.deferredRanges,[{startSeq:job.startSeq,endSeq:job.endSeq}]);
-  assert.ok(input.history.some(message=>message.text==='PRIVATE_GAP_RAW'));
+  const context=conversationContext(f.requests.at(-1));
+  assert.deepEqual(context.summary.deferredRanges,[{startSeq:job.startSeq,endSeq:job.endSeq}]);
+  assert.ok(context.messages.some(message=>message.text==='PRIVATE_GAP_RAW'));
   const wire=JSON.stringify(f.requests.at(-1).messages);
-  assert.match(wire,/conversationSummary仅概括已完成部分，不能视为完整历史/);
+  assert.match(wire,/continuationSummary仅概括已完成部分，不能视为完整历史/);
   assert.equal(f.inputs.length,0);
 });
 
@@ -438,7 +446,8 @@ test('显式搁置不调模型；暂停与重启保留缺口，恢复调度只�
   assert.equal(enabled.info().failed,0);
   assert.equal(enabled.info().deferred,1);
   assert.equal(enabled.info().checkpoint,0);
-  assert.deepEqual(store.autoMemory.contextAfterCheckpoint(conversation.id).map(m=>m.id),first.messageIds);
+  const visibleIds = new Set(store.autoMemory.contextAfterCheckpoint(conversation.id).map(m=>m.id));
+  assert.ok(first.messageIds.every(id => visibleIds.has(id)));
   assert.throws(()=>store.autoMemory.retry(first.id),/搁置/);
 });
 
@@ -451,6 +460,7 @@ test('等待截止时间独立于后台工作结束，超时后后台可以继�
   const background = new BackgroundMemory({ memory: { enabled: true, maxCalls: 10, timeoutMs: 5000}, contextWindow: 100000 },
     store.autoMemory, conversation.id, { extract: async (input, signal) => { await wait(signal, gate.promise); return extracted(input); } });
   t.after(async () => { gate.resolve(); await background.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
+  assert.ok(store.autoMemory.reserveBatch(conversation.id, 'capacity'));
   background.start();
   await assert.rejects(background.wait(undefined, 30), /尚未完成/);
   assert.equal(store.autoMemory.status(conversation.id).running, 1);

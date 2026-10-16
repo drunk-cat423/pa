@@ -1,4 +1,17 @@
+export function downgradeSchema14(db) {
+  db.exec(`
+    PRAGMA foreign_keys=OFF;
+    DROP TRIGGER IF EXISTS context_inbound_insert;
+    DROP TRIGGER IF EXISTS context_delivery_sent;
+    DROP TABLE IF EXISTS auto_memory_context_job_messages;
+    DROP TABLE IF EXISTS auto_memory_context_jobs;
+    DROP TABLE IF EXISTS conversation_context_state;
+    DROP TABLE IF EXISTS conversation_context_messages;
+  `);
+}
+
 export function downgradeSchema11(db) {
+  downgradeSchema14(db);
   db.exec(`
     PRAGMA foreign_keys=OFF;
     DROP TABLE IF EXISTS person_profile_pending_results;

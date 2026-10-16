@@ -2,7 +2,13 @@
 
 SQLite pa.sqlite 保存权威原文、消息来源、运行和投递记录，以及记忆派生数据；Pi session.jsonl 保存模型上下文与审计条目。压缩仅改变活跃模型投影，原文保持完整。两者使用 run ID / Pi entry ID 对应，不能混合恢复不同时点的文件。
 
-## schema v14
+## schema v15
+
+v15增加可见消息序列 `conversation_context_messages`、滚动摘要状态 `conversation_context_state`，以及容量任务快照 `auto_memory_context_jobs` / `auto_memory_context_job_messages`。真人入站和AI确认送达时追加上下文序号；AI生成但未确认送达不进入历史，晚送达只追加。旧可见消息一次性回填；旧群聊没有续聊摘要时保留完整历史，不能因Topic已整理而消失。
+
+群聊和私聊复用continuationSummary；容量任务持久捕获消息边界、原摘要及版本。成功提交Topic、画像、滚动摘要与上下文水位在同一事务，失败不切换。`summaryCursor`表示最近成功快照覆盖到的位置，连续`checkpoint`不能跨越显式搁置的缺口；缺口原文另行保留并通过deferredRanges标记。旧冻结任务、输入、进度和历史水位保持原样，迁移先备份，不产生新的数量触发任务。
+
+## schema v14（历史升级）
 
 v14新增 `person_profile_pending_results` 与 `person_profile_revision_sources`。前者按批次/pending保存无正文处理状态、原文ID、内容哈希和画像revision，后者保留每版事实的来源关联；都没有级联删除。新提交中画像写入、处理回执和已处理active pending物理移除同事务完成，deferred保留正文。旧已归档pending、原始聊天、冻结输入和所有旧画像版本不清理；迁移仍先一致性备份。人物当前画像的总量限制及协议版本见 [记忆说明](memory.md)。
 
@@ -25,7 +31,9 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 | self_profile_revisions | AI全局自我画像及来源消息ID，内容或来源有变化时追加版本 |
 | self_profile_pending | 所有成员明确提出的AI画像建议、原消息ID、归档版本与时间；按来源幂等 |
 | self_profile_reclassifications | 旧AI画像待整理条目迁入原群规则的来源、目标规则版本、前后画像修订及时间；旧条目保留，活跃投影排除 |
-| auto_memory_checkpoints | 起始历史水位、连续成功位置、私聊续聊摘要及其来源任务 |
+| auto_memory_checkpoints | 旧批次起始水位、连续成功位置及摘要来源，保留兼容审计 |
+| conversation_context_messages / conversation_context_state | 持久可见消息顺序、当前滚动摘要及摘要覆盖位置、连续检查点和版本 |
+| auto_memory_context_jobs / auto_memory_context_job_messages | 容量压缩的原摘要版本、固定可见边界和全部消息成员 |
 | auto_memory_jobs / auto_memory_job_messages | 固定任务成员、状态、租约、输入快照和子批次进度 |
 | memory_topics / memory_topic_messages | Topic 正文、版本、hash 及全部原消息来源 |
 | person_fragments / person_fragment_messages | 人物片段、自述/转述/推断类型及消息来源 |
@@ -54,9 +62,9 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 
 ## 后台事务与检查点
 
-群聊按真人消息计数，私聊按成功且已确认发送的完整问答计数。任务固定消息 ID 和序号，已占用消息不再次计入新批次；不能用最大序号差值代替数量。
+群聊和私聊仅在最终上下文含输出预留达到实际窗口85%时创建容量批次，不按消息或问答数量自动触发。任务固定原摘要及版本、可见边界和全部待压缩消息ID；后台处理中到达的新消息或晚送达回复追加在边界之后，留到后续上下文，不改变本次快照。
 
-模型等待不持有写事务。提交事务同时验证租约、来源、人物版本和证据时序，并落地 Topic、人物片段、画像及私聊检查点。只有完整提交后才推进连续成功位置；向量执行逻辑已移除，历史表保留。
+模型等待不持有写事务。提交事务同时验证租约、来源、人物及摘要版本和证据时序，并落地Topic、人物片段、画像、会话摘要及检查点。只有完整提交后才切换摘要和推进连续成功位置；向量执行逻辑已移除，历史表保留。
 
 过长批次保存可恢复的子批次结果，显式重试续接已成功部分。画像冲突使旧提案失效，人工重试重新读取当前版本；普通失败不改写冻结输入。关闭中断、崩溃租约过期和未知调用均保留failed状态，需通过任务CLI明确重排，不静默重复付费。旧input/progress缺少purpose时按profile等价处理；包含个人memory协议时明确停止，不改写历史JSON。
 
@@ -64,7 +72,7 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 
 自我画像合并和pending归档属于同一记忆提交事务。任务捕获全局版本及待整理ID，模型只能归档该快照内保留来源的条目；并发新增不归档。不同房间使用全局版本检查解决冲突。模型结果与提交时当前pending一起检查完整结构容量，超限或版本冲突保留原数据并重读重试。旧版在途任务缺少selfProfile输入时继续原流程，不伪造自我画像提案。
 
-升级起始水位防止数量触发立即回填全部旧历史。当前请求因旧历史达到容量线时，可以按固定容量批次整理活跃历史；不在启动时对所有旧会话发起模型请求。
+升级保留旧任务和历史水位，不在启动时对所有旧会话发起模型请求。旧摘要先保留，原始可见历史也保守保留，直到新协议的完整容量快照成功后再切换；当前请求因旧历史达到容量线时才创建整理任务。
 
 ## 原文、纠正与上下文
 
@@ -72,7 +80,7 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 
 已使用的显式记忆被纠正或失效时，SQL 标记上下文待重置；通过 Pi appendContextEdit / refreshContext 持久化活跃投影后确认代次。SQL 与 Pi 不能跨文件原子提交，失败保持 pending 并在下一次打开时恢复。
 
-渠道会话每次按 SQL、当前画像、已生效摘要和 Topic 重建投影；后台不在聊天期间改写活动 Session。私聊模型摘要由应用保存，Pi 自带 compaction/branch_summary 仍不启用；导入包含这些条目的历史会按现有保护停止处理。
+渠道会话每次按SQL、当前画像、已生效会话摘要和Topic重建投影；后台不在聊天期间改写活动Session。群聊与私聊的滚动摘要均由应用保存，Pi自带compaction/branch_summary仍不启用；导入包含这些条目的历史会按现有保护停止处理。
 
 ## 备份和诊断
 

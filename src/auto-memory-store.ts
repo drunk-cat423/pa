@@ -132,6 +132,42 @@ export function migrateAutoMemory(db: DatabaseSync): void {
   store.syncExplicitProfiles();
 }
 
+/** Visibility order is independent of ingest order: a late delivery always appends. */
+export function migrateRollingContext(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE conversation_context_messages (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+      conversation_id TEXT NOT NULL REFERENCES conversations(id));
+    CREATE INDEX context_messages_room ON conversation_context_messages(conversation_id,seq);
+    INSERT INTO conversation_context_messages(message_id,conversation_id)
+      SELECT m.id,m.conversation_id FROM messages m
+      LEFT JOIN agent_runs r ON r.response_message_id=m.id LEFT JOIN deliveries d ON d.message_id=m.id
+      WHERE m.message_kind='chat' AND (m.role='user' OR (r.status='completed' AND d.status='sent'))
+      ORDER BY CASE WHEN m.role='assistant' THEN d.updated_at ELSE m.created_at END,m.ingest_seq;
+    CREATE TABLE conversation_context_state (
+      conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), cursor INTEGER NOT NULL DEFAULT 0,
+      completed_seq INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, summary TEXT);
+    -- A legacy summary may omit historical initial/deferred ranges. Keep every original
+    -- visible until the first complete rolling snapshot succeeds.
+    INSERT INTO conversation_context_state(conversation_id,summary)
+      SELECT conversation_id,summary FROM auto_memory_checkpoints;
+    CREATE TABLE auto_memory_context_jobs (
+      job_id TEXT PRIMARY KEY REFERENCES auto_memory_jobs(id), base_revision INTEGER NOT NULL,
+      start_cursor INTEGER NOT NULL, end_cursor INTEGER NOT NULL, previous_summary TEXT);
+    CREATE TABLE auto_memory_context_job_messages (
+      job_id TEXT NOT NULL REFERENCES auto_memory_jobs(id), message_id TEXT NOT NULL REFERENCES messages(id),
+      ordinal INTEGER NOT NULL, PRIMARY KEY(job_id,message_id));
+    CREATE TRIGGER context_inbound_insert AFTER INSERT ON messages WHEN NEW.role='user' AND NEW.message_kind='chat' BEGIN
+      INSERT INTO conversation_context_messages(message_id,conversation_id) VALUES(NEW.id,NEW.conversation_id);
+    END;
+    CREATE TRIGGER context_delivery_sent AFTER UPDATE OF status ON deliveries WHEN NEW.status='sent' BEGIN
+      INSERT OR IGNORE INTO conversation_context_messages(message_id,conversation_id)
+        SELECT m.id,m.conversation_id FROM messages m JOIN agent_runs r ON r.response_message_id=m.id
+        WHERE m.id=NEW.message_id AND m.message_kind='chat' AND r.status='completed';
+    END;
+  `);
+}
+
 export class AutoMemoryStore {
   readonly selfProfile: SelfProfileStore;
   constructor(private readonly db: DatabaseSync, private readonly transaction?: <T>(operation: () => T) => T) {
@@ -232,15 +268,58 @@ export class AutoMemoryStore {
     if(!row) throw new Error('会话不存在。'); return row.room_type as 'group'|'private';
   }
   private job(row: Record<string,unknown>): AutoMemoryJob {
+    const rolling=Boolean(this.db.prepare('SELECT 1 FROM auto_memory_context_jobs WHERE job_id=?').get(String(row.id)));
     return {id:String(row.id),conversationId:String(row.conversation_id),reason:row.reason as AutoMemoryReason,status:row.status as AutoMemoryJob['status'],
       startSeq:Number(row.start_seq),endSeq:Number(row.end_seq),attempts:Number(row.attempts),
-      messageIds:this.db.prepare('SELECT message_id FROM auto_memory_job_messages WHERE job_id=? ORDER BY ordinal').all(String(row.id)).map(m=>String(m.message_id)),
+      messageIds:this.db.prepare(`SELECT message_id FROM ${rolling?'auto_memory_context_job_messages':'auto_memory_job_messages'} WHERE job_id=? ORDER BY ordinal`).all(String(row.id)).map(m=>String(m.message_id)),
       ...(row.lease_token==null?{}:{leaseToken:String(row.lease_token),leaseOwner:String(row.lease_owner),leaseUntil:Number(row.lease_until)}),
       ...(row.error==null?{}:{error:String(row.error)})};
+  }
+  private contextState(conversationId:string): Record<string,unknown> {
+    this.checkpoint(conversationId);
+    this.db.prepare(`INSERT OR IGNORE INTO conversation_context_state(conversation_id,summary)
+      SELECT conversation_id,summary FROM auto_memory_checkpoints WHERE conversation_id=?`).run(conversationId);
+    return this.db.prepare('SELECT * FROM conversation_context_state WHERE conversation_id=?').get(conversationId)!;
+  }
+  private contextBoundary(conversationId:string,beforeMessageId?:string): number | undefined {
+    if(beforeMessageId===undefined) return undefined;
+    const row=this.db.prepare('SELECT seq FROM conversation_context_messages WHERE message_id=? AND conversation_id=?').get(beforeMessageId,conversationId);
+    if(!row) throw new Error('上下文边界消息必须属于当前会话且已可见。');
+    return Number(row.seq);
+  }
+  private deferredContextIds(conversationId:string): Set<string> {
+    return new Set(this.db.prepare(`SELECT message_id FROM auto_memory_job_messages jm
+      JOIN auto_memory_jobs j ON j.id=jm.job_id JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=?
+      UNION SELECT message_id FROM auto_memory_context_job_messages jm
+      JOIN auto_memory_jobs j ON j.id=jm.job_id JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=?`)
+      .all(conversationId,conversationId).map(row=>String(row.message_id)));
+  }
+  private reserveContextBatch(conversationId:string,beforeMessageId?:string): AutoMemoryJob | undefined {
+    const state=this.contextState(conversationId);
+    const boundary=this.contextBoundary(conversationId,beforeMessageId);
+    // A pending snapshot owns its whole immutable suffix. Repeated capacity signals
+    // cannot queue overlapping work or silently retry a failed/unknown call.
+    if(this.nextPending(conversationId)) return undefined;
+    const deferred=this.deferredContextIds(conversationId);
+    const rows=this.db.prepare(`SELECT seq,message_id FROM conversation_context_messages WHERE conversation_id=? AND seq>?
+      AND (? IS NULL OR seq<?) ORDER BY seq`).all(conversationId,Number(state.cursor),boundary??null,boundary??null);
+    const selected=rows.filter(row=>!deferred.has(String(row.message_id)));
+    if(!selected.length) return undefined;
+    const ids=selected.map(row=>String(row.message_id));
+    const messages=this.messages(ids); const id=randomUUID();
+    const start=messages.reduce((seq,message)=>Math.min(seq,message.ingestSeq),Infinity);
+    const end=messages.reduce((seq,message)=>Math.max(seq,message.ingestSeq),0);
+    this.db.prepare(`INSERT INTO auto_memory_jobs(id,conversation_id,reason,status,start_seq,end_seq,created_at) VALUES (?,?,'capacity','queued',?,?,?)`)
+      .run(id,conversationId,start,end,timestamp());
+    this.db.prepare('INSERT INTO auto_memory_context_jobs VALUES (?,?,?,?,?)')
+      .run(id,Number(state.revision),Number(state.cursor),Number(rows.at(-1)!.seq),state.summary==null?null:String(state.summary));
+    ids.forEach((messageId,index)=>this.db.prepare('INSERT INTO auto_memory_context_job_messages VALUES (?,?,?)').run(id,messageId,index));
+    return this.job(this.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(id)!);
   }
   reserveBatch(conversationId: string, reason: AutoMemoryReason, batchSize=50, excludeMessageId?: string): AutoMemoryJob | undefined {
     if(!['count','capacity'].includes(reason)||!Number.isSafeInteger(batchSize)||batchSize<1) throw new Error('整理批次参数无效。');
     return this.atomic(()=>{
+      if(reason==='capacity') return this.reserveContextBatch(conversationId,excludeMessageId);
       const checkpoint=this.checkpoint(conversationId); const roomType=this.roomType(conversationId);
       const before=excludeMessageId===undefined?undefined:this.db.prepare('SELECT ingest_seq FROM messages WHERE id=? AND conversation_id=?').get(excludeMessageId,conversationId);
       if(excludeMessageId!==undefined&&!before) throw new Error('整理边界消息必须属于当前会话。');
@@ -248,15 +327,10 @@ export class AutoMemoryStore {
         FROM messages m LEFT JOIN agent_runs r ON r.input_message_id=m.id LEFT JOIN messages response ON response.id=r.response_message_id
         LEFT JOIN deliveries d ON d.run_id=r.id WHERE m.conversation_id=? AND m.role='user' AND m.message_kind='chat' AND m.ingest_seq>?
         AND (? IS NULL OR m.ingest_seq<?) AND NOT EXISTS(SELECT 1 FROM auto_memory_job_messages assigned WHERE assigned.message_id=m.id)
-        ORDER BY m.ingest_seq`).all(conversationId,reason==='capacity'?0:Number(checkpoint.initial_seq),before?.ingest_seq??null,before?.ingest_seq??null);
+        ORDER BY m.ingest_seq`).all(conversationId,Number(checkpoint.initial_seq),before?.ingest_seq??null,before?.ingest_seq??null);
       const eligible=roomType==='group'?users:users.filter(r=>r.status==='completed'&&r.delivery_status==='sent');
       if(reason==='count'&&eligible.length<batchSize) return undefined;
       const selected=eligible.slice(0,batchSize);
-      // Capacity also owns terminal unsuccessful inputs; running or uncertain runs remain raw context.
-      if(reason==='capacity'&&roomType==='private') {
-        const end=selected.length?Number(selected[selected.length-1]!.ingest_seq):Infinity;
-        selected.push(...users.filter(r=>Number(r.ingest_seq)<=end&&(r.run_id==null||r.status==='failed'||r.status==='interrupted')));
-      }
       if(!selected.length) return undefined;
       const members=new Map<string,number>();
       for(const row of selected) {
@@ -298,11 +372,18 @@ export class AutoMemoryStore {
   }
   private messages(ids: readonly string[]): AutoMemoryMessage[] {
     return ids.map(id=>{
-      const r=this.db.prepare(`SELECT m.*,p.person_id,r.status AS run_status,d.status AS delivery_status,input.ingest_seq AS turn_input_seq FROM messages m
+      const r=this.db.prepare(`SELECT m.*,p.person_id,r.status AS run_status,d.status AS delivery_status,input.ingest_seq AS turn_input_seq,
+        context.seq AS context_seq,a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,r.input_message_id FROM messages m
         LEFT JOIN actor_person_bindings p ON p.actor_id=m.actor_id LEFT JOIN agent_runs r ON r.input_message_id=m.id OR r.response_message_id=m.id
-        LEFT JOIN messages input ON input.id=r.input_message_id LEFT JOIN deliveries d ON d.message_id=m.id WHERE m.id=?`).get(id)!;
+        LEFT JOIN messages input ON input.id=r.input_message_id LEFT JOIN deliveries d ON d.message_id=m.id
+        LEFT JOIN actors a ON a.id=m.actor_id LEFT JOIN actors inputa ON inputa.id=input.actor_id
+        LEFT JOIN conversation_context_messages context ON context.message_id=m.id WHERE m.id=?`).get(id)!;
       return {id:String(r.id),conversationId:String(r.conversation_id),role:r.role as 'user'|'assistant',text:String(r.text),ingestSeq:Number(r.ingest_seq),createdAt:String(r.created_at),
         ...(r.turn_input_seq==null?{}:{turnInputSeq:Number(r.turn_input_seq)}),
+        ...(r.context_seq==null?{}:{contextSeq:Number(r.context_seq)}),
+        ...(r.sender_id==null?{}:{senderId:String(r.sender_id)}),...(r.sender_name==null?{}:{senderName:String(r.sender_name)}),
+        ...(r.role!=='assistant'||r.input_message_id==null?{}:{replyToMessageId:String(r.input_message_id),
+          ...(r.reply_sender_id==null?{}:{replyToSenderId:String(r.reply_sender_id)})}),
         ...(r.actor_id==null?{}:{actorId:String(r.actor_id)}),...(r.person_id==null?{}:{personId:String(r.person_id)}),...(r.sent_at==null?{}:{sentAt:String(r.sent_at)}),
         ...(r.run_status==null?{}:{runStatus:String(r.run_status)}),...(r.delivery_status==null?{}:{deliveryStatus:String(r.delivery_status)})};
     });
@@ -333,6 +414,8 @@ export class AutoMemoryStore {
     const row=this.active(job.id,job.leaseToken);
     if(row.input_json!==null) return {...parse<AutoMemoryTaskInput>(row.input_json),job:this.job(row)};
     const canonical=this.job(row); const messages=this.messages(canonical.messageIds); const cp=this.checkpoint(canonical.conversationId);
+    const contextJob=this.db.prepare('SELECT * FROM auto_memory_context_jobs WHERE job_id=?').get(job.id);
+    const previousSummary=contextJob?contextJob.previous_summary:cp.summary;
     const people=new Set(messages.flatMap(m=>m.personId?[m.personId]:[]));
     for (const pending of this.db.prepare(`SELECT DISTINCT p.person_id FROM person_profile_pending p
       JOIN messages source ON source.id=p.source_message_id
@@ -364,7 +447,7 @@ export class AutoMemoryStore {
       ...profiles.flatMap(profile => profile.facts.flatMap(fact => fact.messageIds)),
       ...profileFragments.flatMap(fragment => fragment.messageIds)])]);
     const deferredRanges=this.deferredRanges(canonical.conversationId);
-    const input:AutoMemoryTaskInput={profileProtocol:2,profileSources,profileFragments,...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(cp.summary==null?{}:{previousSummary:String(cp.summary)})};
+    const input:AutoMemoryTaskInput={...(contextJob?{contextProtocol:1 as const}:{}),profileProtocol:2,profileSources,profileFragments,...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(previousSummary==null?{}:{previousSummary:String(previousSummary)})};
     this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
     return input;
   }
@@ -457,7 +540,7 @@ export class AutoMemoryStore {
         ||extract.ignoredMessageIds.some(id=>!input.messages.some(m=>m.id===id&&m.role==='user'))) throw new Error('无价值消息归属无效。');
       const covered=new Set([...extract.ignoredMessageIds,...extract.topics.flatMap(t=>t.messageIds),...extract.fragments.flatMap(f=>f.messageIds)]);
       if(input.messages.some(m=>m.role==='user'&&!covered.has(m.id))) throw new Error('整理结果未覆盖所有真人消息。');
-      if(input.roomType==='private') content(extract.continuationSummary!);
+      if(input.roomType==='private'||input.contextProtocol===1) content(extract.continuationSummary!);
       else if(extract.continuationSummary!==undefined) throw new Error('群聊不能提交私聊续聊摘要。');
       const topicIds=extract.topics.map(topic=>{
         content(topic.summary);evidence(topic.messageIds);const id=randomUUID();
@@ -540,6 +623,19 @@ export class AutoMemoryStore {
       }
       // Check again after all writes; the transaction rolls everything back if the lease expired.
       this.active(jobId,leaseToken);
+      const contextJob=this.db.prepare('SELECT * FROM auto_memory_context_jobs WHERE job_id=?').get(jobId);
+      if(contextJob) {
+        const state=this.contextState(job.conversationId);
+        if(Number(state.revision)!==Number(contextJob.base_revision)||Number(state.cursor)!==Number(contextJob.start_cursor))
+          throw new Error('续聊摘要输入版本冲突。');
+        const deferred=this.deferredContextIds(job.conversationId);
+        const gap=this.db.prepare('SELECT seq,message_id FROM conversation_context_messages WHERE conversation_id=? AND seq<=? ORDER BY seq')
+          .all(job.conversationId,Number(contextJob.end_cursor)).find(row=>deferred.has(String(row.message_id)));
+        const completed=gap?Number(this.db.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM conversation_context_messages WHERE conversation_id=? AND seq<?')
+          .get(job.conversationId,Number(gap.seq))!.seq):Number(contextJob.end_cursor);
+        this.db.prepare('UPDATE conversation_context_state SET cursor=?,completed_seq=?,revision=revision+1,summary=? WHERE conversation_id=?')
+          .run(Number(contextJob.end_cursor),completed,extract.continuationSummary!,job.conversationId);
+      }
       this.db.prepare("UPDATE auto_memory_jobs SET status='done',completed_at=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?").run(timestamp(),jobId);
       const checkpoint=this.checkpoint(job.conversationId);
       const pending=this.db.prepare(`SELECT MIN(m.ingest_seq) AS seq FROM messages m WHERE m.conversation_id=? AND m.role='user'
@@ -552,6 +648,8 @@ export class AutoMemoryStore {
       this.db.prepare(`UPDATE auto_memory_checkpoints SET completed_seq=MAX(completed_seq,?),summary=COALESCE(?,summary),
         summary_job_id=CASE WHEN ? IS NULL THEN summary_job_id ELSE ? END WHERE conversation_id=?`)
         .run(completedSeq,extract.continuationSummary??null,extract.continuationSummary??null,jobId,job.conversationId);
+      if(!contextJob&&extract.continuationSummary!==undefined) this.db.prepare(`UPDATE conversation_context_state SET summary=?
+        WHERE conversation_id=? AND revision=0`).run(extract.continuationSummary,job.conversationId);
     });
   }
   fail(jobId:string,leaseToken:string,error:string): void {
@@ -610,18 +708,36 @@ export class AutoMemoryStore {
   }
   status(conversationId:string): {queued:number;running:number;failed:number;deferred:number;completed:number;checkpoint:number;summary?:string} {
     const cp=this.checkpoint(conversationId);const result={queued:0,running:0,failed:0,deferred:0,completed:0,checkpoint:Number(cp.completed_seq),...(cp.summary==null?{}:{summary:String(cp.summary)})};
+    const context=this.db.prepare(`SELECT s.* FROM conversation_context_state s WHERE s.conversation_id=?
+      AND EXISTS(SELECT 1 FROM auto_memory_context_jobs cj JOIN auto_memory_jobs j ON j.id=cj.job_id WHERE j.conversation_id=s.conversation_id)`).get(conversationId);
+    if(context) {result.checkpoint=Number(context.completed_seq); if(context.summary!=null) result.summary=String(context.summary);}
     for(const r of this.db.prepare(`SELECT CASE WHEN d.job_id IS NOT NULL THEN 'deferred' ELSE j.status END AS status,COUNT(*) AS count
       FROM auto_memory_jobs j LEFT JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=? GROUP BY 1`).all(conversationId)) {
       const key=r.status==='done'?'completed':r.status as 'queued'|'running'|'failed'|'deferred';result[key]=Number(r.count);
     } return result;
   }
   contextAfterCheckpoint(conversationId:string,excludeMessageId?:string): AutoMemoryMessage[] {
-    this.checkpoint(conversationId);
-    const ids=this.db.prepare(`SELECT m.id FROM messages m LEFT JOIN agent_runs r ON r.input_message_id=m.id OR r.response_message_id=m.id
-      LEFT JOIN deliveries d ON d.message_id=m.id WHERE m.conversation_id=? AND m.message_kind='chat' AND (? IS NULL OR m.id<>?)
-      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_messages jm JOIN auto_memory_jobs j ON j.id=jm.job_id WHERE (jm.message_id=m.id OR (m.role='assistant' AND jm.message_id=r.input_message_id)) AND j.status='done')
-      AND (m.role='user' OR (r.status='completed' AND d.status='sent')) ORDER BY m.ingest_seq`).all(conversationId,excludeMessageId??null,excludeMessageId??null).map(r=>String(r.id));
-    return this.messages(ids);
+    return this.conversationContext(conversationId,excludeMessageId).messages;
+  }
+  conversationContext(conversationId:string,beforeMessageId?:string): {
+    summary?:string; checkpoint:number; summaryCursor:number; summaryVersion:number;
+    messages:AutoMemoryMessage[]; deferredRanges?:{startSeq:number;endSeq:number}[];
+  } {
+    return this.atomic(()=>{
+      const state=this.contextState(conversationId),boundary=this.contextBoundary(conversationId,beforeMessageId);
+      // If a caller asks for an older boundary than the committed summary, the
+      // complete raw prefix is the only valid projection for that boundary.
+      const canUseSummary=boundary===undefined||Number(state.cursor)<boundary;
+      const cursor=canUseSummary?Number(state.cursor):0;
+      const deferred=this.deferredContextIds(conversationId);
+      const rows=this.db.prepare(`SELECT message_id,seq FROM conversation_context_messages WHERE conversation_id=?
+        AND (? IS NULL OR seq<?) ORDER BY seq`).all(conversationId,boundary??null,boundary??null)
+        .filter(row=>Number(row.seq)>cursor||deferred.has(String(row.message_id)));
+      const ranges=this.deferredRanges(conversationId);
+      return {checkpoint:canUseSummary?Number(state.completed_seq):0,summaryCursor:cursor,summaryVersion:canUseSummary?Number(state.revision):0,
+        ...(canUseSummary&&state.summary!=null?{summary:String(state.summary)}:{}),
+        messages:this.messages(rows.map(row=>String(row.message_id))),...(ranges.length?{deferredRanges:ranges}:{})};
+    });
   }
   private topic(row:Record<string,unknown>):TopicRecord {
     return {id:String(row.id),conversationId:String(row.conversation_id),jobId:String(row.job_id),summary:String(row.summary),version:Number(row.version),contentHash:String(row.content_hash),

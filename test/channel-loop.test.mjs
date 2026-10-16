@@ -8,6 +8,7 @@ import test from 'node:test';
 import { ChannelHarness } from '../dist/channel-harness.js';
 import { openRecordedConversation } from '../dist/conversation.js';
 import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
+import { conversationContext } from './fixtures/conversation-context.mjs';
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'pa-channel-loop-'));
@@ -149,7 +150,7 @@ test('准备阶段记录持续画像原文；pending下轮可用且不串人', a
   const bobPayload = f.memoryPayload(f.requests.at(-1));
   assert.ok(!bobPayload.profiles.some(profile => profile.personId === alicePersonId || profile.senderIds.includes('alice')));
   assert.ok(!JSON.stringify(bobPayload.profiles).includes('我喜欢登山'));
-  assert.ok(f.currentEnvelope(f.requests.at(-1)).recentGroupMessages.some(message => message.text.includes('我喜欢登山')));
+  assert.ok(conversationContext(f.requests.at(-1)).messages.some(message => message.text.includes('我喜欢登山')));
   await f.h.handle(f.message('mention', '被提及的人适合做什么？', { senderId: 'bob', mentionedSenderIds: ['alice'] }));
   assert.ok(f.memoryPayload(f.requests.at(-1)).profiles.some(profile => profile.personId === alicePersonId));
   assert.equal(f.totalCalls(), 8);

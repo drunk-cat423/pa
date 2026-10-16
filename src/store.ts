@@ -6,7 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { MemoryError } from './memory-types.js';
 import type { MemoryChange, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, PrimaryPerson } from './memory-types.js';
 import type { ChannelRoute, ExternalRunInput, InboundMessage } from './channel-types.js';
-import { AutoMemoryStore, migrateAutoMemory, migrateMemoryRetrieval } from './auto-memory-store.js';
+import { AutoMemoryStore, migrateAutoMemory, migrateMemoryRetrieval, migrateRollingContext } from './auto-memory-store.js';
 import { migrateSelfProfile } from './self-profile-store.js';
 import { memoryWords } from './memory-text.js';
 import { validateTurnPlan, type TurnPlan, type TurnReceipt } from './turn-plan.js';
@@ -67,7 +67,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -443,6 +443,7 @@ export class ConversationStore {
           person_id TEXT NOT NULL, revision INTEGER NOT NULL, fact_index INTEGER NOT NULL,
           message_id TEXT NOT NULL REFERENCES messages(id), PRIMARY KEY(person_id,revision,fact_index,message_id),
           FOREIGN KEY(person_id,revision) REFERENCES person_profile_revisions(person_id,revision));`);
+      if (version < 15) migrateRollingContext(this.db);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');

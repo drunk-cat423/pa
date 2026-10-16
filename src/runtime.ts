@@ -84,10 +84,10 @@ export function boundWebFetchResult(response: Awaited<ReturnType<typeof fetchWeb
 }
 
 export interface ConversationRuntime {
-  prompt(text: string, metadata?: { runId: string; taskId?: string; conversationId?: string; memoryContext?: string; memoryRefs?: MemoryRef[]; searchQuery?: string; fetchUrl?: string; companionTools?: CompanionToolContext }): Promise<string>;
+  prompt(text: string, metadata?: { runId: string; taskId?: string; conversationId?: string; conversationContext?: string; memoryContext?: string; memoryRefs?: MemoryRef[]; searchQuery?: string; fetchUrl?: string; companionTools?: CompanionToolContext }): Promise<string>;
   references(): readonly string[];
   resetContext(): void;
-  estimate(text: string, memoryContext?: string, options?: { channel?: boolean }): ContextEstimate;
+  estimate(text: string, memoryContext?: string, options?: { channel?: boolean; conversationContext?: string }): ContextEstimate;
   recordedTurns(): RecordedTurn[];
   abort(): Promise<void>;
   close(): Promise<void>;
@@ -486,6 +486,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
       }),
       estimate: (text, memoryContext, options) => {
         const messages: Transcript = [...agentSession.messages,
+          ...(options?.conversationContext ? [{ role: 'user' as const, content: [{ type: 'text' as const, text: options.conversationContext }], timestamp: Date.now() }] : []),
           ...(memoryContext ? [{ role: 'user' as const, content: [{ type: 'text' as const, text: memoryContext }], timestamp: Date.now() }] : []),
           { role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() }];
         const channel = Boolean(options?.channel);
@@ -555,6 +556,11 @@ export async function openConversation(config: PaConfig, conversationId: string,
           agentSession.setActiveToolsByName(companionTools ? customTools.map(tool => tool.name) : []);
           try {
             checkRun();
+            if (metadata?.conversationContext) {
+              await agentSession.sendCustomMessage({
+                customType: 'pa_conversation_context', content: metadata.conversationContext, display: false,
+              }, { triggerTurn: false });
+            }
             if (metadata?.memoryContext) {
               await agentSession.sendCustomMessage({
                 customType: 'pa_memory', content: metadata.memoryContext, display: false,

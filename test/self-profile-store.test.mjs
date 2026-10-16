@@ -38,7 +38,7 @@ function inspect(f, operation) {
 function extract(f, job, selfProfile, extra = {}) {
   const input = f.store.autoMemory.taskInput(job);
   return { ignoredMessageIds: input.messages.filter(m => m.role === 'user').map(m => m.id),
-    topics: [], fragments: [], profiles: [], ...(selfProfile === undefined ? {} : { selfProfile }), ...extra };
+    topics: [], fragments: [], profiles: [], ...(input.contextProtocol===1?{continuationSummary:"继续对话"}:{}), ...(selfProfile === undefined ? {} : { selfProfile }), ...extra };
 }
 function proposal(snapshot, content, sourceMessageIds, pendingIds = snapshot.pending.map(p => p.id)) {
   return { baseVersion: snapshot.baseVersion, content, sourceMessageIds, pendingIds };
@@ -318,7 +318,7 @@ test('v6 migration backs up the original database and preserves chats, tombstone
     });
     f.restart();
     inspect(f, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 14);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 15);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       for (const table of tables) assert.deepEqual(db.prepare(`SELECT rowid,* FROM ${table}`).all().map(r => ({ ...r })), before[table]);
     });

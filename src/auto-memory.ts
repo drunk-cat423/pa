@@ -79,7 +79,10 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
       assertProfileEvidenceStrength(v as unknown as ProfileFact, people.get(personId)!, input);
     }
   }
-  if (value.topics.length > 100 || value.fragments.length > 200 || value.profiles.length > people.size) throw new Error('记忆输出数量过大。');
+  // Each provider result is bounded; the trusted aggregate may contain many
+  // independently validated chunks from a capacity snapshot larger than 50 messages.
+  if ((!mergedProfile && (value.topics.length > 100 || value.fragments.length > 200))
+    || value.profiles.length > people.size) throw new Error('记忆输出数量过大。');
   for (const topic of value.topics) {
     if (!record(topic)) throw new Error('Topic无效。');
     text(topic.summary); ids(topic.messageIds, false, topicSources);
@@ -123,7 +126,7 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
     ...value.topics.flatMap(topic => (topic as { messageIds: string[] }).messageIds),
     ...value.fragments.flatMap(fragment => (fragment as { messageIds: string[] }).messageIds)]);
   if (input.mode !== 'profiles' && input.messages.some(message => message.role === 'user' && !covered.has(message.id))) throw new Error('整理遗漏了真人消息。');
-  if (input.roomType === 'private' && input.mode !== 'profiles') text(value.continuationSummary);
+  if ((input.roomType === 'private' || input.contextProtocol === 1) && input.mode !== 'profiles') text(value.continuationSummary);
   else if (value.continuationSummary !== undefined) throw new Error('群聊不生成独立群摘要。');
   if (value.selfProfile !== undefined) {
     if (!input.selfProfile) throw new Error('自我画像缺少输入快照。');
@@ -194,10 +197,9 @@ export class BackgroundMemory {
       ...(this.lastError ? { lastError: this.lastError } : {}) };
   }
 
-  start(reason: 'count' | 'capacity' = 'count', excludeMessageId?: string): void {
+  start(reason?: 'count' | 'capacity', excludeMessageId?: string): void {
     if (this.closed || this.diagnosticFailed || !this.config.memory?.enabled) return;
     if (reason === 'capacity') this.store.reserveBatch(this.conversationId, reason, 50, excludeMessageId);
-    else while (this.store.reserveBatch(this.conversationId, reason, 50, excludeMessageId)) { /* reserve immutable batches */ }
     if (!this.work) {
       this.work = this.run().catch(error => { this.lastError = memoryFailure(error, 'worker'); })
         .finally(() => {
@@ -432,7 +434,7 @@ export class BackgroundMemory {
     }
     if (chunk.messages.length < 2) return undefined;
     let middle = Math.floor(chunk.messages.length / 2);
-    if (chunk.messages[middle]?.role === 'assistant') middle++;
+    if (chunk.contextProtocol !== 1 && chunk.messages[middle]?.role === 'assistant') middle++;
     if (middle >= chunk.messages.length) return undefined;
     return [chunk.messages.slice(0, middle), chunk.messages.slice(middle)].map(messages => ({ ...item,
       messageIds: messages.map(message => message.id) }));

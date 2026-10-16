@@ -25,6 +25,8 @@ export function channelConversationKey(route: ChannelRoute): string {
 export type HarnessResult = 'ignored' | 'observed' | 'duplicate' | 'budget_exhausted'
   | 'sent' | 'uncertain' | 'rejected' | 'failed';
 
+const RESULT_COMMAND = /^\/result(?:\s+([0-9a-f-]+))?\s*$/i;
+
 // Policy and budget live here, independent of the transport's platform protocol.
 export class ChannelHarness {
   private readonly allowed: Set<string>;
@@ -106,7 +108,7 @@ export class ChannelHarness {
     const source = conversation.ingest(message.text, {
       eventId: message.eventId, senderId: message.senderId, modelInputText: message.text, sentAt: message.sentAt,
       ...(message.senderName ? { senderName: message.senderName.slice(0, 100) } : {}),
-      ...(memoryRequest ? { messageKind: 'memory' as const } : {}),
+      ...(memoryRequest || RESULT_COMMAND.test(message.text) ? { messageKind: 'memory' as const } : {}),
     });
     if (!source) return 'duplicate';
     if (message.route.roomType === 'group' && !message.mentioned) return 'observed';
@@ -160,7 +162,7 @@ export class ChannelHarness {
       ...(message.route.channel === 'qq' ? { responseFormat: 'plain_text' as const } : {}),
     };
     const memoryRequest = parseMemoryRequest(message.text);
-    const resultRequest = /^\/result(?:\s+([0-9a-f-]+))?\s*$/i.exec(message.text);
+    const resultRequest = RESULT_COMMAND.exec(message.text);
     if (resultRequest) {
       const result = conversation.taskResult(message.senderId, resultRequest[1]);
       const control = conversation.control(message.text, { ...sender, modelInputText: message.text }, () => result?.text ?? '没有找到你在本会话中已完成的结果。');

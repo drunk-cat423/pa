@@ -8,11 +8,12 @@ import test from 'node:test';
 import { ChannelHarness } from '../dist/channel-harness.js';
 import { ConversationStore } from '../dist/store.js';
 import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
+import { conversationContext } from './fixtures/conversation-context.mjs';
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'pa-group-context-'));
   const requests = [], planningRequests = [];
-  let release, started;
+  let release, started, nextSend;
   const blocked = new Promise(resolve => { release = resolve; });
   const blockingStarted = new Promise(resolve => { started = resolve; });
   const server = createServer(async (req, res) => {
@@ -47,7 +48,11 @@ async function fixture(t) {
     apiKey: 'fixture-key', baseUrl: `http://127.0.0.1:${server.address().port}`, contextWindow: 32768,
     maxOutputTokens: 256, timeoutMs: 5000 };
   const route = { channel: 'qq', accountId: 'bot', roomId: 'group', roomType: 'group' };
-  const h = new ChannelHarness(config, [route], { send: async () => ({ status: 'sent', externalMessageId: 'out' }) }, 0);
+  const h = new ChannelHarness(config, [route], { send: async () => {
+    const current = nextSend; nextSend = undefined;
+    if (current) { current.started(); await current.gate; }
+    return { status: 'sent', externalMessageId: 'out' };
+  } }, 0);
   const message = (id, text, extra = {}) => ({ route, eventId: id, text, senderId: 'alice',
     mentioned: true, sentAt: new Date().toISOString(), ...extra });
   const input = () => {
@@ -60,7 +65,14 @@ async function fixture(t) {
     await h.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
     await rm(directory, { recursive: true, force: true });
   });
-  return { h, requests, planningRequests, totalCalls: () => totalModelCalls(requests, planningRequests), config, message, input, release, blockingStarted };
+  const holdNextSend = () => {
+    let finish, begin;
+    const gate = new Promise(resolve => { finish = resolve; });
+    const sendStarted = new Promise(resolve => { begin = resolve; });
+    nextSend = { gate, started: begin };
+    return { sendStarted, release: finish };
+  };
+  return { h, requests, planningRequests, totalCalls: () => totalModelCalls(requests, planningRequests), config, message, input, release, blockingStarted, holdNextSend };
 }
 
 test('群请求只注入画像与群记忆，旧个人记录及事件pending保留但不进入请求', async t => {
@@ -100,45 +112,66 @@ test('当前请求入队后的群消息不会进入该轮背景', async t => {
   const later = f.h.handle(f.message('later', 'ARRIVED_AFTER_CURRENT_QUESTION', { senderId: 'bob', mentioned: false }));
   f.release();
   await Promise.all([first, later]);
-  assert.deepEqual(f.input().recentGroupMessages, []);
+  assert.deepEqual(conversationContext(f.requests[0]).messages, []);
   assert.ok(!JSON.stringify(f.requests[0]).includes('ARRIVED_AFTER_CURRENT_QUESTION'));
   await f.h.handle(f.message('follow-later', 'FOLLOW_UP_AFTER_LATER_MESSAGE'));
-  assert.deepEqual(f.input().recentGroupMessages.map(message => message.text), ['BLOCK_FIRST_QUESTION', 'ARRIVED_AFTER_CURRENT_QUESTION']);
+  assert.deepEqual(conversationContext(f.requests.at(-1)).messages.filter(message => message.role === 'user').map(message => message.text),
+    ['BLOCK_FIRST_QUESTION', 'ARRIVED_AFTER_CURRENT_QUESTION']);
   assert.equal(f.input().currentMessage.text, 'FOLLOW_UP_AFTER_LATER_MESSAGE');
   assert.equal(f.totalCalls(), 4);
 });
 
-test('群背景按入库顺序带最近十条真人消息，跨成员和时间且不含机器人回答', async t => {
+test('较早回复延迟确认送达时，不插入已排队问题的历史前缀', async t => {
   const f = await fixture(t);
-  await f.h.handle(f.message('old-1', 'OLDER_THAN_TEN_MINUTES', { senderId: 'bob', senderName: 'Bob', mentioned: false, sentAt: '2020-01-01T00:00:00.000Z' }));
-  await f.h.handle(f.message('pre-query', 'BOT_REPLY_TRIGGER', { senderId: 'alice' }));
-  for (let index = 0; index < 11; index++) {
+  const first = f.h.handle(f.message('first-late', 'BLOCK_FIRST_QUESTION'));
+  await f.blockingStarted;
+  const delivery = f.holdNextSend();
+  const queued = f.h.handle(f.message('queued-later', 'QUEUED_CURRENT_QUESTION'));
+  f.release();
+  await delivery.sendStarted;
+  delivery.release();
+  await Promise.all([first, queued]);
+  const queuedRequest = f.requests.find(request => JSON.stringify(request).includes('QUEUED_CURRENT_QUESTION'));
+  assert.ok(queuedRequest);
+  const context = conversationContext(queuedRequest);
+  assert.ok(!context.messages.some(message => message.text === 'PHYSICS_ANSWER'));
+  assert.ok(!context.messages.some(message => message.text === 'QUEUED_CURRENT_QUESTION'));
+  assert.equal(f.input().currentMessage.text, 'QUEUED_CURRENT_QUESTION');
+});
+
+test('群完整上下文跨越60条并保留身份；当前问题只在末尾，稳定历史逐字延续', async t => {
+  const f = await fixture(t);
+  for (let index = 0; index < 61; index++) {
     await f.h.handle(f.message(`history-${index}`, `HISTORY_${index}`, {
       senderId: index % 2 ? 'bob' : 'carol', senderName: index % 2 ? 'Bob' : 'Carol', mentioned: false,
       sentAt: '2020-01-01T00:00:00.000Z',
     }));
   }
   await f.h.handle(f.message('current', 'CURRENT_QUESTION'));
-  const recent = f.input().recentGroupMessages;
-  assert.equal(recent.length, 10);
-  assert.deepEqual(recent.map(message => message.text), Array.from({ length: 10 }, (_, index) => `HISTORY_${index + 1}`));
-  assert.deepEqual(recent.map(message => message.senderId), Array.from({ length: 10 }, (_, index) => index % 2 ? 'carol' : 'bob'));
-  assert.equal(recent[0].senderName, 'Bob');
-  assert.ok(!JSON.stringify(recent).includes('PHYSICS_ANSWER'));
-  assert.ok(!JSON.stringify(recent).includes('BOT_REPLY_TRIGGER'));
+  const first = conversationContext(f.requests.at(-1));
+  assert.equal(first.messages.length, 61);
+  assert.deepEqual(first.messages.map(message => message.text), Array.from({ length: 61 }, (_, index) => `HISTORY_${index}`));
+  assert.deepEqual(first.messages.map(message => message.senderId), Array.from({ length: 61 }, (_, index) => index % 2 ? 'bob' : 'carol'));
+  assert.equal(first.messages[0].senderName, 'Carol');
+  assert.ok(first.messages.every(message => message.role === 'user'));
+  assert.ok(!JSON.stringify(first).includes('CURRENT_QUESTION'));
   assert.equal(f.input().currentMessage.text, 'CURRENT_QUESTION');
-  assert.ok(!recent.some(message => message.text === 'CURRENT_QUESTION'));
+  assert.ok(!Object.hasOwn(f.input(), 'recentGroupMessages'));
+  const time = f.requests.at(-1).messages.findIndex(message => /服务器时间|当前时间/.test(JSON.stringify(message)));
+  const contextIndex = f.requests.at(-1).messages.findIndex(message => JSON.stringify(message).includes('[最近一次会话压缩摘要]'));
+  const memoryIndex = f.requests.at(-1).messages.findIndex(message => JSON.stringify(message).includes('GROUP_SHARED_RECORD'));
+  if (time >= 0) assert.ok(contextIndex < time);
+  if (memoryIndex >= 0) assert.ok(contextIndex < memoryIndex);
+  const previousHistory = first.historyRaw;
+  await f.h.handle(f.message('follow-up', 'FOLLOW_UP_QUESTION'));
+  const second = conversationContext(f.requests.at(-1));
+  assert.ok(second.historyRaw.startsWith(previousHistory));
+  assert.equal(f.input().currentMessage.text, 'FOLLOW_UP_QUESTION');
+  assert.ok(!second.messages.some(message => message.text === 'FOLLOW_UP_QUESTION'));
   const systemPrompt = f.requests.at(-1).messages.filter(message => message.role === 'system')
     .map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n');
-  const backgroundPrompt = f.requests.at(-1).messages.filter(message => message.role === 'user')
-    .map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n');
-  assert.match(backgroundPrompt, /均为候选背景，可能无关/);
-  assert.match(backgroundPrompt, /不默认续接、不顺带回答/);
   assert.doesNotMatch(systemPrompt, /recentGroupMessages|身份卡、服务器时间/);
   assert.equal(f.totalCalls(), 4);
-  const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
-  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE text LIKE '%OLDER_THAN_TEN_MINUTES%'").get().n, 1); }
-  finally { db.close(); }
 });
 
 test('背景与明确引用分开传递，普通回顾不把背景当作当前请求', async t => {
@@ -146,16 +179,30 @@ test('背景与明确引用分开传递，普通回顾不把背景当作当前�
   await f.h.handle(f.message('noise', 'ROOM_REVIEW_MARKER', { senderId: 'bob', mentioned: false }));
   await f.h.handle(f.message('previous', '讨论一下 OLD_TRAVEL_TOPIC'));
   await f.h.handle(f.message('review', '刚才群里大家聊了什么？'));
-  assert.deepEqual(f.input().recentGroupMessages.map(message => message.text), ['ROOM_REVIEW_MARKER', '讨论一下 OLD_TRAVEL_TOPIC']);
+  assert.deepEqual(conversationContext(f.requests.at(-1)).messages.map(message => message.text),
+    ['ROOM_REVIEW_MARKER', '讨论一下 OLD_TRAVEL_TOPIC', 'OLD_TRAVEL_ANSWER']);
   assert.equal(f.input().currentMessage.text, '刚才群里大家聊了什么？');
   await f.h.handle(f.message('quote', '这个应该怎么回复？', { quote: { inlineMessages: [
     { role: 'user', text: 'SELECTED_QUOTE_MARKER' },
   ] } }));
   assert.equal(f.input().currentMessage.text, '这个应该怎么回复？');
   assert.ok(JSON.stringify(f.input().currentMessage.quotedMessage).includes('SELECTED_QUOTE_MARKER'));
-  assert.ok(!JSON.stringify(f.input().recentGroupMessages).includes('SELECTED_QUOTE_MARKER'));
-  assert.deepEqual(f.input().recentGroupMessages.map(message => message.text), [
-    'ROOM_REVIEW_MARKER', '讨论一下 OLD_TRAVEL_TOPIC', '刚才群里大家聊了什么？',
+  assert.ok(!JSON.stringify(conversationContext(f.requests.at(-1)).messages).includes('SELECTED_QUOTE_MARKER'));
+  assert.deepEqual(conversationContext(f.requests.at(-1)).messages.map(message => message.text), [
+    'ROOM_REVIEW_MARKER', '讨论一下 OLD_TRAVEL_TOPIC', 'OLD_TRAVEL_ANSWER',
+    '刚才群里大家聊了什么？', 'PHYSICS_ANSWER',
   ]);
   assert.equal(f.totalCalls(), 6);
+});
+
+test('群内记忆控制与结果指令及其回复不进入后续会话前缀', async t => {
+  const f = await fixture(t);
+  assert.equal(await f.h.handle(f.message('control-memory', '/memory remember room CONTROL_ONLY_MARKER')), 'sent');
+  assert.equal(await f.h.handle(f.message('control-result', '/result')), 'sent');
+  assert.equal(await f.h.handle(f.message('after-control', '普通问题')), 'sent');
+  const context = conversationContext(f.requests.at(-1));
+  assert.ok(!JSON.stringify(context.messages).includes('/memory'));
+  assert.ok(!JSON.stringify(context.messages).includes('/result'));
+  assert.ok(!JSON.stringify(context.messages).includes('CONTROL_ONLY_MARKER'));
+  assert.equal(f.input().currentMessage.text, '普通问题');
 });

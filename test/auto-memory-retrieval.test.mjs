@@ -28,7 +28,7 @@ function fixture(t) {
       const job=store.autoMemory.claimNext(conversation.id,{owner:'test',leaseMs:60000});
       const input=store.autoMemory.taskInput(job);
       assert.equal(input.profileProtocol,2);
-      return {job,input, output:{topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id)}};
+      return {job,input, output:{continuationSummary:"继续对话",topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id)}};
     },
     inspect(action) { const db=new DatabaseSync(path); db.function('history_tokens',{deterministic:true},value=>memoryWords(String(value??'')).join(' '));
       try { return action(db); } finally { db.close(); } }};
@@ -135,7 +135,7 @@ test('a captured third-party target is organized even when only its recorder spo
     f.store.autoMemory,f.conversation.id,{extract:async input=>{
       captured=input;
       const person=input.profiles.find(profile=>profile.personId===bob),pending=person.pending[0];
-      return {topics:[],fragments:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
+      return {continuationSummary:"继续对话",topics:[],fragments:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
         profiles:[{personId:bob,baseVersion:person.baseVersion,facts:[{content:'喜欢绘画',sourceType:'third_party',messageIds:[source]}],
           pendingResults:[{pendingId:pending.id,status:'merged',factIndex:0}]}]};
     }});
@@ -223,7 +223,7 @@ test('deduplicated facts recalled through a Topic reveal only evidence from that
   const sourceTwo=f.store.externalMessage(foreign.id,'foreign').id;
   f.store.autoMemory.reserveBatch(foreign.id,'capacity');
   const job=f.store.autoMemory.claimNext(foreign.id,{owner:'test',leaseMs:60000});
-  f.store.autoMemory.commit(job.id,job.leaseToken,{topics:[{summary:'喝茶偏好',messageIds:[sourceTwo]}],
+  f.store.autoMemory.commit(job.id,job.leaseToken,{continuationSummary:'继续喝茶',topics:[{summary:'喝茶偏好',messageIds:[sourceTwo]}],
     fragments:[{personId:'same-person',content:'喜欢茶',sourceType:'self',messageIds:[sourceTwo],topicIndex:0}],profiles:[],ignoredMessageIds:[]});
   assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM person_fragments').get().n),1);
   const here=f.store.autoMemory.searchTopics(f.conversation.id,{text:'喝茶偏好'}).topics;
@@ -255,12 +255,12 @@ test('failed extraction records safe phase diagnostics, preserves its batch, and
   let calls=0;
   const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:20,timeoutMs:200}},
     f.store.autoMemory,f.conversation.id,{extract:async()=>{calls++;throw new Error('Bearer sk-secret 原始用户机密内容');}});
-  t.after(()=>worker.close()); worker.start(); await assert.rejects(worker.wait(undefined,2000),/失败/);
-  assert.equal(calls,1);assert.equal(f.store.autoMemory.status(f.conversation.id).failed,1);assert.equal(f.store.autoMemory.status(f.conversation.id).queued,1);
+  t.after(()=>worker.close()); worker.start('capacity'); await assert.rejects(worker.wait(undefined,2000),/失败/);
+  assert.equal(calls,1);assert.equal(f.store.autoMemory.status(f.conversation.id).failed,1);assert.equal(f.store.autoMemory.status(f.conversation.id).queued,0);
   worker.start(); await assert.rejects(worker.wait(undefined,2000),/失败/);assert.equal(calls,1);
   const error=f.store.autoMemory.listJobs().find(job=>job.status==='failed').error;
   assert.match(error,/\[unexpected\].*phase=extract/);assert.doesNotMatch(error,/sk-secret|机密/);
-  assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM auto_memory_job_messages').get().n),100);
+  assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM auto_memory_context_job_messages').get().n),100);
 });
 
 test('assistant ignored IDs fail during validation before commit instead of becoming misleading coverage', () => {

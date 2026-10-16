@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore, DuplicateMessageError } from '../dist/store.js';
-import { downgradeSchema10 } from './fixtures/legacy-schema.mjs';
+import { downgradeSchema10, downgradeSchema14 } from './fixtures/legacy-schema.mjs';
 
 function fixture(roomType='group') {
   const directory=mkdtempSync(join(tmpdir(),'pa-auto-memory-'));const path=join(directory,'store.sqlite');
@@ -32,7 +32,7 @@ function ignored(f,job,extra={}) {
   const profiles=input.profileProtocol===2?input.profiles.filter(profile=>profile.pending?.length).map(profile=>({...profile,
     pendingResults:profile.pending.map(item=>({pendingId:item.id,status:'deferred'}))})):[];
   return {ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),topics:[],fragments:[],profiles,
-    ...(input.roomType==='private'?{continuationSummary:'conversation decisions'}:{}),...extra};
+    ...((input.roomType==='private'||input.contextProtocol===1)?{continuationSummary:'conversation decisions'}:{}),...extra};
 }
 function inspect(f,operation){const db=new DatabaseSync(f.path);try{return operation(db);}finally{db.close();}}
 
@@ -87,7 +87,7 @@ test('deferral preserves failed evidence and frozen input, releases later batche
   const f=fixture('private');try {
     const jobs=[];
     for(let i=0;i<3;i++) {
-      f.turn(`turn ${i}`);jobs.push(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity',1));
+      f.turn(`turn ${i}`);jobs.push(f.store.autoMemory.reserveBatch(f.conversation.id,'count',1));
     }
     const first=claim(f),oldResult=ignored(f,first);
     f.store.autoMemory.saveProgress(first.id,first.leaseToken,{chunk:1,topics:[],phase:'preserved'});
@@ -119,7 +119,7 @@ test('deferral preserves failed evidence and frozen input, releases later batche
     const second=claim(f);assert.equal(second.id,jobs[1].id);assert.equal(claim(f),undefined);
     assert.deepEqual(f.store.autoMemory.taskInput(second).deferredRanges,ranges);
     // A newly reserved job during the second batch must stay behind the already frozen third batch.
-    f.turn('turn 3');const fourth=f.store.autoMemory.reserveBatch(f.conversation.id,'capacity',1);
+    f.turn('turn 3');const fourth=f.store.autoMemory.reserveBatch(f.conversation.id,'count',1);
     f.store.autoMemory.commit(second.id,second.leaseToken,ignored(f,second,{continuationSummary:'after second'}));
     assert.equal(f.store.autoMemory.status(f.conversation.id).checkpoint,0);
     const third=claim(f);assert.equal(third.id,jobs[2].id);
@@ -127,7 +127,7 @@ test('deferral preserves failed evidence and frozen input, releases later batche
     f.store.autoMemory.commit(third.id,third.leaseToken,ignored(f,third,{continuationSummary:'after third'}));
     assert.equal(f.store.autoMemory.status(f.conversation.id).checkpoint,0);
     assert.equal(claim(f).id,fourth.id);
-    assert.deepEqual(f.store.autoMemory.contextAfterCheckpoint(f.conversation.id).map(m=>m.text),['turn 0','reply','turn 3','reply']);
+    assert.deepEqual(f.store.autoMemory.contextAfterCheckpoint(f.conversation.id).map(m=>m.text),['turn 0','reply','turn 1','reply','turn 2','reply','turn 3','reply']);
     assert.deepEqual(snapshot().job,before.job);assert.deepEqual(snapshot().members,before.members);
     assert.deepEqual(snapshot().messages.slice(0,before.messages.length),before.messages);
   }finally{f.close();}
@@ -156,7 +156,7 @@ test('deferral rejects queued, running, done, leased failed and unknown jobs',()
 
 test('v12 migration backs up the consistent original database before adding deferrals',()=>{
   const f=fixture();try {
-    f.inbound('original before migration');f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const worker=claim(f);
+    f.inbound('original before migration');f.store.autoMemory.reserveBatch(f.conversation.id,'count',1);const worker=claim(f);
     f.store.autoMemory.saveProgress(worker.id,worker.leaseToken,{chunk:1});f.store.autoMemory.fail(worker.id,worker.leaseToken,'preserve');
     const snapshot=db=>({
       jobs:db.prepare('SELECT * FROM auto_memory_jobs ORDER BY rowid').all(),
@@ -164,8 +164,8 @@ test('v12 migration backs up the consistent original database before adding defe
       messages:db.prepare('SELECT * FROM messages ORDER BY ingest_seq').all(),
     });
     const original=inspect(f,snapshot);
-    f.store.close();inspect(f,db=>db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; DROP TABLE auto_memory_job_deferrals; PRAGMA user_version=12;'));f.restart();
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),14);
+    f.store.close();inspect(f,db=>{downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; DROP TABLE auto_memory_job_deferrals; PRAGMA user_version=12;');});f.restart();
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),15);
     assert.deepEqual(inspect(f,snapshot),original);
     const backups=readdirSync(f.directory).filter(name=>name.includes('.v12.')&&name.endsWith('.bak'));
     assert.equal(backups.length,1);
@@ -223,7 +223,7 @@ test('private count uses 50 complete sent turns, failures and current prompt rem
     assert.equal(f.store.autoMemory.status(f.conversation.id).checkpoint,0);
     const current=f.inbound('current');
     const short=f.store.autoMemory.reserveBatch(f.conversation.id,'capacity',50,current.existingMessageId);
-    assert.deepEqual(short.messageIds,[failed.existingMessageId]);
+    assert.equal(short.messageIds.length,101);assert.ok(short.messageIds.includes(failed.existingMessageId));
     const capacity=claim(f);f.store.autoMemory.commit(capacity.id,capacity.leaseToken,ignored(f,capacity));
     assert.equal(f.store.autoMemory.status(f.conversation.id).checkpoint,101);
     assert.deepEqual(f.store.autoMemory.contextAfterCheckpoint(f.conversation.id).map(m=>m.id),[current.existingMessageId]);
@@ -251,7 +251,7 @@ test('uncertain and pending delivery never become private count rounds',()=>{
     const input=f.inbound();const run=f.store.beginRun(f.conversation.id,'hello','p','m',[],input);
     const delivery=f.store.completeRun(run.id,'draft',undefined,undefined);
     assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'count',1),undefined);
-    assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity'),undefined);
+    assert.deepEqual(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity').messageIds,[input.existingMessageId]);
     f.store.ackDelivery(delivery.deliveryId,'uncertain');
     assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'count',1),undefined);
     assert.deepEqual(f.store.autoMemory.contextAfterCheckpoint(f.conversation.id).map(m=>m.text),['hello']);
@@ -425,10 +425,10 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     assert.equal(inspect(f,db=>db.prepare('SELECT status,content FROM memories WHERE id=?').get(memory.id)).content,null);
     assert.equal(f.store.autoMemory.profile('original-person').facts[0].content,longLegacyFact);
     assert.equal([...longLegacyFact].length,24*'迁移前保留的旧画像事实'.length);
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 14);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 15);
     assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
     assert.equal(readdirSync(f.directory).some(name=>name.includes('.v5.')&&name.endsWith('.bak')),true);
-    f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity').messageIds.length,1);
+    f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity'),undefined);assert.equal(f.store.autoMemory.conversationContext(f.conversation.id).messages.at(-1).text,'new');
   }finally{f.close();}
 });
 

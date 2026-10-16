@@ -38,7 +38,7 @@ function ignored(input,profiles=[]) {
   const deferred=input.profileProtocol===2&&profiles.length===0?input.profiles.filter(p=>p.pending?.length).map(p=>({...p,
     pendingResults:p.pending.map(item=>({pendingId:item.id,status:'deferred'}))})):profiles;
   return {ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),topics:[],fragments:[],profiles:deferred,
-  ...(input.roomType==='private'?{continuationSummary:'继续对话'}:{})};}
+  ...((input.roomType==='private'||input.contextProtocol===1)?{continuationSummary:'继续对话'}:{})};}
 
 test('FTS Chinese words, source identities, before current boundary, actor and room isolation',()=>{
   const f=fixture();try {
@@ -155,7 +155,7 @@ test('v8 migration backs up and preserves archived legacy field metadata, identi
     assert.equal(f.store.autoMemory.personForActor(actor),person);assert.equal(f.store.autoMemory.profile(person).facts[0].field,'diet');assert.equal(f.store.autoMemory.profile(person).pending.length,0);
     f.store.autoMemory.retry(job.id);const retried=f.store.autoMemory.claimNext(f.room.id,{owner:'retry',leaseMs:60000});assert.equal(f.store.autoMemory.taskInput(retried).profiles[0].pending,undefined);
     const current=f.inbound('查询历史');assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{query:'火锅'}).messages[0].id,old.existingMessageId);
-    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version), 14);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
+    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version), 15);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
   }finally{f.close();}
 });
 

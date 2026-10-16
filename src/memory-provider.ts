@@ -47,6 +47,9 @@ export function prepareMemoryExtraction(input: AutoMemoryTaskInput, contextWindo
   assertCurrentMemoryProtocol(input);
   const messageView = (message: AutoMemoryTaskInput['messages'][number]) => ({ id: message.id, role: message.role,
     text: message.text, ingestSeq: message.ingestSeq, ...(message.personId ? { personId: message.personId } : {}),
+    ...(message.contextSeq===undefined?{}:{contextSeq:message.contextSeq}),
+    ...(message.senderId?{senderId:message.senderId}:{}),...(message.senderName?{senderName:message.senderName}:{}),
+    ...(message.replyToMessageId?{replyToMessageId:message.replyToMessageId}:{}),...(message.replyToSenderId?{replyToSenderId:message.replyToSenderId}:{}),
     ...(message.sentAt ? { sentAt: message.sentAt } : {}) });
   const { job: _job, messages, profileSources, ...rest } = input;
   const userContent = JSON.stringify({ ...rest, messages: messages.map(messageView),
@@ -56,7 +59,9 @@ export function prepareMemoryExtraction(input: AutoMemoryTaskInput, contextWindo
       facts: profile.facts.map(({ field: _field, ...fact }) => fact) })) });
   const extractionPrompt = input.profileProtocol === 2 ? EXTRACTION_SYSTEM_PROMPT.replace('"pendingIds"?:string[],',
     '"pendingResults"?:{"pendingId":string,"status":"merged"|"superseded"|"not_profile"|"deferred","factIndex"?:number,"replacementMessageId"?:string,"reason"?:"temporary"|"not_personal"|"insufficient_evidence"}[],') : EXTRACTION_SYSTEM_PROMPT;
-  const systemPrompt = extractionPrompt
+  const contextPrompt = input.contextProtocol===1 ? extractionPrompt.replace('group 禁止 continuationSummary；private 必须给简短 continuationSummary，保留决定和未完成事项，不冒充人物画像。',
+    'group 和 private 都必须给 continuationSummary：将 previousSummary 与本批按 contextSeq 排列的完整可见消息合并为当前房间整体滚动摘要，保留先前仍有效的决定、事实、上下文和未完成事项，处理明确纠正，区分发言者及被回复者，不冒充人物画像。不可把摘要仅写成本批增量；有 deferredRanges 时明确摘要不覆盖这些缺口，不推断缺失内容。') : extractionPrompt;
+  const systemPrompt = contextPrompt
     + `\n续聊摘要最多${Math.min(2000, Math.floor(contextWindow / 20))}个字符。`
     + '\n本次采用精简原子事实协议：fragments 每条只写一个可独立核对的事实，保留 personId、来源类型和原文 messageIds；同一人的同一事实只写一次并合并证据，不跨人物合并，不推断同义事实。群讨论事实只保留在 fragments/Topic，不建立个人长期事件记忆。fragments 只保留稳定画像的原子证据或群 Topic 讨论事实；private 的每条 fragment 必须保留在该人物稳定画像 facts 中，个人临时事件只可概括为当前房间 Topic 或续聊资料，不生成按人物管理的事件片段。只有稳定偏好、称呼、长期目标等才由 profiles 提出画像更新，输出完整结果。既有 profileFragments 是该人的历史原子证据，可结合对应 profileSources 整理画像，但不参与本批覆盖，也不能作为本批 fragment 来源。'
     + '\n完整覆盖严格针对 messages 中 role=user 的消息：每条必须出现在 topics、fragments 或 ignoredMessageIds 至少一处。ignoredMessageIds 只能列真人 user 消息，绝不列 assistant。assistant 仅供上下文，可在 topic 中引用，不需要单独覆盖。'

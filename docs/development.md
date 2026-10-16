@@ -8,14 +8,14 @@
 |---|---|
 | src/config.ts | 聊天与后台调用预算，不读取其他应用凭据 |
 | src/runtime.ts | 受限 Pi 会话、独立 ModelRuntime 工厂、最终输入容量估算、公开 API 重建投影 |
-| src/store.ts | schema v14、原文/run/投递、显式记忆、迁移备份、去重和上下文水位 |
-| src/auto-memory-store.ts | 通用 person 绑定、固定批次、任务租约、子批次检查点、Topic/画像/关键词检索 |
+| src/store.ts | schema v15、原文/run/投递、显式记忆、迁移备份、去重和上下文水位 |
+| src/auto-memory-store.ts | 通用person绑定、可见消息序列、滚动摘要及容量快照、任务租约、子批次检查点、Topic/画像/关键词检索 |
 | src/self-profile-store.ts | 全局AI画像修订、带来源待整理建议、原子归档和并发版本检查 |
 | src/auto-memory.ts | 与聊天独立的后台调度、严格输出校验、显式失败重试、容量等待及 Topic 关键词检索 |
 | src/memory-provider.ts | 独立 Pi 画像/Topic 提取请求 |
 | src/profile-limits.ts / src/profile-pending.ts | 人物完整画像容量、处理回执及来源强度校验 |
 | src/diagnostics.ts / src/logs.ts / src/logs-cli.ts | 独立诊断索引、请求响应证据、任务查询及无模型的离线解析校验 |
-| src/conversation.ts | 原文与 Pi 关联恢复、按当前发送者/@对象构造上下文、画像预算和私聊续聊 |
+| src/conversation.ts | 原文与Pi关联恢复、群聊/私聊完整滚动上下文、当前发送者/@对象画像预算、85%容量触发 |
 | src/channel-harness.ts | 先入库、按房间排队、参与判断、聊天预算、投递和启动后台恢复 |
 | src/channel-types.ts / src/qq-channel.ts | 标准化发送者与真实 mention 目标、QQ 收发/鉴权/重连 |
 | src/harness-policy.ts / src/memory-service.ts | 明确人物绑定、独立 owner 权限、本人显式更新及记忆管理 |
@@ -38,7 +38,7 @@ npm test
 测试使用临时目录、SQLite 和本地 HTTP，不调用外部模型、不消费生产凭据。重点覆盖：
 
 - auto-memory-store：v5 备份迁移、稳定序号、批次覆盖、租约、画像 CAS/时间、绑定、历史片段归属和Topic关键词检索；
-- auto-memory：聊天与整理并行、快速连发问答、50轮续聊、85%及硬上限、长批次恢复、预算画像和服务重启；
+- auto-memory：聊天与整理并行、快速连发问答、完整滚动上下文、85%及硬上限、长批次恢复、预算画像和服务重启；
 - memory-provider：真实 Pi SDK 请求、思考关闭、独立输出预算、取消、严格JSON和已取消协议拒绝；
 - mention-policy / qq-channel：真实 mention 字段契约、人物绑定冲突与管理权限分离；
 - 既有 runtime/conversation/store/CLI：恢复、去重、原文、投递、资源隔离和明确纠正。
@@ -53,6 +53,6 @@ Mock 只验证程序契约。真实模型的人物归属、提取质量、关键
 
 src/turn-plan.ts集中管理intent/mode/updates协议及三种回答提示；channel harness传可信policy启用prepare_turn，画像作为软参考不反复复述。一般渠道对话含准备和回答两次模型请求，网络/历史续轮计入相同上限。测试覆盖落库原子性、身份共享与权限分离、群规则隔离、假保存确认、旧快照兼容和跨房间来源。真实模型的意图、自然表达与语义检索质量尚需按授权联调，当前不宣称已经改善线上聊天质量。
 
-后台每次启动的调用上限由操作者明确设置。轻量自我画像已接入：所有成员的明确建议先保存并注入，再随记忆批次归档；没有独立关系模式、好感度或人格审批流程。Telegram、长回答合并转发和主动插话未在本次实现中。独立群摘要、人物 FTS/向量和删除功能已按用户决定排除。
+后台每次启动的调用上限由操作者明确设置。轻量自我画像已接入：所有成员的明确建议先保存并注入，再随记忆批次归档；没有独立关系模式、好感度或人格审批流程。Telegram、长回答合并转发和主动插话未在本次实现中。独立群情报摘要、人物 FTS/向量和删除功能已按用户决定排除；群聊/私聊的会话压缩摘要用于承接连续对话。
 
 [v0.2 基线](design/pi_evolving_companion_technical_design_v0.2.md) 与 [Shiori 参考](shiori-memory-reference.md) 保留设计来源；发生冲突时以 [记忆 v1](design/companion_memory_v1.md) 和用户最新决定为准。

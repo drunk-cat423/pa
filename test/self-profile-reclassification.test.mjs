@@ -1,3 +1,4 @@
+import { downgradeSchema14 } from './fixtures/legacy-schema.mjs';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -108,7 +109,7 @@ test('迁移后在途旧产物按输入版本冲突失败，显式重试可重�
       calls++;
       if(calls===1){started();await gate;}
       else assert.equal(input.selfProfile.pending.length,0);
-      return {topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
+      return {continuationSummary:'继续对话',topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
         ...(calls===1?{selfProfile:{baseVersion:input.selfProfile.baseVersion,content:term.pending.content,
           sourceMessageIds:[term.source.id],pendingIds:[term.pending.id]}}:{})};
     }});
@@ -152,9 +153,9 @@ test('v11升级只新增审计结构并保留历史，升级前创建一致性�
   const f=fixture(t),term=f.note();
   const pending=f.store.autoMemory.selfProfile.snapshot().pending;
   f.store.close();
-  f.inspect(db=>db.exec('DROP TABLE person_profile_pending_results;DROP TABLE person_profile_revision_sources;DROP TABLE auto_memory_job_deferrals;DROP TABLE self_profile_reclassifications;PRAGMA user_version=11;'));
+  f.inspect(db=>{downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results;DROP TABLE person_profile_revision_sources;DROP TABLE auto_memory_job_deferrals;DROP TABLE self_profile_reclassifications;PRAGMA user_version=11;');});
   f.restart();
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),14);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),15);
   assert.deepEqual(f.store.autoMemory.selfProfile.snapshot().pending,pending);
   assert.equal(f.store.externalMessage(f.room.id,term.source.eventId??'source-1').text,term.source.text);
   assert.ok(readdirSync(f.dir).some(name=>name.includes('.v11.')&&name.endsWith('.bak')));

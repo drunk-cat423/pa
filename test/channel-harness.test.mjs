@@ -10,6 +10,7 @@ import { PersistenceError } from '../dist/conversation.js';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
 import { readQQSettings } from '../dist/qq-config.js';
 import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
+import { conversationContext } from './fixtures/conversation-context.mjs';
 
 async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-output' }, reply = '群聊回复') {
   const directory = await mkdtemp(join(tmpdir(), 'pa-channel-'));
@@ -171,9 +172,11 @@ test('全量消息落库，明确@才调用真实Pi；身份、上下文、去�
   const text = typeof user.content === 'string' ? user.content : user.content.map(p => p.text).join('');
   const input = JSON.parse(text.slice(text.lastIndexOf('\n') + 1));
   assert.equal(input.currentMessage.senderId, 'member-A');
-  assert.deepEqual(input.recentGroupMessages.map(({ role, senderId, text }) => ({ role, senderId, text })), [
+  assert.deepEqual(conversationContext(request.body).messages.map(({ role, senderId, text }) => ({ role, senderId, text })), [
     { role: 'user', senderId: 'member-B', text: '周末准备爬山' },
   ]);
+  assert.equal(input.roomType, 'group');
+  assert.ok(!Object.hasOwn(input, 'recentGroupMessages'));
   assert.ok(!Object.hasOwn(input, 'recentDialogueWithCurrentSender'));
   assert.equal(await h.handle(f.message('two', '我更喜欢海边', { senderId: 'member-C' })), 'sent');
   assert.equal(await h.handle(f.message('one', '另外一个群', { route: f.other })), 'sent');

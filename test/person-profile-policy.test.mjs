@@ -1,3 +1,4 @@
+import { downgradeSchema14 } from './fixtures/legacy-schema.mjs';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
@@ -40,7 +41,7 @@ function personFor(f, senderId = 'alice') {
 function extract(input, profiles) {
   return {
     ignoredMessageIds: input.messages.filter(message => message.role === 'user').map(message => message.id),
-    topics: [], fragments: [], profiles,
+    topics: [], fragments: [], profiles, ...(input.contextProtocol===1?{continuationSummary:"继续对话"}:{}),
   };
 }
 function hash(value) { return createHash('sha256').update(value).digest('hex'); }
@@ -267,10 +268,10 @@ test('v13 migration backup preserves archived legacy pending rows and current da
     f.inspect(db => db.prepare('UPDATE person_profile_pending SET archived_revision=1,archived_at=? WHERE id=?').run('2026-10-16T00:00:00Z', archived.id));
     f.store.close();
     f.inspect(db => {
-      db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; PRAGMA user_version=13;');
+      downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; PRAGMA user_version=13;');
     });
     f.restart();
-    assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 14);
+    assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 15);
     assert.deepEqual({ ...f.inspect(db => db.prepare('SELECT id,person_id,source_message_id,archived_revision,archived_at FROM person_profile_pending WHERE id=?').get(archived.id)) }, {
       id: archived.id, person_id: personId, source_message_id: source.existingMessageId, archived_revision: 1, archived_at: '2026-10-16T00:00:00Z',
     });
