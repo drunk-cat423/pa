@@ -117,17 +117,16 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.equal(pageRequests[1].url, 'https://example.com/article');
   assert.deepEqual(requests[3].tools.find(tool => tool.function.name === 'web_fetch').function.parameters.required, ['url']);
   assert.match(JSON.stringify(requests[4].messages.filter(message => message.role === 'tool')), /PAGE_MARKER/);
-  assert.ok(sent.slice(previousSends).some(part => part.markdown && part.buttons?.length));
+  assert.ok(sent.slice(previousSends).some(part => part.markdown && !Object.hasOwn(part,'buttons')));
   const reader = new DatabaseSync(join(config.dataDir, 'pa.sqlite'), { readOnly: true });
   let documents;
-  try { documents = reader.prepare('SELECT id, pages_json FROM answer_documents ORDER BY rowid').all(); }
+  try { documents = reader.prepare('SELECT rendered_body, summary, pages_json FROM answer_documents ORDER BY rowid').all(); }
   finally { reader.close(); }
   assert.equal(documents.length, 2);
-  assert.doesNotMatch(JSON.parse(documents[0].pages_json).join(''), /参考链接|https?:\/\//);
-  const articlePages = JSON.parse(documents[1].pages_json);
-  assert.match(articlePages.join(''), /\[参考链接\]\nhttps:\/\/example.com\/article$/);
-  assert.equal(await harness.handle(message(`/page ${documents[1].id} ${articlePages.length}`)), 'sent');
-  assert.match(sent.at(-1).text, /\[参考链接\]\nhttps:\/\/example.com\/article$/);
+  assert.equal(documents[0].summary,'');
+  assert.equal(documents[0].pages_json,'[]');
+  assert.doesNotMatch(documents[0].rendered_body, /参考链接|https?:\/\//);
+  assert.match(documents[1].rendered_body, /\[参考链接\]\nhttps:\/\/example.com\/article$/);
   assert.equal(totalModelCalls(requests, planningRequests), 7);
   assert.equal(await harness.handle(message('https://example.com/no-mention', false)), 'observed');
   assert.equal(pageRequests.length, 2);
@@ -141,10 +140,10 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
     assert.ok(progress.every(item => item.status === 'sent' && item.external_message_id));
     const progressIds = new Set(progress.map(item => item.external_message_id));
     const replySent = sent.filter((_message, index) => !progressIds.has('part-' + (index + 1)));
-    const rendered = [...parts, ...views];
-    assert.deepEqual(rendered.map(part => part.text), replySent.map(part => part.text));
-    assert.ok(rendered.every(part => part.status === 'sent' && part.external_message_id));
-    assert.doesNotMatch(rendered.map(part => part.text).join(''), /https:\/\/example.com\/search-source/);
-    assert.match(rendered.map(part => part.text).join(''), /https:\/\/example.com\/article/);
+    assert.equal(views.length,0);
+    assert.deepEqual(parts.map(part => part.text), replySent.map(part => part.text));
+    assert.ok(parts.every(part => part.status === 'sent' && part.external_message_id));
+    assert.doesNotMatch(parts.map(part => part.text).join(''), /https:\/\/example.com\/search-source/);
+    assert.match(parts.map(part => part.text).join(''), /https:\/\/example.com\/article/);
   } finally { database.close(); }
 });

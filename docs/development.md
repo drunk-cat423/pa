@@ -18,7 +18,7 @@
 | src/diagnostics.ts / src/logs.ts / src/logs-cli.ts | 独立诊断索引、请求响应证据、任务查询及无模型的离线解析校验 |
 | src/conversation.ts | 原文与Pi关联恢复、群聊/私聊完整滚动上下文、当前发送者/@对象画像预算、85%容量触发 |
 | src/channel-harness.ts | 先入库、按房间排队、参与判断、聊天预算、投递和启动后台恢复 |
-| src/markdown-pages.ts | 长回答摘要预览、按 UTF-8 字节分页、代码围栏处理与双向按钮指令 |
+| src/markdown-chunks.ts | 原生 Markdown 按 UTF-8 字节自动分段及代码围栏边界处理 |
 | src/channel-types.ts / src/qq-channel.ts | 标准化发送者与真实 mention 目标、QQ 收发/鉴权/重连 |
 | src/harness-policy.ts / src/memory-service.ts | 明确人物绑定、独立 owner 权限、本人显式更新及记忆管理 |
 | src/cli.ts / src/memory.ts | 本地聊天和离线 remember/query/correct；拒绝删除 |
@@ -30,7 +30,7 @@
 
 Pi 的默认自动压缩仍关闭。应用把版本化摘要和消息投影通过公开 API 接入 Pi，原文保持独立。不能直接替换 agent.state.messages，也不能忽略 SQLite / Pi 关联不一致。聊天重启不自动重发未知结果；后台整理依据持久批次和检查点重试。
 
-QQ 长回答采用 [Markdown 摘要与双向分页](qq-long-replies.md)。正文文档持久化后才能发送入口；入口确认送达后，完整回答只加入滚动历史一次。分页是 harness 的无模型读取指令，走同房间输出队列，不创建新的回答或压缩输入。发送回执须同时保留消息 ID 与可选引用索引，以便按实际显示页面解析引用；不可用跨房间 ID 或页面正文相似度猜测来源。
+QQ 回答使用原生 Markdown；长回答按 UTF-8 字节限制自动切段并连续发送。同房间投递串行，逐段确认；不确定或拒绝回执会停止余下部分，重启不自动重发。`/result` 显式领取完整结果，不调用模型。确认的分段保留消息 ID 与引用索引，引用按准确的房间和来源映射解析。旧分页文档与页面回执仍可读取，但当前 harness 不生成分页数据，也不响应 `/page`。
 
 ## 检查
 

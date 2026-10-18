@@ -11,7 +11,7 @@ import type { MemorySource } from './memory-service.js';
 import type { MemoryProvider } from './memory-provider.js';
 import { toPlainText } from './plain-text.js';
 import { appendReferenceUrls, splitReply, QQ_PASSIVE_REPLY_LIMIT } from './reply-chunks.js';
-import { markdownDocument, pageButtons, PAGE_COMMAND } from './markdown-pages.js';
+import { splitMarkdown } from './markdown-chunks.js';
 
 export interface ChannelTransport {
   send(message: OutboundMessage): Promise<DeliveryResult>;
@@ -27,7 +27,6 @@ export type HarnessResult = 'ignored' | 'observed' | 'duplicate' | 'budget_exhau
   | 'sent' | 'uncertain' | 'rejected' | 'failed';
 
 const RESULT_COMMAND = /^\/result(?:\s+([0-9a-f-]+))?\s*$/i;
-const PAGE_CONTROL = /^\/page(?:\s|$)/i;
 
 // Policy and budget live here, independent of the transport's platform protocol.
 export class ChannelHarness {
@@ -107,23 +106,13 @@ export class ChannelHarness {
     const conversation = await this.open(key, message.route);
     if (this.closed) { await conversation.close(); return 'ignored'; }
     const memoryRequest = parseMemoryRequest(message.text);
-    const commandText = message.text.trimStart();
-    const pageRequest = message.route.channel === 'qq' ? PAGE_COMMAND.exec(commandText) : null;
-    const pageControl = message.route.channel === 'qq' && PAGE_CONTROL.test(commandText);
     const source = conversation.ingest(message.text, {
       eventId: message.eventId, senderId: message.senderId, modelInputText: message.text, sentAt: message.sentAt,
       ...(message.senderName ? { senderName: message.senderName.slice(0, 100) } : {}),
-      ...(memoryRequest || pageControl || RESULT_COMMAND.test(message.text) ? { messageKind: 'memory' as const } : {}),
+      ...(memoryRequest || RESULT_COMMAND.test(message.text) ? { messageKind: 'memory' as const } : {}),
     });
     if (!source) return 'duplicate';
-    if (pageRequest) return this.navigate(conversation,message,pageRequest[1]!.toLowerCase(),Number(pageRequest[2]));
     if (message.route.roomType === 'group' && !message.mentioned) return 'observed';
-    if (pageControl) return this.navigate(conversation,message,'',-1);
-    const resultRequest = RESULT_COMMAND.exec(message.text);
-    if (message.route.channel === 'qq' && resultRequest) {
-      const result = conversation.taskResult(message.senderId,resultRequest[1]);
-      if (result && conversation.answerPage(result.deliveryId,0)) return this.navigate(conversation,message,result.deliveryId,0);
-    }
     const task = conversation.enqueueTask(source.id, message);
     return this.schedule(release => this.process(conversation, message, source, task.id, release));
   }
@@ -230,39 +219,18 @@ export class ChannelHarness {
     reply: { text: string; deliveryId: string; referenceUrls?: readonly string[] }, replyOffset = 0, taskId?: string): Promise<HarnessResult> {
     return this.output(message.route, async () => {
     const qq = message.route.channel === 'qq';
-    if (qq) {
-      const mode = this.passiveAvailable(message,replyOffset) ? 'passive' : 'active';
-      const attribution = mode === 'active' ? `回复 ${toPlainText(message.senderName ?? '提问者').slice(0,50)} · ${taskId?.slice(0,8) ?? ''}\n问题：${[...toPlainText(message.text)].slice(0,80).join('')}\n\n` : '';
-      const body = appendReferenceUrls(reply.text,reply.referenceUrls);
-      const document = markdownDocument(body,Buffer.byteLength(attribution+body)>1500);
-      if (document) document.summary = attribution+`回答 ${reply.deliveryId.slice(0,8)}\n\n`+document.summary;
-      const text = document?.summary ?? attribution+body;
-      if (!text.trim()) { conversation.acknowledge(reply.deliveryId,'uncertain'); return 'rejected'; }
-      if (document) conversation.prepareAnswerDocument(reply.deliveryId,document.summary,document.pages,body);
-      else conversation.prepareDeliveryParts(reply.deliveryId,[text]);
-      const slot = mode === 'passive' ? replyOffset : undefined;
-      conversation.beginDeliveryPart(reply.deliveryId,0,mode,slot === undefined ? undefined : slot+1);
-      let delivery: DeliveryResult = { status: 'uncertain' };
-      if (!this.closed) try {
-        delivery = await this.transport.send({ route:message.route,deliveryMode:mode,
-          ...(mode === 'passive' ? { replyToMessageId:message.eventId } : {}),
-          text,markdown:true,partIndex:slot ?? 0,
-          ...(document ? { buttons:pageButtons(reply.deliveryId,0,document.pages.length) } : {}) });
-      } catch { /* A missing receipt must never trigger an automatic resend. */ }
-      conversation.acknowledgePart(reply.deliveryId,0,delivery.status,
-        delivery.status === 'sent' ? delivery.externalMessageId : undefined,
-        delivery.status === 'sent' ? delivery.referenceIndex : undefined);
-      return delivery.status;
-    }
-    let text = appendReferenceUrls(reply.text, reply.referenceUrls);
-    const activeBatch = qq && (!this.passiveAvailable(message, replyOffset) || splitReply(text).length > QQ_PASSIVE_REPLY_LIMIT - replyOffset);
+    const renderedBody = appendReferenceUrls(reply.text, reply.referenceUrls);
+    let text = renderedBody;
+    let parts = qq ? splitMarkdown(text) : splitReply(text);
+    const activeBatch = qq && (!this.passiveAvailable(message, replyOffset) || parts.length > QQ_PASSIVE_REPLY_LIMIT - replyOffset);
     if (activeBatch) text = `回复 ${toPlainText(message.senderName ?? '提问者').slice(0, 50)} · ${taskId?.slice(0, 8) ?? ''}\n问题：${[...toPlainText(message.text)].slice(0, 80).join('')}\n\n${text}`;
-    const parts = splitReply(text);
+    if (activeBatch) parts = splitMarkdown(text);
     if (!parts.length) {
       conversation.acknowledge(reply.deliveryId, 'uncertain');
       return 'rejected';
     }
-    conversation.prepareDeliveryParts(reply.deliveryId, parts);
+    if (qq) conversation.prepareMarkdownDelivery(reply.deliveryId, renderedBody, parts);
+    else conversation.prepareDeliveryParts(reply.deliveryId, parts);
     for (const [partIndex, part] of parts.entries()) {
       if (this.closed) {
         conversation.acknowledge(reply.deliveryId, 'uncertain');
@@ -275,33 +243,14 @@ export class ChannelHarness {
       try {
         delivery = await this.transport.send({ route: message.route, deliveryMode: mode,
           ...(mode === 'passive' ? { replyToMessageId: message.eventId } : {}),
-          text: part, partIndex: slot ?? partIndex, ...(qq ? { plainText: true } : {}) });
+          text: part, partIndex: slot ?? partIndex, ...(qq ? { markdown: true } : {}) });
       } catch { delivery = { status: 'uncertain' }; }
       conversation.acknowledgePart(reply.deliveryId, partIndex, delivery.status,
-        delivery.status === 'sent' ? delivery.externalMessageId : undefined);
+        delivery.status === 'sent' ? delivery.externalMessageId : undefined,
+        delivery.status === 'sent' ? delivery.referenceIndex : undefined);
       if (delivery.status !== 'sent') return delivery.status;
     }
     return 'sent';
-    });
-  }
-
-  private navigate(conversation: RecordedConversation,message: InboundMessage,answerId: string,page: number): Promise<HarnessResult> {
-    return this.output(message.route,async () => {
-      if (this.closed) return 'ignored';
-      const mode = this.passiveAvailable(message,0) ? 'passive' : 'active';
-      // Lookup is serialized after the initial summary's persisted receipt.
-      const view = conversation.beginAnswerPageView(answerId,page,mode,mode === 'passive' ? 1 : undefined);
-      let delivery: DeliveryResult;
-      try {
-        delivery = await this.transport.send({ route:message.route,deliveryMode:mode,
-          ...(mode === 'passive' ? { replyToMessageId:message.eventId } : {}), partIndex:0,markdown:true,
-          text:view?.text ?? '该回答或页码不可用，请使用本会话中已送达回答的翻页按钮。',
-          ...(view ? { buttons:pageButtons(answerId,page,view.count) } : {}) });
-      } catch { delivery = { status:'uncertain' }; }
-      if (view) conversation.ackAnswerPageView(view.id,delivery.status,
-        delivery.status === 'sent' ? delivery.externalMessageId : undefined,
-        delivery.status === 'sent' ? delivery.referenceIndex : undefined);
-      return delivery.status;
     });
   }
 

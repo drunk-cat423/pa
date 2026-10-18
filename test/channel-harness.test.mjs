@@ -66,173 +66,76 @@ async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-ou
     totalCalls: () => totalModelCalls(requests, planningRequests), sent, harness, message };
 }
 
-test('长回复只发送Markdown摘要，正文可跨重启双向翻页且不调用模型', async t => {
-  const original = '先说明结论。\n\n```ts\n' + 'const 内容 = "😀你好";\n'.repeat(200) + '```\n\n最后一段。';
+test('长回答自动发送完整Markdown分段并按引用索引解析，重启不重发', async t => {
+  const original = '先说明结论。\n\n```ts\n' + 'const 内容 = "😀你好";\n'.repeat(240) + '```\n\n最后一段 END_OF_BODY。';
   const f = await fixture(t, (_message,index) => ({ status:'sent',externalMessageId:`part-${index}`,referenceIndex:`ref-${index}` }),original);
   const h = f.harness(0);
   assert.equal(await h.handle(f.message('long','请长回复')),'sent');
-  assert.equal(f.sent.length,1);
-  assert.ok(f.sent[0].markdown);
-  assert.match(f.sent[0].text,/摘要/);
+  assert.ok(f.sent.length > 1);
+  assert.ok(f.sent.every(part => part.markdown && !Object.hasOwn(part,'buttons') && Buffer.byteLength(part.text) <= 1500));
   assert.match(f.sent[0].text,/先说明结论/);
-  const firstCommand = f.sent[0].buttons[0].command;
-  const id = firstCommand.split(' ')[1];
-  assert.equal(await h.handle(f.message('next',firstCommand,{mentioned:false})),'sent');
-  assert.match(f.sent[1].text,/正文 1\//);
-  assert.equal(f.sent[1].buttons[0].command,`/page ${id} 0`);
-  assert.equal(await h.handle(f.message('next2',f.sent[1].buttons[1].command,{senderId:'member-B'})),'sent');
-  const secondPage = f.sent.at(-1).text;
-  assert.equal(await h.handle(f.message('back',f.sent.at(-1).buttons[0].command)),'sent');
-  assert.equal(f.sent.at(-1).text,f.sent[1].text);
-  assert.equal(await h.handle(f.message('summary',`/page ${id} 0`)),'sent');
-  assert.equal(f.sent.at(-1).text,f.sent[0].text);
-  assert.equal(f.requests.length,1);
-  assert.equal(f.planningRequests.length,1);
-  await h.handle(f.message('bad-page','/page missing -1'));
-  assert.match(f.sent.at(-1).text,/不可用/);
-  assert.equal(f.requests.length,1);
-  await h.close();
-  const reopened = f.harness(0);
-  await reopened.start();
-  assert.equal(f.sent.length,6);
-  await reopened.handle(f.message('again',`/page ${id} 2`));
-  assert.equal(f.sent.at(-1).text,secondPage);
-  await reopened.handle(f.message('wrong-room',firstCommand,{route:f.other}));
-  assert.match(f.sent.at(-1).text,/不可用/);
-  await reopened.handle(f.message('bounds',`/page ${id} 999`));
-  assert.match(f.sent.at(-1).text,/不可用/);
+  assert.match(f.sent.at(-1).text,/END_OF_BODY/);
+  assert.ok(f.sent.some(part => part.text.includes('const 内容')));
+  assert.ok(f.sent.filter(part => part.text.includes('const 内容')).every(part => part.text.includes('```')));
   assert.equal(f.requests.length,1);
   const db = new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
   try {
-    assert.deepEqual(db.prepare("SELECT text FROM messages WHERE role='assistant'").all().map(row=>row.text),[original]);
-    assert.equal(db.prepare("SELECT count(*) n FROM conversation_context_messages c JOIN messages m ON m.id=c.message_id WHERE m.role='assistant'").get().n,1);
-    assert.equal(db.prepare("SELECT count(*) n FROM conversation_context_messages c JOIN messages m ON m.id=c.message_id WHERE m.text LIKE '/page %'").get().n,0);
-    assert.equal(db.prepare('SELECT count(*) n FROM agent_runs').get().n,1);
-    assert.equal(db.prepare('SELECT count(*) n FROM answer_page_views').get().n,5);
+    assert.equal(db.prepare("SELECT text FROM messages WHERE role='assistant'").get().text,original);
+    assert.equal(db.prepare('SELECT count(*) n FROM delivery_parts WHERE status=\'sent\'').get().n,f.sent.length);
+    const saved = db.prepare('SELECT summary,pages_json,rendered_body FROM answer_documents').get();
+    assert.equal(saved.summary,'');
+    assert.equal(saved.pages_json,'[]');
+    assert.equal(saved.rendered_body,original);
   } finally { db.close(); }
-  await reopened.handle(f.message('quote-page','解释这一页',{quote:{referenceIndex:'ref-3'}}));
-  assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.text,secondPage);
-  assert.ok(conversationContext(f.requests.at(-1).body).messages.some(item=>item.role==='assistant' && item.text===original));
-  assert.equal(conversationContext(f.requests.at(-1).body).messages.filter(item=>item.role==='assistant').length,1);
-  assert.ok(!conversationContext(f.requests.at(-1).body).messages.some(item=>item.text.startsWith('/page ')));
-});
-
-test('导航等待摘要回执，两个回答使用独立显式目标，result只重发摘要视图',async t=>{
-  let ready,resume;
-  const started=new Promise(resolve=>{ready=resolve;});
-  const gate=new Promise(resolve=>{resume=resolve;});
-  const f=await fixture(t,async(_message,index)=>{
-    if(index===1){ready();await gate;}
-    return {status:'sent',externalMessageId:`out-${index}`};
-  },'结论。\n\n'+'细节😀'.repeat(1500));
-  const h=f.harness(0);
-  const initial=h.handle(f.message('first-doc','第一问'));
-  await started;
-  const command=f.sent[0].buttons[0].command;
-  const clicking=h.handle(f.message('while-sending',command,{senderId:'bob',mentioned:false}));
-  await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(f.sent.length,1);
-  resume();
-  assert.deepEqual(await Promise.all([initial,clicking]),['sent','sent']);
-  const firstPage=f.sent.at(-1).text;
-  await h.handle(f.message('second-doc','第二问'));
-  const secondCommand=f.sent.at(-1).buttons[0].command;
-  assert.notEqual(secondCommand,command);
-  await h.handle(f.message('second-next',secondCommand));
-  assert.notEqual(f.sent.at(-1).text,firstPage);
-  await h.handle(f.message('old-next',command));
-  assert.equal(f.sent.at(-1).text,firstPage);
-  const db=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  let task;
-  try {task=db.prepare(`SELECT t.id FROM channel_tasks t JOIN messages m ON m.id=t.message_id WHERE m.external_event_id='first-doc'`).get().id;}
-  finally {db.close();}
-  await h.handle(f.message('result',`/result ${task}`));
-  assert.equal(f.sent.at(-1).text,f.sent[0].text);
-  assert.equal(f.requests.length,2);
-  const inspect=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  try {assert.equal(inspect.prepare('SELECT count(*) n FROM agent_runs').get().n,2);}
-  finally {inspect.close();}
-});
-
-test('摘要未确认时正文不可访问，重启不重发也不注入完整回答', async t => {
-  const f = await fixture(t,(_message,index)=>index===1?{status:'uncertain'}:{status:'sent',externalMessageId:`part-${index}`},'未发布。\n\n'+'正文😀'.repeat(1000));
-  const h=f.harness(0);
-  assert.equal(await h.handle(f.message('failed','长回复')),'uncertain');
-  const command=f.sent[0].buttons[0].command;
-  await h.handle(f.message('hidden',command));
-  assert.match(f.sent.at(-1).text,/不可用/);
+  const priorSends=f.sent.length;
   await h.close();
   const reopened=f.harness(0);
   await reopened.start();
-  assert.equal(f.sent.length,2);
-  await reopened.handle(f.message('hidden-again',command));
-  assert.match(f.sent.at(-1).text,/不可用/);
-  assert.equal(f.requests.length,1);
-  const db=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  try { assert.equal(db.prepare("SELECT count(*) n FROM conversation_context_messages c JOIN messages m ON m.id=c.message_id WHERE m.role='assistant'").get().n,0); }
-  finally {db.close();}
+  assert.equal(f.sent.length, priorSends);
+  await reopened.handle(f.message('quote-part','解释这一段',{quote:{referenceIndex:'ref-2'}}));
+  assert.ok(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.text.length > 0);
+  assert.equal(conversationContext(f.requests.at(-1).body).messages.filter(item=>item.role==='assistant' && item.text===original).length,1);
 });
 
-test('超长正文仍只消耗一个新鲜被动回复槽位', async t => {
-  const f=await fixture(t,{status:'sent',externalMessageId:'huge'},'结论。\n\n'+'😀'.repeat(10000));
-  assert.equal(await f.harness().handle(f.message('huge','很长回复')),'sent');
+test('长Markdown分段失败停止且不自动重发，result重新发送完整围栏正文', async t => {
+  const original = '结论。\n\n```js\n' + 'const answer = "完整正文😀";\n'.repeat(160) + '```\n\nEND_OF_BODY';
+  let failFirst = true;
+  const f = await fixture(t,(_message,index)=>failFirst && index===1 ? {status:'uncertain'}
+    : {status:'sent',externalMessageId:`recovery-${index}`,referenceIndex:`recovery-ref-${index}`},original);
+  const h=f.harness(0);
+  assert.equal(await h.handle(f.message('first','长回答')),'uncertain');
   assert.equal(f.sent.length,1);
-  assert.equal(f.sent[0].deliveryMode,'passive');
-  assert.ok(Buffer.byteLength(f.sent[0].text)<=1500);
-});
-
-test('显式result可重新领取未发布长回答，恢复摘要按钮和全文且不调用模型', async t => {
-  const original = '这是结论。\n\n' + '完整正文😀。'.repeat(300) + '\n\nEND_OF_BODY';
-  const f = await fixture(t, (_message,index) => index === 1 ? {status:'uncertain'}
-    : {status:'sent',externalMessageId:`recovery-${index}`}, original);
-  const h = f.harness(0);
-  assert.equal(await h.handle(f.message('unpublished-answer','长回答')),'uncertain');
-  const oldCommand = f.sent[0].buttons[0].command;
-  const reader = new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
+  const taskReader=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
   let taskId;
-  try { taskId = reader.prepare("SELECT t.id FROM channel_tasks t JOIN messages m ON m.id=t.message_id WHERE m.external_event_id='unpublished-answer'").get().id; }
-  finally { reader.close(); }
-  assert.equal(await h.handle(f.message('recover-answer',`/result ${taskId}`)),'sent');
-  assert.ok(f.sent.at(-1).markdown && f.sent.at(-1).buttons?.length);
-  assert.notEqual(f.sent.at(-1).buttons[0].command,oldCommand);
-  const inspect = new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  let recovered;
-  try {
-    recovered = inspect.prepare('SELECT id,pages_json,rendered_body FROM answer_documents ORDER BY rowid DESC LIMIT 1').get();
-    assert.equal(recovered.rendered_body,original);
-    assert.equal(inspect.prepare('SELECT count(*) n FROM agent_runs').get().n,2);
-    assert.equal(inspect.prepare("SELECT count(*) n FROM conversation_context_messages c JOIN messages m ON m.id=c.message_id WHERE m.role='assistant'").get().n,0);
-  } finally { inspect.close(); }
-  assert.equal(await h.handle(f.message('recover-last-page',`/page ${recovered.id} ${JSON.parse(recovered.pages_json).length}`)),'sent');
-  assert.match(f.sent.at(-1).text,/END_OF_BODY/);
-  assert.equal(await h.handle(f.message('original-still-unknown',oldCommand)),'sent');
-  assert.match(f.sent.at(-1).text,/不可用/);
+  try { taskId=taskReader.prepare("SELECT id FROM channel_tasks WHERE message_id=(SELECT id FROM messages WHERE external_event_id='first')").get().id; }
+  finally { taskReader.close(); }
+  await h.close();
+  const reopened=f.harness(0);
+  await reopened.start();
+  assert.equal(f.sent.length,1);
+  failFirst=false;
+  assert.equal(await reopened.handle(f.message('result',`/result ${taskId}`)),'sent');
+  const resent=f.sent.slice(1);
+  assert.ok(resent.length>1 && resent.every(part=>part.markdown && Buffer.byteLength(part.text)<=1500));
+  assert.match(resent.at(-1).text,/END_OF_BODY/);
+  assert.equal(resent.filter(part=>/```/.test(part.text)).length>1,true);
   assert.equal(f.requests.length,1);
-  assert.equal(f.totalCalls(),2);
 });
 
-test('前导空白的合法和异常page指令仍是本地控制，保留原文且不调用模型', async t => {
-  const f = await fixture(t);
-  const privateRoute = {...f.route,roomType:'private'};
-  const h = f.harness(0,[f.route,privateRoute]);
-  const invalid = '  /page missing -1';
-  assert.equal(await h.handle(f.message('space-group',invalid)),'sent');
-  assert.equal(await h.handle(f.message('space-private',invalid,{route:privateRoute,mentioned:false})),'sent');
-  assert.equal(await h.handle(f.message('space-observed',invalid,{mentioned:false})),'observed');
-  assert.equal(await h.handle(f.message('space-valid','  /page 00000000-0000-0000-0000-000000000000 1',{mentioned:false})),'sent');
-  assert.equal(f.requests.length,0);
-  assert.equal(f.planningRequests.length,0);
-  const db = new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  try {
-    const rows = db.prepare('SELECT text,message_kind FROM messages ORDER BY ingest_seq').all();
-    assert.equal(rows.length,4);
-    assert.ok(rows.every(row => row.message_kind === 'memory'));
-    assert.equal(rows[0].text,invalid);
-    assert.equal(db.prepare('SELECT count(*) n FROM agent_runs').get().n,0);
-  } finally { db.close(); }
+test('长回答按实际Markdown分段数选择主动发送，/page不触发读取行为', async t => {
+  const original='结论。\n\n'+'详细内容😀。'.repeat(500);
+  const f=await fixture(t,(_message,index)=>({status:'sent',externalMessageId:`part-${index}`}),original);
+  const h=f.harness(0);
+  assert.equal(await h.handle(f.message('expired','旧问题',{sentAt:new Date(Date.now()-300_001).toISOString()})),'sent');
+  assert.ok(f.sent.length>1 && f.sent.every(part=>part.deliveryMode==='active' && part.markdown));
+  const count=f.sent.length;
+  await h.handle(f.message('page','/page ignored 1'));
+  assert.equal(f.requests.length,2);
+  assert.ok(f.sent.length>count);
+  assert.ok(f.sent.at(-1).markdown);
 });
 
-test('关闭发生于摘要发送期间仍记录真实回执', async t => {
+test('关闭发生于Markdown分段发送期间仍记录真实回执', async t => {
   let started,resume;
   const sending=new Promise(resolve=>{started=resolve;});
   const release=new Promise(resolve=>{resume=resolve;});
@@ -242,11 +145,11 @@ test('关闭发生于摘要发送期间仍记录真实回执', async t => {
   await sending;
   const closing=h.close();
   resume();
-  assert.equal(await result,'sent');
+  assert.equal(await result,'uncertain');
   await closing;
   assert.equal(f.sent.length,1);
   const db=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  try { assert.equal(db.prepare('SELECT status FROM deliveries').get().status,'sent'); }
+  try { assert.equal(db.prepare('SELECT status FROM deliveries').get().status,'uncertain'); }
   finally {db.close();}
 });
 

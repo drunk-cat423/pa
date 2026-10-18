@@ -180,7 +180,7 @@ test('并发上限可设为一，模型结束即释放槽位，发送阻塞不�
   assert.deepEqual(await Promise.all([first, second, third]), ['sent', 'sent', 'sent']);
 });
 
-test('同群长回答摘要与其它回答按队列顺序完成', async t => {
+test('同群长回答分段与其它回答按队列顺序完成', async t => {
   const f = await fixture(t), output = f.gate(), h = f.harness();
   const answer = '甲'.repeat(450) + '乙'.repeat(450) + '丙'.repeat(200);
   f.plans.set('long', [{ answer }]);
@@ -199,7 +199,7 @@ test('同群长回答摘要与其它回答按队列顺序完成', async t => {
   assert.equal(f.sent.length, 1);
   output.release();
   assert.deepEqual(await Promise.all([first, depth, normal]), ['sent', 'sent', 'sent']);
-  assert.match(f.sent[0].text,/开头预览/);
+  assert.match(f.sent[0].text,/^甲/);
   assert.equal(f.sent[0].replyToMessageId,'long');
   assert.ok(f.sent.slice(1).some(message => message.text === '回答：普通问题'));
   assert.ok(f.sent.slice(1).some(message => message.text === '专业最终回答'));

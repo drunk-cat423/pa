@@ -4,9 +4,9 @@ SQLite pa.sqlite 保存权威原文、消息来源、运行和投递记录，以
 
 ## schema v17
 
-v17增加 `answer_documents` 保存长回答摘要、完整展示正文与固定正文页面，`answer_page_views` 保存每次页面投递的实际正文、状态、页码、平台消息 ID 和引用索引；`delivery_parts` 增加引用索引。完整展示正文供显式领取未发布结果使用，避免只取到摘要或拼接分页围栏；原始模型正文仍保存在messages。文档以原回答的 delivery UUID 标识并限定当前会话，旧原文、投递和滚动压缩水位不改写。迁移仍先一致性备份再事务提交。
+v17 增加的 `answer_documents` 与 `answer_page_views` 保留旧分页回答、页面正文及其引用索引，继续支持历史读取和引用解析。当前新 Markdown 投递只在 `answer_documents.rendered_body` 保存完整展示正文快照，`summary` 为空、`pages_json` 为空数组；不再新建页面回执。`delivery_parts` 保存自动分段及每段引用索引。`/result` 优先读取完整正文快照，避免把跨代码围栏补齐后的分段错误拼接；原始模型 Markdown 仍保存在 messages。schema 仍为17，旧文档和投递不改写。
 
-摘要及阅读入口确认送达后，完整原始 Markdown 回答作为一次已发布回复进入滚动上下文。翻页只产生展示投递，不重复创建正文消息或模型运行；控制指令不参与普通聊天整理。引用解析使用已确认页面的实际文本，消息 ID 与平台引用索引分开处理。[阅读与引用规则](qq-long-replies.md)
+完整原始 Markdown 回答在所有分段确认后作为一次已发布回复进入滚动上下文。引用解析使用已确认分段的实际文本，消息 ID 与平台引用索引分开处理。旧页面记录仍可用于历史引用解析；当前发送行为见 [QQ Markdown 长回答](qq-long-replies.md)。
 
 ## schema v16（历史升级）
 
@@ -34,7 +34,7 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 | messages / message_ingest_order | 原文、独立模型输入、发送时间、接收时间、单调入库序号；平台事件在会话内唯一 |
 | agent_runs / deliveries | 输入/回复、Pi 关联、完成/失败及 sent/uncertain 投递 |
 | delivery_parts | 实际发送的分段正文、序号、pending/sending/sent/rejected/uncertain 状态与平台消息 ID |
-| answer_documents / answer_page_views | 长回答的持久摘要、固定页面及每次阅读投递；关联原回答，保留实际页面正文与引用映射 |
+| answer_documents / answer_page_views | 当前完整投递正文快照；兼容保存旧摘要、页面和历史阅读投递及引用映射 |
 | memories / memory_revisions / memory_events / memory_uses | 既有显式记忆、版本、来源与使用审计；旧删除墓碑保留 |
 | persons / person_bindings / actor_person_bindings | 通用人物、明确路由身份绑定；兼容迁移 primary_person_bindings |
 | person_profile_revisions | 当前人物画像版本和事实证据，旧版本保留 |
@@ -68,7 +68,7 @@ v12新增self_profile_reclassifications审计表。升级只增加结构，不�
 
 回复及 completed 状态与 pending 投递一并提交后才能发送。sent 仅表示发送端接受，不表示人已阅读。明确拒绝/结果未知保持未确认语义，不自动重发。
 
-分段计划先整体入库，每段在网络请求前写入 sending，收到回执后逐段确认；全部成功才将父投递标为 sent。一段拒绝或未知会停止后续投递，父投递标 uncertain，重启将剩余 pending/sending 段标 uncertain，不自动续发。messages 保存完整模型原文，delivery_parts 保存实际投递文本。QQ长回答只先投递摘要及正文入口，后续页面保存在 answer_page_views；引用已确认发送的消息时返回实际展示的摘要或页面，不用整篇正文替代。
+分段计划先整体入库，每段在网络请求前写入 sending，收到回执后逐段确认；全部成功才将父投递标为 sent。一段拒绝或未知会停止后续投递，父投递标 uncertain，重启将剩余 pending/sending 段标 uncertain，不自动续发。messages 保存完整模型原文，delivery_parts 保存实际投递文本。QQ 原生 Markdown 回答按字节上限自动分段；引用已确认发送的消息时按当前房间及实际分段正文解析。旧分页页面仍按已存正文提供历史引用解析。
 
 恢复时核对 pa_run 标记、原文或 model_input_text 与 Pi entry：有可验证回复则补齐 SQL；无回复标 interrupted；pending 投递改 uncertain；已关联历史不一致则停止。平台原文不会被模型输入 JSON 替代。
 

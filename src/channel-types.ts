@@ -46,7 +46,6 @@ export interface OutboundMessage {
   partIndex?: number;
   plainText?: boolean;
   markdown?: boolean;
-  buttons?: { label: string; command: string }[];
 }
 
 export type DeliveryResult =

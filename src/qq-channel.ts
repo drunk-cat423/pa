@@ -278,13 +278,7 @@ export class QQChannel {
     try {
       const scope = message.route.roomType === 'private' ? 'users' : 'groups';
       const payload = {
-        ...(message.markdown ? { msg_type: 2, markdown: { content }, ...(message.buttons?.length ? {
-          keyboard: { content: { rows: [{ buttons: message.buttons.map((button, index) => ({
-            id: String(index), render_data: { label: button.label, visited_label: button.label, style: 1 },
-            action: { type: 2, permission: { type: 2 }, data: button.command, enter: true, reply: false,
-              unsupport_tips: '请发送按钮中的翻页指令。' },
-          })) }] } },
-        } : {}) } : { msg_type: 0, content }),
+        ...(message.markdown ? { msg_type: 2, markdown: { content } } : { msg_type: 0, content }),
         ...(deliveryMode === 'passive' ? { msg_id: message.replyToMessageId, msg_seq: partIndex + 1 } : {}),
       };
       response = await this.fetchImpl(`${API}/v2/${scope}/${encodeURIComponent(message.route.roomId)}/messages`, {

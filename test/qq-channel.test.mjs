@@ -47,7 +47,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 const response = (status, body) => ({ status, json: async () => body });
 const tokenBody = { access_token: 'test-token', expires_in: 3600 };
 
-test('native Markdown instruction buttons preserve text and optional quote ref_idx for active and passive sends',async()=>{
+test('native Markdown sends preserve text and optional quote ref_idx without keyboards',async()=>{
   const ctx=setup({postResponse:response(200,{id:'native-id',ext_info:{ref_idx:'opaque-index'}})});
   const starting=ctx.channel.start();
   await tick();
@@ -58,19 +58,14 @@ test('native Markdown instruction buttons preserve text and optional quote ref_i
   for(const deliveryMode of ['passive','active']) {
     assert.deepEqual(await ctx.channel.send({route:{channel:'qq',accountId:'123',roomId:'group',roomType:'group'},
       deliveryMode,replyToMessageId:'input',text:'**结论**\n\n```ts\ncode\n```',markdown:true,
-      buttons:[{label:'下一页',command:'/page 123e4567-e89b-12d3-a456-426614174000 1'}]}),
+      }),
       {status:'sent',externalMessageId:'native-id',referenceIndex:'opaque-index'});
   }
   const bodies=ctx.calls.filter(call=>call.url.endsWith('/messages')).map(call=>JSON.parse(call.init.body));
   for(const body of bodies) {
     assert.equal(body.msg_type,2);
     assert.match(body.markdown.content,/\*\*结论\*\*/);
-    const button=body.keyboard.content.rows[0].buttons[0];
-    assert.equal(button.action.type,2);
-    assert.equal(button.action.enter,true);
-    assert.equal(button.action.reply,false);
-    assert.deepEqual(button.action.permission,{type:2});
-    assert.match(button.action.data,/^\/page /);
+    assert.equal(Object.hasOwn(body,'keyboard'),false);
   }
   assert.equal(bodies[0].msg_id,'input');
   assert.equal(bodies[1].msg_id,undefined);

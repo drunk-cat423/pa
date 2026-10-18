@@ -12,7 +12,6 @@ import { memoryWords } from './memory-text.js';
 import { validateTurnPlan, type TurnPlan, type TurnReceipt } from './turn-plan.js';
 import { isMemoryOwner, type HarnessPolicy } from './harness-policy.js';
 import { reclassifySelfProfileTerms, type SelfProfileTermMove } from './self-profile-reclassification.js';
-import { displayedPage } from './markdown-pages.js';
 
 export interface ConversationRecord {
   id: string;
@@ -1250,46 +1249,15 @@ export class ConversationStore {
     });
   }
 
-  prepareAnswerDocument(conversationId: string, deliveryId: string, summary: string, pages: readonly string[], renderedBody?: string): void {
-    this.memoryTransaction(() => {
-      if (!pages.length || !summary || pages.some(page => !page)) throw new Error('回答分页不能为空。');
-      this.prepareDeliveryParts(conversationId, deliveryId, [summary]);
-      const original = this.db.prepare('SELECT m.text FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE d.id=? AND d.conversation_id=?')
-        .get(deliveryId,conversationId)!;
-      this.db.prepare('INSERT INTO answer_documents(id,conversation_id,summary,pages_json,rendered_body,created_at) VALUES (?,?,?,?,?,?)')
-        .run(deliveryId,conversationId,summary,JSON.stringify(pages),renderedBody ?? String(original.text),now());
-    });
-  }
-
   answerPage(conversationId: string, answerId: string, page: number): { answerId: string; page: number; count: number; text: string } | undefined {
     if (!Number.isSafeInteger(page) || page < 0) return undefined;
     const row = this.db.prepare(`SELECT a.summary,a.pages_json FROM answer_documents a JOIN deliveries d ON d.id=a.id
-      WHERE a.id=? AND a.conversation_id=? AND d.status='sent'`).get(answerId,conversationId);
+      WHERE a.id=? AND a.conversation_id=? AND a.pages_json<>'[]' AND d.status='sent'`).get(answerId,conversationId);
     if (!row) return undefined;
     const pages = JSON.parse(String(row.pages_json)) as string[];
-    const text = displayedPage(String(row.summary),pages,page,answerId);
+    const text = page === 0 ? String(row.summary) : pages[page - 1] === undefined ? undefined
+      : `**回答 ${answerId.slice(0,8)} · 正文 ${page}/${pages.length}**\n\n${pages[page - 1]}`;
     return text === undefined ? undefined : { answerId,page,count:pages.length,text };
-  }
-
-  beginAnswerPageView(conversationId: string, answerId: string, page: number, mode: DeliveryMode, replySlot?: number): { id: string; text: string; count: number } | undefined {
-    validateDeliveryMode(mode,replySlot);
-    return this.memoryTransaction(() => {
-      const selected = this.answerPage(conversationId,answerId,page);
-      if (!selected) return undefined;
-      const id = randomUUID(), createdAt = now();
-      this.db.prepare(`INSERT INTO answer_page_views
-        (id,conversation_id,answer_id,page_number,text,status,delivery_mode,reply_slot,created_at,updated_at)
-        VALUES (?,?,?,?,?,'sending',?,?,?,?)`).run(id,conversationId,answerId,page,selected.text,mode,replySlot ?? null,createdAt,createdAt);
-      return { id,text:selected.text,count:selected.count };
-    });
-  }
-
-  ackAnswerPageView(conversationId: string, viewId: string, status: 'sent' | 'uncertain' | 'rejected', externalMessageId?: string, referenceIndex?: string): void {
-    if (!['sent','uncertain','rejected'].includes(status) || (status === 'sent' && !externalMessageId)) throw new Error('分页投递回执无效。');
-    if (this.db.prepare(`UPDATE answer_page_views SET status=?,external_message_id=?,reference_index=?,updated_at=?
-      WHERE id=? AND conversation_id=? AND status='sending'`).run(status,externalMessageId ?? null,referenceIndex ?? null,now(),viewId,conversationId).changes !== 1) {
-      throw new Error('分页投递不存在或已经结束。');
-    }
   }
 
   prepareDeliveryParts(conversationId: string, deliveryId: string, texts: readonly string[]): void {
@@ -1302,6 +1270,17 @@ export class ConversationStore {
       texts.forEach((text, index) => this.db.prepare(`INSERT INTO delivery_parts
         (delivery_id, conversation_id, part_index, text, status, created_at, updated_at)
         VALUES (?, ?, ?, ?, 'pending', ?, ?)`).run(deliveryId, conversationId, index, text, createdAt, createdAt));
+    });
+  }
+
+  prepareMarkdownDelivery(conversationId: string, deliveryId: string, renderedBody: string, texts: readonly string[]): void {
+    if (typeof renderedBody !== 'string' || !renderedBody.trim() || !texts.length
+      || texts.some(text => typeof text !== 'string' || !text.length)) throw new Error('Markdown投递内容无效。');
+    this.memoryTransaction(() => {
+      this.prepareDeliveryParts(conversationId,deliveryId,texts);
+      const createdAt = now();
+      this.db.prepare('INSERT INTO answer_documents(id,conversation_id,summary,pages_json,rendered_body,created_at) VALUES (?,?,\'\',\'[]\',?,?)')
+        .run(deliveryId,conversationId,renderedBody,createdAt);
     });
   }
 

@@ -21,46 +21,24 @@ function fixture(t) {
     inspect(fn){const db=new DatabaseSync(path);try{return fn(db);}finally{db.close();}}};
 }
 
-test('canonical full answer enters rolling and frozen compression exactly once; controls/views never enter',t=>{
-  const f=fixture(t),id=f.result.deliveryId;
-  f.store.prepareAnswerDocument(f.a.id,id,'显示摘要',['第一页','第二页']);
-  assert.equal(f.store.answerPage(f.a.id,id,1),undefined);
-  assert.equal(f.store.autoMemory.conversationContext(f.a.id).messages.filter(m=>m.role==='assistant').length,0);
-  f.store.beginDeliveryPart(f.a.id,id,0);
-  f.store.ackDeliveryPart(f.a.id,id,0,'sent','summary-id','summary-ref');
-  f.store.recordInbound(f.a.id,`/page ${id} 1`,{eventId:'click',senderId:'bob',modelInputText:`/page ${id} 1`,messageKind:'memory'});
-  const view=f.store.beginAnswerPageView(f.a.id,id,1,'passive',1);
-  f.store.ackAnswerPageView(f.a.id,view.id,'sent','page-id','page-ref');
-  f.store.autoMemory.reserveBatch(f.a.id,'capacity');
-  const job=f.store.autoMemory.claimNext(f.a.id,{owner:'test',leaseMs:60000});
-  const input=f.store.autoMemory.taskInput(job);
-  assert.deepEqual(input.messages.map(m=>m.text),['问题',f.canonical]);
-  const another=f.store.beginAnswerPageView(f.a.id,id,0,'active');
-  f.store.ackAnswerPageView(f.a.id,another.id,'sent','summary-repeat','summary-repeat-ref');
-  assert.deepEqual(f.store.autoMemory.taskInput(job),input);
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'summary-id'),{role:'assistant',text:'显示摘要'});
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'summary-ref',true),{role:'assistant',text:'显示摘要'});
-  for(const [external,index] of [['page-id',false],['page-ref',true]]) {
-    assert.deepEqual(f.store.quotedMessage(f.a.id,external,index),{role:'assistant',text:view.text});
-    assert.equal(f.store.quotedMessage(f.b.id,external,index),undefined);
-  }
+test('schema17只读保留旧页面正文与引用索引，不混入规范回答历史',t=>{
+  const f=fixture(t),id=f.result.deliveryId,createdAt=new Date().toISOString();
+  f.store.ackDelivery(id,'sent','summary-id');
+  f.inspect(db=>{
+    db.prepare('INSERT INTO answer_documents(id,conversation_id,summary,pages_json,rendered_body,created_at) VALUES (?,?,?,?,?,?)')
+      .run(id,f.a.id,'显示摘要',JSON.stringify(['第一页','第二页']),f.canonical,createdAt);
+    db.prepare(`INSERT INTO answer_page_views(id,conversation_id,answer_id,page_number,text,status,external_message_id,reference_index,delivery_mode,reply_slot,created_at,updated_at)
+      VALUES ('legacy-view',?,?,1,'旧页面正文','sent','page-id','page-ref','active',NULL,?,?)`).run(f.a.id,id,createdAt,createdAt);
+  });
+  assert.deepEqual(f.store.answerPage(f.a.id,id,1),{answerId:id,page:1,count:2,text:`**回答 ${id.slice(0,8)} · 正文 1/2**\n\n第一页`});
   assert.equal(f.store.answerPage(f.b.id,id,1),undefined);
-  assert.equal(f.store.answerPage(f.a.id,id,3),undefined);
-  f.restart();
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:view.text});
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-id'),{role:'assistant',text:'旧页面正文'});
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文'});
+  assert.equal(f.store.quotedMessage(f.b.id,'page-ref',true),undefined);
   assert.deepEqual(f.store.autoMemory.conversationContext(f.a.id).messages.map(m=>m.text),['问题',f.canonical]);
-});
-
-test('unknown page send survives restart without exposing a quote or retrying the attempt',t=>{
-  const f=fixture(t),id=f.result.deliveryId;
-  f.store.prepareAnswerDocument(f.a.id,id,'摘要',['正文']);
-  f.store.beginDeliveryPart(f.a.id,id,0);
-  f.store.ackDeliveryPart(f.a.id,id,0,'sent','summary');
-  const view=f.store.beginAnswerPageView(f.a.id,id,1,'active');
   f.restart();
-  assert.equal(f.inspect(db=>db.prepare('SELECT status FROM answer_page_views WHERE id=?').get(view.id).status),'uncertain');
-  assert.throws(()=>f.store.ackAnswerPageView(f.a.id,view.id,'sent','unknown'),/已经结束/);
-  assert.equal(f.store.quotedMessage(f.a.id,'unknown'),undefined);
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文'});
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),17);
 });
 
 test('schema16 migration keeps canonical history and creates an intact backup',t=>{
