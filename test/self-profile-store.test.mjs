@@ -318,9 +318,9 @@ test('v6 migration backs up the original database and preserves chats, tombstone
     });
     f.restart();
     inspect(f, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 17);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 18);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
-      for (const table of tables) assert.deepEqual(db.prepare(`SELECT rowid,* FROM ${table}`).all().map(r => ({ ...r })), before[table]);
+      for (const table of tables) assert.deepEqual(db.prepare(`SELECT rowid,* FROM ${table}`).all().map(({image_failure: _failure,...r}) => ({ ...r })), before[table]);
     });
     const backups = readdirSync(f.directory).filter(name => name.includes('.v6.') && name.endsWith('.bak'));
     assert.equal(backups.length, 1);

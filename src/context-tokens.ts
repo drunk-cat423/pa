@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { imageTokenPayload, IMAGE_TOKENS, MAX_REQUEST_IMAGES } from './image-context.js';
 
 const VERSION = 1;
 const CHUNK_BYTES = 8192;
@@ -10,6 +11,7 @@ const hash = (value: string | Uint8Array) => createHash('sha256').update(value).
 export interface ContextFootprint {
   bytes: number;
   blocks: { hash: string; bytes: number; count: number }[];
+  imageIds?: string[];
 }
 export interface ContextCalibration {
   version: 1;
@@ -29,7 +31,8 @@ export function contextCalibrationKey(provider: string, model: string, api: stri
 /** Chunk each message independently so phase/envelope changes do not invalidate history. */
 export function contextFootprint(payload: unknown): ContextFootprint | undefined {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
-  const { messages, ...envelope } = payload as Record<string, unknown>;
+  const visual = imageTokenPayload(payload);
+  const { messages, ...envelope } = visual.text as Record<string, unknown>;
   if (!Array.isArray(messages)) return undefined;
   const blocks = new Map<string, { hash: string; bytes: number; count: number }>();
   let bytes = 0, count = 0;
@@ -47,7 +50,7 @@ export function contextFootprint(payload: unknown): ContextFootprint | undefined
       else blocks.set(key, { hash: digest, bytes: chunk.length, count: 1 });
     }
   }
-  return { bytes, blocks: [...blocks.values()] };
+  return { bytes, blocks: [...blocks.values()], ...(visual.imageIds.length ? { imageIds: visual.imageIds.map(hash) } : {}) };
 }
 
 export function validContextCalibration(value: unknown): value is ContextCalibration {
@@ -58,7 +61,9 @@ export function validContextCalibration(value: unknown): value is ContextCalibra
   const fp = metadata.footprint;
   if (!fp || !Number.isSafeInteger(fp.bytes) || fp.bytes <= 0 || fp.bytes > MAX_BYTES
     || !Array.isArray(fp.blocks) || !fp.blocks.length || fp.blocks.length > MAX_BLOCKS) return false;
-  if (Object.keys(fp).some(key => !['bytes', 'blocks'].includes(key))) return false;
+  if (Object.keys(fp).some(key => !['bytes', 'blocks', 'imageIds'].includes(key))) return false;
+  if (fp.imageIds !== undefined && (!Array.isArray(fp.imageIds) || fp.imageIds.length > MAX_REQUEST_IMAGES
+    || fp.imageIds.some(id => typeof id !== 'string' || !HASH.test(id)))) return false;
   let bytes = 0, count = 0;
   const seen = new Set<string>();
   for (const block of fp.blocks) {
@@ -108,6 +113,14 @@ export class ContextTokenEstimator {
     if (!current) return undefined;
     const blocks = new Map(current.blocks.map(block => [`${block.hash}:${block.bytes}`, block]));
     for (const sample of this.samples.toReversed()) {
+      const remaining = [...(current.imageIds ?? [])];
+      let missingImage = false;
+      for (const id of sample.footprint.imageIds ?? []) {
+        const index = remaining.indexOf(id);
+        if (index < 0) { missingImage = true; break; }
+        remaining.splice(index, 1);
+      }
+      if (missingImage) continue;
       let retainedBytes = 0;
       for (const block of sample.footprint.blocks) {
         retainedBytes += block.bytes * Math.min(block.count, blocks.get(`${block.hash}:${block.bytes}`)?.count ?? 0);
@@ -118,7 +131,7 @@ export class ContextTokenEstimator {
       // Keep the full observed input even when some old blocks were removed.
       // New bytes receive no learned density discount. Reserve separators and token
       // boundaries even when a large number of tiny messages is appended/reordered.
-      const inputTokens = sample.inputTokens + newBytes + 64 + current.blocks.reduce((sum, block) => sum + block.count * 2, 0);
+      const inputTokens = sample.inputTokens + newBytes + remaining.length * IMAGE_TOKENS + 64 + current.blocks.reduce((sum, block) => sum + block.count * 2, 0);
       return {
         inputTokens, calibration: { sampleInputTokens: sample.inputTokens, retainedBytes, newBytes },
       };

@@ -9,7 +9,7 @@
 | src/config.ts | 聊天与后台调用预算，不读取其他应用凭据 |
 | src/runtime.ts | 受限 Pi 会话、独立 ModelRuntime 工厂、最终输入容量估算、公开 API 重建投影 |
 | src/context-tokens.ts | 成功SDK输入用量校准、分块哈希匹配、缓存统计校验及新增内容保守估算 |
-| src/store.ts | schema v17、原文/run/投递、长回答文档与页面引用、显式记忆、迁移备份、去重和上下文水位 |
+| src/store.ts | schema v18、原文/run/投递、长回答文档与页面引用、显式记忆、迁移备份、去重和上下文水位 |
 | src/auto-memory-store.ts | 通用person绑定、可见消息序列、滚动摘要及容量快照、任务租约、子批次检查点、Topic/画像/关键词检索 |
 | src/self-profile-store.ts | 全局AI画像修订、带来源待整理建议、原子归档和并发版本检查 |
 | src/auto-memory.ts | 与聊天独立的后台调度、严格输出校验、显式失败重试、容量等待及 Topic 关键词检索 |
@@ -60,3 +60,5 @@ src/turn-plan.ts集中管理intent/mode/updates协议及三种回答提示；cha
 后台每次启动的调用上限由操作者明确设置。轻量自我画像已接入：所有成员的明确建议先保存并注入，再随记忆批次归档；没有独立关系模式、好感度或人格审批流程。Telegram、长回答合并转发和主动插话未在本次实现中。独立群情报摘要、人物 FTS/向量和删除功能已按用户决定排除；群聊/私聊的会话压缩摘要用于承接连续对话。
 
 [v0.2 基线](design/pi_evolving_companion_technical_design_v0.2.md) 与 [Shiori 参考](shiori-memory-reference.md) 保留设计来源；发生冲突时以 [记忆 v1](design/companion_memory_v1.md) 和用户最新决定为准。
+
+图片链路由 `image-assets.ts` 下载/验证/去重/保存原图并上传Files，`message_images`负责房间与消息关联；`image-context.ts`只依据harness可信metadata投影真正的DeepSeek user file blocks，同一投影用于估算和发送，不改Pi内部或伪造Base64图片文本。`image-context.test.mjs`用QQ真实字段fixture、CDN下载stub和本地HTTP模型验证准备/回答、完整图片历史、重启、后台冻结压缩、摘要切换、原图工具、跨群权限与关闭中的admission取消。后台画像专用任务不额外注入图片。

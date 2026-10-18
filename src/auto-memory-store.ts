@@ -382,7 +382,11 @@ export class AutoMemoryStore {
         LEFT JOIN messages input ON input.id=r.input_message_id LEFT JOIN deliveries d ON d.message_id=m.id
         LEFT JOIN actors a ON a.id=m.actor_id LEFT JOIN actors inputa ON inputa.id=input.actor_id
         LEFT JOIN conversation_context_messages context ON context.message_id=m.id WHERE m.id=?`).get(id)!;
+      const images=this.db.prepare('SELECT metadata_json FROM message_images WHERE message_id=? ORDER BY ordinal').all(id)
+        .map(row=>parse<import('./image-context.js').MessageImage>(row.metadata_json));
       return {id:String(r.id),conversationId:String(r.conversation_id),role:r.role as 'user'|'assistant',text:String(r.text),ingestSeq:Number(r.ingest_seq),createdAt:String(r.created_at),
+        ...(images.length?{images}:{}),
+        ...(r.image_failure==null?{}:{imageFailure:String(r.image_failure)}),
         ...(r.turn_input_seq==null?{}:{turnInputSeq:Number(r.turn_input_seq)}),
         ...(r.context_seq==null?{}:{contextSeq:Number(r.context_seq)}),
         ...(r.sender_id==null?{}:{senderId:String(r.sender_id)}),...(r.sender_name==null?{}:{senderName:String(r.sender_name)}),

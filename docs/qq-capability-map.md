@@ -33,14 +33,14 @@
 | 按钮与互动回调 | 把用户选择转成 harness 可处理的输入 | 平台协议支持自定义指令按钮，但当前长回答不使用按钮或分页指令；回调按钮 ACK 通路未验证。 |
 | 自定义菜单与指令面板 | 展示 harness 已有操作的便捷入口 | 可选适配；记忆、隐私和参与设置仍共用 harness 实现。 |
 | 消息反馈 | 将点赞、点踩收为具体回复的反馈证据 | INTERACTION_CREATE type=13。文档支持；当前账号入口和实际事件待测。成长阶段使用。 |
-| 图片、文件、语音等附件 | 分享图片时共同讨论，理解用户发来的材料 | 通道支持不等于模型会处理；先图片/文件，再按需要考虑语音。后续多模态阶段。 |
+| 图片附件 | 引用原图 @Bot 提问，或平台提供的图文消息 | DeepSeek官方deepseek-flash已实现原图持久化与Files多模态上下文；非@及纯图片只保存。每图8MiB/4096px，最多600图/200MiB。文件与语音尚未接入。 |
 | 单聊流式输出 | 减少长回复的等待感 | 有独立 stream_messages 接口；群聊不支持流式。基础对话稳定后再接。 |
 | 撤回自己发出的消息 | 及时纠正明显错误或重复输出 | 当前文档限制发送后 2 分钟；未实测。后续纠错辅助。 |
 
 以上用途和顺序是工程建议；接口事实依据如下，未实测项目不能写成当前已可用。
 
 - [全量群事件与字段](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_message_create.html)：用于发送者、群、引用、附件和来源定位。MessageScene.ext 还可能携带 auth_token 等鉴权数据，不能原样打印、写入普通日志或送进模型。
-- [群 @ 事件的引用字段](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_at_message_create.html)：当前实现只提取内联引用的文字与公开作者信息，限制嵌套和大小；ref_msg_idx 不等于消息 ID。harness 将引用和当前问题分开，不能据引用执行记忆更新或认定为当前发送者的自述。真实 ID 回查仅限当前 conversation，查不到明确标记 unavailable；目前不读取被引用图片、语音或文件的正文。仅引用而没有文字问题的事件仍遵守空输入边界。
+- [群 @ 事件的引用字段](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_at_message_create.html)：当前实现提取内联引用文字、公开作者信息及图片附件，限制嵌套和大小；ref_msg_idx 不等于消息 ID。harness 将引用和当前问题分开，不能据引用执行记忆更新或认定为当前发送者的自述。真实 ID 回查仅限当前 conversation，查不到明确标记 unavailable；被引用图片通过受限QQ CDN下载、持久化后以真实file块送入模型；语音和普通文件尚未读取。仅引用而没有文字问题的事件仍遵守空输入边界。
 - [群消息发送](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)：文本、Markdown、键盘、引用回复和发送限制。输入消息 ID、用于引用的索引、返回消息 ID 应按用途区分。
 - [文本交互](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/trans/text-chain.html)：定向 @ 与可点击指令。该页部分条目仅频道可用，不能用于推定 QQ 群能力。
 - [菜单与指令面板](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/menu-panel/)：为用户提供操作入口，不要求另建 Web UI。

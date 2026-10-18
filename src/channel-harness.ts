@@ -12,6 +12,7 @@ import type { MemoryProvider } from './memory-provider.js';
 import { toPlainText } from './plain-text.js';
 import { appendReferenceUrls, splitReply, QQ_PASSIVE_REPLY_LIMIT } from './reply-chunks.js';
 import { splitMarkdown } from './markdown-chunks.js';
+import { ImageAssets, ImageAssetError } from './image-assets.js';
 
 export interface ChannelTransport {
   send(message: OutboundMessage): Promise<DeliveryResult>;
@@ -41,6 +42,9 @@ export class ChannelHarness {
   private closed = false;
   private calls = 0;
   private readonly policy: HarnessPolicy;
+  private readonly imageAssets: ImageAssets;
+  private readonly admissions = new Map<string, Promise<unknown>>();
+  private readonly admissionAbort = new AbortController();
 
   constructor(private readonly config: PaConfig, private readonly routes: ChannelRoute[],
     private readonly transport: ChannelTransport, private readonly maxCalls: number, policy: HarnessPolicy = NO_OWNER_POLICY,
@@ -51,6 +55,7 @@ export class ChannelHarness {
     if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 16) throw new Error('任务并发数必须是1到16。');
     this.allowed = new Set(routes.map(channelConversationKey));
     this.policy = validateHarnessPolicy(policy);
+    this.imageAssets = new ImageAssets(config);
   }
 
   info() { return { calls: this.calls, maxCalls: this.maxCalls, computing: this.computing, queued: this.pending.length,
@@ -92,29 +97,62 @@ export class ChannelHarness {
   handle(message: InboundMessage): Promise<HarnessResult> {
     const key = channelConversationKey(message.route);
     if (this.closed || !this.allowed.has(key) || !message.eventId || !message.senderId
-      || !message.text.trim() || message.text.length > 4000
+      || (!message.text.trim() && !message.imageSources?.length && !message.images?.length) || message.text.length > 4000
       || !Number.isFinite(Date.parse(message.sentAt))) return Promise.resolve('ignored');
     const input = { ...message, route: { ...message.route },
+      ...(message.imageSources ? { imageSources: message.imageSources.map(source=>({...source})) } : {}),
+      ...(message.images ? { images: message.images.map(image=>({...image})) } : {}),
       ...(message.mentionedSenderIds ? { mentionedSenderIds: [...message.mentionedSenderIds] } : {}),
       ...(message.quote ? { quote: { ...message.quote,
         ...(message.quote.inlineMessages ? { inlineMessages: message.quote.inlineMessages.map(item => ({ ...item })) } : {}) } } : {}) };
-    return this.accept(key, input);
+    // Serialize only admission/preparation; model and complete output queues remain independent.
+    const admitted = (this.admissions.get(key) ?? Promise.resolve()).then(() => this.accept(key, input));
+    this.admissions.set(key, admitted.then(() => undefined, () => undefined));
+    return admitted.then(result => this.closed ? 'ignored' : typeof result === 'function' ? result() : result);
   }
 
-  private async accept(key: string, message: InboundMessage): Promise<HarnessResult> {
+  private async accept(key: string, message: InboundMessage): Promise<HarnessResult | (() => Promise<HarnessResult>)> {
     if (this.fatal) throw this.fatal;
     const conversation = await this.open(key, message.route);
-    if (this.closed) { await conversation.close(); return 'ignored'; }
+    if (this.closed) return 'ignored';
+    if (conversation.hasInbound(message.eventId)) return 'duplicate';
+    if (message.imageSources?.length) {
+      try {
+        const images = [];
+        for (const source of message.imageSources) images.push({ ...await this.imageAssets.prepare(source,this.admissionAbort.signal),
+          ...(source.quoted ? { quoted: true } : {}), ...(source.referenceHash ? { referenceHash: source.referenceHash } : {}),
+          ...(source.sourceSenderId ? { sourceSenderId: source.sourceSenderId } : {}) });
+        const { imageSources: _sources, ...safe } = message;
+        message = { ...safe, images };
+      } catch (error) {
+        if (!(error instanceof ImageAssetError) || error.code === 'persistence') throw error;
+        if (this.closed) return 'ignored';
+        const source = conversation.ingest(message.text,{eventId:message.eventId,senderId:message.senderId,
+          modelInputText:message.text,sentAt:message.sentAt,imageFailure:error.code,
+          ...(message.senderName?{senderName:message.senderName.slice(0,100)}:{})});
+        if (!source) return 'duplicate';
+        if (!this.closed && message.text.trim() && (message.route.roomType === 'private' || message.mentioned)) {
+          await this.output(message.route, async () => {
+            try { await this.transport.send({ route: message.route, replyToMessageId: message.eventId,
+              text: error.message, deliveryMode: 'passive', plainText: true }); } catch {}
+          });
+        }
+        return 'failed';
+      }
+    }
+    if (this.closed) return 'ignored';
     const memoryRequest = parseMemoryRequest(message.text);
     const source = conversation.ingest(message.text, {
       eventId: message.eventId, senderId: message.senderId, modelInputText: message.text, sentAt: message.sentAt,
       ...(message.senderName ? { senderName: message.senderName.slice(0, 100) } : {}),
       ...(memoryRequest || RESULT_COMMAND.test(message.text) ? { messageKind: 'memory' as const } : {}),
+      ...(message.quote ? { quote: message.quote } : {}),
+      ...(message.images?.length ? { images: message.images } : {}),
     });
     if (!source) return 'duplicate';
-    if (message.route.roomType === 'group' && !message.mentioned) return 'observed';
+    if (!message.text.trim() || (message.route.roomType === 'group' && !message.mentioned)) return 'observed';
     const task = conversation.enqueueTask(source.id, message);
-    return this.schedule(release => this.process(conversation, message, source, task.id, release));
+    return () => this.schedule(release => this.process(conversation, message, source, task.id, release));
   }
 
   private schedule(run: (release: () => void) => Promise<HarnessResult>): Promise<HarnessResult> {
@@ -160,6 +198,7 @@ export class ChannelHarness {
       ...(message.mentionedSenderIds ? { mentionedSenderIds: message.mentionedSenderIds } : {}),
       ...(message.senderName ? { senderName: message.senderName.slice(0, 100) } : {}),
       ...(message.quote ? { quote: message.quote } : {}),
+      ...(message.images?.length ? { images: message.images } : {}),
       ...(message.route.channel === 'qq' ? { responseFormat: 'markdown' as const } : {}),
     };
     const memoryRequest = parseMemoryRequest(message.text);
@@ -256,10 +295,12 @@ export class ChannelHarness {
 
   async close(): Promise<void> {
     this.closed = true;
+    this.admissionAbort.abort();
     for (const waiting of this.pending.splice(0)) waiting.resolve('ignored');
     // Abort model work first; in-flight transport receipts still need the open store.
     await Promise.all([...this.conversations.values()].map(conversation => conversation.abort()));
     await Promise.allSettled(this.opening.values());
+    await Promise.allSettled(this.admissions.values());
     await Promise.all([...this.conversations.values()].map(conversation => conversation.abort()));
     await Promise.allSettled(this.jobs);
     await Promise.allSettled(this.outputs.values());

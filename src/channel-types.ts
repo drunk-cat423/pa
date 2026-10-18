@@ -1,3 +1,8 @@
+import type { ImageSource } from './image-assets.js';
+import type { MessageImage } from './image-context.js';
+
+export interface InboundImage extends ImageSource { quoted?: boolean; sourceSenderId?: string; referenceHash?: string }
+
 export interface ChannelRoute {
   channel: string;
   accountId: string;
@@ -24,6 +29,8 @@ export interface ExternalRunInput {
   quote?: MessageQuote;
   responseFormat?: 'plain_text' | 'markdown';
   messageKind?: 'chat' | 'memory';
+  images?: MessageImage[];
+  imageFailure?: string;
 }
 
 export interface InboundMessage {
@@ -36,6 +43,8 @@ export interface InboundMessage {
   mentioned: boolean;
   mentionedSenderIds?: string[];
   quote?: MessageQuote;
+  imageSources?: InboundImage[];
+  images?: MessageImage[];
 }
 
 export interface OutboundMessage {

@@ -12,6 +12,7 @@ import { memoryWords } from './memory-text.js';
 import { validateTurnPlan, type TurnPlan, type TurnReceipt } from './turn-plan.js';
 import { isMemoryOwner, type HarnessPolicy } from './harness-policy.js';
 import { reclassifySelfProfileTerms, type SelfProfileTermMove } from './self-profile-reclassification.js';
+import { imageMetadata, type MessageImage } from './image-context.js';
 
 export interface ConversationRecord {
   id: string;
@@ -67,7 +68,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -462,6 +463,11 @@ export class ConversationStore {
           FOREIGN KEY(answer_id,conversation_id) REFERENCES deliveries(id,conversation_id));
         CREATE INDEX answer_views_message ON answer_page_views(conversation_id,external_message_id);
         CREATE INDEX answer_views_reference ON answer_page_views(conversation_id,reference_index);`);
+      if (version < 18) this.db.exec(`ALTER TABLE messages ADD COLUMN image_failure TEXT;
+        CREATE TABLE message_images (
+        message_id TEXT NOT NULL REFERENCES messages(id), image_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL, metadata_json TEXT NOT NULL, PRIMARY KEY(message_id,ordinal));
+        CREATE INDEX message_images_asset ON message_images(image_id);`);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
@@ -874,7 +880,7 @@ export class ConversationStore {
       }
       const tokens = historyTokens(options.query ?? '');
       const match = [...new Set(tokens)].map(token => '"' + token.replaceAll('"','""') + '"').join(' OR ');
-      const filtered = `SELECT m.id,m.role,m.text,m.ingest_seq,m.sent_at,m.created_at,m.sender_name,
+      const filtered = `SELECT m.id,m.role,m.text,m.ingest_seq,m.sent_at,m.created_at,m.sender_name,m.image_failure,
         a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,r.input_message_id,r.response_message_id
         ${match ? ',bm25(message_history_fts) AS score' : ''}
         FROM messages m LEFT JOIN actors a ON a.id=m.actor_id
@@ -913,6 +919,8 @@ export class ConversationStore {
         ...(row.sender_name == null ? {} : { senderName: String(row.sender_name) }),
         ...(row.role !== 'assistant' || row.reply_sender_id == null ? {} : { replyToSenderId: String(row.reply_sender_id) }),
         sentAt: String(row.sent_at ?? row.created_at),
+        ...(row.image_failure==null?{}:{imageFailure:String(row.image_failure)}),
+        ...(this.messageImages(conversationId,String(row.id)).length ? { images: this.messageImages(conversationId,String(row.id)).map(imageMetadata) } : {}),
       })) };
     });
   }
@@ -954,7 +962,7 @@ export class ConversationStore {
     return row ? { id: String(row.id), actorId: String(row.actor_id), senderId: String(row.external_user_id), text: String(row.text) } : undefined;
   }
 
-  quotedMessage(conversationId: string, externalId: string, referenceIndex = false): { role: 'user' | 'assistant'; senderId?: string; text: string } | undefined {
+  quotedMessage(conversationId: string, externalId: string, referenceIndex = false): { role: 'user' | 'assistant'; senderId?: string; text: string; images?: MessageImage[] } | undefined {
     if (typeof externalId !== 'string' || !externalId || externalId.length > 512
       || externalId.trim() !== externalId || /[\u0000-\u001f\u007f]/.test(externalId)) return undefined;
     // Both inbound event IDs and confirmed outgoing IDs are scoped to this exact conversation.
@@ -972,7 +980,9 @@ export class ConversationStore {
       LIMIT 2`).all(referenceIndex ? 1 : 0, conversationId, externalId, externalId, conversationId, externalId, conversationId, externalId);
     if (rows.length !== 1) return undefined;
     const row = rows[0]!;
+    const images = this.messageImages(conversationId,String(row.id));
     return { role: row.role as 'user' | 'assistant', text: String(row.text),
+      ...(images.length ? { images } : {}),
       ...(row.senderId == null ? {} : { senderId: String(row.senderId) }) };
   }
 
@@ -1011,10 +1021,34 @@ export class ConversationStore {
     } else if (conversation.channel !== 'cli') {
       throw new Error('渠道输入必须提供实际发送者与事件 ID。');
     }
-    this.db.prepare(`INSERT INTO messages (id, conversation_id, actor_id, role, text, created_at, model_input_text, external_event_id, sender_name, message_kind, sent_at)
-      VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?)`)
+    if (external?.imageFailure && !['unsupported_model','source','download','too_large','format','upload','cancelled'].includes(external.imageFailure)) throw new Error('图片失败回执无效。');
+    this.db.prepare(`INSERT INTO messages (id, conversation_id, actor_id, role, text, created_at, model_input_text, external_event_id, sender_name, message_kind, sent_at,image_failure)
+      VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(messageId, conversationId, actorId, text, createdAt, external?.modelInputText ?? null, external?.eventId ?? null,
-        external?.senderName ?? null, external?.messageKind ?? 'chat', external?.sentAt === undefined ? null : normalizeMemoryTime(external.sentAt));
+        external?.senderName ?? null, external?.messageKind ?? 'chat', external?.sentAt === undefined ? null : normalizeMemoryTime(external.sentAt),external?.imageFailure ?? null);
+    const quote = external?.quote;
+    const quoted = quote?.messageId ? this.quotedMessage(conversationId,quote.messageId)
+      : quote?.referenceIndex ? this.quotedMessage(conversationId,quote.referenceIndex,true) : undefined;
+    const images = [...(external?.images ?? [])];
+    for (const image of quoted?.images ?? []) if (!images.some(item => item.imageId === image.imageId)) images.push({ ...image, quoted: true,
+      ...(!image.sourceSenderId && quoted?.senderId ? { sourceSenderId: quoted.senderId } : {}) });
+    for (const [index, image] of images.entries()) {
+      if (!/^[0-9a-f]{64}$/.test(image.imageId) || !image.fileId || image.tokenEstimate !== 1024) throw new Error('图片持久引用无效。');
+      this.db.prepare('INSERT INTO message_images(message_id,image_id,ordinal,metadata_json) VALUES (?,?,?,?)')
+        .run(messageId, image.imageId, index, JSON.stringify(image));
+    }
+  }
+
+  messageImages(conversationId: string, messageId: string): MessageImage[] {
+    return this.db.prepare(`SELECT i.metadata_json FROM message_images i JOIN messages m ON m.id=i.message_id
+      WHERE m.conversation_id=? AND m.id=? ORDER BY i.ordinal`).all(conversationId,messageId)
+      .map(row => JSON.parse(String(row.metadata_json)) as MessageImage);
+  }
+
+  accessibleImage(conversationId: string, imageId: string): MessageImage | undefined {
+    const row=this.db.prepare(`SELECT i.metadata_json FROM message_images i JOIN messages m ON m.id=i.message_id
+      WHERE m.conversation_id=? AND i.image_id=? ORDER BY m.ingest_seq DESC,i.ordinal LIMIT 1`).get(conversationId,imageId);
+    return row ? JSON.parse(String(row.metadata_json)) as MessageImage : undefined;
   }
 
   recordInbound(conversationId: string, text: string, external: ExternalRunInput): boolean {

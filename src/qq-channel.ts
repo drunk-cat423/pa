@@ -1,4 +1,5 @@
-import type { DeliveryResult, InboundMessage, MessageQuote, OutboundMessage } from './channel-types.js';
+import { createHash } from 'node:crypto';
+import type { DeliveryResult, InboundMessage, InboundImage, MessageQuote, OutboundMessage } from './channel-types.js';
 import { toPlainText } from './plain-text.js';
 
 const API = 'https://api.bot.qq.com';
@@ -104,10 +105,12 @@ function normalizeQuote(data: JsonObject): MessageQuote | undefined {
   function walk(elements: unknown, depth: number, quoted: boolean): void {
     if (!Array.isArray(elements)) return;
     if (depth > 4) { truncated = true; return; }
-    for (const element of elements) {
+    for (const [index,element] of elements.entries()) {
       if (++visited > 32) { truncated = true; return; }
       if (!object(element)) continue;
-      const isQuote = quoted || element.message_type === 103;
+      const isQuote = quoted || element.message_type === 103
+        || Boolean(referenceIndex && String(element.msg_idx) === referenceIndex)
+        || (depth === 1 && data.message_type === 103 && index === 0);
       if (isQuote) seenQuote = true;
       if (isQuote && typeof element.content === 'string' && element.content.trim()) {
         if (inlineMessages.length >= 8 || bytes >= 8000) { truncated = true; return; }
@@ -136,7 +139,7 @@ export function normalizeQQMessage(event: unknown, accountId: string, botId: str
   const privateMessage = event.t === 'C2C_MESSAGE_CREATE';
   const data = event.d;
   if (!object(data) || !nonEmptyString(data.id) || data.id.length > 512
-    || !nonEmptyString(data.content) || !object(data.author)) return undefined;
+    || (data.content !== undefined && typeof data.content !== 'string') || !object(data.author)) return undefined;
 
   const author = data.author;
   if (author.bot === true || author.id === botId || author.member_openid === botId) return undefined;
@@ -159,8 +162,35 @@ export function normalizeQQMessage(event: unknown, accountId: string, botId: str
       if (nonEmptyString(id) && id.length <= 512) selfIds.push(id);
     }
   }
-  const text = privateMessage ? data.content : stripBotPrefix(data.content, selfIds.filter(Boolean));
+  const content = typeof data.content === 'string' ? data.content : '';
+  const text = privateMessage ? content : stripBotPrefix(content, selfIds.filter(Boolean));
   const quote = normalizeQuote(data);
+  const imageSources: InboundImage[] = [];
+  const rootQuoted = data.message_type === 103;
+  const referenceHash = quote ? createHash('sha256').update(JSON.stringify([quote.messageId, quote.referenceIndex])).digest('hex') : undefined;
+  function images(node: JsonObject, quoted: boolean, depth: number): void {
+    if (depth > 4) return;
+    const author = object(node.author) ? node.author : undefined;
+    const sourceSenderId = referenceId(author?.member_openid ?? author?.user_openid ?? author?.id);
+    if (Array.isArray(node.attachments)) for (const attachment of node.attachments) {
+      if (!object(attachment) || !nonEmptyString(attachment.url) || typeof attachment.content_type !== 'string'
+        || !attachment.content_type.startsWith('image/')) continue;
+      imageSources.push({ url: attachment.url.startsWith('//') ? `https:${attachment.url}` : attachment.url,
+        contentType: attachment.content_type,
+        ...(typeof attachment.width === 'number' ? { width: attachment.width } : {}),
+        ...(typeof attachment.height === 'number' ? { height: attachment.height } : {}),
+        ...(typeof attachment.size === 'number' ? { size: attachment.size } : {}),
+        ...(quoted ? { quoted: true, ...(referenceHash ? { referenceHash } : {}) } : {}),
+        ...(sourceSenderId ? { sourceSenderId } : {}) });
+    }
+    if (Array.isArray(node.msg_elements)) for (const [index,element] of node.msg_elements.entries()) {
+      if (object(element)) images(element, quoted || element.message_type === 103
+        || Boolean(quote?.referenceIndex && String(element.msg_idx) === quote.referenceIndex)
+        || (depth === 0 && rootQuoted && index === 0), depth + 1);
+    }
+  }
+  images(data, false, 0);
+  if (!text.trim() && !imageSources.length && !quote) return undefined;
   return {
     route: { channel: 'qq', accountId, roomId, roomType: privateMessage ? 'private' : 'group' },
     eventId: data.id,
@@ -171,6 +201,7 @@ export function normalizeQQMessage(event: unknown, accountId: string, botId: str
     mentioned,
     ...(mentionedSenderIds.length ? { mentionedSenderIds } : {}),
     ...(quote ? { quote } : {}),
+    ...(imageSources.length ? { imageSources } : {}),
   };
 }
 

@@ -23,6 +23,7 @@ import { fetchWebPage } from './web-fetch.js';
 import { outputLengthGuidance } from './output-length.js';
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
 import { ContextTokenEstimator, contextCalibrationKey, type ContextCalibration } from './context-tokens.js';
+import { imageMetadata, imageTokenPayload, imageRequestFits, projectImagePayload, IMAGE_TOKENS, MAX_REQUEST_IMAGES, type ImageProjection, type MessageImage } from './image-context.js';
 import { PREPARE_TURN_PROMPT, PREPARE_TURN_DESCRIPTION, RESPONSE_STAGE_PROMPT, CLI_STAGE_PROMPT, RESPONSE_MODE_PROMPTS, TURN_PLAN_SCHEMA,
   validateTurnPlan, hasUnbackedSaveClaim, type TurnPlan, type TurnReceipt, type ReplyMode } from './turn-plan.js';
 
@@ -44,6 +45,7 @@ export interface ReadHistoryParams {
 export interface CompanionToolContext {
   prepareTurn(plan: TurnPlan): TurnReceipt | Promise<TurnReceipt>;
   readHistory(params: ReadHistoryParams): unknown | Promise<unknown>;
+  readImage?(imageId: string): MessageImage | Promise<MessageImage>;
   onProgress?(text: string): Promise<void>;
 }
 
@@ -60,11 +62,13 @@ export interface ContextEstimate {
 
 // Tokenizer-independent conservative estimate, explicitly not a measured usage value.
 export function estimateContext(input: unknown, contextWindow: number, reservedOutputTokens: number): ContextEstimate {
-  const inputTokens = Buffer.byteLength(JSON.stringify(input), 'utf8') + 64;
+  const visual = imageTokenPayload(input);
+  const inputTokens = Buffer.byteLength(JSON.stringify(visual.text), 'utf8') + visual.imageIds.length * IMAGE_TOKENS + 64;
   const safetyTokens = Math.max(128, Math.ceil(contextWindow * 0.01));
   const total = inputTokens + reservedOutputTokens + safetyTokens;
   return { inputTokens, reservedOutputTokens, safetyTokens, contextWindow,
-    ratio: total / contextWindow, fits: total <= contextWindow, method: 'utf8-byte-estimate' };
+    ratio: visual.imageIds.length > MAX_REQUEST_IMAGES ? Math.max(1,total / contextWindow) : total / contextWindow,
+    fits: total <= contextWindow && visual.imageIds.length <= MAX_REQUEST_IMAGES, method: 'utf8-byte-estimate' };
 }
 
 // Serialize metadata first and crop only body text; never cut a JSON document in half.
@@ -86,10 +90,10 @@ export function boundWebFetchResult(response: Awaited<ReturnType<typeof fetchWeb
 }
 
 export interface ConversationRuntime {
-  prompt(text: string, metadata?: { runId: string; taskId?: string; conversationId?: string; conversationContext?: string; memoryContext?: string; memoryRefs?: MemoryRef[]; searchQuery?: string; fetchUrl?: string; companionTools?: CompanionToolContext }): Promise<string>;
+  prompt(text: string, metadata?: { runId: string; taskId?: string; conversationId?: string; conversationContext?: string; imageProjections?: ImageProjection[]; memoryContext?: string; memoryRefs?: MemoryRef[]; searchQuery?: string; fetchUrl?: string; companionTools?: CompanionToolContext }): Promise<string>;
   references(): readonly string[];
   resetContext(): void;
-  estimate(text: string, memoryContext?: string, options?: { channel?: boolean; conversationContext?: string }): ContextEstimate;
+  estimate(text: string, memoryContext?: string, options?: { channel?: boolean; conversationContext?: string; imageProjections?: ImageProjection[] }): ContextEstimate;
   recordedTurns(): RecordedTurn[];
   abort(): Promise<void>;
   close(): Promise<void>;
@@ -115,13 +119,14 @@ export async function createConfiguredModel(config: PaConfig) {
   });
   if (config.baseUrl) modelRuntime.registerProvider(config.provider, {
     baseUrl: config.baseUrl, api: 'openai-completions',
-    models: [{ id: config.model, name: config.model, reasoning: config.provider === 'deepseek', input: ['text'],
+    models: [{ id: config.model, name: config.model, reasoning: config.provider === 'deepseek', input: config.provider === 'deepseek' && config.model === 'deepseek-flash' ? ['text', 'image'] : ['text'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: config.contextWindow, maxTokens: config.maxOutputTokens }],
   });
   const catalogModel = modelRuntime.getModel(config.provider, config.model);
   if (!catalogModel) throw new Error(`Pi 内置模型目录中没有 ${config.provider}/${config.model}；请明确配置 base URL 或使用有效模型。`);
   const model = { ...catalogModel, contextWindow: Math.min(catalogModel.contextWindow, config.contextWindow),
+    ...(config.provider === 'deepseek' && config.model === 'deepseek-flash' ? { input: ['text', 'image'] as ('text' | 'image')[] } : {}),
     maxTokens: Math.min(catalogModel.maxTokens, config.maxOutputTokens) };
   await modelRuntime.setRuntimeApiKey(config.provider, config.apiKey);
   return { modelRuntime, model };
@@ -171,6 +176,8 @@ export async function openConversation(config: PaConfig, conversationId: string,
     let searchQuery: string | undefined;
     let fetchUrl: string | undefined;
     let companionTools: CompanionToolContext | undefined;
+    let imageProjections: ImageProjection[] = [];
+    let latestInputTokens = 0;
     let referenceUrls: string[] = [];
     let usedWebSearch = false;
     let fatal: Error | undefined;
@@ -282,7 +289,37 @@ export async function openConversation(config: PaConfig, conversationId: string,
           return failPersistence(error);
         }
       },
+    }, {
+      name: 'read_image', label: '读取原图', description: '读取当前房间历史中已保存的imageId原图。用read_history或会话摘要定位imageId；引用图片不等于当前发送者自述。不能读取路径、URL或其他房间。',
+      parameters: { type: 'object', properties: { imageId: { type: 'string', pattern: '^[0-9a-f]{64}$' } }, required: ['imageId'], additionalProperties: false },
+      executionMode: 'sequential',
+      async execute(_id, params, signal) {
+        startTool(signal);
+        if (!companionTools?.readImage) throw new Error('当前没有原图读取权限。');
+        try {
+          const image = await cancellable(() => companionTools!.readImage!((params as { imageId: string }).imageId), signal);
+          const output = result({ image: imageMetadata(image), source: '当前房间已保存原图，归属以图片元数据为准' });
+          const text = output.content[0]!.text;
+          const visibleFiles = imageProjections.flatMap(item => item.content.filter(block => block.type === 'file').map(block => block.file_id));
+          if (visibleFiles.includes(image.fileId)) return result({ image: imageMetadata(image), alreadyVisible: true });
+          if (visibleFiles.length >= MAX_REQUEST_IMAGES) throw new MemoryError('本轮图片数量已达上限，无法追加原图。');
+          const projection: ImageProjection = { text, content: [{ type: 'text', text }, { type: 'file', file_id: image.fileId, bytes: image.bytes }] };
+          const candidate = projectImagePayload({ messages: [{ role: 'user', content: text }] }, [projection]);
+          const allFiles = [...imageProjections,projection].flatMap(item=>item.content.filter(block=>block.type==='file'));
+          if (!imageRequestFits({messages:[{role:'user',content:allFiles}]},[...imageProjections,projection])) throw new MemoryError('本轮图片总容量已达上限，无法追加原图。');
+          const extra = estimateContext(candidate,model.contextWindow,model.maxTokens);
+          if (latestInputTokens + extra.inputTokens + extra.reservedOutputTokens + extra.safetyTokens + toolResultMaxBytes > model.contextWindow) {
+            throw new MemoryError('本轮剩余上下文无法容纳原图，请先完成会话容量整理。');
+          }
+          imageProjections.push(projection);
+          return output;
+        } catch (error) {
+          if (error instanceof MemoryError || error instanceof RequestError) throw error;
+          return failPersistence(error);
+        }
+      },
     }];
+    if (config.provider !== 'deepseek' || config.model !== 'deepseek-flash') customTools.splice(customTools.findIndex(tool => tool.name === 'read_image'),1);
     if (searchEnabled) customTools.push({
       name: 'web_search', label: '网页搜索', description: '搜索公开资料。时间敏感问题根据本轮北京时间明确范围并填写startDate/endDate；范围仅为查询提示，接口没有硬过滤。返回摘要、内部来源和未核验的日期信息；pageUpdatedAt是页面更新时间，不能当作发布时间或事件日期，无日期不代表最新。必要时可读取原始来源核验，但不自动增加调用。回答搜索结论，不向用户展示来源网址或参考链接。',
       parameters: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 500 },
@@ -347,7 +384,8 @@ export async function openConversation(config: PaConfig, conversationId: string,
       const calibrated = tokenEstimator.estimate(payload);
       const inputTokens = (calibrated?.inputTokens ?? fallback.inputTokens) + transportReserve;
       const total = inputTokens + fallback.reservedOutputTokens + fallback.safetyTokens;
-      return { ...fallback, inputTokens, ratio: total / model.contextWindow, fits: total <= model.contextWindow,
+      const imageOverflow = !imageRequestFits(payload,imageProjections);
+      return { ...fallback, inputTokens, ratio: imageOverflow ? Math.max(1,total / model.contextWindow) : total / model.contextWindow, fits: !imageOverflow && total <= model.contextWindow,
         ...(calibrated ? { method: 'usage-calibrated', calibration: calibrated.calibration } : {}) };
     }
     if ([...agentSession.getActiveToolNames(), ...agentSession.getCallableToolNames(),
@@ -391,7 +429,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           name: tool.name, description: tool.description, parameters: tool.parameters, strict: false } })),
       }, channel && !ready, noTools);
       // Transport flags and provider-specific field names are outside the transcript projection.
-      return estimatePayload(payload, 256);
+      return estimatePayload(projectImagePayload(payload, imageProjections), 256);
     }
     const previousTransform = agentSession.agent.transformContext;
     agentSession.agent.transformContext = async (messages, signal) => projectStage(
@@ -437,7 +475,10 @@ export async function openConversation(config: PaConfig, conversationId: string,
         // No unverified cross-provider fallback: preparation must be enforceable.
         throw new RequestError('当前模型协议尚未接通强制准备阶段，请使用已支持的OpenAI兼容接口。','error');
       }
-      if (!estimatePayload(transformed).fits) throw new Error('含工具结果的最终请求超过上下文窗口。');
+      transformed = projectImagePayload(transformed, imageProjections);
+      const requestEstimate = estimatePayload(transformed);
+      if (!requestEstimate.fits) throw new Error('含工具结果的最终请求超过上下文窗口。');
+      latestInputTokens = requestEstimate.inputTokens;
       const calibration = tokenEstimator.metadata(transformed);
       recordDiagnostic(() => {
         pendingDiagnosticCall = diagnostics.startCall({ ...diagnosticContext, kind: 'chat',
@@ -512,6 +553,9 @@ export async function openConversation(config: PaConfig, conversationId: string,
         tools: agentSession.getActiveToolNames(), provider: config.provider, model: config.model,
       }),
       estimate: (text, memoryContext, options) => {
+        const previousProjections = imageProjections;
+        imageProjections = options?.imageProjections ?? [];
+        try {
         const messages: Transcript = [...agentSession.messages,
           ...(options?.conversationContext ? [{ role: 'user' as const, content: [{ type: 'text' as const, text: options.conversationContext }], timestamp: Date.now() }] : []),
           ...(memoryContext ? [{ role: 'user' as const, content: [{ type: 'text' as const, text: memoryContext }], timestamp: Date.now() }] : []),
@@ -531,6 +575,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           const candidate = projectedEstimate(preparedMessages, true, true, mode);
           return candidate.inputTokens > largest.inputTokens ? candidate : largest;
         }, initial);
+        } finally { imageProjections = previousProjections; }
       },
       recordedTurns: () => recordedTurnsFromEntries(manager.getBranch()),
       abort,
@@ -572,6 +617,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           referenceUrls = [];
           usedWebSearch = false;
           companionTools = metadata?.companionTools;
+          imageProjections = metadata?.imageProjections ?? [];
           prepared = false; preparationError = undefined; preparationReceipt = undefined; replyMode = 'standard'; progressAttempted = false;
           toolCalls = 0;
           requestTimedOut = false;

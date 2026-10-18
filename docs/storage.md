@@ -2,9 +2,15 @@
 
 SQLite pa.sqlite 保存权威原文、消息来源、运行和投递记录，以及记忆派生数据；Pi session.jsonl 保存模型上下文与审计条目。压缩仅改变活跃模型投影，原文保持完整。两者使用 run ID / Pi entry ID 对应，不能混合恢复不同时点的文件。
 
-## schema v17
+## schema v18
 
-v17 增加的 `answer_documents` 与 `answer_page_views` 保留旧分页回答、页面正文及其引用索引，继续支持历史读取和引用解析。当前新 Markdown 投递只在 `answer_documents.rendered_body` 保存完整展示正文快照，`summary` 为空、`pages_json` 为空数组；不再新建页面回执。`delivery_parts` 保存自动分段及每段引用索引。`/result` 优先读取完整正文快照，避免把跨代码围栏补齐后的分段错误拼接；原始模型 Markdown 仍保存在 messages。schema 仍为17，旧文档和投递不改写。
+v18增加 `messages.image_failure` 安全失败回执和 `message_images`：以原消息ID、附件顺序关联SHA256 imageId、稳定Files句柄、格式/尺寸/字节数、实际来源发送者及引用索引哈希。引用未知原消息的图片关联当前提问，不回填旧消息；已知引用仅在当前房间精确查找。聊天text和FTS不保存Base64、签名URL或鉴权参数，纯图片消息允许text为空。原图和当前provider/account绑定的Files元数据独立保存于 `PA_DATA_DIR/images`，重启不重新签URL或上传；跨群不能凭imageId取得原图。切换模型账号时，发送只使用该账号已保存的文件句柄，没有映射明确失败。
+
+升级前仍创建一致性备份，旧原文、旧任务输入与进度保持原样；新冻结任务包含稳定图片引用。图片不会被压缩摘要覆盖。
+
+## schema v17（历史升级）
+
+v17 增加的 `answer_documents` 与 `answer_page_views` 保留旧分页回答、页面正文及其引用索引，继续支持历史读取和引用解析。当前新 Markdown 投递只在 `answer_documents.rendered_body` 保存完整展示正文快照，`summary` 为空、`pages_json` 为空数组；不再新建页面回执。`delivery_parts` 保存自动分段及每段引用索引。`/result` 优先读取完整正文快照，避免把跨代码围栏补齐后的分段错误拼接；原始模型 Markdown 仍保存在 messages。旧文档和投递不改写。
 
 完整原始 Markdown 回答在所有分段确认后作为一次已发布回复进入滚动上下文。引用解析使用已确认分段的实际文本，消息 ID 与平台引用索引分开处理。旧页面记录仍可用于历史引用解析；当前发送行为见 [QQ Markdown 长回答](qq-long-replies.md)。
 

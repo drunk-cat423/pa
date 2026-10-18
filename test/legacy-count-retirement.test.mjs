@@ -160,7 +160,7 @@ test('non-count legacy jobs and completed count jobs remain intact; other conver
 test('schema15 upgrade backs up original evidence and never retires or reserves work automatically',t=>{
   const f=fixture(t);f.count('PRIVATE_RAW_TEXT');f.fail();const original=evidence(f);
   f.inspect(db=>{downgradeSchema15(db);db.exec('PRAGMA user_version=15');});f.restart();
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),17);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),18);
   assert.deepEqual(evidence(f),original);
   assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM auto_memory_job_retirements').get().n),0);
   assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM auto_memory_context_jobs').get().n),0);
@@ -171,7 +171,8 @@ test('schema15 upgrade backs up original evidence and never retires or reserves 
     assert.equal(backup.prepare('PRAGMA user_version').get().user_version,15);
     assert.equal(backup.prepare("SELECT name FROM sqlite_master WHERE name='auto_memory_job_retirements'").get(),undefined);
     assert.deepEqual(backup.prepare('SELECT * FROM auto_memory_jobs ORDER BY rowid').all(),original.auto_memory_jobs);
-    assert.deepEqual(backup.prepare('SELECT * FROM messages ORDER BY rowid').all(),original.messages);
+    const legacyMessages=rows=>rows.map(({image_failure: _failure,...message})=>message);
+    assert.deepEqual(legacyMessages(backup.prepare('SELECT * FROM messages ORDER BY rowid').all()),legacyMessages(original.messages));
   } finally {backup.close();}
   f.restart();assert.equal(readdirSync(f.directory).filter(name=>name.endsWith('.bak')).length,1);
 });

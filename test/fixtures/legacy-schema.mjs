@@ -1,4 +1,6 @@
 export function downgradeSchema16(db) {
+  db.exec('DROP TABLE IF EXISTS message_images;');
+  db.exec('ALTER TABLE messages DROP COLUMN image_failure;');
   db.exec(`DROP TABLE IF EXISTS answer_page_views; DROP TABLE IF EXISTS answer_documents;
     ALTER TABLE delivery_parts DROP COLUMN reference_index;`);
 }

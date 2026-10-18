@@ -1,4 +1,5 @@
 import type { SelfProfileSnapshot, SelfProfileProposal } from './self-profile-store.js';
+import type { MessageImage } from './image-context.js';
 export type { SelfProfileSnapshot, SelfProfileProposal } from './self-profile-store.js';
 
 export type AutoMemoryReason = 'count' | 'capacity';
@@ -24,6 +25,8 @@ export interface PersonProfile {
   pendingResults?: ProfilePendingResult[];
 }
 export interface AutoMemoryMessage {
+  images?: MessageImage[];
+  imageFailure?: string;
   id: string; conversationId: string; actorId?: string; personId?: string;
   contextSeq?: number; senderId?: string; senderName?: string; replyToSenderId?: string; replyToMessageId?: string;
   role: 'user' | 'assistant'; text: string; ingestSeq: number; createdAt: string; sentAt?: string;
