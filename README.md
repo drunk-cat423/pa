@@ -137,4 +137,4 @@ npm test
 
 参见 [开发说明](docs/development.md)、[服务器部署](docs/deployment.md)、[Shiori 记忆参考映射](docs/shiori-memory-reference.md) 和 [v0.2 设计基线](docs/design/pi_evolving_companion_technical_design_v0.2.md)。
 
-图片每张最多8MiB、每边4096px，支持JPEG/PNG/GIF/WebP；单请求最多600张、原图合计200MiB。85%上下文容量仍是整理主规则；图像API硬限制也会复用容量整理，不能静默删图。每图按1024 tokens保守预留并参加实测usage校准。签名下载URL和QQ auth_token不写入聊天、任务或普通日志；原图独立保存在 `PA_DATA_DIR/images`，Files句柄只优化传输，不保证供应商KV缓存命中。图片网络失败会给出简短原因，持久化失败停止会话。
+图片每张最多32MiB、每边4096px，支持JPEG/PNG/GIF/WebP；单请求最多600张、原图合计200MiB。85%上下文容量仍是整理主规则；图像API硬限制也会复用容量整理，不能静默删图。每图按1024 tokens保守预留并参加实测usage校准。签名下载URL和QQ auth_token不写入聊天、任务或普通日志；原图独立保存在 `PA_DATA_DIR/images`，Files句柄只优化传输，不保证供应商KV缓存命中。图片网络失败会给出简短原因，持久化失败停止会话。

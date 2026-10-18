@@ -9,7 +9,7 @@ export interface StoredImage {
   imageId: string; fileId: string; mimeType: ImageMime; bytes: number;
   width?: number; height?: number; tokenEstimate: 1024;
 }
-export const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+export const IMAGE_MAX_BYTES = 32 * 1024 * 1024;
 // A fixed limit also satisfies DeepSeek's lower per-side limit for >=15 images,
 // so accumulating history never requires resizing an already-cached image.
 export const IMAGE_MAX_SIDE = 4096;
