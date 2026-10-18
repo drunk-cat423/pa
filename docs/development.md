@@ -9,7 +9,7 @@
 | src/config.ts | 聊天与后台调用预算，不读取其他应用凭据 |
 | src/runtime.ts | 受限 Pi 会话、独立 ModelRuntime 工厂、最终输入容量估算、公开 API 重建投影 |
 | src/context-tokens.ts | 成功SDK输入用量校准、分块哈希匹配、缓存统计校验及新增内容保守估算 |
-| src/store.ts | schema v16、原文/run/投递、显式记忆、迁移备份、去重和上下文水位 |
+| src/store.ts | schema v17、原文/run/投递、长回答文档与页面引用、显式记忆、迁移备份、去重和上下文水位 |
 | src/auto-memory-store.ts | 通用person绑定、可见消息序列、滚动摘要及容量快照、任务租约、子批次检查点、Topic/画像/关键词检索 |
 | src/self-profile-store.ts | 全局AI画像修订、带来源待整理建议、原子归档和并发版本检查 |
 | src/auto-memory.ts | 与聊天独立的后台调度、严格输出校验、显式失败重试、容量等待及 Topic 关键词检索 |
@@ -18,6 +18,7 @@
 | src/diagnostics.ts / src/logs.ts / src/logs-cli.ts | 独立诊断索引、请求响应证据、任务查询及无模型的离线解析校验 |
 | src/conversation.ts | 原文与Pi关联恢复、群聊/私聊完整滚动上下文、当前发送者/@对象画像预算、85%容量触发 |
 | src/channel-harness.ts | 先入库、按房间排队、参与判断、聊天预算、投递和启动后台恢复 |
+| src/markdown-pages.ts | 长回答摘要预览、按 UTF-8 字节分页、代码围栏处理与双向按钮指令 |
 | src/channel-types.ts / src/qq-channel.ts | 标准化发送者与真实 mention 目标、QQ 收发/鉴权/重连 |
 | src/harness-policy.ts / src/memory-service.ts | 明确人物绑定、独立 owner 权限、本人显式更新及记忆管理 |
 | src/cli.ts / src/memory.ts | 本地聊天和离线 remember/query/correct；拒绝删除 |
@@ -28,6 +29,8 @@
 渠道只提供身份、@、消息和传输；记忆、调度、权限与模型调用属于 harness。身份共享不授予管理权限。聊天和整理不共用活动 Pi Session；SQLite 写事务不跨模型等待。同一人物的后台提案使用 CAS 和证据时序检查，不能覆盖较新的明确纠正。
 
 Pi 的默认自动压缩仍关闭。应用把版本化摘要和消息投影通过公开 API 接入 Pi，原文保持独立。不能直接替换 agent.state.messages，也不能忽略 SQLite / Pi 关联不一致。聊天重启不自动重发未知结果；后台整理依据持久批次和检查点重试。
+
+QQ 长回答采用 [Markdown 摘要与双向分页](qq-long-replies.md)。正文文档持久化后才能发送入口；入口确认送达后，完整回答只加入滚动历史一次。分页是 harness 的无模型读取指令，走同房间输出队列，不创建新的回答或压缩输入。发送回执须同时保留消息 ID 与可选引用索引，以便按实际显示页面解析引用；不可用跨房间 ID 或页面正文相似度猜测来源。
 
 ## 检查
 

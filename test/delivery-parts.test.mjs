@@ -100,7 +100,7 @@ test('v7 migration creates a consistent backup and preserves legacy replies and 
       DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity; PRAGMA user_version=7;`);
   });
   f.reopen();
-  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 16);
+  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 17);
   assert.deepEqual(f.store.quotedMessage(f.a.id, 'legacy-id'), { role: 'assistant', text: '**完整原文**' });
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM messages').get().n), 2);
   const backups = readdirSync(f.directory).filter(name => name.includes('.v7.') && name.endsWith('.bak'));

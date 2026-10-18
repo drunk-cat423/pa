@@ -35,7 +35,7 @@ test('schema启用WAL与外键，会话和消息重开后持久化并隔离', ()
       assert.equal(reopened.listMessages('alpha', 10).map(message => message.text).join('|'), '保留原始内容 🙂|回复');
       const db = new DatabaseSync(f.databasePath);
       try {
-        assert.equal(db.prepare('PRAGMA user_version').get().user_version, 16);
+        assert.equal(db.prepare('PRAGMA user_version').get().user_version, 17);
         assert.equal(db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
         assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
         assert.equal(db.prepare('PRAGMA foreign_key_check').all().length, 0);

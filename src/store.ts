@@ -12,6 +12,7 @@ import { memoryWords } from './memory-text.js';
 import { validateTurnPlan, type TurnPlan, type TurnReceipt } from './turn-plan.js';
 import { isMemoryOwner, type HarnessPolicy } from './harness-policy.js';
 import { reclassifySelfProfileTerms, type SelfProfileTermMove } from './self-profile-reclassification.js';
+import { displayedPage } from './markdown-pages.js';
 
 export interface ConversationRecord {
   id: string;
@@ -67,7 +68,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -447,6 +448,21 @@ export class ConversationStore {
       if (version < 16) this.db.exec(`CREATE TABLE auto_memory_job_retirements (
         job_id TEXT PRIMARY KEY REFERENCES auto_memory_jobs(id), reason TEXT NOT NULL, created_at TEXT NOT NULL,
         input_hash TEXT, progress_hash TEXT);`);
+      if (version < 17) this.db.exec(`
+        ALTER TABLE delivery_parts ADD COLUMN reference_index TEXT;
+        CREATE TABLE answer_documents (
+          id TEXT PRIMARY KEY REFERENCES deliveries(id), conversation_id TEXT NOT NULL REFERENCES conversations(id),
+          summary TEXT NOT NULL, pages_json TEXT NOT NULL, rendered_body TEXT NOT NULL, created_at TEXT NOT NULL,
+          FOREIGN KEY(id,conversation_id) REFERENCES deliveries(id,conversation_id));
+        CREATE TABLE answer_page_views (
+          id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
+          answer_id TEXT NOT NULL REFERENCES answer_documents(id), page_number INTEGER NOT NULL CHECK(page_number>=0),
+          text TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('sending','sent','uncertain','rejected')),
+          external_message_id TEXT, reference_index TEXT, delivery_mode TEXT NOT NULL, reply_slot INTEGER,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          FOREIGN KEY(answer_id,conversation_id) REFERENCES deliveries(id,conversation_id));
+        CREATE INDEX answer_views_message ON answer_page_views(conversation_id,external_message_id);
+        CREATE INDEX answer_views_reference ON answer_page_views(conversation_id,reference_index);`);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
@@ -939,20 +955,22 @@ export class ConversationStore {
     return row ? { id: String(row.id), actorId: String(row.actor_id), senderId: String(row.external_user_id), text: String(row.text) } : undefined;
   }
 
-  quotedMessage(conversationId: string, externalId: string): { role: 'user' | 'assistant'; senderId?: string; text: string } | undefined {
+  quotedMessage(conversationId: string, externalId: string, referenceIndex = false): { role: 'user' | 'assistant'; senderId?: string; text: string } | undefined {
     if (typeof externalId !== 'string' || !externalId || externalId.length > 512
       || externalId.trim() !== externalId || /[\u0000-\u001f\u007f]/.test(externalId)) return undefined;
     // Both inbound event IDs and confirmed outgoing IDs are scoped to this exact conversation.
     // Ambiguous IDs fail closed instead of selecting an arbitrary message.
     const rows = this.db.prepare(`SELECT m.id, m.role, m.text, a.external_user_id AS senderId FROM messages m
       LEFT JOIN actors a ON a.id = m.actor_id
-      WHERE m.conversation_id = ? AND ((m.role = 'user' AND m.external_event_id = ?)
+      WHERE ?=0 AND m.conversation_id = ? AND ((m.role = 'user' AND m.external_event_id = ?)
         OR (m.role = 'assistant' AND EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id
           AND d.conversation_id = m.conversation_id AND d.status = 'sent' AND d.external_message_id = ?
           AND NOT EXISTS (SELECT 1 FROM delivery_parts p WHERE p.delivery_id = d.id))))
       UNION ALL SELECT p.delivery_id || ':' || p.part_index, 'assistant', p.text, NULL FROM delivery_parts p
-        WHERE p.conversation_id = ? AND p.status = 'sent' AND p.external_message_id = ?
-      LIMIT 2`).all(conversationId, externalId, externalId, conversationId, externalId);
+        WHERE p.conversation_id = ? AND p.status = 'sent' AND p.${referenceIndex ? 'reference_index' : 'external_message_id'} = ?
+      UNION ALL SELECT v.id,'assistant',v.text,NULL FROM answer_page_views v
+        WHERE v.conversation_id=? AND v.status='sent' AND v.${referenceIndex ? 'reference_index' : 'external_message_id'}=?
+      LIMIT 2`).all(referenceIndex ? 1 : 0, conversationId, externalId, externalId, conversationId, externalId, conversationId, externalId);
     if (rows.length !== 1) return undefined;
     const row = rows[0]!;
     return { role: row.role as 'user' | 'assistant', text: String(row.text),
@@ -1108,7 +1126,10 @@ export class ConversationStore {
       ORDER BY t.created_at DESC,t.rowid DESC LIMIT 1`).get(conversationId, senderId, selectedId ?? null, selectedId ?? null);
     if (!row) return undefined;
     const parts = this.db.prepare('SELECT text FROM delivery_parts WHERE delivery_id=? ORDER BY part_index').all(row.delivery_id!);
-    return { taskId: String(row.id), text: parts.length ? parts.map(part => String(part.text)).join('') : String(row.text),
+    const document = this.db.prepare('SELECT rendered_body FROM answer_documents WHERE id=? AND conversation_id=?')
+      .get(row.delivery_id!,conversationId);
+    return { taskId: String(row.id), text: document ? String(document.rendered_body)
+      : parts.length ? parts.map(part => String(part.text)).join('') : String(row.text),
       deliveryId: String(row.delivery_id), sourceEventId: String(row.external_event_id), sourceText: String(row.source_text) };
   }
 
@@ -1220,12 +1241,55 @@ export class ConversationStore {
 
   markPendingUncertain(conversationId: string): void {
     this.memoryTransaction(() => {
+      this.db.prepare("UPDATE answer_page_views SET status='uncertain',updated_at=? WHERE conversation_id=? AND status='sending'").run(now(),conversationId);
       this.db.prepare("UPDATE run_progress SET status='uncertain',updated_at=? WHERE run_id IN (SELECT id FROM agent_runs WHERE conversation_id=?) AND status IN ('pending','sending')").run(now(),conversationId);
       this.db.prepare("UPDATE delivery_parts SET status = 'uncertain', updated_at = ? WHERE conversation_id = ? AND status IN ('pending', 'sending')")
         .run(now(), conversationId);
       this.db.prepare("UPDATE deliveries SET status = 'uncertain', updated_at = ? WHERE conversation_id = ? AND status = 'pending'")
         .run(now(), conversationId);
     });
+  }
+
+  prepareAnswerDocument(conversationId: string, deliveryId: string, summary: string, pages: readonly string[], renderedBody?: string): void {
+    this.memoryTransaction(() => {
+      if (!pages.length || !summary || pages.some(page => !page)) throw new Error('回答分页不能为空。');
+      this.prepareDeliveryParts(conversationId, deliveryId, [summary]);
+      const original = this.db.prepare('SELECT m.text FROM messages m JOIN deliveries d ON d.message_id=m.id WHERE d.id=? AND d.conversation_id=?')
+        .get(deliveryId,conversationId)!;
+      this.db.prepare('INSERT INTO answer_documents(id,conversation_id,summary,pages_json,rendered_body,created_at) VALUES (?,?,?,?,?,?)')
+        .run(deliveryId,conversationId,summary,JSON.stringify(pages),renderedBody ?? String(original.text),now());
+    });
+  }
+
+  answerPage(conversationId: string, answerId: string, page: number): { answerId: string; page: number; count: number; text: string } | undefined {
+    if (!Number.isSafeInteger(page) || page < 0) return undefined;
+    const row = this.db.prepare(`SELECT a.summary,a.pages_json FROM answer_documents a JOIN deliveries d ON d.id=a.id
+      WHERE a.id=? AND a.conversation_id=? AND d.status='sent'`).get(answerId,conversationId);
+    if (!row) return undefined;
+    const pages = JSON.parse(String(row.pages_json)) as string[];
+    const text = displayedPage(String(row.summary),pages,page,answerId);
+    return text === undefined ? undefined : { answerId,page,count:pages.length,text };
+  }
+
+  beginAnswerPageView(conversationId: string, answerId: string, page: number, mode: DeliveryMode, replySlot?: number): { id: string; text: string; count: number } | undefined {
+    validateDeliveryMode(mode,replySlot);
+    return this.memoryTransaction(() => {
+      const selected = this.answerPage(conversationId,answerId,page);
+      if (!selected) return undefined;
+      const id = randomUUID(), createdAt = now();
+      this.db.prepare(`INSERT INTO answer_page_views
+        (id,conversation_id,answer_id,page_number,text,status,delivery_mode,reply_slot,created_at,updated_at)
+        VALUES (?,?,?,?,?,'sending',?,?,?,?)`).run(id,conversationId,answerId,page,selected.text,mode,replySlot ?? null,createdAt,createdAt);
+      return { id,text:selected.text,count:selected.count };
+    });
+  }
+
+  ackAnswerPageView(conversationId: string, viewId: string, status: 'sent' | 'uncertain' | 'rejected', externalMessageId?: string, referenceIndex?: string): void {
+    if (!['sent','uncertain','rejected'].includes(status) || (status === 'sent' && !externalMessageId)) throw new Error('分页投递回执无效。');
+    if (this.db.prepare(`UPDATE answer_page_views SET status=?,external_message_id=?,reference_index=?,updated_at=?
+      WHERE id=? AND conversation_id=? AND status='sending'`).run(status,externalMessageId ?? null,referenceIndex ?? null,now(),viewId,conversationId).changes !== 1) {
+      throw new Error('分页投递不存在或已经结束。');
+    }
   }
 
   prepareDeliveryParts(conversationId: string, deliveryId: string, texts: readonly string[]): void {
@@ -1259,7 +1323,7 @@ export class ConversationStore {
   }
 
   ackDeliveryPart(conversationId: string, deliveryId: string, partIndex: number,
-    status: 'sent' | 'uncertain' | 'rejected', externalMessageId?: string): void {
+    status: 'sent' | 'uncertain' | 'rejected', externalMessageId?: string, referenceIndex?: string): void {
     if (!['sent', 'uncertain', 'rejected'].includes(status) || !Number.isSafeInteger(partIndex) || partIndex < 0
       || (status === 'sent' && (typeof externalMessageId !== 'string' || !externalMessageId))) throw new Error('投递分段回执无效。');
     this.memoryTransaction(() => {
@@ -1269,8 +1333,8 @@ export class ConversationStore {
       if (!parent || !part) throw new Error('投递分段不存在。');
       if (part.status === status && part.external_message_id === (externalMessageId ?? null)) return;
       if (parent.status !== 'pending' || part.status !== 'sending') throw new Error('投递分段不能修改或继续。');
-      this.db.prepare('UPDATE delivery_parts SET status = ?, external_message_id = ?, updated_at = ? WHERE delivery_id = ? AND part_index = ?')
-        .run(status, externalMessageId ?? null, now(), deliveryId, partIndex);
+      this.db.prepare('UPDATE delivery_parts SET status = ?, external_message_id = ?, reference_index = ?, updated_at = ? WHERE delivery_id = ? AND part_index = ?')
+        .run(status, externalMessageId ?? null, referenceIndex ?? null, now(), deliveryId, partIndex);
       if (status !== 'sent') {
         this.ackDelivery(deliveryId, 'uncertain', undefined, conversationId);
       } else if (!this.db.prepare("SELECT 1 FROM delivery_parts WHERE delivery_id = ? AND status <> 'sent'").get(deliveryId)) {

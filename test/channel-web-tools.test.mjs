@@ -106,7 +106,7 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.match(JSON.stringify(requests[2].messages.filter(message => message.role === 'tool')), /最终回答不展示来源网址或参考链接/);
   assert.ok(sent.length > 1);
   assert.doesNotMatch(sent.map(part => part.text).join(''), /参考链接|https?:\/\//);
-  assert.ok(sent.every(part => [...part.text].length <= 500));
+  assert.ok(sent.every(part => Buffer.byteLength(part.text) <= 1500));
   const previousSends = sent.length;
   assert.equal(await harness.handle(message('https://example.com/article')), 'sent');
   assert.equal(nativeSearch.length, 1);
@@ -117,7 +117,17 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.equal(pageRequests[1].url, 'https://example.com/article');
   assert.deepEqual(requests[3].tools.find(tool => tool.function.name === 'web_fetch').function.parameters.required, ['url']);
   assert.match(JSON.stringify(requests[4].messages.filter(message => message.role === 'tool')), /PAGE_MARKER/);
-  assert.match(sent.slice(previousSends).map(part => part.text).join(''), /\[参考链接\]\nhttps:\/\/example.com\/article$/);
+  assert.ok(sent.slice(previousSends).some(part => part.markdown && part.buttons?.length));
+  const reader = new DatabaseSync(join(config.dataDir, 'pa.sqlite'), { readOnly: true });
+  let documents;
+  try { documents = reader.prepare('SELECT id, pages_json FROM answer_documents ORDER BY rowid').all(); }
+  finally { reader.close(); }
+  assert.equal(documents.length, 2);
+  assert.doesNotMatch(JSON.parse(documents[0].pages_json).join(''), /参考链接|https?:\/\//);
+  const articlePages = JSON.parse(documents[1].pages_json);
+  assert.match(articlePages.join(''), /\[参考链接\]\nhttps:\/\/example.com\/article$/);
+  assert.equal(await harness.handle(message(`/page ${documents[1].id} ${articlePages.length}`)), 'sent');
+  assert.match(sent.at(-1).text, /\[参考链接\]\nhttps:\/\/example.com\/article$/);
   assert.equal(totalModelCalls(requests, planningRequests), 7);
   assert.equal(await harness.handle(message('https://example.com/no-mention', false)), 'observed');
   assert.equal(pageRequests.length, 2);
@@ -125,14 +135,16 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   const database = new DatabaseSync(join(config.dataDir, 'pa.sqlite'), { readOnly: true });
   try {
     const parts = database.prepare('SELECT text, status, external_message_id FROM delivery_parts ORDER BY rowid').all();
+    const views = database.prepare('SELECT text, status, external_message_id FROM answer_page_views ORDER BY rowid').all();
     const progress = database.prepare('SELECT text, status, external_message_id FROM run_progress ORDER BY rowid').all();
     assert.deepEqual(progress.map(item => item.text), ['我先查找并核对资料。', '我看一下链接里的内容。']);
     assert.ok(progress.every(item => item.status === 'sent' && item.external_message_id));
     const progressIds = new Set(progress.map(item => item.external_message_id));
     const replySent = sent.filter((_message, index) => !progressIds.has('part-' + (index + 1)));
-    assert.deepEqual(parts.map(part => part.text), replySent.map(part => part.text));
-    assert.ok(parts.every(part => part.status === 'sent' && part.external_message_id));
-    assert.doesNotMatch(parts.map(part => part.text).join(''), /https:\/\/example.com\/search-source/);
-    assert.match(parts.map(part => part.text).join(''), /https:\/\/example.com\/article/);
+    const rendered = [...parts, ...views];
+    assert.deepEqual(rendered.map(part => part.text), replySent.map(part => part.text));
+    assert.ok(rendered.every(part => part.status === 'sent' && part.external_message_id));
+    assert.doesNotMatch(rendered.map(part => part.text).join(''), /https:\/\/example.com\/search-source/);
+    assert.match(rendered.map(part => part.text).join(''), /https:\/\/example.com\/article/);
   } finally { database.close(); }
 });

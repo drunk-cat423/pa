@@ -180,7 +180,7 @@ test('并发上限可设为一，模型结束即释放槽位，发送阻塞不�
   assert.deepEqual(await Promise.all([first, second, third]), ['sent', 'sent', 'sent']);
 });
 
-test('同群长回答各段连续发送，其它回答按队列顺序完成', async t => {
+test('同群长回答摘要与其它回答按队列顺序完成', async t => {
   const f = await fixture(t), output = f.gate(), h = f.harness();
   const answer = '甲'.repeat(450) + '乙'.repeat(450) + '丙'.repeat(200);
   f.plans.set('long', [{ answer }]);
@@ -199,11 +199,10 @@ test('同群长回答各段连续发送，其它回答按队列顺序完成', as
   assert.equal(f.sent.length, 1);
   output.release();
   assert.deepEqual(await Promise.all([first, depth, normal]), ['sent', 'sent', 'sent']);
-  const firstBatch = f.sent.slice(0, 3);
-  assert.ok(firstBatch.every(message => message.replyToMessageId === 'long'));
-  assert.equal(firstBatch.map(message => message.text).join(''), answer);
-  assert.ok(f.sent.slice(3).some(message => message.text === '回答：普通问题'));
-  assert.ok(f.sent.slice(3).some(message => message.text === '专业最终回答'));
+  assert.match(f.sent[0].text,/开头预览/);
+  assert.equal(f.sent[0].replyToMessageId,'long');
+  assert.ok(f.sent.slice(1).some(message => message.text === '回答：普通问题'));
+  assert.ok(f.sent.slice(1).some(message => message.text === '专业最终回答'));
   assert.ok(f.planningRequests.some(request => request.input.currentMessage.eventId === 'depth'));
   assert.equal(f.inspect(db => JSON.parse(db.prepare(`SELECT p.plan_json FROM turn_preparations p
     JOIN messages m ON m.id=p.source_message_id WHERE m.external_event_id='depth'`).get().plan_json).mode), 'professional');

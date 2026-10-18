@@ -47,6 +47,8 @@ npm start -- history --conversation owner --limit 20
 
 此前 QQ 联调使用 DeepSeek 兼容接口并关闭深度思考。运行时以你实际填写的 provider、model、base URL 和窗口配置为准，密钥仅放在本机 .env，不发送到聊天或提交 Git。
 
+QQ 长回答使用原生 Markdown：先发送简短摘要，正文通过“上一页／下一页”按钮按需读取，每次翻页发送一条新消息。翻页不调用模型、不重新生成答案，也不重复写入聊天历史；完整正文在摘要及阅读入口确认送达后作为一次 AI 回答进入滚动上下文和压缩流程。每一页保留独立引用映射，引用页面时读取该页内容。详细行为、存储边界和实际平台验证范围见 [长回答分页](docs/qq-long-replies.md)。
+
 `PA_QQ_ALLOWED_GROUPS` 使用官方 `group_openid` 白名单（不是数字群号），本地已填入先前验证成功的测试群。`PA_QQ_MAX_MODEL_CALLS` 沿用历史名称，实际限制问答任务数，默认3轮；每轮包含至少2次模型请求，另受PA_LOOP_MAX_MODEL_CALLS限制。填 `0` 则不限轮数持续运行；本地测试群已按用户要求设为 `0`，仍仅 @ 时调用。正数上限达到后退出。模型失败也计数，不自动重试同一消息；新 @ 消息仍可继续处理，数据库故障则停止。单次输出上限和超时仍生效，实际费用由供应商按输入、输出及缓存计费。
 
 私聊使用 PA_QQ_ALLOWED_USERS 白名单，填写事件中的 author.user_openid；允许用户无需 @，未允许用户不保存、不调用模型。原文按房间存储，渠道提问使用各自独立的 Pi 会话，policy.json 的 primaryPerson 或 persons 将已确认的多个场景身份绑定到统一 person。绑定人物的画像跨群/私聊使用，ownerBindings 单独控制管理权限。[配置示例](docs/memory.md)

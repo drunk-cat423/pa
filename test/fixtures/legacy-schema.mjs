@@ -1,4 +1,10 @@
+export function downgradeSchema16(db) {
+  db.exec(`DROP TABLE IF EXISTS answer_page_views; DROP TABLE IF EXISTS answer_documents;
+    ALTER TABLE delivery_parts DROP COLUMN reference_index;`);
+}
+
 export function downgradeSchema15(db) {
+  downgradeSchema16(db);
   db.exec('DROP TABLE IF EXISTS auto_memory_job_retirements;');
 }
 

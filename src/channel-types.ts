@@ -22,7 +22,7 @@ export interface ExternalRunInput {
   senderName?: string;
   modelInputText: string;
   quote?: MessageQuote;
-  responseFormat?: 'plain_text';
+  responseFormat?: 'plain_text' | 'markdown';
   messageKind?: 'chat' | 'memory';
 }
 
@@ -45,8 +45,10 @@ export interface OutboundMessage {
   deliveryMode?: 'passive' | 'active';
   partIndex?: number;
   plainText?: boolean;
+  markdown?: boolean;
+  buttons?: { label: string; command: string }[];
 }
 
 export type DeliveryResult =
-  | { status: 'sent'; externalMessageId: string }
+  | { status: 'sent'; externalMessageId: string; referenceIndex?: string }
   | { status: 'uncertain' | 'rejected' };
