@@ -100,7 +100,7 @@ function memoryContext(memories: MemoryRecord[], channel = false): { content?: s
 export async function openRecordedConversation(config: PaConfig, conversationKey: string, route?: ChannelRoute,
   options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy } = {}): Promise<RecordedConversation> {
   // Acquire the Pi conversation lock before inspecting or mutating its business records.
-  const runtime = await openConversation(config, conversationKey, { enableSearch: Boolean(route) });
+  const runtime = await openConversation(config, conversationKey, { enableSearch: Boolean(route), contextCalibrationScope: conversationKey });
   let store: ConversationStore | undefined;
   let broken = false;
   function persist<T>(operation: () => T, input = ''): T {
@@ -279,7 +279,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
           persist(() => openedStore.refreshExpiredContext(conversation.id));
           applyContextReset();
           if (external) {
-            isolated = await openConversation(config, `${conversationKey}:task:${external.existingMessageId}`, { enableSearch: true });
+            isolated = await openConversation(config, `${conversationKey}:task:${external.existingMessageId}`, { enableSearch: true, contextCalibrationScope: conversationKey });
             taskRuntimes.add(isolated);
           }
           const runtime = isolated ?? baseRuntime;

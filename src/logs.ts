@@ -91,9 +91,19 @@ export function queryDiagnostics(log: DiagnosticLog, filter: DiagnosticFilter = 
   const calls = log.calls(filter);
   const events = log.events(filter);
   const limit = filter.limit ?? 100;
-  return { calls: calls.map(call => ({ ...call, ...(content ? { artifacts: {
-    request: log.artifact(call.callId, 'request'),
-    ...(call.responseRef ? { response: log.artifact(call.callId, 'response') } : {}),
-    ...(call.inputRef ? { input: log.artifact(call.callId, 'input') } : {}),
-  } } : {}) })), events, mayBeTruncated: calls.length >= limit || events.length >= limit };
+  return { calls: calls.map(call => {
+    const { contextCalibration, ...record } = call;
+    return { ...record,
+      ...(contextCalibration ? { contextCalibration: content ? contextCalibration : {
+        version: contextCalibration.version, key: contextCalibration.key,
+        requestBytes: contextCalibration.footprint.bytes,
+        blockCount: contextCalibration.footprint.blocks.reduce((sum, block) => sum + block.count, 0),
+      } } : {}),
+      ...(content ? { artifacts: {
+        request: log.artifact(call.callId, 'request'),
+        ...(call.responseRef ? { response: log.artifact(call.callId, 'response') } : {}),
+        ...(call.inputRef ? { input: log.artifact(call.callId, 'input') } : {}),
+      } } : {}),
+    };
+  }), events, mayBeTruncated: calls.length >= limit || events.length >= limit };
 }

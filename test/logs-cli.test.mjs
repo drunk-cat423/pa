@@ -16,6 +16,7 @@ import { ConversationStore } from '../dist/store.js';
 import { DiagnosticLog, DiagnosticPersistenceError } from '../dist/diagnostics.js';
 import { queryDiagnostics, replayDiagnosticCall } from '../dist/logs.js';
 import { runLogsCli } from '../dist/logs-cli.js';
+import { ContextTokenEstimator, contextCalibrationKey } from '../dist/context-tokens.js';
 
 const cliPath = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
 const standalonePath = fileURLToPath(new URL('../dist/logs-cli.js', import.meta.url));
@@ -29,6 +30,22 @@ function fixture(t) {
   writeFileSync(join(dir, 'pa.sqlite'), 'BUSINESS_DATABASE_MUST_REMAIN_UNOPENED');
   return { dir, log: new DiagnosticLog(dir) };
 }
+
+test('默认诊断仅显示校准摘要，完整哈希分块留给显式content查询',t=>{
+  const {log}=fixture(t);
+  const payload={messages:[{role:'user',content:privateText.repeat(2000)}]};
+  const estimator=new ContextTokenEstimator(contextCalibrationKey('fixture','model','openai-completions','https://local.test','room'));
+  const metadata=estimator.metadata(payload);assert.ok(metadata);
+  const id=log.startCall({traceId:'calibration-query',kind:'chat',provider:'fixture',model:'model',phase:'request',
+    contextCalibration:metadata},payload);
+  const compact=queryDiagnostics(log,{callId:id});
+  assert.equal(compact.calls[0].contextCalibration.requestBytes,metadata.footprint.bytes);
+  assert.equal(compact.calls[0].contextCalibration.blockCount,metadata.footprint.blocks.reduce((sum,b)=>sum+b.count,0));
+  assert.doesNotMatch(JSON.stringify(compact),/footprint|PRIVATE_SAVED_USER_TEXT/);
+  const full=queryDiagnostics(log,{callId:id},true);
+  assert.deepEqual(full.calls[0].contextCalibration,metadata);
+  assert.deepEqual(log.calls({callId:id})[0].contextCalibration,metadata);
+});
 
 function memoryInput() {
   return {

@@ -22,6 +22,7 @@ import { searchDeepSeek, WebSearchError, WebSearchPersistenceError, type SearchD
 import { fetchWebPage } from './web-fetch.js';
 import { outputLengthGuidance } from './output-length.js';
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
+import { ContextTokenEstimator, contextCalibrationKey, type ContextCalibration } from './context-tokens.js';
 import { PREPARE_TURN_PROMPT, PREPARE_TURN_DESCRIPTION, RESPONSE_STAGE_PROMPT, CLI_STAGE_PROMPT, RESPONSE_MODE_PROMPTS, TURN_PLAN_SCHEMA,
   validateTurnPlan, hasUnbackedSaveClaim, type TurnPlan, type TurnReceipt, type ReplyMode } from './turn-plan.js';
 
@@ -53,7 +54,8 @@ export interface ContextEstimate {
   contextWindow: number;
   ratio: number;
   fits: boolean;
-  method: 'utf8-byte-estimate';
+  method: 'utf8-byte-estimate' | 'usage-calibrated';
+  calibration?: { sampleInputTokens: number; retainedBytes: number; newBytes: number };
 }
 
 // Tokenizer-independent conservative estimate, explicitly not a measured usage value.
@@ -157,7 +159,7 @@ async function loadSession(cwd: string, directory: string): Promise<SessionManag
 }
 
 export async function openConversation(config: PaConfig, conversationId: string,
-  options: { enableSearch?: boolean } = {}): Promise<ConversationRuntime> {
+  options: { enableSearch?: boolean; contextCalibrationScope?: string } = {}): Promise<ConversationRuntime> {
   const { directory, release: releaseLock } = await acquireConversationLock(config.dataDir, conversationId);
   let session: AgentSession | undefined;
   try {
@@ -186,6 +188,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
     const diagnostics = new DiagnosticLog(config.dataDir, [config.apiKey]);
     let diagnosticContext: DiagnosticContext = { traceId: randomUUID(), conversationId };
     let pendingDiagnosticCall: string | undefined;
+    let pendingCalibration: { callId: string; metadata: ContextCalibration } | undefined;
     let latestDiagnosticCall: string | undefined;
     let partialDiagnosticResponse: unknown;
     function recordDiagnostic<T>(operation: () => T): T {
@@ -332,6 +335,21 @@ export async function openConversation(config: PaConfig, conversationId: string,
       sessionManager: manager, settingsManager: settings,
     }));
     agentSession = session;
+    const tokenEstimator = new ContextTokenEstimator(contextCalibrationKey(model.provider, model.id, model.api,
+      model.baseUrl, options.contextCalibrationScope ?? conversationId));
+    // Only bounded, endpoint/scope-bound metadata is restored; never scan payload artifacts.
+    const recentCalls = recordDiagnostic(() => diagnostics.calibrationCalls(tokenEstimator.key, 100));
+    for (const call of recentCalls.filter(call => call.provider === model.provider && call.model === model.id).reverse()) {
+      tokenEstimator.learn(call.contextCalibration, call.usage);
+    }
+    function estimatePayload(payload: unknown, transportReserve = 0): ContextEstimate {
+      const fallback = estimateContext(payload, model.contextWindow, model.maxTokens);
+      const calibrated = tokenEstimator.estimate(payload);
+      const inputTokens = (calibrated?.inputTokens ?? fallback.inputTokens) + transportReserve;
+      const total = inputTokens + fallback.reservedOutputTokens + fallback.safetyTokens;
+      return { ...fallback, inputTokens, ratio: total / model.contextWindow, fits: total <= model.contextWindow,
+        ...(calibrated ? { method: 'usage-calibrated', calibration: calibrated.calibration } : {}) };
+    }
     if ([...agentSession.getActiveToolNames(), ...agentSession.getCallableToolNames(),
       ...agentSession.getAllTools().map(tool => tool.name)].some(name => !customTools.some(tool => tool.name === name))) {
       throw new Error('Pi 运行时出现未授权工具。');
@@ -373,7 +391,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           name: tool.name, description: tool.description, parameters: tool.parameters, strict: false } })),
       }, channel && !ready, noTools);
       // Transport flags and provider-specific field names are outside the transcript projection.
-      return estimateContext({ payload, transportReserve: ' '.repeat(256) }, model.contextWindow, model.maxTokens);
+      return estimatePayload(payload, 256);
     }
     const previousTransform = agentSession.agent.transformContext;
     agentSession.agent.transformContext = async (messages, signal) => projectStage(
@@ -419,10 +437,13 @@ export async function openConversation(config: PaConfig, conversationId: string,
         // No unverified cross-provider fallback: preparation must be enforceable.
         throw new RequestError('当前模型协议尚未接通强制准备阶段，请使用已支持的OpenAI兼容接口。','error');
       }
-      if (!estimateContext(transformed, model.contextWindow, model.maxTokens).fits) throw new Error('含工具结果的最终请求超过上下文窗口。');
+      if (!estimatePayload(transformed).fits) throw new Error('含工具结果的最终请求超过上下文窗口。');
+      const calibration = tokenEstimator.metadata(transformed);
       recordDiagnostic(() => {
         pendingDiagnosticCall = diagnostics.startCall({ ...diagnosticContext, kind: 'chat',
-          provider: requestedModel.provider, model: requestedModel.id, phase: 'request' }, transformed);
+          provider: requestedModel.provider, model: requestedModel.id, phase: 'request',
+          ...(calibration ? { contextCalibration: calibration } : {}) }, transformed);
+        pendingCalibration = calibration ? { callId: pendingDiagnosticCall, metadata: calibration } : undefined;
         latestDiagnosticCall = pendingDiagnosticCall;
         partialDiagnosticResponse = undefined;
         diagnostics.event(diagnosticContext, 'request', 'model.request_prepared',
@@ -450,11 +471,17 @@ export async function openConversation(config: PaConfig, conversationId: string,
         if (pendingDiagnosticCall) recordDiagnostic(() => {
           const id = pendingDiagnosticCall!;
           diagnostics.saveResponse(id, assistantMessage);
-          const unknown = ['error', 'aborted'].includes(assistantMessage.stopReason);
+          const unknown = !['stop', 'length', 'toolUse'].includes(assistantMessage.stopReason)
+            || requestTimedOut || Boolean(activeAbortController?.signal.aborted);
           diagnostics.finishCall(id, unknown ? 'unknown' : 'completed', 'response', {
             stopReason: assistantMessage.stopReason,
             ...(unknown ? {} : { usage: assistantMessage.usage, usageSource: 'sdk-normalized', billedUsage: null }),
           });
+          if (!unknown && !requestTimedOut && !activeAbortController?.signal.aborted
+            && ['stop', 'length', 'toolUse'].includes(assistantMessage.stopReason) && pendingCalibration?.callId === id) {
+            tokenEstimator.learn(pendingCalibration.metadata, assistantMessage.usage);
+          }
+          pendingCalibration = undefined;
           pendingDiagnosticCall = undefined;
         });
         if (companionTools && !prepared && !['error', 'aborted'].includes(event.message.stopReason)) {
@@ -552,7 +579,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           diagnosticContext = { traceId: metadata?.runId ?? randomUUID(),
             taskId: metadata?.taskId ?? metadata?.runId ?? conversationId,
             ...(metadata?.runId ? { runId: metadata.runId } : {}), conversationId: metadata?.conversationId ?? conversationId };
-          pendingDiagnosticCall = undefined; latestDiagnosticCall = undefined; partialDiagnosticResponse = undefined;
+          pendingDiagnosticCall = undefined; pendingCalibration = undefined; latestDiagnosticCall = undefined; partialDiagnosticResponse = undefined;
           agentSession.setActiveToolsByName(companionTools ? customTools.map(tool => tool.name) : []);
           try {
             checkRun();
@@ -598,6 +625,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
                 if (partialDiagnosticResponse) diagnostics.saveResponse(pendingDiagnosticCall, partialDiagnosticResponse);
                 diagnostics.finishCall(pendingDiagnosticCall, 'unknown', 'request', { responseComplete: false });
                 pendingDiagnosticCall = undefined;
+                pendingCalibration = undefined;
               }
               diagnostics.event(diagnosticContext, preparationError ? 'prepare' : 'answer', 'turn.failed',
                 { code: requestTimedOut ? 'timeout' : cancelRequested ? 'cancelled' : preparationError ? 'preparation_contract' : 'request_or_answer' }, latestDiagnosticCall);

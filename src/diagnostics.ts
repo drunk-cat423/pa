@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, parse, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { validContextCalibration, type ContextCalibration } from './context-tokens.js';
 
 export interface DiagnosticContext {
   traceId: string;
@@ -18,6 +19,7 @@ export interface DiagnosticCallSpec extends DiagnosticContext {
   model: string;
   phase: string;
   captureLevel?: 'sdk-normalized' | 'http-json';
+  contextCalibration?: ContextCalibration;
 }
 export interface DiagnosticArtifactRef { path: string; sha256: string; bytes: number }
 export interface DiagnosticCallRecord extends DiagnosticCallSpec {
@@ -315,6 +317,7 @@ export class DiagnosticLog {
       if (!['chat', 'memory', 'search'].includes(spec.kind)) fail('诊断调用种类无效。');
       const captureLevel = spec.captureLevel ?? 'sdk-normalized';
       if (!['sdk-normalized', 'http-json'].includes(captureLevel)) fail('诊断捕获层级无效。');
+      if (spec.contextCalibration !== undefined && !validContextCalibration(spec.contextCalibration)) fail('诊断上下文校准元数据无效。');
       for (const value of [spec.provider, spec.model, spec.phase]) {
         if (typeof value !== 'string' || !value.length || value.length > 512) fail('诊断模型或阶段无效。');
       }
@@ -326,6 +329,7 @@ export class DiagnosticLog {
         const record: DiagnosticCallRecord = { ...context, callId, kind: spec.kind, provider: this.clean(spec.provider) as string,
           model: this.clean(spec.model) as string, phase: this.clean(spec.phase) as string, status: 'started', createdAt: at, updatedAt: at,
           captureLevel, billedUsage: null, requestRef: this.saveArtifact(callId, 'request', requestData),
+          ...(spec.contextCalibration === undefined ? {} : { contextCalibration: structuredClone(spec.contextCalibration) }),
           ...(inputData === undefined ? {} : { inputRef: this.saveArtifact(callId, 'input', inputData) }) };
         this.persistCall(database, record);
         this.appendEvent(database, context, record.phase, 'call_started', { captureLevel: record.captureLevel }, callId);
@@ -408,6 +412,21 @@ export class DiagnosticLog {
 
   calls(filter: DiagnosticFilter = {}): DiagnosticCallRecord[] { return this.query('calls', filter); }
   events(filter: DiagnosticFilter = {}): DiagnosticEvent[] { return this.query('events', filter); }
+
+  /** Apply calibration scope/eligibility before the bound, so active rooms cannot evict other rooms' samples. */
+  calibrationCalls(key: string, limit = 100): DiagnosticCallRecord[] {
+    return this.guard(() => {
+      if (typeof key !== 'string' || !/^[0-9a-f]{64}$/.test(key)) fail('诊断上下文校准 key 必须是有效的 SHA256。');
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000) fail('诊断查询 limit 必须在 1 到 10000 之间。');
+      return this.withDatabase(false, database => database.prepare(`SELECT record_json FROM calls
+        WHERE json_extract(record_json, '$.contextCalibration.key') = ?
+          AND json_extract(record_json, '$.status') = 'completed'
+          AND json_extract(record_json, '$.kind') = 'chat'
+          AND json_extract(record_json, '$.usageSource') = 'sdk-normalized'
+        ORDER BY rowid DESC LIMIT ?`).all(key, limit)
+        .map(row => JSON.parse(String(row.record_json)) as DiagnosticCallRecord), () => []);
+    });
+  }
 
   artifact(callId: string, name: 'request' | 'response' | 'input'): unknown {
     return this.guard(() => {
