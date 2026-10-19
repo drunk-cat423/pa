@@ -76,6 +76,8 @@ function parseUrl(value: string): URL {
   return url;
 }
 
+export function normalizeWebFetchUrl(value: string): string { return parseUrl(value).href; }
+
 function nativeTransport(request: { url: URL; address: string; family: number; signal: AbortSignal }): Promise<WebFetchResponse> {
   return new Promise((resolve, reject) => {
     const client = request.url.protocol === 'https:' ? https : http;
@@ -394,8 +396,9 @@ export async function fetchWebPage(url: string, config: WebFetchConfig, signal?:
     if (typeof lastModified === 'string') dateEvidence.push({ kind: 'http_last_modified', value: lastModified, source: 'header:last-modified' });
     const normalizedDateEvidence = normalizeDateEvidence(dateEvidence);
     if (Date.now() >= deadline) fail('timeout');
-    const excerpt = content.text.slice(0, config.maxTextChars).replace(/[\ud800-\udbff]$/, '');
-    return { url: parsed.href, statusCode: response.statusCode, text: excerpt, truncated: content.text.length > excerpt.length, fetchedAt: new Date().toISOString(), dateEvidence: normalizedDateEvidence };
+    // Keep the complete extracted text within the existing response-byte bound.
+    // Task-local readers paginate it before it can enter model context.
+    return { url: parsed.href, statusCode: response.statusCode, text: content.text, truncated: false, fetchedAt: new Date().toISOString(), dateEvidence: normalizedDateEvidence };
   } catch (error) {
     if (controller.signal.aborted) throw controller.signal.reason;
     if (error instanceof WebFetchError) throw error;

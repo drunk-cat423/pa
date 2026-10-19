@@ -94,7 +94,7 @@ test('拒绝全部重定向、非成功状态、二进制、压缩与未知编�
   }
 });
 
-test('流式字节与Content-Length硬限，正文按字符截短并标记', async () => {
+test('流式字节与Content-Length硬限，提取完整正文留给任务缓存分段', async () => {
   const huge = fixture('abcdef');
   await rejects(fetchWebPage('https://example.com', { ...config, maxResponseBytes: 5 }, undefined, huge.deps), 'size');
   assert.equal(huge.destroyed, true);
@@ -102,14 +102,14 @@ test('流式字节与Content-Length硬限，正文按字符截短并标记', asy
   await rejects(fetchWebPage('https://example.com', { ...config, maxResponseBytes: 10 }, undefined, length.deps), 'size');
   const mock = fixture('中文正文很长');
   const result = await fetchWebPage('https://example.com', { ...config, maxTextChars: 4 }, undefined, mock.deps);
-  assert.equal(result.text, '中文正文');
-  assert.equal(result.truncated, true);
+  assert.equal(result.text, '中文正文很长');
+  assert.equal(result.truncated, false);
   const multibyte = fixture('中中');
   await rejects(fetchWebPage('https://example.com', { ...config, maxResponseBytes: 5 }, undefined, multibyte.deps), 'size');
   const emoji = fixture('a😀b');
   const shortEmoji = await fetchWebPage('https://example.com', { ...config, maxTextChars: 2 }, undefined, emoji.deps);
-  assert.equal(shortEmoji.text, 'a');
-  assert.equal(shortEmoji.truncated, true);
+  assert.equal(shortEmoji.text, 'a😀b');
+  assert.equal(shortEmoji.truncated, false);
 });
 
 test('取消已发起请求、DNS等待和流读取，超时也中断不响应的依赖', async () => {
