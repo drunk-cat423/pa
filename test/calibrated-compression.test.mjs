@@ -29,13 +29,13 @@ test('渠道按实测校准跨任务复用，字节超窗口不误压缩，接�
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const config={cwd:directory,dataDir:join(directory,'data'),provider:'deepseek',model:'fixture',apiKey:'local-key',
     baseUrl:`http://127.0.0.1:${server.address().port}`,contextWindow:1000000,maxOutputTokens:256,timeoutMs:10000,
-    memory:{enabled:true,maxCalls:10,timeoutMs:10000}};
+    memory:{enabled:true,maxCalls:10,maxOutputTokens:8192,timeoutMs:10000}};
   const route={channel:'qq',accountId:'local',roomType:'group',roomId:'room'};
   const createHarness=()=>{
     const h=new ChannelHarness(config,[route],{send:async()=>({status:'sent',externalMessageId:`sent-${++sent}`})},0,{version:1,ownerBindings:[]},
       {extract:async input=>{
         extractions.push(input);
-        return {topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
+        return {topics:[],fragments:[],profiles:[],ignoredMessageIds:input.extractionProtocol === 2 ? [] : input.messages.filter(m=>m.role==='user').map(m=>m.id),
           continuationSummary:'CALIBRATED_ROLLING_SUMMARY'};
       }});
     harnesses.push(h);return h;

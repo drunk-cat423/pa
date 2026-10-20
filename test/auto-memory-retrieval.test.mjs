@@ -8,6 +8,7 @@ import { BackgroundMemory, validateExtract } from '../dist/auto-memory.js';
 import { migrateMemoryRetrieval } from '../dist/auto-memory-store.js';
 import { memoryWords } from '../dist/memory-text.js';
 import { ConversationStore } from '../dist/store.js';
+import { emptyExtraction, legacyFrozenInput } from './fixtures/memory-output.mjs';
 
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(),'pa-retrieval-'));
@@ -26,7 +27,8 @@ function fixture(t) {
     batch() {
       store.autoMemory.reserveBatch(conversation.id,'capacity');
       const job=store.autoMemory.claimNext(conversation.id,{owner:'test',leaseMs:60000});
-      const input=store.autoMemory.taskInput(job);
+      // These tests keep the legacy fragment/index contract readable for frozen history.
+      const input=legacyFrozenInput(store,path,job);
       assert.equal(input.profileProtocol,2);
       return {job,input, output:{continuationSummary:"继续对话",topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id)}};
     },
@@ -126,7 +128,10 @@ test('legacy personal-event pending stays stored but never enters profiles or ne
 
 test('a captured third-party target is organized even when only its recorder spoke in this batch', async t => {
   const f=fixture(t); f.inbound('我是小乙','bob');
-  let batch=f.batch();f.store.autoMemory.commit(batch.job.id,batch.job.leaseToken,batch.output);
+  f.store.autoMemory.reserveMaterialsIfDue(f.conversation.id,1000);
+  f.store.autoMemory.reserveMaterialsIfDue(f.conversation.id,601000);
+  const first=f.store.autoMemory.claimNext(f.conversation.id,{owner:'test',leaseMs:60000,pipeline:'materials'});
+  f.store.autoMemory.commit(first.id,first.leaseToken,emptyExtraction(f.store.autoMemory.taskInput(first)));
   const bob=f.store.autoMemory.personForActor(f.store.findActor(f.conversation.id,'bob'));
   const source=f.inbound('小乙喜欢绘画','owner');
   f.store.autoMemory.addProfilePending(bob,source,'喜欢绘画','third_party',{allowThirdParty:true});
@@ -135,11 +140,13 @@ test('a captured third-party target is organized even when only its recorder spo
     f.store.autoMemory,f.conversation.id,{extract:async input=>{
       captured=input;
       const person=input.profiles.find(profile=>profile.personId===bob),pending=person.pending[0];
-      return {continuationSummary:"继续对话",topics:[],fragments:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
+      return {topics:[],fragments:[],ignoredMessageIds:[],
         profiles:[{personId:bob,baseVersion:person.baseVersion,facts:[{content:'喜欢绘画',sourceType:'third_party',messageIds:[source]}],
           pendingResults:[{pendingId:pending.id,status:'merged',factIndex:0}]}]};
     }});
-  t.after(()=>worker.close());worker.start('capacity');await worker.wait(undefined,2000);
+  f.store.autoMemory.reserveMaterialsIfDue(f.conversation.id,602000);
+  assert.ok(f.store.autoMemory.reserveMaterialsIfDue(f.conversation.id,1202000));
+  t.after(()=>worker.close());worker.start();await worker.wait(undefined,2000);
   assert.ok(captured.profiles.some(profile=>profile.personId===bob));
   assert.ok(!captured.messages.some(message=>message.personId===bob));
   assert.equal(f.store.autoMemory.profile(bob).facts[0].sourceType,'third_party');assert.equal(f.store.autoMemory.profile(bob).pending.length,0);
@@ -223,6 +230,7 @@ test('deduplicated facts recalled through a Topic reveal only evidence from that
   const sourceTwo=f.store.externalMessage(foreign.id,'foreign').id;
   f.store.autoMemory.reserveBatch(foreign.id,'capacity');
   const job=f.store.autoMemory.claimNext(foreign.id,{owner:'test',leaseMs:60000});
+  legacyFrozenInput(f.store,f.path,job);
   f.store.autoMemory.commit(job.id,job.leaseToken,{continuationSummary:'继续喝茶',topics:[{summary:'喝茶偏好',messageIds:[sourceTwo]}],
     fragments:[{personId:'same-person',content:'喜欢茶',sourceType:'self',messageIds:[sourceTwo],topicIndex:0}],profiles:[],ignoredMessageIds:[]});
   assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM person_fragments').get().n),1);
@@ -273,7 +281,7 @@ test('private fragments require stable profile evidence while room Topics may re
   const f=fixture(t),room=f.store.ensureConversation('private','/private.jsonl',{channel:'qq',accountId:'test',roomType:'private',roomId:'private'});
   f.store.recordInbound(room.id,'我今天去了杭州',{eventId:'private-source',senderId:'alice',modelInputText:'今天去了杭州'});
   const source=f.store.externalMessage(room.id,'private-source').id;
-  f.store.autoMemory.reserveBatch(room.id,'capacity');const job=f.store.autoMemory.claimNext(room.id,{owner:'test',leaseMs:60000}),input=f.store.autoMemory.taskInput(job);
+  f.store.autoMemory.reserveBatch(room.id,'capacity');const job=f.store.autoMemory.claimNext(room.id,{owner:'test',leaseMs:60000}),input=legacyFrozenInput(f.store,f.path,job);
   const person=input.profiles[0].personId,fragment={personId:person,content:'今天去了杭州',sourceType:'self',messageIds:[source]};
   const output={topics:[{summary:'杭州行程',messageIds:[source]}],fragments:[fragment],profiles:[],ignoredMessageIds:[],continuationSummary:'接着讨论杭州行程'};
   assert.throws(()=>validateExtract(output,input),/只能保存稳定画像证据/);

@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
+import { validateExtract } from '../dist/auto-memory.js';
+import { emptyExtraction } from './fixtures/memory-output.mjs';
 import { MemoryError } from '../dist/memory-types.js';
 import { selfProfileBudget, selfProfileBytes, validateSelfProfileProposal } from '../dist/self-profile-store.js';
 import { downgradeSchema10 } from './fixtures/legacy-schema.mjs';
@@ -37,8 +39,7 @@ function inspect(f, operation) {
 }
 function extract(f, job, selfProfile, extra = {}) {
   const input = f.store.autoMemory.taskInput(job);
-  return { ignoredMessageIds: input.messages.filter(m => m.role === 'user').map(m => m.id),
-    topics: [], fragments: [], profiles: [], ...(input.contextProtocol===1?{continuationSummary:"继续对话"}:{}), ...(selfProfile === undefined ? {} : { selfProfile }), ...extra };
+  return { ...emptyExtraction(input, '继续对话'), ...(selfProfile === undefined ? {} : { selfProfile }), ...extra };
 }
 function proposal(snapshot, content, sourceMessageIds, pendingIds = snapshot.pending.map(p => p.id)) {
   return { baseVersion: snapshot.baseVersion, content, sourceMessageIds, pendingIds };
@@ -141,9 +142,9 @@ test('proposal source metadata can exceed the full budget and rolls back other m
     const input = f.store.autoMemory.taskInput(job);
     const result = proposal(input.selfProfile, 'brief', sources, []);
     assert.throws(() => validateSelfProfileProposal(result, input.selfProfile, input.messages, 800), /容量/);
-    assert.throws(() => f.store.autoMemory.commit(job.id, job.leaseToken, extract(f, job, result, {
-      topics: [{ summary: 'source discussion', messageIds: sources }],
-    }), 800), /容量/);
+    assert.throws(() => f.store.autoMemory.commit(job.id, job.leaseToken, validateExtract(extract(f, job, result, {
+      topics: [{ summary: 'source discussion', messageIds: [] }],
+    }), input), 800), /容量/);
     assert.equal(f.store.autoMemory.selfProfile.snapshot().baseVersion, 0);
     assert.equal(inspect(f, db => db.prepare('SELECT COUNT(*) AS n FROM memory_topics').get().n), 0);
     assert.equal(f.store.autoMemory.status(f.rooms[0].id).completed, 0);
@@ -164,9 +165,9 @@ test('concurrent pending that overflows a proposed snapshot triggers input-versi
     f.store.autoMemory.selfProfile.addPending(concurrent.existingMessageId, 'y'.repeat(100), budget);
     const current = f.store.autoMemory.selfProfile.snapshot();
     assert.ok(selfProfileBytes(current) <= budget);
-    assert.throws(() => f.store.autoMemory.commit(job.id, job.leaseToken, extract(f, job, result, {
-      topics: [{ summary: 'name', messageIds: [first.existingMessageId] }],
-    }), budget), /输入版本/);
+    assert.throws(() => f.store.autoMemory.commit(job.id, job.leaseToken, validateExtract(extract(f, job, result, {
+      topics: [{ summary: 'name', messageIds: [] }],
+    }), input), budget), /输入版本/);
     assert.deepEqual(f.store.autoMemory.selfProfile.snapshot(), current);
     assert.equal(inspect(f, db => db.prepare('SELECT COUNT(*) AS n FROM memory_topics').get().n), 0);
     f.store.autoMemory.clearProgress(job.id, job.leaseToken);
@@ -210,10 +211,10 @@ test('self profile, pending archival, Topics, person profiles and job completion
     f.store.autoMemory.selfProfile.addPending(source.existingMessageId, 'concise');
     const job = f.claim();
     const input = f.store.autoMemory.taskInput(job);
-    const data = extract(f, job, proposal(input.selfProfile, 'concise', [source.existingMessageId]), {
-      ignoredMessageIds: [], topics: [{ summary: 'style request', messageIds: [source.existingMessageId] }],
+    const data = validateExtract(extract(f, job, proposal(input.selfProfile, 'concise', [source.existingMessageId]), {
+      topics: [{ summary: 'style request', messageIds: [] }],
       profiles: [{ ...input.profiles[0], facts: [{ content: 'concise preference', sourceType: 'self', messageIds: [source.existingMessageId] }] }],
-    });
+    }), input);
     const foreign = f.inbound('foreign', f.rooms[1]);
     assert.throws(() => f.store.autoMemory.commit(job.id, job.leaseToken,
       { ...data, selfProfile: proposal(input.selfProfile, 'invented', [foreign.existingMessageId], []) }), /原始真人/);
@@ -295,7 +296,7 @@ test('old persisted task inputs without selfProfile remain usable and cannot com
   } finally { f.close(); }
 });
 
-test('v6 migration backs up the original database and preserves chats, tombstones, evidence and queued job input', () => {
+test('v6 migration backs up original data and preserves frozen job input while isolating its old lease', () => {
   const f = fixture();
   try {
     const source = f.inbound('original chat');
@@ -318,7 +319,7 @@ test('v6 migration backs up the original database and preserves chats, tombstone
     });
     f.restart();
     inspect(f, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 18);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version,22);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       for (const table of tables) assert.deepEqual(db.prepare(`SELECT rowid,* FROM ${table}`).all().map(({image_failure: _failure,...r}) => ({ ...r })), before[table]);
     });
@@ -331,6 +332,12 @@ test('v6 migration backs up the original database and preserves chats, tombstone
       for (const table of tables) assert.deepEqual(backup.prepare(`SELECT rowid,* FROM ${table}`).all().map(r => ({ ...r })), before[table]);
     } finally { backup.close(); }
     assert.equal(f.store.externalMessage(f.rooms[0].id, source.eventId).id, source.existingMessageId);
-    assert.equal(f.store.autoMemory.taskInput(job).selfProfile, undefined);
+    const frozen = inspect(f, db => db.prepare('SELECT input_json FROM auto_memory_jobs WHERE id=?').get(job.id));
+    assert.equal(frozen.input_json, JSON.stringify(oldInput));
+    assert.equal(JSON.parse(frozen.input_json).selfProfile, undefined);
+    assert.throws(() => f.store.autoMemory.taskInput(job), /租约已失效/);
+    assert.throws(() => f.store.autoMemory.retry(job.id), /隔离/);
+    assert.equal(f.store.autoMemory.status(f.rooms[0].id).isolated, 1);
+    assert.equal(f.store.autoMemory.listJobs().find(item => item.id === job.id).isolated, true);
   } finally { f.close(); }
 });

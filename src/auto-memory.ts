@@ -1,13 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import type { PaConfig } from './config.js';
 import { ObsoletePersonalMemoryError, assertCurrentMemoryProtocol, mergeProfileFacts, sameFact, sameFactContent, type AutoMemoryStore } from './auto-memory-store.js';
-import type { AutoMemoryJob, AutoMemoryTaskInput, ValidatedExtract, PersonProfile, ProfileFact } from './auto-memory-types.js';
+import type { AutoMemoryJob, AutoMemoryTaskInput, AutoMemoryPipeline, ValidatedExtract, PersonProfile, ProfileFact } from './auto-memory-types.js';
 import { createMemoryProvider, MemoryInputTooLargeError, type MemoryProvider } from './memory-provider.js';
 import { selfProfileBudget, validateSelfProfileProposal } from './self-profile-store.js';
 import { memoryFailure, memoryFailurePhase, MemoryProviderError } from './memory-diagnostics.js';
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
 import { assertProfileCapacity, profileCapacity } from './profile-limits.js';
 import { assertProfileEvidenceStrength, assertProfileProtocol, PersonProfileProtocolError, validateProfilePendingResults } from './profile-pending.js';
+import { assertMemoryOutputFits, assertMemorySourceRange, assertProcessedRanges, COMPACT_TOPIC_LIMITS,
+  memoryOutputBudget, memorySourceRange, MemoryOutputBudgetError } from './memory-work.js';
 
 type Budget = { calls: number };
 const budgets = new WeakMap<PaConfig, Budget>();
@@ -20,6 +22,14 @@ const record = (value: unknown): value is Record<string, unknown> => value !== n
 
 /** Reject malformed model output before any write; the store independently validates sources at commit. */
 export function validateExtract(value: unknown, input: AutoMemoryTaskInput, mergedProfile = false): ValidatedExtract {
+  const compact = input.extractionProtocol === 2;
+  if (compact && input.mode === 'self' && record(value)) {
+    const proposal = value;
+    if (['topics', 'fragments', 'profiles', 'ignoredMessageIds'].some(key => proposal[key] !== undefined
+      && (!Array.isArray(proposal[key]) || proposal[key].length > 0)) || value.continuationSummary !== undefined
+      || !value.selfProfile) throw new Error('自我画像步骤只能返回自我画像。');
+    value = { ...value, topics: [], fragments: [], profiles: [], ignoredMessageIds: [] };
+  }
   if (input.mode === 'profiles' && record(value)) {
     const proposal = value;
     if (['topics', 'fragments', 'ignoredMessageIds'].some(key => proposal[key] !== undefined
@@ -29,6 +39,10 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
   }
   if (!record(value) || !Array.isArray(value.topics) || !Array.isArray(value.fragments)
     || !Array.isArray(value.profiles) || !Array.isArray(value.ignoredMessageIds)) throw new Error('记忆输出必须包含结构化数组。');
+  if (input.pipeline === 'compression' && (value.topics.length || value.fragments.length || value.profiles.length
+    || value.ignoredMessageIds.length || value.selfProfile !== undefined)) throw new Error('对话压缩不能修改资料。');
+  if (input.pipeline === 'materials' && value.continuationSummary !== undefined) throw new Error('资料整理不能修改续聊摘要。');
+  if (compact && (value.ignoredMessageIds.length || value.fragments.length)) throw new Error('新整理协议不接受逐条覆盖清单或人物事件片段。');
   if (input.mode === 'messages' && (value.profiles.length || (input.roomType === 'private' && value.fragments.length))) {
     throw new Error('消息任务不能修改人物画像或生成私聊人物片段。');
   }
@@ -85,8 +99,19 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
     || value.profiles.length > people.size) throw new Error('记忆输出数量过大。');
   for (const topic of value.topics) {
     if (!record(topic)) throw new Error('Topic无效。');
-    text(topic.summary); ids(topic.messageIds, false, topicSources);
+    text(topic.summary);
+    if (compact) {
+      if (!Array.isArray(topic.messageIds) || topic.messageIds.length || [...String(topic.summary)].length > COMPACT_TOPIC_LIMITS.characters
+        || (!mergedProfile && topic.sourceRange !== undefined)) throw new Error('Topic只能包含有界摘要，来源范围由程序记录。');
+      if (mergedProfile) assertMemorySourceRange(topic.sourceRange as Parameters<typeof assertMemorySourceRange>[0], input.job.messageIds.length);
+    } else ids(topic.messageIds, false, topicSources);
     if (topic.messageIds.some(id=>topicSources.get(id)?.conversationId!==conversationId)) throw new Error('Topic来源必须属于当前会话。');
+  }
+  if (compact && !mergedProfile) {
+    const limits = input.outputBudget;
+    if (value.topics.length > (limits?.topicCount ?? COMPACT_TOPIC_LIMITS.count)
+      || value.topics.reduce((sum, topic) => sum + [...String((topic as {summary: string}).summary)].length, 0)
+        > (limits?.topicTotalCharacters ?? COMPACT_TOPIC_LIMITS.totalCharacters)) throw new Error('Topic摘要超过本步骤输出预算。');
   }
   for (const fragment of value.fragments) {
     if (!record(fragment) || typeof fragment.personId !== 'string' || !people.has(fragment.personId)) throw new Error('人物片段身份无效。');
@@ -115,7 +140,7 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
         return !pending || !(profile.facts as ProfileFact[]).some(item => item.messageIds.includes(pending.sourceMessageId));
       }))) throw new Error('只能归档已捕获且保留来源的人物待整理条目。');
   }
-  if (input.profileProtocol === 2 && input.mode !== 'messages') for (const baseline of input.profiles) {
+  if (input.profileProtocol === 2 && input.mode !== 'messages' && input.mode !== 'self') for (const baseline of input.profiles) {
     const capacity = profileCapacity(baseline);
     if ((input.mode === 'profiles' || baseline.pending?.length || capacity.needsConsolidation || capacity.exceedsLimits)
       && !updated.has(baseline.personId)) throw new Error('人物画像整理遗漏了必须收敛或处理待办的人物。');
@@ -125,15 +150,27 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
   const covered = new Set([...value.ignoredMessageIds,
     ...value.topics.flatMap(topic => (topic as { messageIds: string[] }).messageIds),
     ...value.fragments.flatMap(fragment => (fragment as { messageIds: string[] }).messageIds)]);
-  if (input.mode !== 'profiles' && input.messages.some(message => message.role === 'user' && !covered.has(message.id))) throw new Error('整理遗漏了真人消息。');
-  if ((input.roomType === 'private' || input.contextProtocol === 1) && input.mode !== 'profiles') text(value.continuationSummary);
+  if (!compact && input.mode !== 'profiles' && input.messages.some(message => message.role === 'user' && !covered.has(message.id))) throw new Error('整理遗漏了真人消息。');
+  if (input.pipeline !== 'materials' && (input.roomType === 'private' || input.contextProtocol === 1) && input.mode !== 'profiles' && input.mode !== 'self') {
+    text(value.continuationSummary);
+    if (compact && [...String(value.continuationSummary)].length > (input.outputBudget?.summaryCharacters ?? 2000)) throw new Error('续聊摘要超过本步骤输出预算。');
+  }
   else if (value.continuationSummary !== undefined) throw new Error('群聊不生成独立群摘要。');
   if (value.selfProfile !== undefined) {
     if (!input.selfProfile) throw new Error('自我画像缺少输入快照。');
     validateSelfProfileProposal(value.selfProfile, input.selfProfile, input.messages, input.selfProfileBudgetBytes);
   }
   const result = value as unknown as ValidatedExtract;
-  return { ...result, profiles: result.profiles.map(profile => {
+  const range = compact && input.messages.length > 0 && !mergedProfile && input.mode !== 'profiles' && input.mode !== 'self' ? memorySourceRange(input) : undefined;
+  if (compact && mergedProfile) {
+    assertProcessedRanges(result.processedRanges, input.job.messageIds.length);
+    for (const topic of result.topics) if (!result.processedRanges!.some(range =>
+      range.startOrdinal === topic.sourceRange!.startOrdinal && range.endOrdinal === topic.sourceRange!.endOrdinal)) {
+      throw new Error('Topic来源没有对应的整理完成回执。');
+    }
+  }
+  return { ...result, ...(range ? { processedRanges: [range], topics: result.topics.map(topic => ({ ...topic, sourceRange: range })) } : {}),
+    profiles: result.profiles.map(profile => {
     const normalized = { ...profile, facts: mergeProfileFacts(profile.facts) };
     if (input.profileProtocol === 2) {
       // Pending indices refer to the submitted array; exact duplicate merging can move them.
@@ -151,22 +188,29 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
 }
 
 interface WorkItem {
-  mode?: 'messages' | 'profiles';
+  mode?: 'messages' | 'profiles' | 'self';
   messageIds: string[];
   personIds: string[];
   pendingIds?: string[];
 }
 interface Progress {
-  version: 2;
+  version: 2 | 3;
   remaining: WorkItem[];
   extract: ValidatedExtract;
   profiles: PersonProfile[];
   summary?: string;
 }
 
+/** Local maintenance may drain a frozen set without observing or reserving new work. */
+export interface MemoryExecutionScope {
+  pipeline: 'materials';
+  jobIds: readonly string[];
+}
+
 /** One worker per conversation, independent of the chat Session and of other rooms. */
 export class BackgroundMemory {
-  private work: Promise<void> | undefined;
+  private readonly work = new Map<AutoMemoryPipeline, Promise<void>>();
+  private readonly pipelineErrors = new Map<AutoMemoryPipeline, string>();
   private closed = false;
   private diagnosticFailed = false;
   private diagnostics: DiagnosticLog | undefined;
@@ -178,51 +222,81 @@ export class BackgroundMemory {
   private readonly timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly config: PaConfig, private readonly store: AutoMemoryStore,
-    private readonly conversationId: string, provider?: MemoryProvider) {
+    private readonly conversationId: string, provider?: MemoryProvider, private readonly scope?: MemoryExecutionScope) {
+    if (scope) {
+      if (scope.pipeline !== 'materials' || !scope.jobIds.length || new Set(scope.jobIds).size !== scope.jobIds.length
+        || scope.jobIds.some(id => typeof id !== 'string' || !id)) throw new Error('回填执行范围无效。');
+      this.scope = { pipeline: scope.pipeline, jobIds: [...scope.jobIds] };
+      const status = this.store.status(conversationId, scope.pipeline, scope.jobIds);
+      if (status.queued + status.running + status.failed + status.completed + status.deferred + (status.retired ?? 0)
+        + (status.isolated ?? 0) !== scope.jobIds.length) throw new Error('回填任务范围与当前会话不一致。');
+    }
     this.provider = provider ?? createMemoryProvider(config);
     this.budget = sharedBudget(config);
-    if (config.memory?.enabled) {
+    if (config.memory?.enabled && !scope) {
       this.timer = setInterval(() => {
-        try { this.start(); } catch { this.lastError = '后台任务巡检失败。'; }
+        try { this.start(); } catch {
+          this.lastError = '后台任务持久化巡检失败，工作器已停止。';
+          this.diagnosticFailed = true;
+          for (const controller of this.controllers) controller.abort();
+        }
       }, 1000);
       this.timer.unref();
     }
   }
 
-  info() {
-    const { summary, ...status } = this.store.status(this.conversationId);
+  info(pipeline?: AutoMemoryPipeline) {
+    const effectivePipeline = pipeline ?? this.scope?.pipeline;
+    const { summary, ...status } = this.store.status(this.conversationId, effectivePipeline, this.scope?.jobIds);
+    const lastError = effectivePipeline ? this.pipelineErrors.get(effectivePipeline) : this.lastError;
     return { enabled: this.config.memory?.enabled === true, ...status, hasSummary: Boolean(summary),
       ...(status.deferred ? { deferredRanges: this.store.deferredRanges(this.conversationId) } : {}),
       calls: this.budget.calls,
-      ...(this.lastError ? { lastError: this.lastError } : {}) };
+      ...(pipeline || this.scope ? {} : { compression: this.store.status(this.conversationId, 'compression'),
+        materials: { ...this.store.status(this.conversationId, 'materials'), ...this.store.materialSchedule(this.conversationId) } }),
+      ...(lastError ? { lastError } : {}) };
   }
 
   start(reason?: 'count' | 'capacity', excludeMessageId?: string): void {
     if (this.closed || this.diagnosticFailed || !this.config.memory?.enabled) return;
-    if (reason === 'capacity') this.store.reserveBatch(this.conversationId, reason, 50, excludeMessageId);
-    if (!this.work) {
-      this.work = this.run().catch(error => { this.lastError = memoryFailure(error, 'worker'); })
+    if (this.scope && (reason !== undefined || excludeMessageId !== undefined)) throw new Error('回填执行不能预约新的整理或压缩任务。');
+    if (!this.scope) {
+      if (reason === 'capacity') this.store.reserveCompressionBatch(this.conversationId, excludeMessageId);
+      this.store.reserveMaterialsIfDue(this.conversationId);
+    }
+    const pipelines = this.scope ? [this.scope.pipeline] : ['compression', 'materials', 'legacy'] as const;
+    for (const pipeline of pipelines) if (!this.work.has(pipeline)) {
+      const work = this.run(pipeline).catch(error => {
+        this.lastError = memoryFailure(error, 'worker');
+        this.pipelineErrors.set(pipeline, this.lastError);
+        this.diagnosticFailed = true;
+        for (const controller of this.controllers) controller.abort();
+      })
         .finally(() => {
-          this.work = undefined;
-          if (!this.closed && !this.diagnosticFailed) {
-            const status = this.store.status(this.conversationId);
+          this.work.delete(pipeline);
+          if (!this.closed && !this.diagnosticFailed && !this.scope) {
+            const status = this.store.status(this.conversationId, pipeline);
             if (status.queued && !status.failed && !status.running) queueMicrotask(() => this.start());
           }
         });
+      this.work.set(pipeline, work);
     }
   }
 
   retry(jobId: string): void {
     if (this.diagnosticFailed) throw new DiagnosticPersistenceError();
+    if (this.scope && !this.scope.jobIds.includes(jobId)) throw new Error('不能重试本次回填范围外的任务。');
     this.store.retry(jobId);
     this.start();
   }
 
-  async wait(afterCompleted?: number, timeoutMs = (this.config.memory?.timeoutMs ?? 120000) * 2 + 10000): Promise<void> {
+  async wait(afterCompleted?: number, timeoutMs = (this.config.memory?.timeoutMs ?? 120000) * 2 + 10000,
+    pipeline?: AutoMemoryPipeline): Promise<void> {
     const deadline = Date.now() + timeoutMs;
+    const effectivePipeline = pipeline ?? this.scope?.pipeline;
     do {
-      const status = this.store.status(this.conversationId);
-      if (this.closed || this.diagnosticFailed || status.failed) throw new Error(this.lastError ?? '后台任务失败或已关闭。');
+      const status = this.store.status(this.conversationId, effectivePipeline, this.scope?.jobIds);
+      if (this.closed || this.diagnosticFailed || status.failed) throw new Error((effectivePipeline ? this.pipelineErrors.get(effectivePipeline) : this.lastError) ?? '后台任务失败或已关闭。');
       if (afterCompleted !== undefined && status.completed > afterCompleted) return;
       if (!status.running && !status.queued) return;
       if (!this.config.memory?.enabled || Date.now() >= deadline) break;
@@ -252,15 +326,17 @@ export class BackgroundMemory {
     finally { clearTimeout(timer); this.controllers.delete(controller); }
   }
 
-  private async run(): Promise<void> {
+  private async run(pipeline: AutoMemoryPipeline): Promise<void> {
     const setting = this.config.memory!;
     while (!this.closed) {
-      const job = this.store.claimNext(this.conversationId, { owner: this.owner, leaseMs: setting.timeoutMs + 10000 });
+      const job = this.store.claimNext(this.conversationId, { owner: this.owner, leaseMs: setting.timeoutMs + 10000, pipeline,
+        ...(this.scope ? { jobIds: this.scope.jobIds } : {}) });
       if (!job) return;
       const lease = job.leaseToken!;
       let phase = 'input';
       let callId: string | undefined;
       let committed = false;
+      let compactTask = false;
       const context: DiagnosticContext = { traceId: job.id, taskId: job.id, jobId: job.id,
         conversationId: job.conversationId, attempt: job.attempts };
       try {
@@ -268,7 +344,10 @@ export class BackgroundMemory {
         if (this.config.dataDir) this.diagnostics ??= new DiagnosticLog(this.config.dataDir, this.config.apiKey ? [this.config.apiKey] : []);
         this.diagnostics?.event(context, 'claim', 'claimed');
         if (setting.maxCalls > 0 && this.budget.calls >= setting.maxCalls) throw new Error('budget');
-        const input: AutoMemoryTaskInput = { ...this.store.taskInput(job), selfProfileBudgetBytes: selfProfileBudget(this.config.contextWindow) };
+        const captured = this.store.taskInput(job);
+        compactTask = captured.extractionProtocol === 2;
+        const input: AutoMemoryTaskInput = { ...captured, selfProfileBudgetBytes: selfProfileBudget(this.config.contextWindow),
+          ...(captured.extractionProtocol === 2 ? { outputBudget: memoryOutputBudget(this.config, captured.pipeline) } : {}) };
         assertCurrentMemoryProtocol(input);
         assertProfileProtocol(input);
         this.store.assertProfileEvidenceCurrent(input);
@@ -285,6 +364,7 @@ export class BackgroundMemory {
           try {
             phase = 'extract';
             this.diagnostics?.event(context, phase, 'started', { messageIds: chunk.messages.map(message => message.id) });
+            assertMemoryOutputFits(chunk, this.config);
             const proposal = await this.request(signal => this.provider.extract(chunk, signal, { onCall: id => { callId = id; } }), () => Boolean(callId));
             this.diagnostics?.event(context, phase, 'completed', undefined, callId);
             phase = 'validate';
@@ -294,7 +374,7 @@ export class BackgroundMemory {
             this.diagnostics?.event(context, phase, 'completed', undefined, callId);
           }
           catch (error) {
-            if (!(error instanceof MemoryInputTooLargeError) || callId) throw error;
+            if (!(error instanceof MemoryInputTooLargeError || error instanceof MemoryOutputBudgetError) || callId) throw error;
             const replacements = this.splitWork(item, chunk);
             if (!replacements) throw error;
             progress.remaining.splice(0, 1, ...replacements);
@@ -309,6 +389,7 @@ export class BackgroundMemory {
           progress.extract.fragments.push(...result.fragments.map(fragment => ({ ...fragment,
             ...(fragment.topicIndex === undefined ? {} : { topicIndex: fragment.topicIndex + offset }) })));
           progress.extract.ignoredMessageIds.push(...result.ignoredMessageIds);
+          if (input.extractionProtocol === 2) progress.extract.processedRanges!.push(...(result.processedRanges ?? []));
           for (const profile of result.profiles) {
             const original = progress.profiles.find(old => old.personId === profile.personId)!;
             const previous = progress.extract.profiles.find(old => old.personId === profile.personId);
@@ -363,7 +444,8 @@ export class BackgroundMemory {
         committed = true;
         this.diagnostics?.event(context, phase, 'completed', undefined, callId);
         if (callId) this.diagnostics?.finishCall(callId, 'completed', phase);
-        this.lastError = undefined;
+        this.pipelineErrors.delete(pipeline);
+        this.lastError = [...this.pipelineErrors.values()].at(-1);
       } catch (error) {
         phase = memoryFailurePhase(error, phase);
         let failure = error;
@@ -378,9 +460,12 @@ export class BackgroundMemory {
         if (failure instanceof DiagnosticPersistenceError) this.diagnosticFailed = true;
         this.lastError = this.diagnosticFailed ? '后台整理失败；[diagnostic_persistence] 诊断持久化失败，当前工作器已停止。'
           : `后台整理失败；${memoryFailure(error, phase)}`;
+        this.pipelineErrors.set(pipeline, this.lastError);
         const conflict = error instanceof Error && /版本冲突|输入版本/.test(error.message);
         if (!committed) {
-          if (conflict) this.store.clearProgress(job.id, lease);
+          // A compact task's protocol and completion receipts stay tied to its
+          // original snapshot. A conflict requires an explicit replacement task.
+          if (conflict && !compactTask) this.store.clearProgress(job.id, lease);
           this.store.fail(job.id, lease, this.lastError);
         }
         // A failed/aborted request may have been billed or completed upstream. Only explicit retry may call again.
@@ -405,6 +490,12 @@ export class BackgroundMemory {
       messages: input.messages.filter(message => ids.has(message.id)), profiles,
       profileFragments: fragments, profileSources: [...allSources.values()].filter(message => sourceIds.has(message.id)),
       ...(progress.summary ? { previousSummary: progress.summary } : {}) };
+    if (input.extractionProtocol === 2) {
+      if (item.mode === 'messages' || item.mode === 'self') {
+        chunk.profiles = []; chunk.profileFragments = []; chunk.profileSources = [];
+      }
+      if (item.mode === 'messages' || !input.selfProfile?.pending.length) delete chunk.selfProfile;
+    }
     if (item.mode === 'profiles') {
       delete chunk.selfProfile;
       delete chunk.previousSummary;
@@ -415,13 +506,34 @@ export class BackgroundMemory {
         sourceMessageIds: previous.sourceMessageIds,
         pending: input.selfProfile.pending.filter(pending => !previous.pendingIds.includes(pending.id)) };
     }
+    if (input.extractionProtocol === 2 && item.mode === 'self') {
+      delete chunk.previousSummary;
+      if (chunk.selfProfile) chunk.selfProfile = { ...chunk.selfProfile,
+        pending: chunk.selfProfile.pending.filter(pending => !item.pendingIds || item.pendingIds.includes(pending.id)) };
+      const sources = new Set(chunk.selfProfile?.pending.map(pending => pending.sourceMessageId));
+      chunk.messages = chunk.messages.filter(message => sources.has(message.id));
+    }
+    if (input.extractionProtocol === 2 && item.mode === 'messages') delete chunk.selfProfile;
+    if (input.pipeline === 'materials') delete chunk.previousSummary;
     return chunk;
   }
 
   /** Only preflight rejection may create smaller work. A complete person's facts are never split. */
   private splitWork(item: WorkItem, chunk: AutoMemoryTaskInput): WorkItem[] | undefined {
     if (item.mode === undefined) {
+      if (chunk.pipeline === 'compression') return chunk.messages.length < 2 ? undefined
+        : [chunk.messages.slice(0, Math.floor(chunk.messages.length / 2)), chunk.messages.slice(Math.floor(chunk.messages.length / 2))]
+          .map(messages => ({ ...item, messageIds: messages.map(message => message.id) }));
+      if (chunk.extractionProtocol === 2) return [{ ...item, mode: 'messages' },
+        ...item.personIds.map(personId => ({ ...item, personIds: [personId], mode: 'profiles' as const })),
+        ...(chunk.selfProfile?.pending.length ? [{ ...item, personIds: [], mode: 'self' as const }] : [])];
       return [{ ...item, mode: 'messages' }, ...(item.personIds.length ? [{ ...item, mode: 'profiles' as const }] : [])];
+    }
+    if (item.mode === 'self') {
+      const pendingIds = chunk.selfProfile?.pending.map(pending => pending.id) ?? [];
+      if (pendingIds.length < 2) return undefined;
+      const middle = Math.floor(pendingIds.length / 2);
+      return [pendingIds.slice(0, middle), pendingIds.slice(middle)].map(pendingIds => ({ ...item, pendingIds }));
     }
     if (item.mode === 'profiles' && item.personIds.length > 1) {
       const middle = Math.floor(item.personIds.length / 2);
@@ -444,22 +556,28 @@ export class BackgroundMemory {
     const existing = this.store.loadProgress(job.id, job.leaseToken!);
     if (existing !== undefined && existing !== null) {
       assertCurrentMemoryProtocol(existing);
-      if (!record(existing) || existing.version !== 2) throw new PersonProfileProtocolError();
+      if (!record(existing) || existing.version !== (input.extractionProtocol === 2 ? 3 : 2)) throw new PersonProfileProtocolError();
       if (!Array.isArray(existing.remaining) || !record(existing.extract)
         || !Array.isArray(existing.profiles)) throw new Error('后台整理检查点损坏。');
       const available = new Set(input.messages.map(message => message.id));
       const people = new Set(input.profiles.map(profile => profile.personId));
-      const pendingIds = new Set(input.profiles.flatMap(profile => (profile.pending ?? []).map(pending => pending.id)));
-      if (existing.remaining.some(item => !record(item) || ![undefined, 'messages', 'profiles'].includes(item.mode as WorkItem['mode'])
+      const pendingIds = new Set([...input.profiles.flatMap(profile => (profile.pending ?? []).map(pending => pending.id)),
+        ...(input.extractionProtocol === 2 ? input.selfProfile?.pending.map(pending => pending.id) ?? [] : [])]);
+      if (existing.remaining.some(item => !record(item) || ![undefined, 'messages', 'profiles', ...(input.extractionProtocol === 2 ? ['self'] : [])].includes(item.mode as WorkItem['mode'])
         || !Array.isArray(item.messageIds) || new Set(item.messageIds).size !== item.messageIds.length || item.messageIds.some(id => !available.has(id))
         || !Array.isArray(item.personIds) || new Set(item.personIds).size !== item.personIds.length || item.personIds.some(id => !people.has(id))
         || (item.pendingIds !== undefined && (!Array.isArray(item.pendingIds) || item.pendingIds.some(id => !pendingIds.has(id)))))) throw new Error('后台检查点来源不匹配。');
       this.store.assertProfileEvidenceCurrent(input, existing.extract as unknown as ValidatedExtract);
       this.store.assertProfileEvidenceCurrent(input, { profiles: existing.profiles as PersonProfile[] });
+      if (input.extractionProtocol === 2 && !Array.isArray(existing.extract.processedRanges)) throw new Error('后台整理检查点缺少步骤完成回执。');
       return existing as unknown as Progress;
     }
-    return { version: 2, remaining: [{ messageIds: input.messages.map(message => message.id), personIds: input.profiles.map(profile => profile.personId) }], profiles: input.profiles,
-      extract: { topics: [], fragments: [], profiles: [], ignoredMessageIds: [] },
+    return { version: input.extractionProtocol === 2 ? 3 : 2,
+      remaining: input.pipeline === 'materials' && input.messages.length === 0
+        ? [...input.profiles.map(profile => ({ messageIds: [] as string[], personIds: [profile.personId], mode: 'profiles' as const })),
+          ...(input.selfProfile?.pending.length ? [{ messageIds: [] as string[], personIds: [] as string[], mode: 'self' as const }] : [])]
+        : [{ messageIds: input.messages.map(message => message.id), personIds: input.profiles.map(profile => profile.personId) }], profiles: input.profiles,
+      extract: { topics: [], fragments: [], profiles: [], ignoredMessageIds: [], ...(input.extractionProtocol === 2 ? { processedRanges: [] } : {}) },
       ...(input.previousSummary ? { summary: input.previousSummary } : {}) };
   }
 
@@ -472,6 +590,6 @@ export class BackgroundMemory {
     this.closed = true;
     clearInterval(this.timer);
     for (const controller of this.controllers) controller.abort();
-    await Promise.allSettled([this.work]);
+    await Promise.allSettled([...this.work.values()]);
   }
 }

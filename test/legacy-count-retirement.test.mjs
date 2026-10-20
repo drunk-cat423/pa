@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
 import { downgradeSchema15 } from './fixtures/legacy-schema.mjs';
+import { emptyExtraction, legacyFrozenInput } from './fixtures/memory-output.mjs';
 
 const digest=value=>createHash('sha256').update(value).digest('hex');
 function fixture(t) {
@@ -35,6 +36,7 @@ function fixture(t) {
   };
 }
 function output(input,summary='完整历史摘要') {
+  if(input.extractionProtocol===2) return emptyExtraction(input,summary);
   return {topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
     ...(input.contextProtocol===1?{continuationSummary:summary}:{})};
 }
@@ -46,7 +48,7 @@ function evidence(f) {
 
 test('retiring the failed + queued + deferred count backlog preserves evidence and hands every original to rolling',t=>{
   const f=fixture(t);
-  f.count('旧 Topic 来源');const done=f.claim(),doneInput=f.store.autoMemory.taskInput(done);
+  f.count('旧 Topic 来源');const done=f.claim(),doneInput=legacyFrozenInput(f.store,f.path,done);
   f.store.autoMemory.commit(done.id,done.leaseToken,{...output(doneInput),ignoredMessageIds:[],
     topics:[{summary:'保留旧 Topic 证据',messageIds:done.messageIds}]});
   f.count('曾搁置的 PRIVATE_RAW_TEXT');const deferred=f.fail();
@@ -65,7 +67,9 @@ test('retiring the failed + queued + deferred count backlog preserves evidence a
   }
   assert.deepEqual(f.store.autoMemory.status(f.room.id),{queued:0,running:0,failed:0,deferred:0,completed:1,retired:17,
     checkpoint:done.endSeq});
-  assert.equal(f.claim(),undefined);assert.deepEqual(f.store.autoMemory.pendingConversations(),[]);
+  assert.equal(f.claim(),undefined);
+  // Raw material may still start the separate timer; retirement never pretends it was organized.
+  assert.deepEqual(f.store.autoMemory.pendingConversations(),[f.room.id]);
   assert.deepEqual(f.store.autoMemory.deferredRanges(f.room.id),[]);
   const listed=f.store.autoMemory.listJobs().find(job=>job.id===deferred.id);
   assert.equal(listed.status,'failed');assert.equal(listed.deferred,true);assert.equal(listed.retired,true);
@@ -160,7 +164,7 @@ test('non-count legacy jobs and completed count jobs remain intact; other conver
 test('schema15 upgrade backs up original evidence and never retires or reserves work automatically',t=>{
   const f=fixture(t);f.count('PRIVATE_RAW_TEXT');f.fail();const original=evidence(f);
   f.inspect(db=>{downgradeSchema15(db);db.exec('PRAGMA user_version=15');});f.restart();
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),18);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),22);
   assert.deepEqual(evidence(f),original);
   assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM auto_memory_job_retirements').get().n),0);
   assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM auto_memory_context_jobs').get().n),0);

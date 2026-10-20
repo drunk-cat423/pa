@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createMemoryProvider, MemoryInputTooLargeError, prepareMemoryExtraction, parseMemoryResponse } from '../dist/memory-provider.js';
+import { DiagnosticLog } from '../dist/diagnostics.js';
+import { replayDiagnosticCall } from '../dist/logs.js';
 
 const output = {
   ignoredMessageIds: [], topics: [], fragments: [], profiles: [], continuationSummary: '继续讨论行程安排。',
@@ -56,6 +58,7 @@ async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'pa-memory-provider-'));
   const requests = [];
   let mode = 'success';
+  let result = output;
   const server = createServer(async (request, response) => {
     let raw = '';
     for await (const chunk of request) raw += chunk;
@@ -65,7 +68,7 @@ async function fixture(t) {
     }
     if (mode === 'http-error') { response.writeHead(503); response.end('private provider rejection'); return; }
     const stopReason = mode === 'length' ? 'length' : 'stop';
-    const content = mode === 'invalid-json' ? '{invalid json' : JSON.stringify(output);
+    const content = mode === 'invalid-json' ? '{invalid json' : JSON.stringify(result);
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     response.write(`data: ${JSON.stringify({ id: 'local', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null }] })}\n\n`);
     response.write(`data: ${JSON.stringify({ id: 'local', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, delta: {}, finish_reason: stopReason }] })}\n\n`);
@@ -83,8 +86,47 @@ async function fixture(t) {
     await new Promise(resolve => server.close(resolve));
     await rm(directory, { recursive: true, force: true });
   });
-  return { config, requests, setMode: value => { mode = value; } };
+  return { config, requests, setMode: value => { mode = value; }, setOutput: value => { result = value; } };
 }
+
+test('new wire protocol reaches the local SDK with aliases and preserves replay and response diagnostics', async t => {
+  const f = await fixture(t);
+  const sourceId = '00000000-0000-4000-8000-000000000001';
+  const personId = '00000000-0000-4000-8000-000000000002';
+  const pendingId = '00000000-0000-4000-8000-000000000003';
+  const snapshot = { ...input, extractionProtocol: 2, profileProtocol: 2, contextProtocol: 1,
+    job: { ...input.job, reason: 'capacity', messageIds: [sourceId] },
+    messages: [{ ...input.messages[0], id: sourceId, personId }],
+    profiles: [{ personId, baseVersion: 0, facts: [], pending: [{ id: pendingId,
+      content: '喜欢茶', sourceMessageId: sourceId, sourceType: 'self' }] }] };
+  const wire = { topics: [{ summary: '话题 m0' }], continuationSummary: '继续 m0',
+    profiles: [{ personId: 'p0', baseVersion: 0, facts: [{ content: '喜欢茶 m0', sourceType: 'self', messageIds: ['m0'] }],
+      pendingResults: [{ pendingId: 'q0', status: 'merged', factIndex: 0 }] }] };
+  f.setOutput(wire);
+  let callId;
+  const result = await createMemoryProvider(f.config).extract(snapshot, new AbortController().signal, { onCall: id => { callId = id; } });
+  assert.equal(f.requests.length, 1);
+  const request = f.requests[0].body;
+  assert.equal(request.tools, undefined);
+  const user = JSON.parse(request.messages.find(message => message.role === 'user').content);
+  assert.equal(user.messages[0].id, 'm0');
+  assert.equal(user.profiles[0].personId, 'p0');
+  assert.equal(user.profiles[0].pending[0].id, 'q0');
+  assert.doesNotMatch(JSON.stringify(request), /00000000-0000-4000-8000-/);
+  assert.equal(result.profiles[0].personId, personId);
+  assert.deepEqual(result.profiles[0].facts[0].messageIds, [sourceId]);
+  assert.equal(result.profiles[0].pendingResults[0].pendingId, pendingId);
+  assert.equal(result.profiles[0].facts[0].content, '喜欢茶 m0');
+  assert.deepEqual(result.topics, [{ summary: '话题 m0', messageIds: [] }]);
+  const diagnostic = name => readFile(join(f.config.dataDir, 'diagnostics', 'calls', callId, `${name}.json`), 'utf8').then(JSON.parse);
+  assert.equal((await diagnostic('input')).messages[0].id, sourceId);
+  assert.ok(JSON.stringify(await diagnostic('request')).includes('m0'));
+  const response = await diagnostic('response');
+  assert.equal(response.stopReason, 'stop');
+  assert.deepEqual(JSON.parse(response.content.find(block => block.type === 'text').text), wire);
+  const replay = replayDiagnosticCall(new DiagnosticLog(f.config.dataDir), callId);
+  assert.equal(replay.ok, true); assert.equal(replay.networkRequests, 0); assert.equal(replay.businessWrites, 0);
+});
 
 test('离线请求准备明确摘要缺口，不把搁置区间当作已整理内容', () => {
   const prepared=prepareMemoryExtraction({...input,previousSummary:'已完成的后续话题',deferredRanges:[{startSeq:1,endSeq:80}]},100000);

@@ -8,6 +8,7 @@ import { DiagnosticLog, DiagnosticPersistenceError } from './diagnostics.js';
 import { profileCapacity } from './profile-limits.js';
 import { imageMetadata, imageRequestFits, projectImagePayload, type ImageProjection } from './image-context.js';
 import { ImageAssets } from './image-assets.js';
+import { decodeMemoryWireResponse, memoryWireReferences, prepareMemoryWireExtraction } from './memory-wire.js';
 
 export interface MemoryProvider {
   extract(input: AutoMemoryTaskInput, signal: AbortSignal, options?: { onCall?: (callId: string) => void }): Promise<unknown>;
@@ -47,6 +48,7 @@ interface ConfiguredModel {
 /** Pure request preparation supports saved-input replay without creating a provider or network call. */
 export function prepareMemoryExtraction(input: AutoMemoryTaskInput, contextWindow: number) {
   assertCurrentMemoryProtocol(input);
+  if (input.extractionProtocol === 2) return prepareMemoryWireExtraction(input, contextWindow);
   const messageView = (message: AutoMemoryTaskInput['messages'][number]) => ({ id: message.id, role: message.role,
     ...(message.imageFailure ? {imageFailure:message.imageFailure} : {}),
     ...(input.mode !== 'profiles' && message.images?.length ? { images: message.images.map(imageMetadata) } : {}),
@@ -99,6 +101,7 @@ export function parseMemoryResponse(message: unknown, input: AutoMemoryTaskInput
   try { parsed = JSON.parse(text); } catch {
     throw new MemoryProviderError('model_json', '记忆整理模型返回的内容不是有效 JSON。');
   }
+  if (input.extractionProtocol === 2) return decodeMemoryWireResponse(parsed, input);
   if (input.selfProfile && input.mode !== 'profiles' && (!parsed || typeof parsed !== 'object' || !('selfProfile' in parsed))) {
     throw new MemoryProviderError('model_contract', '记忆整理缺少自我画像结果。');
   }
@@ -124,7 +127,8 @@ export function createMemoryProvider(config: PaConfig): MemoryProvider {
       const memoryOutputTokens = config.memory?.maxOutputTokens ?? config.maxOutputTokens;
       const maxTokens = Math.min(model.maxTokens, memoryOutputTokens);
       const { systemPrompt, userContent } = prepareMemoryExtraction(input, model.contextWindow);
-      const images = input.mode === 'profiles' ? [] : [...new Map(input.messages.flatMap(message => message.images ?? []).map(image => [image.imageId,image])).values()].map(image => {
+      const messageRefs = input.extractionProtocol === 2 ? memoryWireReferences(input).messages : undefined;
+      const images = input.mode === 'profiles' || (input.extractionProtocol === 2 && input.mode === 'self') ? [] : [...new Map(input.messages.flatMap(message => message.images ?? []).map(image => [image.imageId,image])).values()].map(image => {
         const currentAsset = imageAssets.get(image.imageId);
         if (!currentAsset) throw new MemoryProviderError('model_request','当前模型账号没有整理原图的可用引用，请重新发送原图。');
         imageAssets.read(image.imageId);
@@ -132,7 +136,7 @@ export function createMemoryProvider(config: PaConfig): MemoryProvider {
       });
       const projections: ImageProjection[] = images.length ? [{ text: userContent,
         content: [{ type: 'text', text: userContent }, ...images.flatMap(image => [
-          { type: 'text' as const, text: `[图片 imageId=${image.imageId}；所属消息=${input.messages.filter(message => message.images?.some(item => item.imageId === image.imageId)).map(message => message.id).join(',')}；归属与引用关系见images元数据]` },
+          { type: 'text' as const, text: `[图片 imageId=${image.imageId}；所属消息=${input.messages.filter(message => message.images?.some(item => item.imageId === image.imageId)).map(message => messageRefs?.get(message.id) ?? message.id).join(',')}；归属与引用关系见images元数据]` },
           { type: 'file' as const, file_id: image.fileId, bytes: image.bytes }])] }] : [];
       const userMessage = { role: 'user' as const, content: userContent, timestamp: Date.now() };
       const projectedInput = projectImagePayload({

@@ -8,9 +8,10 @@ import { BackgroundMemory, validateExtract } from '../dist/auto-memory.js';
 import { DiagnosticLog, DiagnosticPersistenceError } from '../dist/diagnostics.js';
 import { createMemoryProvider, parseMemoryResponse } from '../dist/memory-provider.js';
 import { ConversationStore } from '../dist/store.js';
+import { emptyExtraction } from './fixtures/memory-output.mjs';
 
 test('memory response must end normally; valid JSON does not turn a partial/tool response into success', () => {
-  const content = [{ type: 'text', text: '{"topics":[],"fragments":[],"profiles":[],"ignoredMessageIds":[]}' }];
+  const content = [{ type: 'text', text: '{"topics":[],"profiles":[]}' }];
   for (const stopReason of [undefined, 'toolUse', 'bogus']) {
     assert.throws(() => parseMemoryResponse({ content, stopReason }, {}), /没有正常结束/);
   }
@@ -23,10 +24,11 @@ async function fixture(t, mode = 'success') {
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); requests.push(body);
     const input = JSON.parse(body.messages.findLast(message => message.role === 'user').content);
-    const output = { ...(input.contextProtocol===1?{continuationSummary:"继续对话"}:{}), topics: [], fragments: [], profiles: [],
-      ignoredMessageIds: mode === 'coverage' ? [] : input.messages.filter(message => message.role === 'user').map(message => message.id),
-      ...(input.selfProfile ? { selfProfile: { baseVersion: input.selfProfile.baseVersion,
-        content: input.selfProfile.content, sourceMessageIds: input.selfProfile.sourceMessageIds, pendingIds: [] } } : {}) };
+    const selfProfile = input.selfProfile && !['messages', 'profiles', 'self'].includes(input.mode) ? { baseVersion: input.selfProfile.baseVersion,
+      content: input.selfProfile.content, sourceMessageIds: ['m0'], pendingIds: [] } : undefined;
+    const output = input.pipeline === 'compression' ? { continuationSummary: mode === 'coverage' ? '' : '继续对话' }
+      : input.mode === 'self' ? { selfProfile } : input.mode === 'profiles' ? { profiles: [] } : {
+      topics: [], profiles: [], ...(mode === 'coverage' ? {} : { continuationSummary: '继续对话' }), ...(selfProfile ? { selfProfile } : {}) };
     const content = mode === 'json' ? '{PRIVATE_INVALID_JSON' : JSON.stringify(output);
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const choice of [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null },
@@ -38,7 +40,7 @@ async function fixture(t, mode = 'success') {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const config = { cwd: directory, dataDir: directory, provider: 'deepseek', model: 'fixture', apiKey: 'PRIVATE_FIXTURE_KEY',
     baseUrl: `http://127.0.0.1:${server.address().port}/v1`, contextWindow: 100000, maxOutputTokens: 2048, timeoutMs: 5000,
-    memory: { enabled: true, maxCalls: 0, timeoutMs: 5000 } };
+    memory: { enabled: true, maxCalls: 0, timeoutMs: 5000, maxOutputTokens: 8192 } };
   const store = new ConversationStore(join(directory, 'store.sqlite'));
   const conversation = store.ensureConversation('room', join(directory, 'session.jsonl'),
     { channel: 'qq', accountId: 'a', roomId: 'g', roomType: 'group' });
@@ -81,17 +83,20 @@ for (const failure of ['validate', 'commit']) test(`worker ${failure} failure ke
   const f = await fixture(t, failure === 'validate' ? 'coverage' : 'success');
   if (failure === 'commit') f.store.autoMemory.commit = () => { throw new Error('PRIVATE_COMMIT_ERROR'); };
   const worker = f.worker(); worker.start('capacity');
-  await assert.rejects(worker.wait(undefined, 3000), /失败/);
+  await assert.rejects(worker.wait(undefined, 3000, 'compression'), /失败/);
   const [job] = f.store.autoMemory.listJobs();
-  assert.equal(job.status, 'failed'); assert.equal(f.requests.length, 1);
-  const [call] = f.log.calls({ jobId: job.id });
+  assert.equal(job.pipeline, 'compression');
+  assert.equal(job.status, 'failed'); assert.ok(f.requests.length >= 1);
+  const call = f.log.calls({ jobId: job.id }).find(item => item.phase === failure);
+  assert.ok(call);
   assert.equal(call.status, 'failed'); assert.equal(call.phase, failure);
   assert.equal(call.traceId, job.id); assert.equal(call.taskId, job.id); assert.equal(call.attempt, 1);
   assert.ok(f.log.artifact(call.callId, 'response').content.length);
   assert.equal(f.log.artifact(call.callId, 'input').messages.length, 1);
+  assert.equal(f.log.artifact(call.callId, 'input').pipeline, 'compression');
   if (failure === 'validate') assert.throws(() => validateExtract(
     parseMemoryResponse(f.log.artifact(call.callId, 'response'), f.log.artifact(call.callId, 'input')),
-    f.log.artifact(call.callId, 'input')), /遗漏/);
+    f.log.artifact(call.callId, 'input')), /正文无效|遗漏/);
   const events = f.log.events({ jobId: job.id });
   assert.ok(events.some(event => event.phase === failure && event.event === 'failed' && event.callId === call.callId));
   assert.ok(events.some(event => event.phase === 'claim'));
@@ -103,7 +108,11 @@ for (const failure of ['validate', 'commit']) test(`worker ${failure} failure ke
 test('paused background and injected fake providers preserve scheduling while only real SDK calls create call records', async t => {
   const f = await fixture(t); let calls = 0;
   const provider = { extract: async input => {
-    calls++; return { continuationSummary:"继续对话", topics: [], fragments: [], profiles: [], ignoredMessageIds: input.messages.map(message => message.id) };
+    calls++;
+    if (input.mode === 'self') return { selfProfile: { baseVersion: input.selfProfile.baseVersion,
+      content: input.selfProfile.content, sourceMessageIds: input.selfProfile.sourceMessageIds, pendingIds: [] } };
+    if (input.mode === 'profiles') return { profiles: input.profiles.map(profile => ({ ...profile, pendingResults: [] })) };
+    return emptyExtraction(input, '继续对话');
   } };
   const paused = f.worker({ memory: { ...f.config.memory, enabled: false } }, provider);
   paused.start('capacity'); await paused.close(); assert.equal(calls, 0); assert.equal(f.requests.length, 0);
@@ -134,8 +143,10 @@ for (const afterCommit of [false, true]) test(`diagnostic persistence failure ${
   };
   const worker = f.worker();
   try {
-    worker.start('capacity'); await assert.rejects(worker.wait(undefined, 3000), /诊断持久化失败/);
-    assert.equal(f.store.autoMemory.listJobs()[0].status, afterCommit ? 'done' : 'failed');
+    worker.start('capacity'); await assert.rejects(worker.wait(undefined, 3000, 'compression'), /诊断持久化失败/);
+    const [job] = f.store.autoMemory.listJobs();
+    assert.equal(job.pipeline, 'compression');
+    assert.equal(job.status, afterCommit ? 'done' : 'failed');
     assert.equal(f.requests.length, 1);
     f.store.recordInbound(f.conversation.id, '后续原文', { eventId: 'two', senderId: 'a', modelInputText: '后续原文' });
     worker.start('capacity'); worker.start();

@@ -23,10 +23,12 @@ function wait(signal, gate) {
   });
 }
 function extracted(input) {
+  if (input.pipeline === 'compression') return { topics: [], fragments: [], profiles: [], ignoredMessageIds: [],
+    continuationSummary: '已经讨论测试计划，下一步继续执行。' };
   if (input.mode === 'profiles') return { profiles: input.profiles.map(profile => ({ personId: profile.personId,
     baseVersion: profile.baseVersion, facts: profile.facts, pendingResults: (profile.pending ?? []).map(pending => ({ pendingId: pending.id, status: 'deferred' })) })) };
   const ids = input.messages.filter(message => message.role === 'user').map(message => message.id);
-  return { topics: ids.length ? [{ summary: '本批讨论了测试计划。', messageIds: ids }] : [],
+  return { topics: ids.length ? [{ summary: '本批讨论了测试计划。', messageIds: input.extractionProtocol === 2 ? [] : ids }] : [],
     fragments: [], profiles: [], ignoredMessageIds: [],
     ...(input.roomType === 'private' || input.contextProtocol === 1
       ? { continuationSummary: '已经讨论测试计划，下一步继续执行。' } : {}) };
@@ -105,6 +107,7 @@ async function fixture(t, extract = async input => extracted(input), overrides =
     apiKey: 'fixture-key', baseUrl: `http://127.0.0.1:${server.address().port}`, contextWindow: 1000000,
     maxOutputTokens: 256, timeoutMs: 10000,
     memory: { enabled: true, maxCalls: 100, timeoutMs: 10000 }, ...overrides };
+  config.memory = { maxOutputTokens: 8192, ...config.memory };
   const route = { channel: 'qq', accountId: 'bot', roomType: 'group', roomId: 'g1' };
   const other = { ...route, roomId: 'g2' };
   const privateRoute = { ...route, roomType: 'private', roomId: 'private-a' };
@@ -367,6 +370,7 @@ test('后台提供完整旧画像并整体替换收敛结果，不再补回未�
   let observedFacts = 0;
   const f = await fixture(t, async input => {
     const result = extracted(input); const person = input.profiles[0];
+    if (input.mode === 'messages') return result;
     observedFacts = person.facts.length;
     result.profiles = [{ personId: person.personId, baseVersion: person.baseVersion, facts: [
       { content: '长期兴趣是天文', sourceType: 'self', messageIds: [person.facts[0].messageIds[0]] }] }];

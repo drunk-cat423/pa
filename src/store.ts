@@ -4,9 +4,10 @@ import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { isDeepStrictEqual } from 'node:util';
 import { MemoryError } from './memory-types.js';
-import type { MemoryChange, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, PrimaryPerson } from './memory-types.js';
+import type { MemoryChange, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, PrimaryPerson,
+  FactPerson, SharedFactContext, SharedFactAttributionInput } from './memory-types.js';
 import type { ChannelRoute, ExternalRunInput, InboundMessage } from './channel-types.js';
-import { AutoMemoryStore, migrateAutoMemory, migrateMemoryRetrieval, migrateRollingContext } from './auto-memory-store.js';
+import { AutoMemoryStore, migrateAutoMemory, migrateMemoryRetrieval, migrateRollingContext, migrateMemoryPipelines, migrateMaterialBackfill } from './auto-memory-store.js';
 import { migrateSelfProfile } from './self-profile-store.js';
 import { memoryWords } from './memory-text.js';
 import { validateTurnPlan, type TurnPlan, type TurnReceipt } from './turn-plan.js';
@@ -68,7 +69,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 22;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -78,6 +79,7 @@ export interface HistoryOptions {
 export interface HistoryMessage {
   id: string; senderId?: string; senderName?: string; replyToSenderId?: string;
   role: 'user' | 'assistant'; text: string; sentAt?: string;
+  correctedBy?: string[];
 }
 
 
@@ -468,6 +470,21 @@ export class ConversationStore {
         message_id TEXT NOT NULL REFERENCES messages(id), image_id TEXT NOT NULL,
         ordinal INTEGER NOT NULL, metadata_json TEXT NOT NULL, PRIMARY KEY(message_id,ordinal));
         CREATE INDEX message_images_asset ON message_images(image_id);`);
+      if (version < 19) this.db.exec(`CREATE TABLE memory_fact_attributions (
+        memory_id TEXT NOT NULL, revision INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('statement','correction')),
+        subject_actor_ids_json TEXT NOT NULL, excluded_actor_ids_json TEXT NOT NULL,
+        corrected_message_ids_json TEXT NOT NULL,
+        PRIMARY KEY(memory_id,revision),
+        FOREIGN KEY(memory_id,revision) REFERENCES memory_revisions(memory_id,revision));`);
+      if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
+      if (version < 20) this.db.exec(`CREATE TABLE memory_topic_scopes (
+        topic_id TEXT PRIMARY KEY REFERENCES memory_topics(id),
+        start_ordinal INTEGER NOT NULL CHECK(start_ordinal >= 0),
+        end_ordinal INTEGER NOT NULL CHECK(end_ordinal >= start_ordinal)
+      );`);
+      if (version < 21) migrateMemoryPipelines(this.db);
+      if (version < 22) migrateMaterialBackfill(this.db);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
@@ -735,12 +752,124 @@ export class ConversationStore {
       AND (scope_type='room' OR (scope_type='legacy' AND EXISTS (SELECT 1 FROM conversations c JOIN rooms r ON r.id=c.room_id WHERE c.id=memories.conversation_id AND r.channel='cli')))`,[conversationId],query,limit);
   }
 
+  private factPerson(conversationId: string, actorId: string): FactPerson | null {
+    const row = this.db.prepare(`SELECT a.external_user_id,ap.person_id,
+      (SELECT sender_name FROM messages WHERE actor_id=a.id AND sender_name IS NOT NULL ORDER BY ingest_seq DESC LIMIT 1) AS name
+      FROM actors a JOIN conversations c ON c.room_id=a.room_id
+      LEFT JOIN actor_person_bindings ap ON ap.actor_id=a.id WHERE c.id=? AND a.id=?`)
+      .get(conversationId,actorId);
+    if (!row || row.external_user_id == null) return null;
+    return { senderId: String(row.external_user_id), ...(row.person_id == null ? {} : {personId:String(row.person_id)}),
+      ...(row.name == null ? {} : {displayName:String(row.name).slice(0,100)}) };
+  }
+
+  roomFactContext(conversationId: string, beforeMessageId?: string, includeBoundary = false): {
+    facts: SharedFactContext[]; corrections: SharedFactContext[]; correctedMessages: Record<string,string[]>; summaryInvalidated: boolean;
+  } {
+    this.requireMemoryConversation(conversationId);
+    const room = this.db.prepare('SELECT r.room_type FROM conversations c JOIN rooms r ON r.id=c.room_id WHERE c.id=?').get(conversationId);
+    if (room?.room_type !== 'group') return {facts:[],corrections:[],correctedMessages:{},summaryInvalidated:false};
+    const boundary = beforeMessageId === undefined ? undefined : this.db.prepare('SELECT ingest_seq FROM messages WHERE id=? AND conversation_id=?')
+      .get(beforeMessageId,conversationId);
+    if (beforeMessageId !== undefined && !boundary) throw new MemoryError('共享事实边界不属于当前房间。');
+    const beforeSeq = boundary ? Number(boundary.ingest_seq) + (includeBoundary ? 1 : 0) : null;
+    const rows = this.db.prepare(`SELECT m.*,s.actor_id AS source_actor,s.created_at AS source_time,
+      a.kind AS attribution_kind,a.subject_actor_ids_json,a.excluded_actor_ids_json,a.corrected_message_ids_json
+      FROM memories m LEFT JOIN messages s ON s.id=m.source_message_id AND s.conversation_id=m.conversation_id
+      LEFT JOIN memory_fact_attributions a ON a.memory_id=m.id AND a.revision=m.revision
+      WHERE m.conversation_id=? AND m.scope_type='room' AND m.subject_actor_id IS NULL AND m.person_id IS NULL
+      AND m.profile_field IS NULL AND m.status='active' AND m.is_current=1
+      AND (m.expires_at IS NULL OR m.expires_at>?) AND (? IS NULL OR s.ingest_seq<?)
+      ORDER BY COALESCE(s.ingest_seq,0) DESC,m.updated_at DESC,m.rowid DESC`)
+      .all(conversationId,now(),beforeSeq,beforeSeq);
+    const result: ReturnType<ConversationStore['roomFactContext']> = {facts:[],corrections:[],correctedMessages:{},summaryInvalidated:false};
+    // Retain the invalidation lineage through later revisions, corrections and
+    // expiry. Expiring a corrective note must not make its old error true again.
+    const lineage = this.db.prepare(`SELECT v.source_message_id,s.ingest_seq,a.corrected_message_ids_json
+      FROM memory_fact_attributions a JOIN memory_revisions v ON v.memory_id=a.memory_id AND v.revision=a.revision
+      JOIN memories m ON m.id=v.memory_id JOIN messages s ON s.id=v.source_message_id AND s.conversation_id=m.conversation_id
+      WHERE m.conversation_id=? AND m.status='active' AND a.kind='correction'
+      AND (? IS NULL OR s.ingest_seq<?) ORDER BY s.ingest_seq DESC,v.revision DESC`)
+      .all(conversationId,beforeSeq,beforeSeq);
+    const edges = new Map<string,Set<string>>();
+    for (const row of lineage) {
+      const id=String(row.source_message_id),targets=edges.get(id)??new Set<string>();
+      for (const target of JSON.parse(String(row.corrected_message_ids_json)) as string[]) targets.add(target);
+      edges.set(id,targets);
+    }
+    for (const row of lineage) {
+      const source=String(row.source_message_id);
+      if (result.correctedMessages[source]) continue;
+      const pending=[...(edges.get(source)??[])],visited=new Set<string>();
+      while (pending.length) {
+        const target=pending.pop()!;
+        if (visited.has(target)) continue;
+        visited.add(target);
+        const sources=result.correctedMessages[target]??=[];
+        if (!sources.includes(source)) sources.push(source);
+        pending.push(...(edges.get(target)??[]));
+      }
+    }
+    for (const row of rows) {
+      // A newer explicit correction can supersede the source of an older fact or
+      // correction, without modifying either original message or memory version.
+      if (row.source_message_id != null && result.correctedMessages[String(row.source_message_id)]) continue;
+      const people = (value: unknown): FactPerson[] => (value == null ? [] : JSON.parse(String(value)) as string[])
+        .flatMap(id => { const person=this.factPerson(conversationId,id); return person?[person]:[]; });
+      const item: SharedFactContext = {id:String(row.id),revision:Number(row.revision),kind:row.kind as MemoryKind,
+        content:String(row.content),sourceMessageId:row.source_message_id==null?null:String(row.source_message_id),
+        sourceSpeaker:row.source_actor==null?(row.writer_actor_id==null?null:this.factPerson(conversationId,String(row.writer_actor_id)))
+          :this.factPerson(conversationId,String(row.source_actor)),sourceTime:String(row.source_time??row.updated_at),
+        attribution:row.attribution_kind==='correction'?'correction':'statement',
+        subjects:people(row.subject_actor_ids_json),excludedSubjects:people(row.excluded_actor_ids_json),
+        correctsMessageIds:row.corrected_message_ids_json==null?[]:JSON.parse(String(row.corrected_message_ids_json)) as string[]};
+      if (item.attribution === 'correction') {
+        result.corrections.push(item);
+      } else result.facts.push(item);
+    }
+    const state=this.db.prepare('SELECT cursor FROM conversation_context_state WHERE conversation_id=?').get(conversationId);
+    const contextBoundary=beforeMessageId===undefined?undefined:this.db.prepare('SELECT seq FROM conversation_context_messages WHERE conversation_id=? AND message_id=?')
+      .get(conversationId,beforeMessageId);
+    if (Number(state?.cursor??0)>0 && (contextBoundary===undefined || Number(state!.cursor)<Number(contextBoundary.seq))) {
+      const inSummary=this.db.prepare('SELECT 1 FROM conversation_context_messages WHERE conversation_id=? AND message_id=? AND seq<=?');
+      result.summaryInvalidated=Object.keys(result.correctedMessages).some(id=>Boolean(inSummary.get(conversationId,id,Number(state!.cursor))));
+    }
+    return result;
+  }
+
+  private saveFactAttribution(conversationId: string, sourceMessageId: string, memory: MemoryRecord,
+    attribution: SharedFactAttributionInput, mentionedSenderIds: readonly string[]): void {
+    const source = this.db.prepare(`SELECT m.actor_id,m.text,m.ingest_seq,a.external_user_id FROM messages m
+      JOIN actors a ON a.id=m.actor_id WHERE m.id=? AND m.conversation_id=? AND m.role='user'`)
+      .get(sourceMessageId,conversationId);
+    if (!source) throw new MemoryError('共享事实缺少本房间真人来源。');
+    const resolveActor = (senderId: string): string => {
+      if (senderId !== source.external_user_id && !mentionedSenderIds.includes(senderId)
+        && !String(source.text).includes(`<@${senderId}>`) && !String(source.text).includes(`<@!${senderId}>`)
+        && !String(source.text).includes(senderId)) throw new MemoryError('涉及人物须由本条真实 @ 或明确身份ID指定，不能按昵称猜测。');
+      const actor = this.db.prepare('SELECT a.id FROM actors a JOIN conversations c ON c.room_id=a.room_id WHERE c.id=? AND a.external_user_id=?')
+        .get(conversationId,senderId);
+      if (!actor) throw new MemoryError('共享事实涉及的人物不属于当前房间。');
+      return String(actor.id);
+    };
+    const subjects=attribution.subjectSenderIds.map(resolveActor),excluded=attribution.excludedSenderIds.map(resolveActor);
+    for (const id of attribution.correctsMessageIds) {
+      if (!this.db.prepare('SELECT id FROM messages WHERE id=? AND conversation_id=? AND ingest_seq<?')
+        .get(id,conversationId,Number(source.ingest_seq))) throw new MemoryError('只能纠正本房间当前消息之前的明确来源，不能引用他群、当前或未来消息。');
+    }
+    this.db.prepare('INSERT INTO memory_fact_attributions VALUES (?,?,?,?,?,?)').run(memory.id,memory.revision,attribution.kind,
+      JSON.stringify(subjects),JSON.stringify(excluded),JSON.stringify(attribution.correctsMessageIds));
+  }
+
   correctMemory(conversationId: string, id: string, input: MemoryInput, expectedRevision?: number): MemoryChange {
     validateMemoryInput(input);
     validateRevision(expectedRevision);
     return this.memoryTransaction(() => {
       const actorId=this.validateMemorySource(conversationId,input.sourceMessageId);
       const existing=this.requireCurrentMemory(conversationId,id,expectedRevision);
+      const attribution=this.db.prepare('SELECT * FROM memory_fact_attributions WHERE memory_id=? AND revision=?').get(id,Number(existing.revision));
+      if (attribution && (attribution.kind==='correction' || String(attribution.subject_actor_ids_json)!=='[]')
+        && input.content!==existing.content) throw new MemoryError('此共享事实带有人物归属，请用明确的自然语言归属纠正更新；不能用无结构修订丢失或猜测人物归属。');
       if(input.sourceMessageId!==undefined && existing.source_message_id!=null) {
         const incoming=this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(input.sourceMessageId);
         const previous=this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(String(existing.source_message_id));
@@ -756,6 +885,8 @@ export class ConversationStore {
         VALUES (?,?,?,'active',?,?,?,?,?)`).run(id,revision,input.content,eventId,input.sourceMessageId??null,updatedAt,occurredAt,expiresAt);
       this.db.prepare(`UPDATE memories SET kind=?,content=?,revision=?,source_event_id=?,source_message_id=?,updated_at=?,occurred_at=?,expires_at=? WHERE id=?`)
         .run(input.kind??String(existing.kind),input.content,revision,eventId,input.sourceMessageId??null,updatedAt,occurredAt,expiresAt,id);
+      if (attribution) this.db.prepare('INSERT INTO memory_fact_attributions VALUES (?,?,?,?,?,?)')
+        .run(id,revision,attribution.kind!,attribution.subject_actor_ids_json!,attribution.excluded_actor_ids_json!,attribution.corrected_message_ids_json!);
       this.requireContextReset(conversationId);
       return {memory:asMemory(this.findMemory(conversationId,id)),contextResetRequired:true};
     });
@@ -810,7 +941,8 @@ export class ConversationStore {
       if (!source) throw new MemoryError('本轮缺少有效来源。');
       const canonical = JSON.stringify({ intent:plan.intent,mode:plan.mode,
         ...(plan.progressText === undefined ? {} : {progressText:plan.progressText}),updates:plan.updates.map(u=>({target:u.target,
-        content:u.content,sourceType:u.sourceType??'third_party',senderId:u.senderId??null,key:u.key??null})) });
+        content:u.content,sourceType:u.sourceType??'third_party',senderId:u.senderId??null,key:u.key??null,
+        ...(u.attribution === undefined ? {} : {attribution:u.attribution})})) });
       const previous = this.db.prepare('SELECT plan_json,receipt_json FROM turn_preparations WHERE source_message_id=?').get(sourceMessageId);
       if (previous) {
         if (previous.plan_json !== canonical) throw new MemoryError('本条消息已经完成准备，不能重复更改保存内容。');
@@ -846,12 +978,19 @@ export class ConversationStore {
           if(rules.length>50 || Buffer.byteLength(JSON.stringify(rules))>12000) throw new MemoryError('本群规则容量已满，请精简或纠正已有约定。');
           receipt.saved.push({target:update.target,status:'saved'});
         } else {
-          const duplicate=this.db.prepare(`SELECT id FROM memories WHERE conversation_id=? AND scope_type='room'
-            AND status='active' AND is_current=1 AND content=?`).get(conversationId,update.content);
-          if(!duplicate)this.rememberMemory(conversationId,{content:update.content,kind:'fact',sourceMessageId});
+          // Same wording from different speakers is not the same sourced fact.
+          // Replay of this exact preparation is handled by the receipt above.
+          const memory=this.rememberMemory(conversationId,{content:update.content,kind:'fact',sourceMessageId}).memory;
+          const attribution=update.attribution??{kind:'statement' as const,subjectSenderIds:[],excludedSenderIds:[],correctsMessageIds:[]};
+          this.saveFactAttribution(conversationId,sourceMessageId,memory,attribution,mentionedSenderIds);
+          if (attribution.kind === 'correction') (receipt.attributionCorrections??=[]).push({memoryId:memory.id,
+            sourceMessageId,speakerSenderId:String(source.external_user_id),subjectSenderIds:attribution.subjectSenderIds,
+            excludedSenderIds:attribution.excludedSenderIds,correctsMessageIds:attribution.correctsMessageIds});
           receipt.saved.push({target:update.target,status:'saved'});
         }
       }
+      if (receipt.attributionCorrections && Buffer.byteLength(JSON.stringify(receipt.attributionCorrections),'utf8') > 3000)
+        throw new MemoryError('本轮归属纠正元数据过多，请减少涉及人物或旧消息数量；本批均未保存。');
       this.db.prepare('INSERT INTO turn_preparations VALUES (?,?,?,?)').run(sourceMessageId,canonical,JSON.stringify(receipt),now());
       return receipt;
     });
@@ -894,6 +1033,7 @@ export class ConversationStore {
           AND (? IS NULL OR COALESCE(m.sent_at,m.created_at)<?)
           AND (? IS NULL OR COALESCE(m.sent_at,m.created_at)>?)`;
       const parameters = [conversationId,Number(current.ingest_seq),Number(current.ingest_seq),actorId,actorId,before,before,after,after];
+      const correctedMessages = this.roomFactContext(conversationId,currentMessageId,true).correctedMessages;
       const ranked = this.db.prepare(filtered + (match ? ' AND message_history_fts MATCH ? ORDER BY score,m.ingest_seq DESC LIMIT ?' : ' ORDER BY m.ingest_seq DESC LIMIT ?'))
         .all(...parameters,...(match ? [match] : []),limit);
       const selected = new Map<string, (typeof ranked)[number]>();
@@ -915,6 +1055,7 @@ export class ConversationStore {
       if (!match) for (const row of ranked) selected.set(String(row.id),row);
       return { scope, messages: [...selected.values()].sort((a,b) => Number(a.ingest_seq)-Number(b.ingest_seq)).map(row => ({
         id: String(row.id), role: row.role as 'user'|'assistant', text: String(row.text),
+        ...(correctedMessages[String(row.id)] ? {correctedBy:correctedMessages[String(row.id)]} : {}),
         ...(row.sender_id == null ? {} : { senderId: String(row.sender_id) }),
         ...(row.sender_name == null ? {} : { senderName: String(row.sender_name) }),
         ...(row.role !== 'assistant' || row.reply_sender_id == null ? {} : { replyToSenderId: String(row.reply_sender_id) }),
@@ -962,26 +1103,28 @@ export class ConversationStore {
     return row ? { id: String(row.id), actorId: String(row.actor_id), senderId: String(row.external_user_id), text: String(row.text) } : undefined;
   }
 
-  quotedMessage(conversationId: string, externalId: string, referenceIndex = false): { role: 'user' | 'assistant'; senderId?: string; text: string; images?: MessageImage[] } | undefined {
+  quotedMessage(conversationId: string, externalId: string, referenceIndex = false): { role: 'user' | 'assistant'; senderId?: string; text: string; images?: MessageImage[]; sourceMessageId?: string } | undefined {
     if (typeof externalId !== 'string' || !externalId || externalId.length > 512
       || externalId.trim() !== externalId || /[\u0000-\u001f\u007f]/.test(externalId)) return undefined;
     // Both inbound event IDs and confirmed outgoing IDs are scoped to this exact conversation.
     // Ambiguous IDs fail closed instead of selecting an arbitrary message.
-    const rows = this.db.prepare(`SELECT m.id, m.role, m.text, a.external_user_id AS senderId FROM messages m
+    const rows = this.db.prepare(`SELECT m.id, m.role, m.text, a.external_user_id AS senderId,m.id AS sourceMessageId FROM messages m
       LEFT JOIN actors a ON a.id = m.actor_id
       WHERE ?=0 AND m.conversation_id = ? AND ((m.role = 'user' AND m.external_event_id = ?)
         OR (m.role = 'assistant' AND EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id
           AND d.conversation_id = m.conversation_id AND d.status = 'sent' AND d.external_message_id = ?
           AND NOT EXISTS (SELECT 1 FROM delivery_parts p WHERE p.delivery_id = d.id))))
-      UNION ALL SELECT p.delivery_id || ':' || p.part_index, 'assistant', p.text, NULL FROM delivery_parts p
+      UNION ALL SELECT p.delivery_id || ':' || p.part_index, 'assistant', p.text, NULL,d.message_id FROM delivery_parts p
+        JOIN deliveries d ON d.id=p.delivery_id AND d.conversation_id=p.conversation_id
         WHERE p.conversation_id = ? AND p.status = 'sent' AND p.${referenceIndex ? 'reference_index' : 'external_message_id'} = ?
-      UNION ALL SELECT v.id,'assistant',v.text,NULL FROM answer_page_views v
+      UNION ALL SELECT v.id,'assistant',v.text,NULL,d.message_id FROM answer_page_views v
+        JOIN deliveries d ON d.id=v.answer_id AND d.conversation_id=v.conversation_id
         WHERE v.conversation_id=? AND v.status='sent' AND v.${referenceIndex ? 'reference_index' : 'external_message_id'}=?
       LIMIT 2`).all(referenceIndex ? 1 : 0, conversationId, externalId, externalId, conversationId, externalId, conversationId, externalId);
     if (rows.length !== 1) return undefined;
     const row = rows[0]!;
     const images = this.messageImages(conversationId,String(row.id));
-    return { role: row.role as 'user' | 'assistant', text: String(row.text),
+    return { role: row.role as 'user' | 'assistant', text: String(row.text), sourceMessageId:String(row.sourceMessageId),
       ...(images.length ? { images } : {}),
       ...(row.senderId == null ? {} : { senderId: String(row.senderId) }) };
   }

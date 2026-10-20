@@ -32,13 +32,13 @@ test('schema17只读保留旧页面正文与引用索引，不混入规范回答
   });
   assert.deepEqual(f.store.answerPage(f.a.id,id,1),{answerId:id,page:1,count:2,text:`**回答 ${id.slice(0,8)} · 正文 1/2**\n\n第一页`});
   assert.equal(f.store.answerPage(f.b.id,id,1),undefined);
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-id'),{role:'assistant',text:'旧页面正文'});
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文'});
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-id'),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId});
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId});
   assert.equal(f.store.quotedMessage(f.b.id,'page-ref',true),undefined);
   assert.deepEqual(f.store.autoMemory.conversationContext(f.a.id).messages.map(m=>m.text),['问题',f.canonical]);
   f.restart();
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文'});
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),18);
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId});
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),22);
 });
 
 test('schema16 migration keeps canonical history and creates an intact backup',t=>{
@@ -47,7 +47,7 @@ test('schema16 migration keeps canonical history and creates an intact backup',t
   f.inspect(db=>{downgradeSchema16(db);db.exec('PRAGMA user_version=16');});
   f.restart();
   assert.ok(readdirSync(f.dir).some(name=>name.includes('.v16.')&&name.endsWith('.bak')));
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),18);
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'legacy'),{role:'assistant',text:f.canonical});
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),22);
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'legacy'),{role:'assistant',text:f.canonical,sourceMessageId:f.result.messageId});
   assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
 });

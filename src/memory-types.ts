@@ -24,6 +24,38 @@ export interface MemoryRecord {
 }
 
 export interface PrimaryPerson { id: string; bindings: { route: ChannelRoute; senderId: string }[] }
+export interface SharedFactAttributionInput {
+  kind: 'statement' | 'correction';
+  subjectSenderIds: string[];
+  excludedSenderIds: string[];
+  correctsMessageIds: string[];
+}
+export interface FactPerson {
+  senderId: string;
+  personId?: string;
+  displayName?: string;
+}
+export interface SharedFactContext {
+  id: string;
+  revision: number;
+  kind: MemoryKind;
+  content: string;
+  sourceMessageId: string | null;
+  sourceSpeaker: FactPerson | null;
+  sourceTime: string;
+  attribution: 'statement' | 'correction';
+  subjects: FactPerson[];
+  excludedSubjects: FactPerson[];
+  correctsMessageIds: string[];
+}
+export interface AttributionCorrection {
+  memoryId: string;
+  sourceMessageId: string;
+  speakerSenderId: string;
+  subjectSenderIds: string[];
+  excludedSenderIds: string[];
+  correctsMessageIds: string[];
+}
 export interface MemoryRef { id: string; revision: number }
 export interface MemoryInput {
   content: string; kind?: MemoryKind; sourceMessageId?: string;

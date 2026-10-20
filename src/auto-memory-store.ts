@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { MemoryError, type PrimaryPerson } from './memory-types.js';
-import type { AutoMemoryJob, AutoMemoryMessage, AutoMemoryReason, AutoMemoryTaskInput, PersonProfile, PersonProfilePending, ProfileFact, TopicRecord, ValidatedExtract } from './auto-memory-types.js';
+import type { AutoMemoryJob, AutoMemoryMessage, AutoMemoryPipeline, AutoMemoryReason, AutoMemoryTaskInput, MaterialBackfillBatch, MaterialBackfillLimits, MaterialBackfillPlan, MaterialBackfillRun, PersonProfile, PersonProfilePending, ProfileFact, TopicRecord, ValidatedExtract } from './auto-memory-types.js';
 import { SelfProfileStore } from './self-profile-store.js';
 import { memoryWords } from './memory-text.js';
 import { assertProfileCapacity, profileCapacity } from './profile-limits.js';
 import { assertProfileEvidenceStrength, assertProfileProtocol, validateProfilePendingResults } from './profile-pending.js';
+import { assertMemorySourceRange, assertProcessedRanges, COMPACT_TOPIC_LIMITS } from './memory-work.js';
+import { memoryScheduleDue, noteMemoryContent } from './memory-schedule.js';
 
 const timestamp = () => new Date().toISOString();
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -43,6 +45,7 @@ export function assertCurrentMemoryProtocol(value: unknown): void {
   if (!value || typeof value !== 'object') return;
   if (Array.isArray(value)) { value.forEach(assertCurrentMemoryProtocol); return; }
   const object = value as Record<string, unknown>;
+  if (object.extractionProtocol !== undefined && object.extractionProtocol !== 2) throw new Error('未知整理协议；固定输入与进度保持不变。');
   if (object.purpose === 'memory' || object.memoryPending !== undefined || object.memoryArchives !== undefined) {
     throw new ObsoletePersonalMemoryError();
   }
@@ -168,6 +171,116 @@ export function migrateRollingContext(db: DatabaseSync): void {
   `);
 }
 
+/** Preserve frozen work while separating context compression from material extraction. */
+export function migrateMemoryPipelines(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE auto_memory_jobs_v21 (
+      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
+      reason TEXT NOT NULL CHECK(reason IN ('count','capacity','idle','interval')),
+      status TEXT NOT NULL CHECK(status IN ('queued','running','failed','done')),
+      start_seq INTEGER NOT NULL,end_seq INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,
+      lease_token TEXT,lease_owner TEXT,lease_until INTEGER,error TEXT,input_json TEXT,progress_json TEXT,
+      created_at TEXT NOT NULL,completed_at TEXT,
+      pipeline TEXT NOT NULL DEFAULT 'legacy' CHECK(pipeline IN ('legacy','compression','materials')));
+    INSERT INTO auto_memory_jobs_v21(rowid,id,conversation_id,reason,status,start_seq,end_seq,attempts,
+      lease_token,lease_owner,lease_until,error,input_json,progress_json,created_at,completed_at)
+      SELECT rowid,id,conversation_id,reason,status,start_seq,end_seq,attempts,
+      lease_token,lease_owner,lease_until,error,input_json,progress_json,created_at,completed_at FROM auto_memory_jobs;
+    DROP TABLE auto_memory_jobs;
+    ALTER TABLE auto_memory_jobs_v21 RENAME TO auto_memory_jobs;
+    CREATE INDEX auto_memory_jobs_order ON auto_memory_jobs(conversation_id,pipeline,start_seq);
+    CREATE TABLE auto_memory_legacy_isolations (
+      job_id TEXT PRIMARY KEY REFERENCES auto_memory_jobs(id),reason TEXT NOT NULL,created_at TEXT NOT NULL,
+      input_hash TEXT,progress_hash TEXT);
+    CREATE TABLE auto_memory_material_state (
+      conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),observed_seq INTEGER NOT NULL DEFAULT 0,
+      first_content_at INTEGER,last_content_at INTEGER,reserved_seq INTEGER NOT NULL DEFAULT 0,completed_seq INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE auto_memory_material_jobs (job_id TEXT PRIMARY KEY REFERENCES auto_memory_jobs(id));
+    CREATE TABLE auto_memory_material_job_messages (
+      job_id TEXT NOT NULL REFERENCES auto_memory_jobs(id),message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+      ordinal INTEGER NOT NULL,PRIMARY KEY(job_id,message_id));
+    CREATE TABLE auto_memory_material_legacy_messages (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id),job_id TEXT NOT NULL REFERENCES auto_memory_jobs(id),
+      disposition TEXT NOT NULL CHECK(disposition IN ('done','isolated')));
+    INSERT OR IGNORE INTO auto_memory_material_legacy_messages
+      SELECT message_id,id,CASE WHEN status='done' THEN 'done' ELSE 'isolated' END FROM (
+        SELECT jm.message_id,j.id,j.status,j.rowid AS job_rowid FROM auto_memory_job_messages jm JOIN auto_memory_jobs j ON j.id=jm.job_id
+        UNION ALL SELECT jm.message_id,j.id,j.status,j.rowid AS job_rowid FROM auto_memory_context_job_messages jm JOIN auto_memory_jobs j ON j.id=jm.job_id)
+      ORDER BY status='done' DESC,job_rowid;
+    CREATE TABLE auto_memory_material_observed_pending (
+      kind TEXT NOT NULL CHECK(kind IN ('person','self')),pending_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id),observed_at INTEGER NOT NULL,
+      assigned_job_id TEXT REFERENCES auto_memory_jobs(id),blocked INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(kind,pending_id));
+    CREATE TABLE auto_memory_material_job_pending (
+      job_id TEXT NOT NULL REFERENCES auto_memory_jobs(id),kind TEXT NOT NULL CHECK(kind IN ('person','self')),
+      pending_id TEXT NOT NULL,payload_json TEXT NOT NULL,PRIMARY KEY(job_id,kind,pending_id));
+    INSERT INTO auto_memory_material_observed_pending(kind,pending_id,conversation_id,observed_at,blocked)
+      SELECT 'person',p.id,m.conversation_id,0,1 FROM person_profile_pending p JOIN messages m ON m.id=p.source_message_id
+      WHERE EXISTS(SELECT 1 FROM auto_memory_material_legacy_messages l WHERE l.message_id=m.id AND l.disposition='isolated');
+    INSERT INTO auto_memory_material_observed_pending(kind,pending_id,conversation_id,observed_at,blocked)
+      SELECT 'self',p.id,m.conversation_id,0,1 FROM self_profile_pending p JOIN messages m ON m.id=p.source_message_id
+      WHERE EXISTS(SELECT 1 FROM auto_memory_material_legacy_messages l WHERE l.message_id=m.id AND l.disposition='isolated');
+  `);
+  const observeCaptured=(kind:'person'|'self',id:string,jobId:string,blocked:boolean)=>{
+    db.prepare(`INSERT OR IGNORE INTO auto_memory_material_observed_pending
+      (kind,pending_id,conversation_id,observed_at,assigned_job_id,blocked) SELECT ?,p.id,m.conversation_id,0,?,?
+      FROM ${kind==='person'?'person_profile_pending':'self_profile_pending'} p JOIN messages m ON m.id=p.source_message_id WHERE p.id=?`)
+      .run(kind,jobId,blocked?1:0,id);
+    if(blocked) db.prepare('UPDATE auto_memory_material_observed_pending SET blocked=1,assigned_job_id=? WHERE kind=? AND pending_id=?')
+      .run(jobId,kind,id);
+  };
+  for(const row of db.prepare('SELECT id,status,input_json FROM auto_memory_jobs WHERE input_json IS NOT NULL').all()) {
+    // Migration never rewrites or interprets a frozen protocol as current work.
+    // Read only captured queue IDs; malformed/unknown payloads remain preserved.
+    try {
+      const input=parse<AutoMemoryTaskInput>(row.input_json);
+      for(const profile of input.profiles??[]) for(const pending of profile.pending??[]) observeCaptured('person',pending.id,String(row.id),row.status!=='done');
+      for(const pending of input.selfProfile?.pending??[]) observeCaptured('self',pending.id,String(row.id),row.status!=='done');
+    } catch { /* Opaque historical input remains isolated with its original hash. */ }
+  }
+  for(const row of db.prepare(`SELECT DISTINCT r.pending_id,r.job_id,j.status FROM person_profile_pending_results r
+    JOIN auto_memory_jobs j ON j.id=r.job_id`).all()) observeCaptured('person',String(row.pending_id),String(row.job_id),row.status!=='done');
+  for (const row of db.prepare("SELECT * FROM auto_memory_jobs WHERE status<>'done'").all()) {
+    db.prepare('INSERT INTO auto_memory_legacy_isolations VALUES (?,?,?,?,?)').run(String(row.id),
+      '旧混合整理任务已隔离；固定输入、进度和租约保留，需操作者处理。',timestamp(),
+      row.input_json==null?null:hash(String(row.input_json)),row.progress_json==null?null:hash(String(row.progress_json)));
+  }
+}
+
+/** Manual backfills create new material work; legacy records remain immutable evidence. */
+export function migrateMaterialBackfill(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE auto_memory_jobs_v22 (
+      id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),
+      reason TEXT NOT NULL CHECK(reason IN ('count','capacity','idle','interval','backfill')),
+      status TEXT NOT NULL CHECK(status IN ('queued','running','failed','done')),
+      start_seq INTEGER NOT NULL,end_seq INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,
+      lease_token TEXT,lease_owner TEXT,lease_until INTEGER,error TEXT,input_json TEXT,progress_json TEXT,
+      created_at TEXT NOT NULL,completed_at TEXT,
+      pipeline TEXT NOT NULL DEFAULT 'legacy' CHECK(pipeline IN ('legacy','compression','materials')));
+    INSERT INTO auto_memory_jobs_v22(rowid,id,conversation_id,reason,status,start_seq,end_seq,attempts,
+      lease_token,lease_owner,lease_until,error,input_json,progress_json,created_at,completed_at,pipeline)
+      SELECT rowid,id,conversation_id,reason,status,start_seq,end_seq,attempts,
+      lease_token,lease_owner,lease_until,error,input_json,progress_json,created_at,completed_at,pipeline FROM auto_memory_jobs;
+    DROP TABLE auto_memory_jobs;
+    ALTER TABLE auto_memory_jobs_v22 RENAME TO auto_memory_jobs;
+    CREATE INDEX auto_memory_jobs_order ON auto_memory_jobs(conversation_id,pipeline,start_seq);
+    CREATE TABLE material_backfill_runs (
+      id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),reason TEXT NOT NULL,
+      cutoff_context_seq INTEGER NOT NULL,plan_hash TEXT NOT NULL,plan_json TEXT NOT NULL,created_at TEXT NOT NULL);
+    CREATE INDEX material_backfill_runs_room ON material_backfill_runs(conversation_id,created_at);
+    CREATE TABLE material_backfill_jobs (
+      run_id TEXT NOT NULL REFERENCES material_backfill_runs(id),job_id TEXT NOT NULL UNIQUE REFERENCES auto_memory_jobs(id),
+      ordinal INTEGER NOT NULL,batch_json TEXT NOT NULL,PRIMARY KEY(run_id,ordinal));
+    CREATE TABLE material_backfill_pending_audit (
+      run_id TEXT NOT NULL REFERENCES material_backfill_runs(id),job_id TEXT NOT NULL REFERENCES auto_memory_jobs(id),
+      kind TEXT NOT NULL CHECK(kind IN ('person','self')),pending_id TEXT NOT NULL,
+      previous_observed_at INTEGER,previous_assigned_job_id TEXT REFERENCES auto_memory_jobs(id),previous_blocked INTEGER,
+      created_at TEXT NOT NULL,PRIMARY KEY(job_id,kind,pending_id));
+  `);
+}
+
 export class AutoMemoryStore {
   readonly selfProfile: SelfProfileStore;
   constructor(private readonly db: DatabaseSync, private readonly transaction?: <T>(operation: () => T) => T) {
@@ -269,9 +382,9 @@ export class AutoMemoryStore {
   }
   private job(row: Record<string,unknown>): AutoMemoryJob {
     const rolling=Boolean(this.db.prepare('SELECT 1 FROM auto_memory_context_jobs WHERE job_id=?').get(String(row.id)));
-    return {id:String(row.id),conversationId:String(row.conversation_id),reason:row.reason as AutoMemoryReason,status:row.status as AutoMemoryJob['status'],
+    return {id:String(row.id),conversationId:String(row.conversation_id),pipeline:(row.pipeline??'legacy') as AutoMemoryPipeline,reason:row.reason as AutoMemoryReason,status:row.status as AutoMemoryJob['status'],
       startSeq:Number(row.start_seq),endSeq:Number(row.end_seq),attempts:Number(row.attempts),
-      messageIds:this.db.prepare(`SELECT message_id FROM ${rolling?'auto_memory_context_job_messages':'auto_memory_job_messages'} WHERE job_id=? ORDER BY ordinal`).all(String(row.id)).map(m=>String(m.message_id)),
+      messageIds:this.db.prepare(`SELECT message_id FROM ${row.pipeline==='materials'?'auto_memory_material_job_messages':rolling?'auto_memory_context_job_messages':'auto_memory_job_messages'} WHERE job_id=? ORDER BY ordinal`).all(String(row.id)).map(m=>String(m.message_id)),
       ...(row.lease_token==null?{}:{leaseToken:String(row.lease_token),leaseOwner:String(row.lease_owner),leaseUntil:Number(row.lease_until)}),
       ...(row.error==null?{}:{error:String(row.error)})};
   }
@@ -289,19 +402,19 @@ export class AutoMemoryStore {
   }
   private deferredContextIds(conversationId:string): Set<string> {
     return new Set(this.db.prepare(`SELECT message_id FROM auto_memory_job_messages jm
-      JOIN auto_memory_jobs j ON j.id=jm.job_id JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=?
+      JOIN auto_memory_jobs j ON j.id=jm.job_id JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=? AND j.pipeline<>'materials'
       AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)
       UNION SELECT message_id FROM auto_memory_context_job_messages jm
-      JOIN auto_memory_jobs j ON j.id=jm.job_id JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=?
+      JOIN auto_memory_jobs j ON j.id=jm.job_id JOIN auto_memory_job_deferrals d ON d.job_id=j.id WHERE j.conversation_id=? AND j.pipeline<>'materials'
       AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)`)
       .all(conversationId,conversationId).map(row=>String(row.message_id)));
   }
-  private reserveContextBatch(conversationId:string,beforeMessageId?:string): AutoMemoryJob | undefined {
+  private reserveContextBatch(conversationId:string,beforeMessageId?:string,pipeline:AutoMemoryPipeline='legacy'): AutoMemoryJob | undefined {
     const state=this.contextState(conversationId);
     const boundary=this.contextBoundary(conversationId,beforeMessageId);
     // A pending snapshot owns its whole immutable suffix. Repeated capacity signals
     // cannot queue overlapping work or silently retry a failed/unknown call.
-    if(this.nextPending(conversationId)) return undefined;
+    if(this.nextPending(conversationId,pipeline)) return undefined;
     const deferred=this.deferredContextIds(conversationId);
     const rows=this.db.prepare(`SELECT seq,message_id FROM conversation_context_messages WHERE conversation_id=? AND seq>?
       AND (? IS NULL OR seq<?) ORDER BY seq`).all(conversationId,Number(state.cursor),boundary??null,boundary??null);
@@ -311,12 +424,237 @@ export class AutoMemoryStore {
     const messages=this.messages(ids); const id=randomUUID();
     const start=messages.reduce((seq,message)=>Math.min(seq,message.ingestSeq),Infinity);
     const end=messages.reduce((seq,message)=>Math.max(seq,message.ingestSeq),0);
-    this.db.prepare(`INSERT INTO auto_memory_jobs(id,conversation_id,reason,status,start_seq,end_seq,created_at) VALUES (?,?,'capacity','queued',?,?,?)`)
-      .run(id,conversationId,start,end,timestamp());
+    this.db.prepare(`INSERT INTO auto_memory_jobs(id,conversation_id,reason,status,start_seq,end_seq,created_at,pipeline) VALUES (?,?,'capacity','queued',?,?,?,?)`)
+      .run(id,conversationId,start,end,timestamp(),pipeline);
     this.db.prepare('INSERT INTO auto_memory_context_jobs VALUES (?,?,?,?,?)')
       .run(id,Number(state.revision),Number(state.cursor),Number(rows.at(-1)!.seq),state.summary==null?null:String(state.summary));
     ids.forEach((messageId,index)=>this.db.prepare('INSERT INTO auto_memory_context_job_messages VALUES (?,?,?)').run(id,messageId,index));
     return this.job(this.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(id)!);
+  }
+  reserveCompressionBatch(conversationId:string,beforeMessageId?:string): AutoMemoryJob | undefined {
+    return this.atomic(()=>this.reserveContextBatch(conversationId,beforeMessageId,'compression'));
+  }
+  private materialState(conversationId:string): Record<string,unknown> {
+    this.checkpoint(conversationId);
+    if(this.db.prepare('INSERT OR IGNORE INTO auto_memory_material_state(conversation_id) VALUES (?)').run(conversationId).changes)
+      this.advanceMaterialCheckpoint(conversationId);
+    return this.db.prepare('SELECT * FROM auto_memory_material_state WHERE conversation_id=?').get(conversationId)!;
+  }
+  /** These two informational watermarks use ingest_seq; snapshot ordinals use visibility order. */
+  materialSchedule(conversationId:string): {firstContentAt?:number;lastContentAt?:number;reservedSeq:number;completedSeq:number} {
+    return this.atomic(()=>{
+      const row=this.materialState(conversationId);
+      return {reservedSeq:Number(row.reserved_seq),completedSeq:Number(row.completed_seq),
+        ...(row.first_content_at==null?{}:{firstContentAt:Number(row.first_content_at),lastContentAt:Number(row.last_content_at)})};
+    });
+  }
+  private activeMaterialPending(conversationId:string): {kind:'person'|'self';id:string;payload:Record<string,unknown>}[] {
+    const people=this.db.prepare(`SELECT p.id,p.person_id,p.content,p.source_message_id,p.source_type FROM person_profile_pending p
+      JOIN messages m ON m.id=p.source_message_id WHERE m.conversation_id=? AND p.archived_revision IS NULL AND p.purpose='profile' ORDER BY p.rowid`)
+      .all(conversationId).map(row=>({kind:'person' as const,id:String(row.id),payload:{id:String(row.id),personId:String(row.person_id),
+        content:String(row.content),sourceMessageId:String(row.source_message_id),sourceType:String(row.source_type)}}));
+    const self=this.db.prepare(`SELECT p.id,p.content,p.source_message_id FROM self_profile_pending p JOIN messages m ON m.id=p.source_message_id
+      WHERE m.conversation_id=? AND p.archived_revision IS NULL
+      AND NOT EXISTS(SELECT 1 FROM self_profile_reclassifications r WHERE r.pending_id=p.id) ORDER BY p.rowid`)
+      .all(conversationId).map(row=>({kind:'self' as const,id:String(row.id),payload:{id:String(row.id),content:String(row.content),sourceMessageId:String(row.source_message_id)}}));
+    return [...people,...self];
+  }
+  private materialBackfillPlan(conversationId:string,requested:Partial<MaterialBackfillLimits>={}) {
+    if(!this.db.prepare('SELECT id FROM conversations WHERE id=?').get(conversationId)) throw new Error('会话不存在。');
+    const limits:MaterialBackfillLimits={maxMessages:requested.maxMessages??100,maxBytes:requested.maxBytes??65536,maxPending:requested.maxPending??20};
+    if(Object.values(limits).some(value=>!Number.isSafeInteger(value)||value<1)) throw new Error('回填批次限制必须为正整数。');
+    const cutoffContextSeq=Number(this.db.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM conversation_context_messages WHERE conversation_id=?')
+      .get(conversationId)!.seq);
+    const visible=this.db.prepare(`SELECT c.message_id,
+      (EXISTS(SELECT 1 FROM auto_memory_job_messages jm JOIN auto_memory_jobs j ON j.id=jm.job_id
+        WHERE jm.message_id=c.message_id AND j.pipeline='legacy' AND j.status='done')
+      OR EXISTS(SELECT 1 FROM auto_memory_context_job_messages jm JOIN auto_memory_jobs j ON j.id=jm.job_id
+        WHERE jm.message_id=c.message_id AND j.pipeline='legacy' AND j.status='done')) AS legacy_done,
+      EXISTS(SELECT 1 FROM auto_memory_material_job_messages jm WHERE jm.message_id=c.message_id) AS material_owned
+      FROM conversation_context_messages c JOIN messages m ON m.id=c.message_id
+      WHERE c.conversation_id=? AND c.seq<=? AND m.message_kind='chat' ORDER BY c.seq`).all(conversationId,cutoffContextSeq);
+    const excluded={legacyDoneMessages:visible.filter(row=>Boolean(row.legacy_done)).length,
+      materialMessages:visible.filter(row=>!row.legacy_done&&Boolean(row.material_owned)).length,materialPending:0};
+    const messages=this.messages(visible.filter(row=>!row.legacy_done&&!row.material_owned).map(row=>String(row.message_id)));
+    const pending=this.activeMaterialPending(conversationId).filter(item=>{
+      const owned=this.db.prepare(`SELECT 1 FROM auto_memory_material_job_pending p JOIN auto_memory_jobs j ON j.id=p.job_id
+        WHERE p.kind=? AND p.pending_id=? AND j.pipeline='materials' LIMIT 1`).get(item.kind,item.id);
+      if(owned) excluded.materialPending++;
+      return !owned;
+    });
+    const batches:{messages:AutoMemoryMessage[];pending:typeof pending;summary:MaterialBackfillBatch}[]=[];
+    let currentMessages:AutoMemoryMessage[]=[],currentBytes=0;
+    const addMessages=()=>{
+      if(!currentMessages.length) return;
+      const humanCount=currentMessages.filter(message=>message.role==='user').length;
+      batches.push({messages:currentMessages,pending:[],summary:{ordinal:batches.length,messageCount:currentMessages.length,humanCount,
+        assistantCount:currentMessages.length-humanCount,pendingCount:0,bytes:currentBytes,oversized:currentBytes>limits.maxBytes}});
+      currentMessages=[];currentBytes=0;
+    };
+    for(const message of messages) {
+      const bytes=Buffer.byteLength(JSON.stringify(message));
+      if(currentMessages.length&&(currentMessages.length>=limits.maxMessages||currentBytes+bytes>limits.maxBytes)) addMessages();
+      currentMessages.push(message);currentBytes+=bytes;
+      if(bytes>limits.maxBytes) addMessages();
+    }
+    addMessages();
+    // Keep queue batches independent: the live profile baseline is read only when
+    // its batch reaches the front of the material lane.
+    let currentPending:typeof pending=[];currentBytes=0;
+    const addPending=()=>{
+      if(!currentPending.length) return;
+      batches.push({messages:[],pending:currentPending,summary:{ordinal:batches.length,messageCount:0,humanCount:0,assistantCount:0,
+        pendingCount:currentPending.length,bytes:currentBytes,oversized:currentBytes>limits.maxBytes}});
+      currentPending=[];currentBytes=0;
+    };
+    for(const item of pending) {
+      const bytes=Buffer.byteLength(JSON.stringify(item.payload));
+      if(currentPending.length&&(currentPending.length>=limits.maxPending||currentBytes+bytes>limits.maxBytes)) addPending();
+      currentPending.push(item);currentBytes+=bytes;
+      if(bytes>limits.maxBytes) addPending();
+    }
+    addPending();
+    const planHash=hash(JSON.stringify({conversationId,cutoffContextSeq,limits,
+      messages:messages.map(message=>({id:message.id,hash:hash(JSON.stringify(message))})),pending,batches:batches.map(batch=>batch.summary)}));
+    const humanCount=messages.filter(message=>message.role==='user').length;
+    const plan:MaterialBackfillPlan={conversationId,cutoffContextSeq,planHash,limits,messageCount:messages.length,humanCount,
+      assistantCount:messages.length-humanCount,pendingCount:pending.length,personPendingCount:pending.filter(item=>item.kind==='person').length,
+      selfPendingCount:pending.filter(item=>item.kind==='self').length,bytes:batches.reduce((total,batch)=>total+batch.summary.bytes,0),
+      batchCount:batches.length,oversizedMessages:messages.filter(message=>Buffer.byteLength(JSON.stringify(message))>limits.maxBytes).length,
+      excluded,batches:batches.map(batch=>batch.summary)};
+    return {plan,batches};
+  }
+  /** A read-only, consistent snapshot; this never starts a timer or creates a queue row. */
+  planMaterialBackfill(conversationId:string,limits:Partial<MaterialBackfillLimits>={}): MaterialBackfillPlan {
+    return this.atomic(()=>this.materialBackfillPlan(conversationId,limits).plan);
+  }
+  reserveMaterialBackfill(conversationId:string,options:Partial<MaterialBackfillLimits>&{reason:string}): string | undefined {
+    if(typeof options.reason!=='string'||!options.reason.trim()||options.reason.length>4000) throw new Error('回填原因无效。');
+    return this.atomic(()=>{
+      const {plan,batches}=this.materialBackfillPlan(conversationId,options);
+      if(!batches.length) return undefined;
+      const runId=randomUUID(),createdAt=timestamp();
+      this.db.prepare('INSERT INTO material_backfill_runs VALUES (?,?,?,?,?,?,?)')
+        .run(runId,conversationId,options.reason,plan.cutoffContextSeq,plan.planHash,JSON.stringify(plan),createdAt);
+      const state=this.materialState(conversationId);
+      let reservedSeq=Number(state.reserved_seq);
+      for(const batch of batches) {
+        const id=randomUUID(),start=batch.messages.reduce((value,message)=>Math.min(value,message.ingestSeq),batch.messages.length?Infinity:reservedSeq);
+        const end=batch.messages.reduce((value,message)=>Math.max(value,message.ingestSeq),batch.messages.length?0:reservedSeq);
+        this.db.prepare(`INSERT INTO auto_memory_jobs(id,conversation_id,reason,status,start_seq,end_seq,created_at,pipeline)
+          VALUES (?,?,'backfill','queued',?,?,?,'materials')`).run(id,conversationId,start,end,createdAt);
+        this.db.prepare('INSERT INTO auto_memory_material_jobs VALUES (?)').run(id);
+        this.db.prepare('INSERT INTO material_backfill_jobs VALUES (?,?,?,?)').run(runId,id,batch.summary.ordinal,JSON.stringify(batch.summary));
+        batch.messages.forEach((message,index)=>this.db.prepare('INSERT INTO auto_memory_material_job_messages VALUES (?,?,?)').run(id,message.id,index));
+        for(const item of batch.pending) {
+          const previous=this.db.prepare('SELECT * FROM auto_memory_material_observed_pending WHERE kind=? AND pending_id=?').get(item.kind,item.id);
+          this.db.prepare('INSERT INTO material_backfill_pending_audit VALUES (?,?,?,?,?,?,?,?)').run(runId,id,item.kind,item.id,
+            previous?.observed_at??null,previous?.assigned_job_id??null,previous?.blocked??null,createdAt);
+          this.db.prepare('INSERT INTO auto_memory_material_job_pending VALUES (?,?,?,?)').run(id,item.kind,item.id,JSON.stringify(item.payload));
+          this.db.prepare(`INSERT INTO auto_memory_material_observed_pending(kind,pending_id,conversation_id,observed_at,assigned_job_id,blocked)
+            VALUES (?,?,?,?,?,0) ON CONFLICT(kind,pending_id) DO UPDATE SET assigned_job_id=excluded.assigned_job_id`)
+            .run(item.kind,item.id,conversationId,Date.now(),id);
+        }
+        reservedSeq=Math.max(reservedSeq,end);
+      }
+      const observedSeq=Number(this.db.prepare('SELECT COALESCE(MAX(ingest_seq),0) AS seq FROM messages WHERE conversation_id=?').get(conversationId)!.seq);
+      this.db.prepare(`UPDATE auto_memory_material_state SET observed_seq=MAX(observed_seq,?),reserved_seq=?,first_content_at=NULL,last_content_at=NULL
+        WHERE conversation_id=?`).run(observedSeq,reservedSeq,conversationId);
+      return runId;
+    });
+  }
+  materialBackfillRun(runId:string): MaterialBackfillRun | undefined {
+    return this.atomic(()=>{
+      const row=this.db.prepare('SELECT * FROM material_backfill_runs WHERE id=?').get(runId);
+      if(!row) return undefined;
+      const plan=parse<MaterialBackfillPlan>(row.plan_json);
+      const jobs=this.db.prepare(`SELECT b.*,j.status,j.attempts,j.error,
+        EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=j.id) AS deferred,
+        EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id) AS retired,
+        EXISTS(SELECT 1 FROM auto_memory_legacy_isolations i WHERE i.job_id=j.id) AS isolated
+        FROM material_backfill_jobs b JOIN auto_memory_jobs j ON j.id=b.job_id WHERE b.run_id=? ORDER BY b.ordinal`).all(runId)
+        .map(item=>({...parse<MaterialBackfillBatch>(item.batch_json),id:String(item.job_id),status:item.status as AutoMemoryJob['status'],
+          attempts:Number(item.attempts),...(item.error==null?{}:{error:String(item.error)}),
+          ...(item.deferred?{deferred:true}:{}),...(item.retired?{retired:true}:{}),...(item.isolated?{isolated:true}:{})}));
+      const status={queued:0,running:0,failed:0,completed:0,deferred:0,retired:0,isolated:0};
+      for(const job of jobs) status[job.isolated?'isolated':job.retired?'retired':job.deferred?'deferred':job.status==='done'?'completed':job.status]++;
+      const retainedPending=Number(this.db.prepare(`SELECT COUNT(*) AS count FROM auto_memory_material_job_pending p JOIN material_backfill_jobs b ON b.job_id=p.job_id
+        WHERE b.run_id=? AND ((p.kind='person' AND EXISTS(SELECT 1 FROM person_profile_pending live WHERE live.id=p.pending_id AND live.archived_revision IS NULL AND live.purpose='profile'))
+          OR (p.kind='self' AND EXISTS(SELECT 1 FROM self_profile_pending live WHERE live.id=p.pending_id AND live.archived_revision IS NULL
+            AND NOT EXISTS(SELECT 1 FROM self_profile_reclassifications r WHERE r.pending_id=live.id))))`).get(runId)!.count);
+      return {...plan,runId,reason:String(row.reason),createdAt:String(row.created_at),jobIds:jobs.map(job=>job.id),jobs,status,
+        remainingMessages:jobs.filter(job=>job.status!=='done').reduce((count,job)=>count+job.messageCount,0),
+        remainingPending:jobs.filter(job=>job.status!=='done').reduce((count,job)=>count+job.pendingCount,0),retainedPending};
+    });
+  }
+  listMaterialBackfillRuns(conversationId?:string,limit=100): MaterialBackfillRun[] {
+    if(!Number.isSafeInteger(limit)||limit<1||limit>1000) throw new Error('回填查询数量无效。');
+    return this.atomic(()=>this.db.prepare(`SELECT id FROM material_backfill_runs WHERE (? IS NULL OR conversation_id=?) ORDER BY rowid DESC LIMIT ?`)
+      .all(conversationId??null,conversationId??null,limit).map(row=>this.materialBackfillRun(String(row.id))!));
+  }
+  private advanceMaterialCheckpoint(conversationId:string): void {
+    let completed=0;
+    for(const row of this.db.prepare(`SELECT m.ingest_seq,
+      (EXISTS(SELECT 1 FROM auto_memory_material_legacy_messages l WHERE l.message_id=m.id AND l.disposition='done')
+      OR EXISTS(SELECT 1 FROM auto_memory_material_job_messages jm JOIN auto_memory_jobs j ON j.id=jm.job_id
+        WHERE jm.message_id=m.id AND j.status='done')) AS covered
+      FROM messages m WHERE m.conversation_id=? AND m.role='user' AND m.message_kind='chat' ORDER BY m.ingest_seq`).all(conversationId)) {
+      if(!row.covered) break;
+      completed=Number(row.ingest_seq);
+    }
+    this.db.prepare('UPDATE auto_memory_material_state SET completed_seq=? WHERE conversation_id=?').run(completed,conversationId);
+  }
+  reserveMaterialsIfDue(conversationId:string,now=Date.now()): AutoMemoryJob | undefined {
+    // Validate even empty polls; invalid clocks cannot become persisted schedule state.
+    noteMemoryContent(undefined,now);
+    return this.atomic(()=>{
+      const state=this.materialState(conversationId);
+      const newHuman=this.db.prepare(`SELECT 1 FROM messages m WHERE m.conversation_id=? AND m.role='user' AND m.message_kind='chat'
+        AND m.ingest_seq>? AND NOT EXISTS(SELECT 1 FROM auto_memory_material_legacy_messages l WHERE l.message_id=m.id)
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_material_job_messages jm WHERE jm.message_id=m.id) LIMIT 1`)
+        .get(conversationId,Number(state.observed_seq));
+      const highest=Number(this.db.prepare('SELECT COALESCE(MAX(ingest_seq),0) AS seq FROM messages WHERE conversation_id=?').get(conversationId)!.seq);
+      let newContent=Boolean(newHuman);
+      const pending=this.activeMaterialPending(conversationId);
+      for(const item of pending) {
+        const blocked=Boolean(this.db.prepare(`SELECT 1 FROM auto_memory_material_legacy_messages WHERE message_id=? AND disposition='isolated'`)
+          .get(String(item.payload.sourceMessageId)));
+        const inserted=this.db.prepare(`INSERT OR IGNORE INTO auto_memory_material_observed_pending
+          (kind,pending_id,conversation_id,observed_at,blocked) VALUES (?,?,?,?,?)`).run(item.kind,item.id,conversationId,now,blocked?1:0);
+        if(inserted.changes&&!blocked) newContent=true;
+      }
+      let window=state.first_content_at==null?undefined:{firstContentAt:Number(state.first_content_at),lastContentAt:Number(state.last_content_at)};
+      if(newContent) window=noteMemoryContent(window,now);
+      this.db.prepare('UPDATE auto_memory_material_state SET observed_seq=?,first_content_at=?,last_content_at=? WHERE conversation_id=?')
+        .run(highest,window?.firstContentAt??null,window?.lastContentAt??null,conversationId);
+      const reason=memoryScheduleDue(window,now);
+      if(!reason) return undefined;
+      // Membership, rather than a max end_seq, owns coverage. Late delivered AI messages
+      // therefore remain eligible even when their ingest sequence is below reserved_seq.
+      const members=this.db.prepare(`SELECT c.message_id,m.ingest_seq FROM conversation_context_messages c JOIN messages m ON m.id=c.message_id
+        WHERE c.conversation_id=? AND NOT EXISTS(SELECT 1 FROM auto_memory_material_legacy_messages l WHERE l.message_id=c.message_id)
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_material_job_messages jm WHERE jm.message_id=c.message_id) ORDER BY c.seq`).all(conversationId);
+      const captured=pending.filter(item=>Boolean(this.db.prepare(`SELECT 1 FROM auto_memory_material_observed_pending o
+        WHERE kind=? AND pending_id=? AND blocked=0 AND (assigned_job_id IS NULL
+          OR EXISTS(SELECT 1 FROM auto_memory_jobs j WHERE j.id=o.assigned_job_id AND j.status='done'))`).get(item.kind,item.id)));
+      // Clear both clocks at reservation. Completion never touches this state, so
+      // content arriving during execution owns the next window across restarts.
+      this.db.prepare('UPDATE auto_memory_material_state SET first_content_at=NULL,last_content_at=NULL WHERE conversation_id=?').run(conversationId);
+      if(!members.length&&!captured.length) return undefined;
+      const id=randomUUID(),seqs=members.map(row=>Number(row.ingest_seq));
+      const start=seqs.reduce((a,b)=>Math.min(a,b),seqs.length?Infinity:Number(state.reserved_seq));
+      const end=seqs.reduce((a,b)=>Math.max(a,b),Number(state.reserved_seq));
+      this.db.prepare(`INSERT INTO auto_memory_jobs(id,conversation_id,reason,status,start_seq,end_seq,created_at,pipeline)
+        VALUES (?,?,?,'queued',?,?,?,'materials')`).run(id,conversationId,reason,start,end,timestamp());
+      this.db.prepare('INSERT INTO auto_memory_material_jobs VALUES (?)').run(id);
+      members.forEach((row,index)=>this.db.prepare('INSERT INTO auto_memory_material_job_messages VALUES (?,?,?)').run(id,String(row.message_id),index));
+      for(const item of captured) {
+        this.db.prepare('INSERT INTO auto_memory_material_job_pending VALUES (?,?,?,?)').run(id,item.kind,item.id,JSON.stringify(item.payload));
+        this.db.prepare('UPDATE auto_memory_material_observed_pending SET assigned_job_id=? WHERE kind=? AND pending_id=?').run(id,item.kind,item.id);
+      }
+      this.db.prepare('UPDATE auto_memory_material_state SET reserved_seq=MAX(reserved_seq,?) WHERE conversation_id=?').run(end,conversationId);
+      return this.job(this.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(id)!);
+    });
   }
   reserveBatch(conversationId: string, reason: AutoMemoryReason, batchSize=50, excludeMessageId?: string): AutoMemoryJob | undefined {
     if(!['count','capacity'].includes(reason)||!Number.isSafeInteger(batchSize)||batchSize<1) throw new Error('整理批次参数无效。');
@@ -346,12 +684,13 @@ export class AutoMemoryStore {
       return this.job(this.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(id)!);
     });
   }
-  claimNext(conversationId: string, options: {owner:string;leaseMs:number;now?:number}): AutoMemoryJob | undefined {
+  claimNext(conversationId: string, options: {owner:string;leaseMs:number;now?:number;pipeline?:AutoMemoryPipeline;jobIds?:readonly string[]}): AutoMemoryJob | undefined {
     if(!options.owner||!Number.isSafeInteger(options.leaseMs)||options.leaseMs<1) throw new Error('整理租约无效。');
     return this.atomic(()=>{
       const current=options.now??Date.now();
-      const row=this.nextPending(conversationId);
-      if(!row||row.status==='failed'||(row.status==='running'&&Number(row.lease_until)>current)) return undefined;
+      const row=this.nextPending(conversationId,options.pipeline);
+      if(!row||(options.jobIds!==undefined&&!options.jobIds.includes(String(row.id)))||row.status==='failed'
+        ||(row.status==='running'&&Number(row.lease_until)>current)) return undefined;
       if (row.status === 'running') {
         this.db.prepare("UPDATE auto_memory_jobs SET status='failed',error=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?")
           .run('[interrupted] phase=recover; 先前调用结果未知，固定批次和检查点保留，需显式重试。', String(row.id));
@@ -363,15 +702,17 @@ export class AutoMemoryStore {
       this.taskInput(job); return job;
     });
   }
-  private nextPending(conversationId:string): Record<string,unknown> | undefined {
-    return this.db.prepare(`SELECT j.* FROM auto_memory_jobs j WHERE j.conversation_id=? AND j.status<>'done'
+  private nextPending(conversationId:string,pipeline:AutoMemoryPipeline='legacy'): Record<string,unknown> | undefined {
+    return this.db.prepare(`SELECT j.* FROM auto_memory_jobs j WHERE j.conversation_id=? AND j.pipeline=? AND j.status<>'done'
       AND NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=j.id)
-      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id) ORDER BY j.rowid LIMIT 1`).get(conversationId);
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_legacy_isolations i WHERE i.job_id=j.id) ORDER BY j.rowid LIMIT 1`).get(conversationId,pipeline);
   }
   private active(jobId:string,leaseToken:string): Record<string,unknown> {
     const row=this.db.prepare(`SELECT * FROM auto_memory_jobs WHERE id=? AND status='running' AND lease_token=? AND lease_until>?
       AND NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=auto_memory_jobs.id)
-      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=auto_memory_jobs.id)`).get(jobId,leaseToken,Date.now());
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=auto_memory_jobs.id)
+      AND NOT EXISTS(SELECT 1 FROM auto_memory_legacy_isolations i WHERE i.job_id=auto_memory_jobs.id)`).get(jobId,leaseToken,Date.now());
     if(!row) throw new Error('整理租约已失效。'); return row;
   }
   private messages(ids: readonly string[]): AutoMemoryMessage[] {
@@ -424,12 +765,27 @@ export class AutoMemoryStore {
     const canonical=this.job(row); const messages=this.messages(canonical.messageIds); const cp=this.checkpoint(canonical.conversationId);
     const contextJob=this.db.prepare('SELECT * FROM auto_memory_context_jobs WHERE job_id=?').get(job.id);
     const previousSummary=contextJob?contextJob.previous_summary:cp.summary;
+    if(canonical.pipeline==='compression') {
+      const input:AutoMemoryTaskInput={pipeline:'compression',contextProtocol:1,extractionProtocol:2,profileProtocol:2,
+        job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles:[],
+        ...(previousSummary==null?{}:{previousSummary:String(previousSummary)})};
+      this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
+      return input;
+    }
+    const materialPending=canonical.pipeline==='materials'?this.db.prepare('SELECT kind,payload_json FROM auto_memory_material_job_pending WHERE job_id=? ORDER BY rowid')
+      .all(job.id).map(item=>({kind:String(item.kind),payload:parse<PersonProfilePending & {personId?:string}>(item.payload_json)})):[];
     const people=new Set(messages.flatMap(m=>m.personId?[m.personId]:[]));
-    for (const pending of this.db.prepare(`SELECT DISTINCT p.person_id FROM person_profile_pending p
+    if(canonical.pipeline==='materials') {
+      for(const item of materialPending) if(item.kind==='person'&&item.payload.personId) people.add(item.payload.personId);
+    } else for (const pending of this.db.prepare(`SELECT DISTINCT p.person_id FROM person_profile_pending p
       JOIN messages source ON source.id=p.source_message_id
       WHERE source.conversation_id=? AND source.ingest_seq<=? AND p.archived_revision IS NULL AND p.purpose='profile'`)
       .all(canonical.conversationId,canonical.endSeq)) people.add(String(pending.person_id));
     let profiles=[...people].map(personId=>this.profile(personId));
+    if(canonical.pipeline==='materials') profiles=profiles.map(profile=>({...profile,pending:materialPending
+      .filter(item=>item.kind==='person'&&item.payload.personId===profile.personId).map(item=>{
+        const {personId:_,...pending}=item.payload;return pending;
+      })}));
     const profileFragments: NonNullable<AutoMemoryTaskInput['profileFragments']> = [];
     let fragmentBytes = 0;
     for (const personId of people) for (const fragment of this.db.prepare(`SELECT id,content,source_type FROM person_fragments
@@ -454,8 +810,15 @@ export class AutoMemoryStore {
     const profileSources=this.messages([...new Set([...profiles.flatMap(p=>(p.pending??[]).map(item=>item.sourceMessageId)),
       ...profiles.flatMap(profile => profile.facts.flatMap(fact => fact.messageIds)),
       ...profileFragments.flatMap(fragment => fragment.messageIds)])]);
-    const deferredRanges=this.deferredRanges(canonical.conversationId);
-    const input:AutoMemoryTaskInput={...(contextJob?{contextProtocol:1 as const}:{}),profileProtocol:2,profileSources,profileFragments,...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile:this.selfProfile.snapshot(),...(previousSummary==null?{}:{previousSummary:String(previousSummary)})};
+    const deferredRanges=canonical.pipeline==='materials'?[]:this.deferredRanges(canonical.conversationId);
+    const selfProfile=this.selfProfile.snapshot();
+    if(canonical.pipeline==='materials') selfProfile.pending=materialPending.filter(item=>item.kind==='self').map(item=>({
+      id:item.payload.id,content:item.payload.content,sourceMessageId:item.payload.sourceMessageId}));
+    const input:AutoMemoryTaskInput={...(canonical.pipeline==='materials'?{pipeline:'materials' as const,extractionProtocol:2 as const}
+      :contextJob?{contextProtocol:1 as const,extractionProtocol:2 as const}:{}),profileProtocol:2,profileSources,profileFragments,
+      ...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),
+      job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile,
+      ...(canonical.pipeline==='materials'||previousSummary==null?{}:{previousSummary:String(previousSummary)})};
     this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
     return input;
   }
@@ -532,9 +895,13 @@ export class AutoMemoryStore {
     this.atomic(()=>{
       const row=this.active(jobId,leaseToken); const job=this.job(row); const input=this.taskInput(job); assertCurrentMemoryProtocol(input); assertProfileProtocol(input); assertCurrentMemoryProtocol(extract); this.assertProfileEvidenceCurrent(input,extract); const owned=new Set(job.messageIds);
       if([...(input.profileSources??[]),...input.messages].some(m=>m.actorId!==undefined&&this.personForActor(m.actorId)!==m.personId)) throw new Error('人物绑定版本冲突，请重读后重试。');
-      const first=this.nextPending(job.conversationId);
+      const first=this.nextPending(job.conversationId,job.pipeline);
       if(first?.id!==jobId) throw new Error('同房间整理必须按批次顺序提交。');
       if(!Array.isArray(extract.topics)||!Array.isArray(extract.fragments)||!Array.isArray(extract.profiles)) throw new Error('整理产物结构无效。');
+      if(job.pipeline==='compression'&&(input.pipeline!=='compression'||extract.topics.length||extract.fragments.length||extract.profiles.length
+        ||extract.selfProfile!==undefined)) throw new Error('上下文压缩只能提交续聊摘要和完成回执。');
+      if(job.pipeline==='materials'&&(input.pipeline!=='materials'||extract.continuationSummary!==undefined))
+        throw new Error('资料整理不能提交上下文压缩摘要。');
       const sourceRooms = new Map([...input.messages,...(input.profileSources??[])].map(message=>[message.id,message.conversationId]));
       const evidence=(ids:string[],sourceType?:string,personId?:string)=>{
         const sources = new Map(input.messages.map(message => [message.id,message]));
@@ -546,15 +913,35 @@ export class AutoMemoryStore {
       const content=(s:string)=>{if(typeof s!=='string'||!s.trim()||s.length>32000) throw new Error('整理正文无效。');};
       if(!Array.isArray(extract.ignoredMessageIds)||new Set(extract.ignoredMessageIds).size!==extract.ignoredMessageIds.length
         ||extract.ignoredMessageIds.some(id=>!input.messages.some(m=>m.id===id&&m.role==='user'))) throw new Error('无价值消息归属无效。');
-      const covered=new Set([...extract.ignoredMessageIds,...extract.topics.flatMap(t=>t.messageIds),...extract.fragments.flatMap(f=>f.messageIds)]);
-      if(input.messages.some(m=>m.role==='user'&&!covered.has(m.id))) throw new Error('整理结果未覆盖所有真人消息。');
-      if(input.roomType==='private'||input.contextProtocol===1) content(extract.continuationSummary!);
+      if (input.extractionProtocol === 2) {
+        if (!this.db.prepare('SELECT 1 FROM auto_memory_context_jobs WHERE job_id=?').get(job.id)
+          && !this.db.prepare('SELECT 1 FROM auto_memory_material_jobs WHERE job_id=?').get(job.id)) throw new Error('范围整理协议必须对应固定快照。');
+        if (extract.ignoredMessageIds.length || extract.fragments.length) throw new Error('新整理协议不接受逐条覆盖清单或人物事件片段。');
+        if(job.pipeline==='materials'&&job.messageIds.length===0) {
+          if(!Array.isArray(extract.processedRanges)||extract.processedRanges.length) throw new Error('空消息快照只能提交空完成回执。');
+        } else assertProcessedRanges(extract.processedRanges, job.messageIds.length);
+      } else {
+        const covered=new Set([...extract.ignoredMessageIds,...extract.topics.flatMap(t=>t.messageIds),...extract.fragments.flatMap(f=>f.messageIds)]);
+        if(input.messages.some(m=>m.role==='user'&&!covered.has(m.id))) throw new Error('整理结果未覆盖所有真人消息。');
+      }
+      if(input.pipeline==='materials') { /* Materials never update conversation context. */ }
+      else if(input.roomType==='private'||input.contextProtocol===1) content(extract.continuationSummary!);
       else if(extract.continuationSummary!==undefined) throw new Error('群聊不能提交私聊续聊摘要。');
       const topicIds=extract.topics.map(topic=>{
-        content(topic.summary);evidence(topic.messageIds);const id=randomUUID();
+        content(topic.summary);
+        if (input.extractionProtocol === 2) {
+          if (topic.messageIds.length || [...topic.summary].length > COMPACT_TOPIC_LIMITS.characters) throw new Error('Topic只能包含有界摘要，来源范围由程序记录。');
+          assertMemorySourceRange(topic.sourceRange!, job.messageIds.length);
+          if (!extract.processedRanges!.some(range => range.startOrdinal === topic.sourceRange!.startOrdinal
+            && range.endOrdinal === topic.sourceRange!.endOrdinal)) throw new Error('Topic来源没有对应的整理完成回执。');
+        } else evidence(topic.messageIds);
+        const id=randomUUID();
         if (topic.messageIds.some(messageId=>sourceRooms.get(messageId)!==job.conversationId)) throw new Error('Topic来源必须属于当前会话。');
         this.db.prepare('INSERT INTO memory_topics(id,conversation_id,job_id,summary,content_hash,created_at) VALUES (?,?,?,?,?,?)').run(id,job.conversationId,jobId,topic.summary,hash(topic.summary),timestamp());
-        topic.messageIds.forEach(messageId=>this.db.prepare('INSERT INTO memory_topic_messages VALUES (?,?)').run(id,messageId)); return id;
+        if (input.extractionProtocol === 2) this.db.prepare('INSERT INTO memory_topic_scopes VALUES (?,?,?)')
+          .run(id,topic.sourceRange!.startOrdinal,topic.sourceRange!.endOrdinal);
+        else topic.messageIds.forEach(messageId=>this.db.prepare('INSERT INTO memory_topic_messages VALUES (?,?)').run(id,messageId));
+        return id;
       });
       for(const fragment of extract.fragments) {
         if(!['self','third_party','inference'].includes(fragment.sourceType)) throw new Error('证据类型无效。');
@@ -645,6 +1032,11 @@ export class AutoMemoryStore {
           .run(Number(contextJob.end_cursor),completed,extract.continuationSummary!,job.conversationId);
       }
       this.db.prepare("UPDATE auto_memory_jobs SET status='done',completed_at=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?").run(timestamp(),jobId);
+      if(job.pipeline==='materials') {
+        this.advanceMaterialCheckpoint(job.conversationId);
+        return;
+      }
+      if(job.pipeline==='compression') return;
       const checkpoint=this.checkpoint(job.conversationId);
       const pending=this.db.prepare(`SELECT MIN(m.ingest_seq) AS seq FROM messages m WHERE m.conversation_id=? AND m.role='user'
         AND m.message_kind='chat' AND m.ingest_seq>? AND NOT EXISTS(SELECT 1 FROM auto_memory_job_messages jm
@@ -665,6 +1057,12 @@ export class AutoMemoryStore {
   }
   retry(jobId:string): void {
     this.atomic(()=>{
+      if(this.db.prepare('SELECT 1 FROM auto_memory_legacy_isolations WHERE job_id=?').get(jobId)) throw new Error('已隔离的旧整理任务不能重试。');
+      const frozen = this.db.prepare('SELECT input_json,error FROM auto_memory_jobs WHERE id=?').get(jobId);
+      if (frozen?.input_json && String(frozen.error).includes('[profile_conflict]')
+        && parse<AutoMemoryTaskInput>(frozen.input_json).extractionProtocol === 2) {
+        throw new Error('范围整理任务的版本冲突不能按旧输入重试；请先保留并搁置该任务，再创建新快照。');
+      }
       if(this.db.prepare('SELECT job_id FROM auto_memory_job_retirements WHERE job_id=?').get(jobId)) throw new Error('已退役的整理任务不能重试。');
       if(this.db.prepare('SELECT job_id FROM auto_memory_job_deferrals WHERE job_id=?').get(jobId)) throw new Error('已搁置的整理任务不能重试。');
       if(this.db.prepare("UPDATE auto_memory_jobs SET status='queued',error=NULL WHERE id=? AND status='failed'").run(jobId).changes!==1) throw new Error('任务不处于失败状态。');
@@ -710,7 +1108,7 @@ export class AutoMemoryStore {
   }
   deferredRanges(conversationId:string): {startSeq:number;endSeq:number}[] {
     return this.db.prepare(`SELECT j.start_seq,j.end_seq FROM auto_memory_jobs j JOIN auto_memory_job_deferrals d ON d.job_id=j.id
-      WHERE j.conversation_id=? AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)
+      WHERE j.conversation_id=? AND j.pipeline<>'materials' AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)
       ORDER BY j.start_seq,j.rowid`).all(conversationId)
       .map(row=>({startSeq:Number(row.start_seq),endSeq:Number(row.end_seq)}));
   }
@@ -730,28 +1128,49 @@ export class AutoMemoryStore {
     this.atomic(()=>{this.active(jobId,leaseToken);this.db.prepare('UPDATE auto_memory_jobs SET progress_json=NULL,input_json=NULL WHERE id=?').run(jobId);});
   }
   pendingConversations(): string[] {
-    return this.db.prepare(`SELECT DISTINCT j.conversation_id FROM auto_memory_jobs j WHERE j.status IN ('queued','running')
-      AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)`).all().map(r=>String(r.conversation_id));
+    return this.db.prepare(`SELECT c.id AS conversation_id FROM conversations c WHERE
+      EXISTS(SELECT 1 FROM auto_memory_jobs j WHERE j.conversation_id=c.id AND j.status IN ('queued','running')
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements r WHERE r.job_id=j.id)
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_legacy_isolations i WHERE i.job_id=j.id)
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=j.id))
+      OR EXISTS(SELECT 1 FROM auto_memory_material_state s WHERE s.conversation_id=c.id AND s.first_content_at IS NOT NULL)
+      OR EXISTS(SELECT 1 FROM messages m WHERE m.conversation_id=c.id AND m.role='user' AND m.message_kind='chat'
+        AND m.ingest_seq>COALESCE((SELECT observed_seq FROM auto_memory_material_state s WHERE s.conversation_id=c.id),0)
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_material_legacy_messages l WHERE l.message_id=m.id)
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_material_job_messages jm WHERE jm.message_id=m.id))
+      OR EXISTS(SELECT 1 FROM person_profile_pending p JOIN messages m ON m.id=p.source_message_id
+        WHERE m.conversation_id=c.id AND p.archived_revision IS NULL AND p.purpose='profile'
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_material_observed_pending o WHERE o.kind='person' AND o.pending_id=p.id))
+      OR EXISTS(SELECT 1 FROM self_profile_pending p JOIN messages m ON m.id=p.source_message_id
+        WHERE m.conversation_id=c.id AND p.archived_revision IS NULL
+        AND NOT EXISTS(SELECT 1 FROM self_profile_reclassifications r WHERE r.pending_id=p.id)
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_material_observed_pending o WHERE o.kind='self' AND o.pending_id=p.id))`)
+      .all().map(r=>String(r.conversation_id));
   }
-  listJobs(limit=100): {id:string;conversationId:string;status:string;reason:string;attempts:number;error:string|null;deferred?:true;deferredReason?:string;retired?:true;retiredReason?:string}[] {
+  listJobs(limit=100): {id:string;conversationId:string;pipeline:AutoMemoryPipeline;status:string;reason:string;attempts:number;error:string|null;deferred?:true;deferredReason?:string;retired?:true;retiredReason?:string;isolated?:true;isolatedReason?:string}[] {
     if(!Number.isSafeInteger(limit)||limit<1||limit>1000) throw new Error('任务查询数量无效。');
-    return this.db.prepare(`SELECT j.id,j.conversation_id,j.status,j.reason,j.attempts,j.error,d.reason AS deferred_reason,r.reason AS retired_reason
+    return this.db.prepare(`SELECT j.id,j.conversation_id,j.pipeline,j.status,j.reason,j.attempts,j.error,d.reason AS deferred_reason,r.reason AS retired_reason,i.reason AS isolated_reason
       FROM auto_memory_jobs j LEFT JOIN auto_memory_job_deferrals d ON d.job_id=j.id
-      LEFT JOIN auto_memory_job_retirements r ON r.job_id=j.id ORDER BY j.rowid DESC LIMIT ?`).all(limit)
-      .map(r=>({id:String(r.id),conversationId:String(r.conversation_id),
+      LEFT JOIN auto_memory_job_retirements r ON r.job_id=j.id LEFT JOIN auto_memory_legacy_isolations i ON i.job_id=j.id ORDER BY j.rowid DESC LIMIT ?`).all(limit)
+      .map(r=>({id:String(r.id),conversationId:String(r.conversation_id),pipeline:r.pipeline as AutoMemoryPipeline,
         status:String(r.status),reason:String(r.reason),attempts:Number(r.attempts),error:r.error==null?null:String(r.error),
         ...(r.deferred_reason==null?{}:{deferred:true as const,deferredReason:String(r.deferred_reason)}),
-        ...(r.retired_reason==null?{}:{retired:true as const,retiredReason:String(r.retired_reason)})}));
+        ...(r.retired_reason==null?{}:{retired:true as const,retiredReason:String(r.retired_reason)}),
+        ...(r.isolated_reason==null?{}:{isolated:true as const,isolatedReason:String(r.isolated_reason)})}));
   }
-  status(conversationId:string): {queued:number;running:number;failed:number;deferred:number;retired?:number;completed:number;checkpoint:number;summary?:string} {
+  status(conversationId:string,pipeline?:AutoMemoryPipeline,jobIds?:readonly string[]): {queued:number;running:number;failed:number;deferred:number;retired?:number;isolated?:number;completed:number;checkpoint:number;summary?:string} {
     const cp=this.checkpoint(conversationId);const result:ReturnType<AutoMemoryStore['status']>={queued:0,running:0,failed:0,deferred:0,completed:0,checkpoint:Number(cp.completed_seq),...(cp.summary==null?{}:{summary:String(cp.summary)})};
     const context=this.db.prepare(`SELECT s.* FROM conversation_context_state s WHERE s.conversation_id=?
       AND EXISTS(SELECT 1 FROM auto_memory_context_jobs cj JOIN auto_memory_jobs j ON j.id=cj.job_id WHERE j.conversation_id=s.conversation_id)`).get(conversationId);
-    if(context) {result.checkpoint=Number(context.completed_seq); if(context.summary!=null) result.summary=String(context.summary);}
-    for(const r of this.db.prepare(`SELECT CASE WHEN r.job_id IS NOT NULL THEN 'retired' WHEN d.job_id IS NOT NULL THEN 'deferred' ELSE j.status END AS status,COUNT(*) AS count
+    if(context&&pipeline!=='materials') {result.checkpoint=Number(context.completed_seq); if(context.summary!=null) result.summary=String(context.summary);}
+    if(pipeline==='materials') {result.checkpoint=this.materialSchedule(conversationId).completedSeq;delete result.summary;}
+    for(const r of this.db.prepare(`SELECT CASE WHEN i.job_id IS NOT NULL THEN 'isolated' WHEN r.job_id IS NOT NULL THEN 'retired' WHEN d.job_id IS NOT NULL THEN 'deferred' ELSE j.status END AS status,COUNT(*) AS count
       FROM auto_memory_jobs j LEFT JOIN auto_memory_job_deferrals d ON d.job_id=j.id
-      LEFT JOIN auto_memory_job_retirements r ON r.job_id=j.id WHERE j.conversation_id=? GROUP BY 1`).all(conversationId)) {
-      const key=r.status==='done'?'completed':r.status as 'queued'|'running'|'failed'|'deferred'|'retired';result[key]=Number(r.count);
+      LEFT JOIN auto_memory_job_retirements r ON r.job_id=j.id LEFT JOIN auto_memory_legacy_isolations i ON i.job_id=j.id
+      WHERE j.conversation_id=? AND (? IS NULL OR j.pipeline=?)
+      AND (? IS NULL OR j.id IN (SELECT value FROM json_each(?))) GROUP BY 1`)
+      .all(conversationId,pipeline??null,pipeline??null,jobIds===undefined?null:JSON.stringify(jobIds),jobIds===undefined?null:JSON.stringify(jobIds))) {
+      const key=r.status==='done'?'completed':r.status as 'queued'|'running'|'failed'|'deferred'|'retired'|'isolated';result[key]=Number(r.count);
     } return result;
   }
   contextAfterCheckpoint(conversationId:string,excludeMessageId?:string): AutoMemoryMessage[] {
@@ -778,8 +1197,18 @@ export class AutoMemoryStore {
     });
   }
   private topic(row:Record<string,unknown>):TopicRecord {
+    const scope = this.db.prepare('SELECT start_ordinal,end_ordinal FROM memory_topic_scopes WHERE topic_id=?').get(String(row.id));
     return {id:String(row.id),conversationId:String(row.conversation_id),jobId:String(row.job_id),summary:String(row.summary),version:Number(row.version),contentHash:String(row.content_hash),
+      ...(scope ? { sourceRange: { startOrdinal: Number(scope.start_ordinal), endOrdinal: Number(scope.end_ordinal) } } : {}),
       messageIds:this.db.prepare('SELECT message_id FROM memory_topic_messages WHERE topic_id=?').all(String(row.id)).map(r=>String(r.message_id))};
+  }
+  /** A range is coarse provenance, not evidence that every message supports the Topic. */
+  topicTouchesSources(topic: TopicRecord, messageIds: readonly string[]): boolean {
+    if (!messageIds.length) return false;
+    if (!topic.sourceRange) return topic.messageIds.some(id => messageIds.includes(id));
+    return Boolean(this.db.prepare(`SELECT 1 FROM (SELECT * FROM auto_memory_context_job_messages UNION ALL SELECT * FROM auto_memory_material_job_messages) jm
+      WHERE jm.job_id=? AND jm.ordinal BETWEEN ? AND ? AND jm.message_id IN (SELECT value FROM json_each(?)) LIMIT 1`)
+      .get(topic.jobId, topic.sourceRange.startOrdinal, topic.sourceRange.endOrdinal, JSON.stringify(messageIds)));
   }
   searchTopics(conversationId: string, query: { text: string; limit?: number }):
     { status: 'ready'; topics: (TopicRecord & { score: number })[] } {
@@ -794,6 +1223,7 @@ export class AutoMemoryStore {
       ORDER BY lexical_score,t.id LIMIT ?`).all(conversationId,match,limit)
       .map(row => ({ ...this.topic(row), score: -Number(row.lexical_score) })) : [];
     const topics = lexical.map(topic => {
+      if (topic.sourceRange) return { ...topic, facts: [] };
       const facts = this.db.prepare(`SELECT DISTINCT f.id,f.person_id,f.content,f.source_type FROM person_fragments f
         JOIN person_fragment_messages fm ON fm.fragment_id=f.id JOIN memory_topic_messages tm ON tm.message_id=fm.message_id
         JOIN memory_topics scoped ON scoped.id=tm.topic_id WHERE scoped.id=? AND scoped.conversation_id=?

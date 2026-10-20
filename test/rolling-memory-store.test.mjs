@@ -8,6 +8,7 @@ import { ConversationStore } from '../dist/store.js';
 import { BackgroundMemory } from '../dist/auto-memory.js';
 import { MemoryInputTooLargeError, prepareMemoryExtraction } from '../dist/memory-provider.js';
 import { downgradeSchema14 } from './fixtures/legacy-schema.mjs';
+import { emptyExtraction } from './fixtures/memory-output.mjs';
 
 function fixture(t, roomType='group') {
   const dir=mkdtempSync(join(tmpdir(),'pa-rolling-')),path=join(dir,'store.sqlite');
@@ -28,8 +29,7 @@ function fixture(t, roomType='group') {
   };
 }
 function output(input,summary='rolling summary') {
-  return {topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
-    continuationSummary:summary};
+  return emptyExtraction(input, summary);
 }
 function commit(f,summary) {const job=f.claim(),input=f.store.autoMemory.taskInput(job);f.store.autoMemory.commit(job.id,job.leaseToken,output(input,summary));return input;}
 
@@ -114,7 +114,7 @@ test('independent SQLite connections cannot reserve overlapping snapshots or ste
   } finally {other.close();}
 });
 
-test('v14 frozen failed jobs keep input and progress unchanged and require explicit retry',async t=>{
+test('v14 frozen failed jobs are isolated and keep their input and progress unchanged',async t=>{
   const f=fixture(t);f.inbound('legacy input');
   f.store.autoMemory.reserveBatch(f.room.id,'count',1);const job=f.claim();
   const input=f.store.autoMemory.taskInput(job);
@@ -131,9 +131,10 @@ test('v14 frozen failed jobs keep input and progress unchanged and require expli
       const result=output(captured);delete result.continuationSummary;return result;
     }});
   t.after(()=>worker.close());
-  worker.start();await assert.rejects(worker.wait(),/失败/);assert.equal(calls,0);
+  worker.start();await worker.wait();assert.equal(calls,0);
   assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json,error FROM auto_memory_jobs WHERE id=?').get(job.id)),frozen);
-  worker.retry(job.id);await worker.wait();assert.equal(calls,1);
+  assert.equal(f.store.autoMemory.status(f.room.id).isolated,1);
+  assert.throws(()=>worker.retry(job.id),/隔离/);
   assert.equal(f.inspect(db=>db.prepare('SELECT input_json FROM auto_memory_jobs WHERE id=?').get(job.id)).input_json,frozen.input_json);
   assert.deepEqual(f.context().messages.map(m=>m.text),['legacy input']);
 });
@@ -162,26 +163,31 @@ test('new background chunks roll summaries forward and persist completed work be
 test('group rolling extraction prompt requires a full continuation summary and actual identity fields',t=>{
   const f=fixture(t);f.inbound('hello');f.reserve();const job=f.claim(),input=f.store.autoMemory.taskInput(job);
   const prepared=prepareMemoryExtraction(input,8192),message=JSON.parse(prepared.userContent).messages[0];
-  assert.match(prepared.systemPrompt,/group 和 private 都必须给 continuationSummary/);
+  assert.match(prepared.systemPrompt,/group\s*和\s*private\s*都必须给\s*continuationSummary/);
   assert.doesNotMatch(prepared.systemPrompt,/group 禁止 continuationSummary/);
   assert.equal(message.senderId,'alice');assert.equal(message.senderName,'ALICE');assert.ok(message.contextSeq>0);
 });
 
-test('a capacity snapshot commits more than one hundred Topics from individually bounded chunks',async t=>{
+test('a materials snapshot commits range Topics from bounded chunks without changing the conversation summary',async t=>{
   const f=fixture(t);for(let i=0;i<101;i++)f.inbound(`topic ${i}`);
   const counts=[];
-  const worker=new BackgroundMemory({contextWindow:65536,memory:{enabled:true,maxCalls:20,timeoutMs:3000}},
+  const worker=new BackgroundMemory({contextWindow:65536,memory:{enabled:true,maxCalls:100,timeoutMs:3000}},
     f.store.autoMemory,f.room.id,{extract:async input=>{
       if(input.mode==='profiles')return {profiles:input.profiles.map(profile=>({...profile,pendingResults:[]}))};
-      if(input.messages.length>60)throw new MemoryInputTooLargeError('split before calling provider');
+      if(input.messages.length>4)throw new MemoryInputTooLargeError('split before calling provider');
       counts.push(input.messages.length);
       return {...output(input,`${input.previousSummary??''}|${input.messages.length}`),ignoredMessageIds:[],
-        topics:input.messages.map(message=>({summary:message.text,messageIds:[message.id]}))};
+        topics:input.messages.map(message=>({summary:message.text,messageIds:[]}))};
     }});
-  t.after(()=>worker.close());worker.start('capacity');await worker.wait(undefined,10000);
+  t.after(()=>worker.close());
+  assert.equal(f.store.autoMemory.reserveMaterialsIfDue(f.room.id,1000),undefined);
+  assert.ok(f.store.autoMemory.reserveMaterialsIfDue(f.room.id,601000));
+  worker.start();await worker.wait(undefined,10000);
   assert.equal(counts.reduce((sum,count)=>sum+count,0),101);
-  assert.ok(counts.every(count=>count<=60));
+  assert.ok(counts.every(count=>count<=4));
   assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM memory_topics').get().n),101);
-  assert.equal(f.context().messages.length,0);
-  assert.equal(f.context().summaryVersion,1);
+  assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM memory_topic_messages').get().n),0);
+  assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM memory_topic_scopes').get().n),101);
+  assert.equal(f.context().messages.length,101);
+  assert.equal(f.context().summaryVersion,0);
 });

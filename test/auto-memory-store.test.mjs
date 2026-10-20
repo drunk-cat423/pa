@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore, DuplicateMessageError } from '../dist/store.js';
 import { downgradeSchema10, downgradeSchema14 } from './fixtures/legacy-schema.mjs';
+import { emptyExtraction, legacyFrozenInput } from './fixtures/memory-output.mjs';
 
 function fixture(roomType='group') {
   const directory=mkdtempSync(join(tmpdir(),'pa-auto-memory-'));const path=join(directory,'store.sqlite');
@@ -31,7 +32,7 @@ function ignored(f,job,extra={}) {
   const input=f.store.autoMemory.taskInput(job);
   const profiles=input.profileProtocol===2?input.profiles.filter(profile=>profile.pending?.length).map(profile=>({...profile,
     pendingResults:profile.pending.map(item=>({pendingId:item.id,status:'deferred'}))})):[];
-  return {ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),topics:[],fragments:[],profiles,
+  return {...emptyExtraction(input),profiles,
     ...((input.roomType==='private'||input.contextProtocol===1)?{continuationSummary:'conversation decisions'}:{}),...extra};
 }
 function inspect(f,operation){const db=new DatabaseSync(f.path);try{return operation(db);}finally{db.close();}}
@@ -165,7 +166,7 @@ test('v12 migration backs up the consistent original database before adding defe
     });
     const original=inspect(f,snapshot);
     f.store.close();inspect(f,db=>{downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; DROP TABLE auto_memory_job_deferrals; PRAGMA user_version=12;');});f.restart();
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),18);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),22);
     assert.deepEqual(inspect(f,snapshot),original);
     const backups=readdirSync(f.directory).filter(name=>name.includes('.v12.')&&name.endsWith('.bak'));
     assert.equal(backups.length,1);
@@ -176,7 +177,8 @@ test('v12 migration backs up the consistent original database before adding defe
       assert.deepEqual(backup.prepare('PRAGMA foreign_key_check').all(),[]);
     }finally{backup.close();}
     f.store.autoMemory.defer(worker.id,'defer after migration');
-    assert.equal(f.store.autoMemory.status(f.conversation.id).deferred,1);
+    assert.equal(f.store.autoMemory.status(f.conversation.id).isolated,1);
+    assert.equal(inspect(f,db=>db.prepare('SELECT reason FROM auto_memory_job_deferrals WHERE job_id=?').get(worker.id)).reason,'defer after migration');
   }finally{f.close();}
 });
 
@@ -336,6 +338,7 @@ test('atomic Topic, person evidence, profile and room-scoped keyword search',()=
   const f=fixture();try {
     const source=f.inbound('I enjoy tea');const actor=f.store.findActor(f.conversation.id,'alice');const person=f.store.autoMemory.personForActor(actor);
     f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const worker=claim(f);
+    legacyFrozenInput(f.store,f.path,worker);
     const extract=ignored(f,worker,{ignoredMessageIds:[],topics:[{summary:'Tea discussion',messageIds:[source.existingMessageId]}],
       fragments:[{personId:person,content:'tea',sourceType:'self',messageIds:[source.existingMessageId],topicIndex:0}],
       profiles:[{personId:person,baseVersion:0,facts:[{content:'tea',sourceType:'self',messageIds:[source.existingMessageId]}]}]});
@@ -353,6 +356,7 @@ test('commit rejects omitted messages, foreign evidence and false self claims wi
   const f=fixture();try {
     const alice=f.inbound('Alice');const bob=f.inbound('Bob','bob');const person=f.store.autoMemory.personForActor(f.store.findActor(f.conversation.id,'alice'));
     f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const worker=claim(f);
+    legacyFrozenInput(f.store,f.path,worker);
     assert.throws(()=>f.store.autoMemory.commit(worker.id,worker.leaseToken,{...ignored(f,worker),ignoredMessageIds:[]}),/未覆盖/);
     assert.throws(()=>f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{topics:[{summary:'bad',messageIds:['foreign']}]})),/固定批次/);
     assert.throws(()=>f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{topics:[{summary:'valid',messageIds:[alice.existingMessageId]}],
@@ -425,7 +429,7 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     assert.equal(inspect(f,db=>db.prepare('SELECT status,content FROM memories WHERE id=?').get(memory.id)).content,null);
     assert.equal(f.store.autoMemory.profile('original-person').facts[0].content,longLegacyFact);
     assert.equal([...longLegacyFact].length,24*'迁移前保留的旧画像事实'.length);
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version), 18);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),22);
     assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
     assert.equal(readdirSync(f.directory).some(name=>name.includes('.v5.')&&name.endsWith('.bak')),true);
     f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity'),undefined);assert.equal(f.store.autoMemory.conversationContext(f.conversation.id).messages.at(-1).text,'new');
@@ -436,6 +440,7 @@ test('confirmed binding migrates archived fragments and Topic facts, retaining a
   const f=fixture();try {
     const source=f.inbound('我喜欢茶'),actor=f.store.findActor(f.conversation.id,'alice'),oldPerson=f.store.autoMemory.personForActor(actor);
     f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const first=claim(f);
+    legacyFrozenInput(f.store,f.path,first);
     const fact={content:'喜欢茶',sourceType:'self',messageIds:[source.existingMessageId]};
     f.store.autoMemory.commit(first.id,first.leaseToken,ignored(f,first,{topics:[{summary:'喝茶讨论',messageIds:fact.messageIds}],
       fragments:[{personId:oldPerson,...fact,topicIndex:0}],profiles:[{personId:oldPerson,baseVersion:0,facts:[fact]}]}));

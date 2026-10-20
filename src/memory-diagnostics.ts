@@ -30,6 +30,8 @@ export function memoryFailure(error: unknown, phase: string): string {
     code = 'profile_protocol'; detail = '人物画像协议已变更；旧固定输入与进度已保留，需操作者处理。';
   } else if (error instanceof Error && error.name === 'PersonProfileCapacityError') {
     code = 'profile_capacity'; detail = '人物画像超过容量或格式限制；原文、版本和待整理条目保持不变。';
+  } else if (error instanceof Error && error.name === 'MemoryOutputBudgetError') {
+    code = 'output_budget'; detail = '预计输出超过预算，尚未提交模型；需要更小的整理步骤。';
   } else if (error instanceof Error && error.name === 'MemoryInputTooLargeError') {
     code = 'input_too_large'; detail = '输入超出模型窗口，尚未提交模型。';
   } else if (/版本冲突|输入版本/.test(message)) {
@@ -44,7 +46,7 @@ export function memoryFailure(error: unknown, phase: string): string {
     // Validation errors are application-authored; report a fixed category, never model/user values.
     code = /遗漏|覆盖/.test(message) ? 'coverage' : /来源|证据|引用|自述/.test(message) ? 'evidence'
       : /画像|人物|档案/.test(message) ? 'profile_contract' : 'output_contract';
-    detail = '模型提案未通过结构、来源或完整覆盖检查。';
+    detail = '模型提案未通过结构、来源或处理范围检查。';
   } else if (phase === 'commit') {
     code = 'commit'; detail = '整理结果未提交；原文、固定批次和检查点已保留。';
   }

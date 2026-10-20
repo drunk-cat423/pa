@@ -1,4 +1,26 @@
+export function downgradeSchema21(db) {
+  db.exec(`PRAGMA foreign_keys=OFF;
+    DROP TABLE IF EXISTS material_backfill_pending_audit;
+    DROP TABLE IF EXISTS material_backfill_jobs;
+    DROP TABLE IF EXISTS material_backfill_runs;`);
+}
+
+export function downgradeSchema20(db) {
+  downgradeSchema21(db);
+  db.exec(`PRAGMA foreign_keys=OFF;
+    DROP TABLE IF EXISTS auto_memory_material_job_pending;
+    DROP TABLE IF EXISTS auto_memory_material_observed_pending;
+    DROP TABLE IF EXISTS auto_memory_material_legacy_messages;
+    DROP TABLE IF EXISTS auto_memory_material_job_messages;
+    DROP TABLE IF EXISTS auto_memory_material_jobs;
+    DROP TABLE IF EXISTS auto_memory_material_state;
+    DROP TABLE IF EXISTS auto_memory_legacy_isolations;`);
+}
+
 export function downgradeSchema16(db) {
+  downgradeSchema20(db);
+  db.exec('DROP TABLE IF EXISTS memory_topic_scopes;');
+  db.exec('DROP TABLE IF EXISTS memory_fact_attributions;');
   db.exec('DROP TABLE IF EXISTS message_images;');
   db.exec('ALTER TABLE messages DROP COLUMN image_failure;');
   db.exec(`DROP TABLE IF EXISTS answer_page_views; DROP TABLE IF EXISTS answer_documents;

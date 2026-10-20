@@ -94,6 +94,26 @@ test('准备协议不能接受伪造来源或任意工具权限字段',t=>{
   assert.throws(()=>validateTurnPlan(plan([{target:'sender',content:'你好',senderId:'other'}])),/不能指定/);
 });
 
+test('群共享事实归属要求完整结构并校验归属边界',()=>{
+  const attribution={kind:'statement',subjectSenderIds:['member'],excludedSenderIds:[],correctsMessageIds:[]};
+  assert.deepEqual(validateTurnPlan(plan([{target:'room_memory',content:'唤醒失败是巧克力的',attribution}])).updates[0].attribution,attribution);
+  const invalid=[
+    {...attribution, excludedSenderIds:['owner']},
+    {...attribution, correctsMessageIds:['old-message']},
+    {...attribution, subjectSenderIds:['member'], excludedSenderIds:['member']},
+    {...attribution, subjectSenderIds:['member','member']},
+    {...attribution, subjectSenderIds:['x'.repeat(513)]},
+    {...attribution, correctsMessageIds:['x'.repeat(129)]},
+    {...attribution, extra:'owner'},
+    {kind:'correction',subjectSenderIds:[],excludedSenderIds:[],correctsMessageIds:[]},
+  ];
+  for(const value of invalid) assert.throws(()=>validateTurnPlan(plan([{target:'room_memory',content:'事实',attribution:value}])),/归属信息无效/);
+  assert.throws(()=>validateTurnPlan(plan([{target:'sender',content:'事实',attribution}])),/归属信息无效/);
+  assert.throws(()=>validateTurnPlan(plan([{target:'room_memory',content:'事实',attribution:{...attribution,excludedSenderIds:undefined}}])),/归属信息无效/);
+  const correction={kind:'correction',subjectSenderIds:['member'],excludedSenderIds:['owner'],correctsMessageIds:['old-message']};
+  assert.deepEqual(validateTurnPlan(plan([{target:'room_memory',content:'归属纠正',attribution:correction}])).updates[0].attribution,correction);
+});
+
 test('进度提示允许60个Unicode字符并拒绝空白、超长和多行内容',()=>{
   const base=plan([]);
   assert.equal(validateTurnPlan({...base,progressText:'想'.repeat(60)}).progressText,'想'.repeat(60));

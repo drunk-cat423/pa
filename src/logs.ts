@@ -30,7 +30,7 @@ export function replayDiagnosticCall(log: DiagnosticLog, callId: string): Replay
   const response = log.artifact(callId, 'response');
   const report: ReplayReport = { callId, kind: call.kind, ok: false, phase: 'parse', offline: true,
     networkRequests: 0, businessWrites: 0, captureLevel: call.captureLevel,
-    scope: call.kind === 'memory' ? '保存输入的解析、结构、来源及覆盖校验；不重放提交或当前权限判定'
+    scope: call.kind === 'memory' ? '按保存的协议解析、校验结构与来源；执行范围由程序回执确认，不证明逐条语义覆盖；不重放提交或当前权限判定'
       : call.kind === 'search' ? '保存搜索响应的解析校验；不联网、不核验来源真实性或当前日期'
       : '模型响应与准备计划的结构校验；不执行工具、不验证当前授权或提交状态' };
   if (call.kind === 'search') {

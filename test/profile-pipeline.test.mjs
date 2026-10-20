@@ -21,7 +21,12 @@ function workerFixture(t, input, extract, saved) {
   const checkpoints = [];
   const store = {
     reserveBatch() {},
-    claimNext() { if (state !== 'queued') return; state = 'running'; return { ...input.job, leaseToken: 'lease' }; },
+    reserveCompressionBatch() {},
+    reserveMaterialsIfDue() {},
+    claimNext(_conversationId, options) {
+      if (options?.pipeline !== 'legacy' || state !== 'queued') return;
+      state = 'running'; return { ...input.job, pipeline: 'legacy', leaseToken: 'lease' };
+    },
     taskInput() { return structuredClone(input); },
     assertProfileEvidenceCurrent() {}, renewLease() {},
     loadProgress() { return progress === undefined ? undefined : structuredClone(progress); },
@@ -30,8 +35,10 @@ function workerFixture(t, input, extract, saved) {
     fail(_id, _lease, error) { state = 'failed'; failures.push(error); },
     retry() { state = 'queued'; },
     commit(_id, _lease, value) { completed = structuredClone(value); state = 'done'; },
-    status() { return { queued: Number(state === 'queued'), running: Number(state === 'running'), failed: Number(state === 'failed'),
+    status(_conversationId, pipeline) { if (pipeline && pipeline !== 'legacy') return { queued: 0, running: 0, failed: 0, completed: 0 };
+      return { queued: Number(state === 'queued'), running: Number(state === 'running'), failed: Number(state === 'failed'),
       completed: Number(state === 'done') }; },
+    materialSchedule() { return { reservedSeq: 0, completedSeq: 0 }; },
   };
   const worker = new BackgroundMemory({ contextWindow: 100000, memory: { enabled: true, maxCalls: 0, timeoutMs: 1000 } }, store, 'room', { extract });
   t.after(() => worker.close());

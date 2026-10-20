@@ -100,7 +100,7 @@ test('不修改已捕获的后台输入；旧快照或原文不能把已迁移�
   assert.equal(f.store.autoMemory.selfProfile.snapshot().content,'');
 });
 
-test('迁移后在途旧产物按输入版本冲突失败，显式重试可重新读取资料且不自动收费重试',async t=>{
+test('迁移后在途范围任务保留冲突快照并拒绝普通重试，显式搁置后新任务可继续',async t=>{
   const f=fixture(t),term=f.note();
   let release,started,calls=0;
   const gate=new Promise(resolve=>{release=resolve;}),begun=new Promise(resolve=>{started=resolve;});
@@ -108,24 +108,33 @@ test('迁移后在途旧产物按输入版本冲突失败，显式重试可重�
     f.store.autoMemory,f.room.id,{extract:async input=>{
       calls++;
       if(calls===1){started();await gate;}
-      else assert.equal(input.selfProfile.pending.length,0);
-      return {continuationSummary:'继续对话',topics:[],fragments:[],profiles:[],ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),
+      else assert.equal(input.selfProfile,undefined);
+      return {topics:[],fragments:[],profiles:[],ignoredMessageIds:[],
         ...(calls===1?{selfProfile:{baseVersion:input.selfProfile.baseVersion,content:term.pending.content,
           sourceMessageIds:[term.source.id],pendingIds:[term.pending.id]}}:{})};
     }});
   try {
-    background.start('capacity');await begun;
+    f.store.autoMemory.reserveMaterialsIfDue(f.room.id,0);
+    assert.ok(f.store.autoMemory.reserveMaterialsIfDue(f.room.id,600000));
+    background.start();await begun;
     const job=f.store.autoMemory.listJobs()[0];
-    const membership=f.inspect(db=>db.prepare('SELECT message_id FROM auto_memory_job_messages WHERE job_id=?').all(job.id));
+    const membership=f.inspect(db=>db.prepare('SELECT message_id FROM auto_memory_material_job_messages WHERE job_id=?').all(job.id));
     f.store.reclassifySelfProfileTerms([term.move],f.policy,0);release();
     await assert.rejects(background.wait(undefined,3000),/失败/);
     assert.equal(calls,1);
     const failed=f.inspect(db=>db.prepare('SELECT status,input_json,progress_json,error FROM auto_memory_jobs WHERE id=?').get(job.id));
-    assert.equal(failed.status,'failed');assert.equal(failed.input_json,null);assert.equal(failed.progress_json,null);
+    assert.equal(failed.status,'failed');assert.ok(failed.input_json);assert.ok(failed.progress_json);
     assert.match(failed.error,/profile_conflict/);
-    background.retry(job.id);await background.wait(undefined,3000);
+    assert.throws(()=>background.retry(job.id),/版本冲突不能按旧输入重试/);
+    assert.equal(calls,1);
+    f.store.autoMemory.defer(job.id,'操作者保留冲突任务');
+    f.store.recordInbound(f.room.id,'继续聊',{eventId:'after-conflict',senderId:'owner',modelInputText:'继续聊'});
+    f.store.autoMemory.reserveMaterialsIfDue(f.room.id,600001);
+    assert.ok(f.store.autoMemory.reserveMaterialsIfDue(f.room.id,1200001));
+    background.start();await background.wait(undefined,3000);
     assert.equal(calls,2);assert.equal(f.store.autoMemory.status(f.room.id).completed,1);
-    assert.deepEqual(f.inspect(db=>db.prepare('SELECT message_id FROM auto_memory_job_messages WHERE job_id=?').all(job.id)),membership);
+    assert.deepEqual(f.inspect(db=>db.prepare('SELECT message_id FROM auto_memory_material_job_messages WHERE job_id=?').all(job.id)),membership);
+    assert.equal(f.inspect(db=>db.prepare('SELECT input_json FROM auto_memory_jobs WHERE id=?').get(job.id)).input_json,failed.input_json);
     assert.equal(f.store.autoMemory.selfProfile.snapshot().content,'');
   } finally {release();await background.close();}
 });
@@ -155,7 +164,7 @@ test('v11升级只新增审计结构并保留历史，升级前创建一致性�
   f.store.close();
   f.inspect(db=>{downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results;DROP TABLE person_profile_revision_sources;DROP TABLE auto_memory_job_deferrals;DROP TABLE self_profile_reclassifications;PRAGMA user_version=11;');});
   f.restart();
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),18);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),22);
   assert.deepEqual(f.store.autoMemory.selfProfile.snapshot().pending,pending);
   assert.equal(f.store.externalMessage(f.room.id,term.source.eventId??'source-1').text,term.source.text);
   assert.ok(readdirSync(f.dir).some(name=>name.includes('.v11.')&&name.endsWith('.bak')));

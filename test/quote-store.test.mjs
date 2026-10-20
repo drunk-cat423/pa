@@ -14,8 +14,8 @@ test('引用ID只匹配当前conversation入站或确认投递，重复和未确
     const b = store.ensureConversation('B', '/pi/b.jsonl', { ...route, roomId: 'other' });
     store.recordInbound(a.id, 'A原文', { eventId: 'shared', senderId: 'author-A', modelInputText: 'A原文' });
     store.recordInbound(b.id, 'B原文', { eventId: 'shared', senderId: 'author-B', modelInputText: 'B原文' });
-    assert.deepEqual(store.quotedMessage(a.id, 'shared'), { role: 'user', senderId: 'author-A', text: 'A原文' });
-    assert.deepEqual(store.quotedMessage(b.id, 'shared'), { role: 'user', senderId: 'author-B', text: 'B原文' });
+    assert.deepEqual(store.quotedMessage(a.id, 'shared'), { role: 'user', senderId: 'author-A', text: 'A原文', sourceMessageId:store.externalMessage(a.id,'shared').id });
+    assert.deepEqual(store.quotedMessage(b.id, 'shared'), { role: 'user', senderId: 'author-B', text: 'B原文', sourceMessageId:store.externalMessage(b.id,'shared').id });
     const run = store.beginRun(a.id, '问题', 'p', 'm', [], { eventId: 'question', senderId: 'asker', modelInputText: '问题' });
     const delivery = store.completeRun(run.id, '**模型原文**', undefined, undefined);
     assert.equal(store.quotedMessage(a.id, 'outgoing'), undefined);
@@ -24,7 +24,7 @@ test('引用ID只匹配当前conversation入站或确认投递，重复和未确
     const confirmedRun = store.beginRun(a.id, '确认问题', 'p', 'm', [], { eventId: 'confirmed-question', senderId: 'asker', modelInputText: '确认问题' });
     const confirmed = store.completeRun(confirmedRun.id, '**模型原文**', undefined, undefined);
     store.ackDelivery(confirmed.deliveryId, 'sent', 'confirmed-outgoing');
-    assert.deepEqual(store.quotedMessage(a.id, 'confirmed-outgoing'), { role: 'assistant', text: '**模型原文**' });
+    assert.deepEqual(store.quotedMessage(a.id, 'confirmed-outgoing'), { role: 'assistant', text: '**模型原文**', sourceMessageId:confirmed.messageId });
     assert.equal(store.quotedMessage(b.id, 'confirmed-outgoing'), undefined);
     store.recordInbound(a.id, '碰撞ID', { eventId: 'confirmed-outgoing', senderId: 'other', modelInputText: '碰撞ID' });
     assert.equal(store.quotedMessage(a.id, 'confirmed-outgoing'), undefined);

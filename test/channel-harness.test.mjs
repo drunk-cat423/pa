@@ -213,8 +213,12 @@ test('引用平台正文或当前房间精确ID，引用指令不写记忆；原
   assert.equal(await h.handle(f.message('quote-question', '这句话什么意思？', { quote: { messageId: 'old-quote' } })), 'sent');
   const first = currentInput(f.requests.at(-1));
   assert.equal(first.input.currentMessage.text, '这句话什么意思？');
+  const quoteSourceDb=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
+  let quoteSourceId;
+  try { quoteSourceId=quoteSourceDb.prepare('SELECT id FROM messages WHERE external_event_id=?').get('old-quote').id; }
+  finally { quoteSourceDb.close(); }
   assert.deepEqual(first.input.currentMessage.quotedMessage, { status: 'available', role: 'user',
-    senderId: 'original-author', text: '被引用的旧消息', truncated: false });
+    senderId: 'original-author', text: '被引用的旧消息', truncated: false,sourceMessageId:quoteSourceId });
   assert.match(first.text, /不是当前发送者的本人自述/);
   assert.match(JSON.stringify(f.requests.at(-1).body), /输出格式要求：Markdown/);
   assert.equal(await h.handle(f.message('quoted-command', '讨论这句话', { quote: { referenceIndex: 'platform-index',
@@ -264,8 +268,12 @@ test('确认投递的assistant引用可重启解析，Markdown要求只作用QQ'
   await h.close();
   const reopened = f.harness(0, [f.route, telegram]);
   await reopened.handle(f.message('quote-outgoing', '你的话什么意思', { quote: { messageId: 'qq-output' } }));
+  const quoteSourceDb=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
+  let quoteSourceId;
+  try { quoteSourceId=quoteSourceDb.prepare('SELECT r.response_message_id FROM agent_runs r JOIN messages m ON m.id=r.input_message_id WHERE m.external_event_id=?').get('one-outgoing').response_message_id; }
+  finally { quoteSourceDb.close(); }
   assert.deepEqual(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage,
-    { status: 'available', role: 'assistant', text: '群聊回复', truncated: false });
+    { status: 'available', role: 'assistant', text: '群聊回复', truncated: false,sourceMessageId:quoteSourceId });
   await reopened.handle(f.message('telegram-question', '其他渠道', { route: telegram }));
   assert.doesNotMatch(JSON.stringify(f.requests.at(-1).body), /plain_text/);
 });

@@ -8,6 +8,7 @@ import { ConversationStore } from '../dist/store.js';
 import { BackgroundMemory, validateExtract } from '../dist/auto-memory.js';
 import { MemoryInputTooLargeError } from '../dist/memory-provider.js';
 import { downgradeSchema10 } from './fixtures/legacy-schema.mjs';
+import { emptyExtraction } from './fixtures/memory-output.mjs';
 
 function fixture(roomType = 'group') {
   const dir=mkdtempSync(join(tmpdir(),'pa-profile-history-')); const path=join(dir,'store.sqlite');
@@ -33,12 +34,11 @@ function addPending(f, conversationId, sourceId, _legacyCallId, target, content,
   const source=f.inspect(db=>db.prepare('SELECT actor_id FROM messages WHERE id=? AND conversation_id=?').get(sourceId,conversationId));
   return f.store.autoMemory.addProfilePending(f.store.autoMemory.ensureActorPerson(source.actor_id),sourceId,content,sourceType);
 }
-function batch(f) { f.store.autoMemory.reserveBatch(f.room.id,'capacity');return f.store.autoMemory.claimNext(f.room.id,{owner:'test',leaseMs:60000}); }
+function batch(f) { f.store.autoMemory.reserveBatch(f.room.id,'capacity');return f.store.autoMemory.claimNext(f.room.id,{owner:'test',leaseMs:60000,pipeline:'legacy'}); }
 function ignored(input,profiles=[]) {
   const deferred=input.profileProtocol===2&&profiles.length===0?input.profiles.filter(p=>p.pending?.length).map(p=>({...p,
     pendingResults:p.pending.map(item=>({pendingId:item.id,status:'deferred'}))})):profiles;
-  return {ignoredMessageIds:input.messages.filter(m=>m.role==='user').map(m=>m.id),topics:[],fragments:[],profiles:deferred,
-  ...((input.roomType==='private'||input.contextProtocol===1)?{continuationSummary:'继续对话'}:{})};}
+  return {...emptyExtraction(input,'继续对话'),profiles:deferred};}
 
 test('FTS Chinese words, source identities, before current boundary, actor and room isolation',()=>{
   const f=fixture();try {
@@ -132,7 +132,7 @@ test('v8 migration backs up and preserves archived legacy field metadata, identi
     f.store.autoMemory.selfProfile.commit(self,{baseVersion:self.baseVersion,content:'名字叫 PA',sourceMessageIds:[old.existingMessageId],pendingIds:[self.pending[0].id]},[]);
     const style=f.inbound('回复要简洁');addPending(f,f.room.id,style.existingMessageId,'legacy-ai-style','ai_self','回复要简洁');
     const selfRows=f.inspect(db=>db.prepare('SELECT * FROM self_profile_pending ORDER BY id').all().map(row=>({...row})));
-    f.inspect(db=>{
+    const frozenBeforeMigration=f.inspect(db=>{
       downgradeSchema10(db);
       db.prepare('UPDATE persons SET revision=1 WHERE id=?').run(person);
       db.prepare('INSERT INTO person_profile_revisions VALUES (?,1,?,NULL,?)').run(person,JSON.stringify([{field:'diet',content:'喜欢火锅',sourceType:'self',messageIds:[old.existingMessageId]}]),new Date().toISOString());
@@ -146,6 +146,7 @@ test('v8 migration backs up and preserves archived legacy field metadata, identi
         CREATE INDEX active_self_profile_pending ON self_profile_pending(archived_revision);
         DROP TRIGGER history_message_insert; DROP TRIGGER history_message_update; DROP TRIGGER history_message_delete;
         DROP TABLE message_history_fts; DROP TABLE person_profile_pending; DROP TABLE profile_tool_receipts; DROP TABLE run_progress; PRAGMA user_version=8;`);
+      return db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id);
     });
     f.restart();assert.ok(readdirSync(f.dir).some(name=>name.includes('.v8.')&&name.endsWith('.bak')));
     assert.deepEqual(f.inspect(db=>db.prepare('SELECT * FROM self_profile_pending ORDER BY id').all().map(row=>({...row}))),selfRows);
@@ -153,9 +154,11 @@ test('v8 migration backs up and preserves archived legacy field metadata, identi
     addPending(f,f.room.id,old.existingMessageId,'repeat-archived','ai_self','你的名字叫 PA');
     assert.equal(f.store.autoMemory.selfProfile.snapshot().pending.length,1);
     assert.equal(f.store.autoMemory.personForActor(actor),person);assert.equal(f.store.autoMemory.profile(person).facts[0].field,'diet');assert.equal(f.store.autoMemory.profile(person).pending.length,0);
-    f.store.autoMemory.retry(job.id);const retried=f.store.autoMemory.claimNext(f.room.id,{owner:'retry',leaseMs:60000});assert.equal(f.store.autoMemory.taskInput(retried).profiles[0].pending,undefined);
+    assert.throws(()=>f.store.autoMemory.retry(job.id),/隔离|退役|重试/);
+    assert.equal(f.store.autoMemory.claimNext(f.room.id,{owner:'retry',leaseMs:60000,pipeline:'legacy'}),undefined);
+    assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id)),frozenBeforeMigration);
     const current=f.inbound('查询历史');assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{query:'火锅'}).messages[0].id,old.existingMessageId);
-    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version), 18);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
+    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),22);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
   }finally{f.close();}
 });
 
@@ -184,7 +187,7 @@ test('cross-room archived-profile CAS rolls back topics and pending archival for
     const profile=input=>({personId:'shared',baseVersion:input.profiles[0].baseVersion,facts:[{content:'喜欢绿茶',sourceType:'self',messageIds:[first.existingMessageId]}],
       pendingResults:[{pendingId:input.profiles[0].pending[0].id,status:'merged',factIndex:0}]});
     f.store.autoMemory.commit(one.id,one.leaseToken,ignored(firstInput,[profile(firstInput)]));
-    const stale={...ignored(secondInput,[profile(secondInput)]),topics:[{summary:'另一个房间的话题',messageIds:secondInput.messages.map(m=>m.id)}]};
+    const stale=validateExtract({...ignored(secondInput,[profile(secondInput)]),topics:[{summary:'另一个房间的话题',messageIds:[]}]},secondInput);
     assert.throws(()=>f.store.autoMemory.commit(two.id,two.leaseToken,stale),/版本冲突/);
     assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM memory_topics WHERE job_id=?').get(two.id).n),0);
     assert.equal(f.store.autoMemory.profile('shared').baseVersion,1);assert.equal(f.store.autoMemory.status(other.id).completed,0);
@@ -200,18 +203,21 @@ test('background chunk splitting keeps captured pending evidence and archives on
     background=new BackgroundMemory(config,f.store.autoMemory,f.room.id,{extract:async input=>{
       if(input.mode!=='profiles'&&input.messages.length>2) throw new MemoryInputTooLargeError('split');
       calls++;
-      if(input.mode==='messages') return ignored(input);
+      if(input.mode==='messages') return emptyExtraction(input);
       const p=input.profiles[0];const note=p.pending?.[0];
       if(note) assert.equal(input.profileSources[0].text,'我喜欢阅读');
       const resultProfile={personId:p.personId,baseVersion:p.baseVersion,
         facts:note?[{content:'喜欢阅读',sourceType:'self',messageIds:[note.sourceMessageId]}]:p.facts,
         pendingResults:note?[{pendingId:note.id,status:'merged',factIndex:0}]:[]};
-      const proposal=input.mode==='profiles'?{profiles:[resultProfile]}:ignored(input,[resultProfile]);
+      const proposal={...emptyExtraction(input),profiles:[resultProfile]};
       validateExtract(proposal,input);
       return proposal;
     }});
-    background.start('capacity');await background.wait(undefined,3000);
-    assert.equal(calls,3);const p=f.store.autoMemory.profileForActors(f.store.findActor(f.room.id,'alice'))[0];
+    f.store.autoMemory.reserveMaterialsIfDue(f.room.id,1000);
+    assert.ok(f.store.autoMemory.reserveMaterialsIfDue(f.room.id,601000));
+    background.start();await background.wait(undefined,3000,'materials');
+    assert.equal(calls,4);
+    const p=f.store.autoMemory.profileForActors(f.store.findActor(f.room.id,'alice'))[0];
     assert.equal(p.facts[0].content,'喜欢阅读');assert.equal(p.pending.length,0);assert.equal(p.baseVersion,2);
   }finally{await background?.close();f.close();}
 });

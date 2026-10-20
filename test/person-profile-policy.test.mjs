@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
+import { emptyExtraction } from './fixtures/memory-output.mjs';
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'pa-person-profile-policy-'));
@@ -39,10 +40,7 @@ function personFor(f, senderId = 'alice') {
   return f.store.autoMemory.personForActor(f.store.findActor(f.room.id, senderId));
 }
 function extract(input, profiles) {
-  return {
-    ignoredMessageIds: input.messages.filter(message => message.role === 'user').map(message => message.id),
-    topics: [], fragments: [], profiles, ...(input.contextProtocol===1?{continuationSummary:"继续对话"}:{}),
-  };
+  return { ...emptyExtraction(input), profiles };
 }
 function hash(value) { return createHash('sha256').update(value).digest('hex'); }
 
@@ -271,7 +269,7 @@ test('v13 migration backup preserves archived legacy pending rows and current da
       downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; PRAGMA user_version=13;');
     });
     f.restart();
-    assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 18);
+    assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),22);
     assert.deepEqual({ ...f.inspect(db => db.prepare('SELECT id,person_id,source_message_id,archived_revision,archived_at FROM person_profile_pending WHERE id=?').get(archived.id)) }, {
       id: archived.id, person_id: personId, source_message_id: source.existingMessageId, archived_revision: 1, archived_at: '2026-10-16T00:00:00Z',
     });

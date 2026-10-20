@@ -34,10 +34,10 @@ test('parts are ordered, exact confirmed text can be quoted under an uncertain p
   assert.throws(() => f.store.ackDelivery(f.deliveryId, 'sent', 'fake'), /逐段确认/);
   f.store.beginDeliveryPart(f.a.id, f.deliveryId, 1);
   f.store.ackDeliveryPart(f.a.id, f.deliveryId, 1, 'uncertain');
-  assert.deepEqual(f.store.quotedMessage(f.a.id, 'external-0'), { role: 'assistant', text: '第一段' });
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'external-0'), { role: 'assistant', text: '第一段', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id) });
   assert.equal(f.store.quotedMessage(f.b.id, 'external-0'), undefined);
   f.reopen().markPendingUncertain(f.a.id);
-  assert.deepEqual(f.store.quotedMessage(f.a.id, 'external-0'), { role: 'assistant', text: '第一段' });
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'external-0'), { role: 'assistant', text: '第一段', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id) });
   assert.throws(() => f.store.beginDeliveryPart(f.a.id, f.deliveryId, 2), /不存在/);
   assert.equal(f.inspect(db => db.prepare('SELECT text FROM messages WHERE role=?').get('assistant').text), '**完整原文**');
 });
@@ -66,7 +66,7 @@ test('last receipt and parent completion are atomic; cross-conversation child re
   f.inspect(db => db.exec('DROP TRIGGER prevent_completion'));
   f.store.ackDeliveryPart(f.a.id, f.deliveryId, 0, 'sent', 'real-id');
   // Parent and child have the same ID, but quote resolution returns the actual transmitted part once.
-  assert.deepEqual(f.store.quotedMessage(f.a.id, 'real-id'), { role: 'assistant', text: '实际文本' });
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'real-id'), { role: 'assistant', text: '实际文本', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id) });
   f.inspect(db => {
     db.exec('PRAGMA foreign_keys=ON');
     assert.throws(() => db.prepare(`INSERT INTO delivery_parts
@@ -100,8 +100,8 @@ test('v7 migration creates a consistent backup and preserves legacy replies and 
       DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity; PRAGMA user_version=7;`);
   });
   f.reopen();
-  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version), 18);
-  assert.deepEqual(f.store.quotedMessage(f.a.id, 'legacy-id'), { role: 'assistant', text: '**完整原文**' });
+  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),22);
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'legacy-id'), { role: 'assistant', text: '**完整原文**', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id) });
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM messages').get().n), 2);
   const backups = readdirSync(f.directory).filter(name => name.includes('.v7.') && name.endsWith('.bak'));
   assert.equal(backups.length, 1);
