@@ -12,6 +12,7 @@ import { ConversationStore } from '../dist/store.js';
 import { estimateContext } from '../dist/runtime.js';
 import { MemoryInputTooLargeError } from '../dist/memory-provider.js';
 import { conversationContext } from './fixtures/conversation-context.mjs';
+import { DiagnosticLog } from '../dist/diagnostics.js';
 
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 function wait(signal, gate) {
@@ -224,6 +225,10 @@ test('单条不可容纳输入不死循环，不发送超限模型请求', async
   const f = await fixture(t, undefined, { contextWindow: 2500 }); const h = f.harness();
   assert.equal(await h.handle(f.message('huge', 'x'.repeat(3999), { route: f.privateRoute })), 'failed');
   assert.equal(f.requests.length, 0); assert.equal(f.inputs.length, 0);
+  const failure = new DiagnosticLog(f.config.dataDir).events().find(event => event.event === 'turn.preflight_failed');
+  assert.ok(failure?.taskId);
+  assert.match(failure.details.reason, /上下文/);
+  assert.doesNotMatch(JSON.stringify(failure), /x{10}/);
 });
 
 test('仅发送者及真实@对象画像，绑定人物私聊自述可在群使用', async t => {

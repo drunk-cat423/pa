@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, realpath } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { readRecordedTurns } from './transcript.js';
@@ -16,6 +16,7 @@ import { requestTimeContext } from './request-time.js';
 import { NO_OWNER_POLICY, type HarnessPolicy } from './harness-policy.js';
 import { imageMetadata, type ImageProjection, type ImageContent } from './image-context.js';
 import { ImageAssets } from './image-assets.js';
+import { DiagnosticLog } from './diagnostics.js';
 
 export class PersistenceError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -176,6 +177,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
     applyContextReset();
     const background = new BackgroundMemory(config, openedStore.autoMemory, conversation.id, options.memoryProvider);
     const imageAssets = new ImageAssets(config);
+    const diagnostics = new DiagnosticLog(config.dataDir, [config.apiKey]);
     background.start();
     let closed = false;
     let active: Promise<{ text: string; runId: string; deliveryId: string }> | undefined;
@@ -278,6 +280,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
         preparations.add(controller);
         const baseRuntime = runtime;
         let isolated: ConversationRuntime | undefined;
+        let runStarted = false;
         const pending = (async () => {
           if (external && !external.existingMessageId) {
             const inserted = persist(() => openedStore.recordInbound(conversation.id, text, external!), text);
@@ -502,6 +505,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
           if (controller.signal.aborted) throw controller.signal.reason instanceof RequestError ? controller.signal.reason : new RequestError('本轮请求已取消。', 'cancelled');
           const run = persist(() => openedStore.beginRun(conversation.id, text, config.provider, config.model, recalled.refs, runExternal, modelInput,
             isolated?.info().sessionFile), text);
+          runStarted = true;
           let reply: string;
           try {
             reply = await runtime.prompt(modelInput, {
@@ -566,7 +570,15 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
           const referenceUrls = runtime.references();
           return { text: reply, runId: run.id, deliveryId: delivery.deliveryId,
             ...(referenceUrls.length ? { referenceUrls } : {}) };
-        })().finally(async () => {
+        })().catch(error => {
+          if (!runStarted && error instanceof RequestError) {
+            const taskId = external?.taskId;
+            diagnostics.event({ traceId: taskId ?? randomUUID(), conversationId: conversation.id,
+              ...(taskId ? { taskId } : {}) }, 'prepare', 'turn.preflight_failed',
+            { code: error.kind, reason: safeMessage(error, config, text) });
+          }
+          throw error;
+        }).finally(async () => {
           preparations.delete(controller);
           if (isolated) { taskRuntimes.delete(isolated); await isolated.close(); }
           tasks.delete(pending);

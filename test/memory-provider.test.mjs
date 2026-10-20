@@ -68,7 +68,7 @@ async function fixture(t) {
     }
     if (mode === 'http-error') { response.writeHead(503); response.end('private provider rejection'); return; }
     const stopReason = mode === 'length' ? 'length' : 'stop';
-    const content = mode === 'invalid-json' ? '{invalid json' : JSON.stringify(result);
+    const content = mode === 'invalid-json' ? '{invalid json' : mode === 'empty' ? '' : JSON.stringify(result);
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     response.write(`data: ${JSON.stringify({ id: 'local', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null }] })}\n\n`);
     response.write(`data: ${JSON.stringify({ id: 'local', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, delta: {}, finish_reason: stopReason }] })}\n\n`);
@@ -108,6 +108,7 @@ test('new wire protocol reaches the local SDK with aliases and preserves replay 
   assert.equal(f.requests.length, 1);
   const request = f.requests[0].body;
   assert.equal(request.tools, undefined);
+  assert.deepEqual(request.response_format, { type: 'json_object' });
   const user = JSON.parse(request.messages.find(message => message.role === 'user').content);
   assert.equal(user.messages[0].id, 'm0');
   assert.equal(user.profiles[0].personId, 'p0');
@@ -160,6 +161,7 @@ test('uses local Pi model with no embedding interface; DeepSeek thinking stays d
   assert.equal(chat.headers.authorization, 'Bearer local-model-key');
   assert.equal(chat.body.model, 'deepseek-chat');
   assert.deepEqual(chat.body.thinking, { type: 'disabled' });
+  assert.deepEqual(chat.body.response_format, { type: 'json_object' });
   assert.equal(chat.body.max_tokens, 2048);
   assert.ok(chat.body.messages.some(message => message.role === 'system' && message.content.includes('只输出一个严格 JSON')));
   assert.ok(chat.body.messages.some(message => message.role === 'user' && message.content.includes('message-1')));
@@ -173,8 +175,13 @@ test('model errors, length limits, malformed JSON, and oversized input never ret
   const provider = createMemoryProvider(f.config);
   f.setMode('length');
   await assert.rejects(provider.extract(input, new AbortController().signal), /输出长度上限/);
+  assert.equal(f.requests.length, 1);
+  f.setMode('empty');
+  await assert.rejects(provider.extract(input, new AbortController().signal), /没有返回 JSON 文本/);
+  assert.equal(f.requests.length, 2);
   f.setMode('invalid-json');
   await assert.rejects(provider.extract(input, new AbortController().signal), /不是有效 JSON/);
+  assert.equal(f.requests.length, 3);
 
   const tooSmall = createMemoryProvider({ ...f.config, contextWindow: 1024, maxOutputTokens: 256 });
   const before = f.requests.length;

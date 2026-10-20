@@ -139,10 +139,15 @@ export function createMemoryProvider(config: PaConfig): MemoryProvider {
           { type: 'text' as const, text: `[图片 imageId=${image.imageId}；所属消息=${input.messages.filter(message => message.images?.some(item => item.imageId === image.imageId)).map(message => messageRefs?.get(message.id) ?? message.id).join(',')}；归属与引用关系见images元数据]` },
           { type: 'file' as const, file_id: image.fileId, bytes: image.bytes }])] }] : [];
       const userMessage = { role: 'user' as const, content: userContent, timestamp: Date.now() };
-      const projectedInput = projectImagePayload({
+      const jsonMode = config.provider === 'deepseek' && model.api === 'openai-completions';
+      const projectMemoryPayload = (payload: Parameters<typeof projectImagePayload>[0]) => {
+        const projected = projectImagePayload(payload, projections) as Record<string, unknown>;
+        return jsonMode ? { ...projected, response_format: { type: 'json_object' as const } } : projected;
+      };
+      const projectedInput = projectMemoryPayload({
         systemPrompt,
         messages: [userMessage],
-      }, projections);
+      });
       const estimate = estimateContext(projectedInput, model.contextWindow, maxTokens);
       if (!estimate.fits || !imageRequestFits(projectedInput,projections)) {
         throw new MemoryInputTooLargeError(
@@ -158,7 +163,7 @@ export function createMemoryProvider(config: PaConfig): MemoryProvider {
         }, { signal, maxTokens, transport: 'sse', maxRetries: 0,
           onPayload: payload => {
             try {
-              const projected = projectImagePayload(payload,projections);
+              const projected = projectMemoryPayload(payload);
               if (!estimateContext(projected,model.contextWindow,maxTokens).fits || !imageRequestFits(projected,projections)) throw new MemoryInputTooLargeError('记忆整理图文输入超过模型上下文或图片容量上限。');
               log = new DiagnosticLog(config.dataDir, [config.apiKey]);
               const job = input.job;
