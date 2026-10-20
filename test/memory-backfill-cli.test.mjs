@@ -46,7 +46,11 @@ async function modelServer(t) {
     if (request.url !== '/v1/chat/completions') {
       response.writeHead(404); response.end(); return;
     }
-    const content = JSON.stringify({ topics: [], profiles: [] });
+    const input = JSON.parse(requests.at(-1).body.messages.findLast(message => message.role === 'user').content);
+    const content = JSON.stringify(input.mode === 'profiles'
+      ? { profiles: input.profiles.map(profile => ({ personId: profile.personId, baseVersion: profile.baseVersion,
+        facts: profile.facts, pendingResults: (profile.pending ?? []).map(item => ({ pendingId: item.id, status: 'deferred' })) })) }
+      : { topics: [], profiles: [] });
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     response.write(`data: ${JSON.stringify({ id: 'local-backfill', object: 'chat.completion.chunk', created: 1,
       model: 'deepseek-chat', choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null }] })}\n\n`);
@@ -124,8 +128,9 @@ test('run uses a bounded local model budget, records failure without retry, and 
   const stoppedResult = stoppedLines.at(-1);
   assert.equal(stoppedResult.event, 'stopped');
   assert.equal(stoppedResult.calls, 1);
-  assert.equal(stoppedResult.run.status.completed, 1);
+  assert.equal(stoppedResult.run.status.completed, 0);
   assert.equal(stoppedResult.run.status.failed, 1);
+  assert.equal(stoppedResult.run.status.queued, 1);
   assert.equal(server.requests.length, 1);
   assert.equal(server.requests[0].url, '/v1/chat/completions');
 
@@ -139,15 +144,15 @@ test('run uses a bounded local model budget, records failure without retry, and 
   const completedReservation = await runCli(['reserve', smallRoom.id, 'completed run test'], env);
   assert.equal(completedReservation.code, 0, completedReservation.stderr);
   const completedRunId = JSON.parse(completedReservation.stdout).runId;
-  const completed = await runCli(['run', completedRunId, '--max-calls', '1'], env);
+  const completed = await runCli(['run', completedRunId, '--max-calls', '2'], env);
   assert.equal(completed.code, 0, completed.stderr);
-  assert.equal(server.requests.length, 2);
+  assert.equal(server.requests.length, 3);
   const alreadyDone = await runCli(['run', completedRunId], envFor(dataDir));
   assert.equal(alreadyDone.code, 0, alreadyDone.stderr);
   const result = JSON.parse(alreadyDone.stdout);
   assert.equal(result.calls, 0);
   assert.equal(result.note.includes('没有发起模型调用'), true);
-  assert.equal(server.requests.length, 2);
+  assert.equal(server.requests.length, 3);
 });
 
 test('invalid CLI parameters fail before creating the configured database directory', async t => {

@@ -45,7 +45,7 @@ async function main(): Promise<void> {
     const base = readConfig();
     const config = { ...base, memory: { ...base.memory!, enabled: true, maxCalls } };
     const worker = new BackgroundMemory(config, store.autoMemory, run.conversationId, undefined,
-      { pipeline: 'materials', jobIds: run.jobIds });
+      { pipeline: 'materials', jobIds: run.jobIds, separateMaterialSteps: true });
     let interrupted = false;
     const stop = () => { interrupted = true; void worker.close(); };
     process.once('SIGINT', stop);

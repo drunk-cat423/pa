@@ -195,6 +195,7 @@ interface WorkItem {
 }
 interface Progress {
   version: 2 | 3;
+  separateMaterialSteps?: true;
   remaining: WorkItem[];
   extract: ValidatedExtract;
   profiles: PersonProfile[];
@@ -205,6 +206,7 @@ interface Progress {
 export interface MemoryExecutionScope {
   pipeline: 'materials';
   jobIds: readonly string[];
+  separateMaterialSteps?: boolean;
 }
 
 /** One worker per conversation, independent of the chat Session and of other rooms. */
@@ -226,7 +228,7 @@ export class BackgroundMemory {
     if (scope) {
       if (scope.pipeline !== 'materials' || !scope.jobIds.length || new Set(scope.jobIds).size !== scope.jobIds.length
         || scope.jobIds.some(id => typeof id !== 'string' || !id)) throw new Error('回填执行范围无效。');
-      this.scope = { pipeline: scope.pipeline, jobIds: [...scope.jobIds] };
+      this.scope = { pipeline: scope.pipeline, jobIds: [...scope.jobIds], separateMaterialSteps: scope.separateMaterialSteps === true };
       const status = this.store.status(conversationId, scope.pipeline, scope.jobIds);
       if (status.queued + status.running + status.failed + status.completed + status.deferred + (status.retired ?? 0)
         + (status.isolated ?? 0) !== scope.jobIds.length) throw new Error('回填任务范围与当前会话不一致。');
@@ -351,7 +353,15 @@ export class BackgroundMemory {
         assertCurrentMemoryProtocol(input);
         assertProfileProtocol(input);
         this.store.assertProfileEvidenceCurrent(input);
-        const progress = this.readProgress(job, input);
+        const savedProgress = this.store.loadProgress(job.id, lease);
+        const progress = this.readProgress(job, input, savedProgress, true);
+        if (savedProgress == null && this.scope?.separateMaterialSteps === true && input.pipeline === 'materials'
+          && input.extractionProtocol === 2) {
+          phase = 'checkpoint';
+          this.diagnostics?.event(context, phase, 'started', { separateMaterialSteps: true, initial: true });
+          this.store.saveProgress(job.id, lease, progress);
+          this.diagnostics?.event(context, phase, 'completed', { separateMaterialSteps: true, initial: true });
+        }
         this.diagnostics?.event(context, phase, 'prepared', { messageIds: input.messages.map(message => message.id),
           remainingChunks: progress.remaining.length });
         while (progress.remaining.length) {
@@ -500,6 +510,10 @@ export class BackgroundMemory {
       delete chunk.selfProfile;
       delete chunk.previousSummary;
       delete chunk.selfProfileBudgetBytes;
+      if ((this.scope?.separateMaterialSteps === true || progress.separateMaterialSteps === true) && input.pipeline === 'materials') {
+        chunk.messages = chunk.messages.filter(message => message.role === 'user');
+        chunk.profileSources = (chunk.profileSources ?? []).filter(message => message.role === 'user');
+      }
     } else if (input.selfProfile && progress.extract.selfProfile) {
       const previous = progress.extract.selfProfile;
       chunk.selfProfile = { baseVersion: previous.baseVersion, content: previous.content,
@@ -552,13 +566,15 @@ export class BackgroundMemory {
       messageIds: messages.map(message => message.id) }));
   }
 
-  private readProgress(job: AutoMemoryJob, input: AutoMemoryTaskInput): Progress {
-    const existing = this.store.loadProgress(job.id, job.leaseToken!);
+  private readProgress(job: AutoMemoryJob, input: AutoMemoryTaskInput, loadedProgress?: unknown, progressWasLoaded = false): Progress {
+    const existing = progressWasLoaded ? loadedProgress : this.store.loadProgress(job.id, job.leaseToken!);
     if (existing !== undefined && existing !== null) {
       assertCurrentMemoryProtocol(existing);
       if (!record(existing) || existing.version !== (input.extractionProtocol === 2 ? 3 : 2)) throw new PersonProfileProtocolError();
       if (!Array.isArray(existing.remaining) || !record(existing.extract)
         || !Array.isArray(existing.profiles)) throw new Error('后台整理检查点损坏。');
+      if (existing.separateMaterialSteps !== undefined && (existing.separateMaterialSteps !== true
+        || input.pipeline !== 'materials' || input.extractionProtocol !== 2)) throw new Error('后台整理检查点损坏。');
       const available = new Set(input.messages.map(message => message.id));
       const people = new Set(input.profiles.map(profile => profile.personId));
       const pendingIds = new Set([...input.profiles.flatMap(profile => (profile.pending ?? []).map(pending => pending.id)),
@@ -572,11 +588,22 @@ export class BackgroundMemory {
       if (input.extractionProtocol === 2 && !Array.isArray(existing.extract.processedRanges)) throw new Error('后台整理检查点缺少步骤完成回执。');
       return existing as unknown as Progress;
     }
-    return { version: input.extractionProtocol === 2 ? 3 : 2,
-      remaining: input.pipeline === 'materials' && input.messages.length === 0
+    const messageIds = input.messages.map(message => message.id);
+    const separateMaterialSteps = this.scope?.separateMaterialSteps === true && input.pipeline === 'materials'
+      && input.extractionProtocol === 2;
+    const remaining: WorkItem[] = separateMaterialSteps
+      ? [
+        ...(messageIds.length ? [{ messageIds, personIds: [], mode: 'messages' as const }] : []),
+        ...input.profiles.map(profile => ({ messageIds, personIds: [profile.personId], mode: 'profiles' as const })),
+        ...(input.selfProfile?.pending.length ? [{ messageIds, personIds: [], mode: 'self' as const }] : []),
+      ]
+      : input.pipeline === 'materials' && input.messages.length === 0
         ? [...input.profiles.map(profile => ({ messageIds: [] as string[], personIds: [profile.personId], mode: 'profiles' as const })),
           ...(input.selfProfile?.pending.length ? [{ messageIds: [] as string[], personIds: [] as string[], mode: 'self' as const }] : [])]
-        : [{ messageIds: input.messages.map(message => message.id), personIds: input.profiles.map(profile => profile.personId) }], profiles: input.profiles,
+        : [{ messageIds, personIds: input.profiles.map(profile => profile.personId) }];
+    return { version: input.extractionProtocol === 2 ? 3 : 2,
+      ...(separateMaterialSteps ? { separateMaterialSteps: true as const } : {}),
+      remaining, profiles: input.profiles,
       extract: { topics: [], fragments: [], profiles: [], ignoredMessageIds: [], ...(input.extractionProtocol === 2 ? { processedRanges: [] } : {}) },
       ...(input.previousSummary ? { summary: input.previousSummary } : {}) };
   }

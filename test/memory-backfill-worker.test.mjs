@@ -11,14 +11,14 @@ import { emptyExtraction } from './fixtures/memory-output.mjs';
 function fixture(t, roomType = 'group') {
   const directory = mkdtempSync(join(tmpdir(), 'pa-backfill-worker-'));
   const path = join(directory, 'store.sqlite');
-  const store = new ConversationStore(path);
+  let store = new ConversationStore(path);
   const room = store.ensureConversation('room', '/room.jsonl', {
     channel: 'qq', accountId: 'test', roomType, roomId: 'room',
   });
   let event = 0;
   t.after(async () => { store.close(); rmSync(directory, { recursive: true, force: true }); });
   return {
-    directory, path, store, room,
+    directory, path, get store() { return store; }, room,
     inbound(text, senderId = 'alice') {
       const external = { eventId: String(++event), senderId, senderName: senderId, modelInputText: text };
       store.recordInbound(room.id, text, external);
@@ -26,10 +26,11 @@ function fixture(t, roomType = 'group') {
     },
     reserve(reason = 'test backfill') { return store.autoMemory.reserveMaterialBackfill(room.id, { reason }); },
     run(runId) { return store.autoMemory.materialBackfillRun(runId); },
-    worker(runId, extract) {
+    worker(runId, extract, separateMaterialSteps = false) {
       return new BackgroundMemory({ contextWindow: 8192, memory: { enabled: true, maxCalls: 20, timeoutMs: 1000 } },
-        store.autoMemory, room.id, { extract }, { pipeline: 'materials', jobIds: this.run(runId).jobIds });
+        store.autoMemory, room.id, { extract }, { pipeline: 'materials', jobIds: this.run(runId).jobIds, separateMaterialSteps });
     },
+    restart() { store.close(); store = new ConversationStore(path); return store; },
   };
 }
 
@@ -146,4 +147,95 @@ test('scoped pending-only worker processes person and self pending while retaini
     assert.equal(original.text, '我喜欢乌龙茶，也建议回答简洁');
     assert.equal(db.prepare('SELECT count(*) AS count FROM messages').get().count, 1);
   } finally { db.close(); }
+});
+
+test('separate material steps persist before calling, remove AI messages from profile input, and resume saved progress without repeating Topics', async t => {
+  const f = fixture(t, 'private');
+  const sourceOne = f.inbound('我偏好乌龙茶');
+  const sourceTwo = f.inbound('我平时喜欢简洁回答');
+  const actorId = f.store.findActor(f.room.id, 'alice');
+  const personId = f.store.autoMemory.ensureActorPerson(actorId);
+  f.store.autoMemory.addProfilePending(personId, sourceOne.existingMessageId, '偏好乌龙茶', 'third_party');
+  f.store.autoMemory.addProfilePending(personId, sourceTwo.existingMessageId, '喜欢简洁回答', 'third_party');
+
+  f.store.autoMemory.reserveMaterialsIfDue(f.room.id, 0);
+  const initialJob = f.store.autoMemory.reserveMaterialsIfDue(f.room.id, 600_000);
+  const initialClaim = f.store.autoMemory.claimNext(f.room.id, { owner: 'seed', leaseMs: 60_000, pipeline: 'materials' });
+  assert.equal(initialClaim.id, initialJob.id);
+  const initialInput = f.store.autoMemory.taskInput(initialClaim);
+  const initialProfile = initialInput.profiles[0];
+  const initialOutput = emptyExtraction(initialInput);
+  initialOutput.profiles = [{ personId, baseVersion: initialProfile.baseVersion,
+    facts: initialProfile.pending.map(pending => ({ content: pending.content, sourceType: 'third_party',
+      messageIds: [pending.sourceMessageId] })),
+    pendingResults: initialProfile.pending.map((pending, index) => ({ pendingId: pending.id, status: 'merged', factIndex: index })) }];
+  f.store.autoMemory.commit(initialClaim.id, initialClaim.leaseToken, initialOutput);
+  const existingFacts = f.store.autoMemory.profile(personId).facts;
+
+  const priorRun = f.store.beginRun(f.room.id, sourceOne.modelInputText, 'fixture', 'fixture-model', [], sourceOne);
+  const delivered = f.store.completeRun(priorRun.id, 'assistant 提到一些不应作为画像证据的内容。', undefined, undefined);
+  f.store.ackDelivery(delivered.deliveryId, 'sent');
+  const newSource = f.inbound('补充新的长期偏好');
+  const runId = f.reserve();
+  const run = f.run(runId);
+  assert.equal(run.jobs.length, 1);
+
+  const calls = [];
+  const firstWorker = f.worker(runId, async input => {
+    calls.push(input.mode ?? 'all');
+    if (calls.length === 1) {
+      const persisted = f.store.autoMemory.loadProgress(input.job.id, input.job.leaseToken);
+      assert.equal(persisted.version, 3);
+      assert.equal(persisted.separateMaterialSteps, true);
+      assert.deepEqual(persisted.remaining.map(item => item.mode), ['messages', 'profiles']);
+      assert.equal(input.mode, 'messages');
+      assert.equal(input.messages.some(message => message.role === 'assistant'), true);
+      const output = emptyExtraction(input);
+      output.topics = [{ summary: '用户讨论的有效话题', messageIds: [] }];
+      return output;
+    }
+    assert.equal(input.mode, 'profiles');
+    assert.equal(input.messages.some(message => message.role === 'assistant'), false);
+    assert.deepEqual(input.messages.map(message => message.id), [newSource.existingMessageId]);
+    assert.equal(input.profileSources.some(message => message.role === 'assistant'), false);
+    assert.deepEqual(input.profiles[0].facts, existingFacts);
+    assert.deepEqual(input.profiles[0].facts.flatMap(fact => fact.messageIds).sort(),
+      [sourceOne.existingMessageId, sourceTwo.existingMessageId].sort());
+    assert.deepEqual(input.profileSources.map(message => message.id).sort(),
+      [sourceOne.existingMessageId, sourceTwo.existingMessageId].sort());
+    throw new Error('profile step failed once');
+  }, true);
+  t.after(() => firstWorker.close());
+  firstWorker.start();
+  await assert.rejects(firstWorker.wait(undefined, 3000), /失败/);
+  assert.deepEqual(calls, ['messages', 'profiles']);
+  const failedJob = f.run(runId).jobs[0];
+  const db = new DatabaseSync(f.path);
+  let saved;
+  try { saved = JSON.parse(db.prepare('SELECT progress_json FROM auto_memory_jobs WHERE id=?').get(failedJob.id).progress_json); }
+  finally { db.close(); }
+  assert.deepEqual(saved.remaining.map(item => item.mode), ['profiles']);
+  assert.equal(saved.extract.topics.length, 1);
+  assert.equal(saved.extract.processedRanges.length, 1);
+
+  await firstWorker.close();
+  f.restart();
+  f.store.autoMemory.retry(failedJob.id);
+  const resumedCalls = [];
+  const resumedWorker = f.worker(runId, async input => {
+    resumedCalls.push(input.mode ?? 'all');
+    assert.equal(input.mode, 'profiles');
+    assert.equal(input.messages.some(message => message.role === 'assistant'), false);
+    assert.equal(input.profileSources.some(message => message.role === 'assistant'), false);
+    const profile = input.profiles[0];
+    return { ...emptyExtraction(input), profiles: [{ personId: profile.personId, baseVersion: profile.baseVersion,
+      facts: profile.facts, pendingResults: profile.pending.map(pending => ({ pendingId: pending.id, status: 'deferred' })) }] };
+  });
+  t.after(() => resumedWorker.close());
+  resumedWorker.start();
+  await resumedWorker.wait(undefined, 3000);
+  assert.deepEqual(resumedCalls, ['profiles']);
+  assert.equal(f.run(runId).status.completed, 1);
+  assert.equal(f.store.autoMemory.searchTopics(f.room.id, { text: '有效话题' }).topics.length, 1);
+  assert.deepEqual(f.store.autoMemory.profile(personId).facts, existingFacts);
 });
