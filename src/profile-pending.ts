@@ -1,4 +1,4 @@
-import type { AutoMemoryTaskInput, PersonProfile, ProfileFact, ProfilePendingResult } from './auto-memory-types.js';
+import type { AutoMemoryMessage, AutoMemoryTaskInput, PersonProfile, ProfileFact, ProfilePendingResult } from './auto-memory-types.js';
 
 export class PersonProfileProtocolError extends Error {
   constructor() {
@@ -8,6 +8,17 @@ export class PersonProfileProtocolError extends Error {
 }
 export function assertProfileProtocol(input: AutoMemoryTaskInput): void {
   if (input.profileProtocol !== 2) throw new PersonProfileProtocolError();
+  if (input.profileBaselineProtocol !== undefined && (input.profileBaselineProtocol !== 1
+    || input.pipeline !== 'materials' || input.extractionProtocol !== 2)) throw new PersonProfileProtocolError();
+}
+
+/** Model visibility differs from frozen evidence retained for identity checks and audit. */
+export function profileSourcesForModel(input: AutoMemoryTaskInput): AutoMemoryMessage[] {
+  if (input.profileBaselineProtocol === undefined) return input.profileSources ?? [];
+  assertProfileProtocol(input);
+  const pendingSources = new Set(input.profiles.flatMap(profile => (profile.pending ?? []).map(item => item.sourceMessageId)));
+  const messages = new Set(input.messages.map(message => message.id));
+  return (input.profileSources ?? []).filter(message => pendingSources.has(message.id) && !messages.has(message.id));
 }
 
 /** A rewrite cannot promote older third-party/inferred evidence into a self claim. */
@@ -35,6 +46,7 @@ export function validateProfilePendingResults(profile: PersonProfile, baseline: 
   const captured = new Map(pending.map(item => [item.id, item]));
   const seen = new Set<string>();
   const sources = new Map([...input.messages, ...(input.profileSources ?? [])].map(message => [message.id, message]));
+  const visibleSources = new Set([...input.messages, ...profileSourcesForModel(input)].map(message => message.id));
   const normalized: ProfilePendingResult[] = [];
   for (const result of results) {
     if (!result || typeof result !== 'object' || Array.isArray(result)
@@ -58,6 +70,7 @@ export function validateProfilePendingResults(profile: PersonProfile, baseline: 
         if (nextPending && profile.facts[next.factIndex]) retainedSources.add(nextPending.sourceMessageId);
       }
       if (!exactKeys('pendingId','status','replacementMessageId') || !replacement || replacement.role !== 'user'
+        || (input.profileBaselineProtocol === 1 && !visibleSources.has(replacement.id))
         || source.personId !== baseline.personId || replacement.personId !== baseline.personId
         || !Number.isSafeInteger(source.ingestSeq) || !Number.isSafeInteger(replacement.ingestSeq)
         || replacement.ingestSeq <= source.ingestSeq || !retainedSources.has(replacement.id)

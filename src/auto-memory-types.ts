@@ -65,6 +65,8 @@ export interface AutoMemoryTaskInput {
   extractionProtocol?: 2;
   contextProtocol?: 1;
   profileProtocol?: 2;
+  /** New material tasks use archived profiles as the model's baseline; old evidence stays audit-only. */
+  profileBaselineProtocol?: 1;
   mode?: 'messages' | 'profiles' | 'self';
   job: AutoMemoryJob; roomType: 'private' | 'group'; messages: AutoMemoryMessage[];
   previousSummary?: string; profiles: PersonProfile[]; selfProfile?: SelfProfileSnapshot;

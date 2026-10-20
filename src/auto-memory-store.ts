@@ -46,6 +46,7 @@ export function assertCurrentMemoryProtocol(value: unknown): void {
   if (Array.isArray(value)) { value.forEach(assertCurrentMemoryProtocol); return; }
   const object = value as Record<string, unknown>;
   if (object.extractionProtocol !== undefined && object.extractionProtocol !== 2) throw new Error('未知整理协议；固定输入与进度保持不变。');
+  if (object.profileBaselineProtocol !== undefined && object.profileBaselineProtocol !== 1) throw new Error('未知画像基线协议；固定输入与进度保持不变。');
   if (object.purpose === 'memory' || object.memoryPending !== undefined || object.memoryArchives !== undefined) {
     throw new ObsoletePersonalMemoryError();
   }
@@ -814,7 +815,7 @@ export class AutoMemoryStore {
     const selfProfile=this.selfProfile.snapshot();
     if(canonical.pipeline==='materials') selfProfile.pending=materialPending.filter(item=>item.kind==='self').map(item=>({
       id:item.payload.id,content:item.payload.content,sourceMessageId:item.payload.sourceMessageId}));
-    const input:AutoMemoryTaskInput={...(canonical.pipeline==='materials'?{pipeline:'materials' as const,extractionProtocol:2 as const}
+    const input:AutoMemoryTaskInput={...(canonical.pipeline==='materials'?{pipeline:'materials' as const,extractionProtocol:2 as const,profileBaselineProtocol:1 as const}
       :contextJob?{contextProtocol:1 as const,extractionProtocol:2 as const}:{}),profileProtocol:2,profileSources,profileFragments,
       ...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),
       job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile,

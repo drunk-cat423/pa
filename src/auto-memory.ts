@@ -195,6 +195,7 @@ interface WorkItem {
 }
 interface Progress {
   version: 2 | 3;
+  profileBaselineProtocol?: 1;
   separateMaterialSteps?: true;
   remaining: WorkItem[];
   extract: ValidatedExtract;
@@ -571,6 +572,7 @@ export class BackgroundMemory {
     if (existing !== undefined && existing !== null) {
       assertCurrentMemoryProtocol(existing);
       if (!record(existing) || existing.version !== (input.extractionProtocol === 2 ? 3 : 2)) throw new PersonProfileProtocolError();
+      if (existing.profileBaselineProtocol !== input.profileBaselineProtocol) throw new PersonProfileProtocolError();
       if (!Array.isArray(existing.remaining) || !record(existing.extract)
         || !Array.isArray(existing.profiles)) throw new Error('后台整理检查点损坏。');
       if (existing.separateMaterialSteps !== undefined && (existing.separateMaterialSteps !== true
@@ -602,6 +604,7 @@ export class BackgroundMemory {
           ...(input.selfProfile?.pending.length ? [{ messageIds: [] as string[], personIds: [] as string[], mode: 'self' as const }] : [])]
         : [{ messageIds, personIds: input.profiles.map(profile => profile.personId) }];
     return { version: input.extractionProtocol === 2 ? 3 : 2,
+      ...(input.profileBaselineProtocol === 1 ? { profileBaselineProtocol: 1 as const } : {}),
       ...(separateMaterialSteps ? { separateMaterialSteps: true as const } : {}),
       remaining, profiles: input.profiles,
       extract: { topics: [], fragments: [], profiles: [], ignoredMessageIds: [], ...(input.extractionProtocol === 2 ? { processedRanges: [] } : {}) },
