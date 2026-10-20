@@ -22,7 +22,8 @@ import { searchDeepSeek, WebSearchError, WebSearchPersistenceError, type SearchD
 import { WebFetchReader } from './web-fetch-reader.js';
 import { outputLengthGuidance } from './output-length.js';
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
-import { ContextTokenEstimator, contextCalibrationKey, type ContextCalibration } from './context-tokens.js';
+import { ContextTokenEstimator, contextCalibrationKey, normalizedInputTokens, upgradeContextCalibration,
+  validContextCalibration, type ContextCalibration } from './context-tokens.js';
 import { imageMetadata, imageTokenPayload, imageRequestFits, projectImagePayload, IMAGE_TOKENS, MAX_REQUEST_IMAGES, type ImageProjection, type MessageImage } from './image-context.js';
 import { PREPARE_TURN_PROMPT, PREPARE_TURN_DESCRIPTION, RESPONSE_STAGE_PROMPT, CLI_STAGE_PROMPT, RESPONSE_MODE_PROMPTS, TURN_PLAN_SCHEMA,
   validateTurnPlan, hasUnbackedSaveClaim, type TurnPlan, type TurnReceipt, type ReplyMode } from './turn-plan.js';
@@ -377,10 +378,31 @@ export async function openConversation(config: PaConfig, conversationId: string,
     agentSession = session;
     const tokenEstimator = new ContextTokenEstimator(contextCalibrationKey(model.provider, model.id, model.api,
       model.baseUrl, options.contextCalibrationScope ?? conversationId));
-    // Only bounded, endpoint/scope-bound metadata is restored; never scan payload artifacts.
+    // Prefer bounded metadata. Before the first v2 sample, upgrade a bounded set
+    // of legacy fingerprints only from hash-verified, exactly matching requests.
     const recentCalls = recordDiagnostic(() => diagnostics.calibrationCalls(tokenEstimator.key, 100));
-    for (const call of recentCalls.filter(call => call.provider === model.provider && call.model === model.id).reverse()) {
-      tokenEstimator.learn(call.contextCalibration, call.usage);
+    const calibrationCalls = recentCalls.filter(call => call.provider === model.provider && call.model === model.id
+      && validContextCalibration(call.contextCalibration) && call.contextCalibration.key === tokenEstimator.key
+      && normalizedInputTokens(call.usage) !== undefined).slice(0, 8);
+    const hasStableSample = calibrationCalls.some(call => call.contextCalibration?.version === 2);
+    let legacyBytes = 16 * 1024 * 1024;
+    const restored = calibrationCalls.map(call => {
+      let metadata = call.contextCalibration!;
+      if (!hasStableSample && metadata.version === 1 && Number.isSafeInteger(call.requestRef.bytes)
+        && call.requestRef.bytes > 0 && call.requestRef.bytes <= legacyBytes) {
+        legacyBytes -= call.requestRef.bytes;
+        try {
+          metadata = upgradeContextCalibration(metadata, diagnostics.artifact(call.callId, 'request')) ?? metadata;
+        } catch (error) {
+          // Optional migration cannot trust missing/corrupt artifacts. Keep the
+          // original fingerprint; its normal matching rules still apply.
+          if (!(error instanceof DiagnosticPersistenceError)) throw error;
+        }
+      }
+      return { metadata, usage: call.usage };
+    });
+    for (const sample of restored.reverse()) {
+      tokenEstimator.learn(sample.metadata, sample.usage);
     }
     function estimatePayload(payload: unknown, transportReserve = 0): ContextEstimate {
       const fallback = estimateContext(payload, model.contextWindow, model.maxTokens);

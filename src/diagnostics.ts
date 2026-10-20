@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, parse, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { validContextCalibration, type ContextCalibration } from './context-tokens.js';
+import { normalizedInputTokens, validContextCalibration, type ContextCalibration } from './context-tokens.js';
 
 export interface DiagnosticContext {
   traceId: string;
@@ -418,13 +418,29 @@ export class DiagnosticLog {
     return this.guard(() => {
       if (typeof key !== 'string' || !/^[0-9a-f]{64}$/.test(key)) fail('诊断上下文校准 key 必须是有效的 SHA256。');
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000) fail('诊断查询 limit 必须在 1 到 10000 之间。');
-      return this.withDatabase(false, database => database.prepare(`SELECT record_json FROM calls
+      return this.withDatabase(false, database => {
+        const samples: DiagnosticCallRecord[] = [];
+        let bytes = 0;
+        const rows = database.prepare(`SELECT record_json FROM calls
         WHERE json_extract(record_json, '$.contextCalibration.key') = ?
           AND json_extract(record_json, '$.status') = 'completed'
           AND json_extract(record_json, '$.kind') = 'chat'
           AND json_extract(record_json, '$.usageSource') = 'sdk-normalized'
-        ORDER BY rowid DESC LIMIT ?`).all(key, limit)
-        .map(row => JSON.parse(String(row.record_json)) as DiagnosticCallRecord), () => []);
+        ORDER BY rowid DESC LIMIT ?`).iterate(key, limit);
+        // v2 records contain finer fingerprints. Do not materialize 100 large
+        // records when the estimator retains only eight successful samples.
+        for (const row of rows) {
+          const json = String(row.record_json);
+          const size = Buffer.byteLength(json, 'utf8');
+          if (bytes + size > 16 * 1024 * 1024) continue;
+          const record = JSON.parse(json) as DiagnosticCallRecord;
+          if (!validContextCalibration(record.contextCalibration) || record.contextCalibration.key !== key
+            || normalizedInputTokens(record.usage) === undefined) continue;
+          samples.push(record); bytes += size;
+          if (samples.length >= Math.min(8, limit)) break;
+        }
+        return samples;
+      }, () => []);
     });
   }
 

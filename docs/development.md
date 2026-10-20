@@ -8,7 +8,7 @@
 |---|---|
 | src/config.ts | 聊天与后台调用预算，不读取其他应用凭据 |
 | src/runtime.ts | 受限 Pi 会话、独立 ModelRuntime 工厂、最终输入容量估算、公开 API 重建投影 |
-| src/context-tokens.ts | 成功SDK输入用量校准、分块哈希匹配、缓存统计校验及新增内容保守估算 |
+| src/context-tokens.ts | 成功SDK输入用量校准、字段与正文细分指纹、旧样本核验升级、缓存统计校验及新增内容保守估算 |
 | src/store.ts | schema v18、原文/run/投递、长回答文档与页面引用、显式记忆、迁移备份、去重和上下文水位 |
 | src/auto-memory-store.ts | 通用person绑定、可见消息序列、滚动摘要及容量快照、任务租约、子批次检查点、Topic/画像/关键词检索 |
 | src/self-profile-store.ts | 全局AI画像修订、带来源待整理建议、原子归档和并发版本检查 |
