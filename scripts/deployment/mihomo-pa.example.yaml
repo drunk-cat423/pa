@@ -25,16 +25,24 @@ proxy-providers:
     interval: 86400
     proxy: DIRECT
     size-limit: 2097152
+    # provider 的健康检查只测试有效节点，排除流量/到期信息等占位项。
+    filter: "(?i)(United States|Singapore|Japan|Korea|Netherlands|United Kingdom|Hong Kong|Taiwan|Malaysia)"
     health-check:
       enable: true
       url: https://www.gstatic.com/generate_204
-      interval: 600
+      interval: 60
       timeout: 5000
-      lazy: true
+      lazy: false
       expected-status: 204
 proxy-groups:
   - name: PA-Proxy
-    type: select
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 60
+    timeout: 5000
+    lazy: false
+    expected-status: 204
+    tolerance: 100
     use:
       - subscription
     # 排除订阅中的剩余流量、到期时间等非节点条目。

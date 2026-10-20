@@ -57,6 +57,10 @@ systemctl disable --now mysql.service
 
 Mihomo 作为独立的 `mihomo-pa.service` 运行，只监听 `127.0.0.1:17890`，不启用 TUN、系统代理或公网代理入口。安装二进制位于 `/opt/mihomo-pa/mihomo`，私有配置位于 `/etc/mihomo-pa/config.yaml`，订阅缓存及节点选择位于 `/var/lib/mihomo-pa`。服务和不含凭证的配置模板见 `scripts/deployment/mihomo-pa.service`、`scripts/deployment/mihomo-pa.example.yaml`。安装时校验官方发布文件的 SHA-256；私有配置使用 root:mihomo-pa、640，缓存目录只允许服务账号访问。订阅每天直接刷新，已有缓存供重启时使用；真实订阅地址和节点凭证不得进入代码仓库或日志输出。
 
+`PA-Proxy` 使用 `url-test` 自动选线：每60秒进行一次HTTPS健康检查，单次5秒超时、要求HTTP 204；当前节点可用时，延迟改善超过100ms才切换，当前节点不可用时重新选择可用线路。节点由 `use: [subscription]` 引入，因此实际定时探测必须同时配置在 `proxy-providers.subscription.health-check`，不能只修改组的 `interval`。provider与组都筛掉流量/到期信息等占位项，`lazy: false` 保持空闲时也持续探测。内核的选线结果最多缓存10秒，探测失败后切换可能有短暂延迟。探测结果只代表测试地址当时的连通性和延迟；换线作用于后续连接，现有抓取不会自动续传或重试。字段语义见 [Mihomo自动选择](https://wiki.metacubex.one/config/proxy-groups/url-test/)、[代理组健康检查](https://wiki.metacubex.one/config/proxy-groups/#url)和[v1.19.32选线实现](https://github.com/MetaCubeX/mihomo/blob/v1.19.32/adapter/outboundgroup/urltest.go)。
+
+从手选组升级时，还需通过 Unix 控制接口调用 `DELETE /proxies/PA-Proxy`，清除并持久化该组之前保存的固定选择。验收要确认组的 `type=URLTest` 且 `fixed` 为空，热重载后仍为空，并实测故障探测后的自动换线；仅修改类型或看到定时测速记录不能证明已经解除手动固定。此操作只清除该组的选线偏好，不删除订阅、缓存文件或其他组。
+
 在 `/etc/pa/pa.env` 设置 `PA_FETCH_PROXY_URL=http://127.0.0.1:17890`；需要通过公共 DNS 解析网页目标时，同时设置 `PA_FETCH_PUBLIC_DNS=true`。这两个配置仅作用于 `web_fetch` 及其 DNS 查询，不配置 `HTTP_PROXY`、`HTTPS_PROXY` 或全局网络 agent。QQ Gateway、QQ API、DeepSeek 模型/整理/搜索 API 及图片上传继续使用原连接。DeepSeek 服务端原生搜索的出站网络由 DeepSeek 控制，不经过 PA 的代理。
 
 网页读取先解析并检查目标地址，再用 HTTP CONNECT 连接已验证的公网 IP；TLS 的服务器名、证书校验和 HTTP Host 保留原网页域名。代理不重新解析网页域名；内网地址、重定向和现有响应大小限制仍按原规则拒绝。代理连接失败时返回工具错误，不自动重试或改成直连。当前只支持无认证、无路径/查询/片段的 HTTP 代理 URL。
