@@ -53,6 +53,18 @@ systemctl disable --now mysql.service
 
 更新使用新的发布目录，完成构建和检查后停服务、备份数据，再切换 current 并启动。配置和数据不随发布包替换。若只有代码回退可兼容现有 schema，切回旧代码即可；schema 回退需要同一停机快照中的 SQLite 与 Pi JSONL 一起恢复，不能分别拼接。不要重新启动本机实例与服务器实例同时试用。
 
+## PA 网页读取代理
+
+Mihomo 作为独立的 `mihomo-pa.service` 运行，只监听 `127.0.0.1:17890`，不启用 TUN、系统代理或公网代理入口。安装二进制位于 `/opt/mihomo-pa/mihomo`，私有配置位于 `/etc/mihomo-pa/config.yaml`，订阅缓存及节点选择位于 `/var/lib/mihomo-pa`。服务和不含凭证的配置模板见 `scripts/deployment/mihomo-pa.service`、`scripts/deployment/mihomo-pa.example.yaml`。安装时校验官方发布文件的 SHA-256；私有配置使用 root:mihomo-pa、640，缓存目录只允许服务账号访问。订阅每天直接刷新，已有缓存供重启时使用；真实订阅地址和节点凭证不得进入代码仓库或日志输出。
+
+在 `/etc/pa/pa.env` 设置 `PA_FETCH_PROXY_URL=http://127.0.0.1:17890`；需要通过公共 DNS 解析网页目标时，同时设置 `PA_FETCH_PUBLIC_DNS=true`。这两个配置仅作用于 `web_fetch` 及其 DNS 查询，不配置 `HTTP_PROXY`、`HTTPS_PROXY` 或全局网络 agent。QQ Gateway、QQ API、DeepSeek 模型/整理/搜索 API 及图片上传继续使用原连接。DeepSeek 服务端原生搜索的出站网络由 DeepSeek 控制，不经过 PA 的代理。
+
+网页读取先解析并检查目标地址，再用 HTTP CONNECT 连接已验证的公网 IP；TLS 的服务器名、证书校验和 HTTP Host 保留原网页域名。代理不重新解析网页域名；内网地址、重定向和现有响应大小限制仍按原规则拒绝。代理连接失败时返回工具错误，不自动重试或改成直连。当前只支持无认证、无路径/查询/片段的 HTTP 代理 URL。
+
+验证时分别检查：Mihomo 仅监听回环；以 pa 用户调用实际 `fetchWebPage` 读取外网正文及公共 DNS；非公网地址仍被拒绝；PA 进程没有全局代理变量，QQ 重新就绪且 DeepSeek API 仍可直连。控制接口仅提供本机 Unix socket `/run/mihomo-pa/controller.sock`，可由服务器操作者检查节点及连接，不开放 HTTP 管理端口。此次接入无需修改 Nginx、Waline 或安全组。
+
+回退时先将 PA 切回此前发布并恢复对应配置，确认 QQ 就绪后，再停用 `mihomo-pa.service`；不修改数据库、摘要或任务水位。
+
 ### 旧计数队列退出
 
 升级到含schema v16的发布后，若仍有旧count任务阻塞，先停PA服务、备份整个 `/var/lib/pa` 及配置；在服务保持停止时，以pa用户运行维护命令：

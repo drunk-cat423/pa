@@ -1,0 +1,48 @@
+# 复制到服务器私有 /etc/mihomo-pa/config.yaml，再填写订阅；不要提交真实订阅。
+mixed-port: 17890
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: warning
+ipv6: false
+find-process-mode: "off"
+unified-delay: true
+tcp-concurrent: true
+keep-alive-interval: 30
+external-controller: ""
+external-controller-unix: /run/mihomo-pa/controller.sock
+profile:
+  store-selected: true
+tun:
+  enable: false
+dns:
+  enable: false
+proxy-providers:
+  subscription:
+    type: http
+    url: https://subscription.example.invalid/replace-locally
+    path: ./providers/subscription.yaml
+    interval: 86400
+    proxy: DIRECT
+    size-limit: 2097152
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 600
+      timeout: 5000
+      lazy: true
+      expected-status: 204
+proxy-groups:
+  - name: PA-Proxy
+    type: select
+    use:
+      - subscription
+    # 排除订阅中的剩余流量、到期时间等非节点条目。
+    filter: "(?i)(United States|Singapore|Japan|Korea|Netherlands|United Kingdom|Hong Kong|Taiwan|Malaysia)"
+rules:
+  - DOMAIN-SUFFIX,deepseek.com,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,gtimg.com,DIRECT
+  - DOMAIN-SUFFIX,qpic.cn,DIRECT
+  - DOMAIN-SUFFIX,qlogo.cn,DIRECT
+  - MATCH,PA-Proxy

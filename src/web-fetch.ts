@@ -2,6 +2,7 @@ import { lookup } from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
 import { isIP } from 'node:net';
+import { parseWebFetchProxyUrl, requestThroughWebFetchProxy } from './web-fetch-proxy.js';
 
 export interface WebFetchConfig {
   enabled: boolean;
@@ -9,6 +10,7 @@ export interface WebFetchConfig {
   maxResponseBytes: number;
   maxTextChars: number;
   publicDns?: boolean;
+  proxyUrl?: string;
 }
 
 export interface WebFetchResponse {
@@ -107,15 +109,23 @@ function cancellable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
-async function publicDnsLookup(hostname: string, signal: AbortSignal): Promise<{ address: string; family: number }[]> {
+async function publicDnsLookup(hostname: string, signal: AbortSignal, proxy?: URL): Promise<{ address: string; family: number }[]> {
   const addresses: { address: string; family: number }[] = [];
   // Explicit deployment option, never a fallback after a system DNS rejection.
   for (const type of ['A', 'AAAA']) {
     if (signal.aborted) throw signal.reason;
     let request: http.ClientRequest | undefined;
     let response: http.IncomingMessage | undefined;
+    let proxyResponse: Awaited<ReturnType<typeof requestThroughWebFetchProxy>> | undefined;
     try {
-      response = await cancellable(new Promise<http.IncomingMessage>((resolve, reject) => {
+      if (proxy) {
+        proxyResponse = await requestThroughWebFetchProxy({
+          url: new URL(`https://cloudflare-dns.com/dns-query?${new URLSearchParams({ name: hostname, type })}`),
+          address: '1.1.1.1', signal,
+          headers: { Host: 'cloudflare-dns.com', Accept: 'application/dns-json', 'Accept-Encoding': 'identity' },
+        }, proxy);
+        response = proxyResponse.body;
+      } else response = await cancellable(new Promise<http.IncomingMessage>((resolve, reject) => {
         request = https.request({
           hostname: '1.1.1.1', port: 443, servername: 'cloudflare-dns.com',
           path: `/dns-query?${new URLSearchParams({ name: hostname, type })}`,
@@ -157,6 +167,7 @@ async function publicDnsLookup(hostname: string, signal: AbortSignal): Promise<{
         addresses.push({ address: item.data, family });
       }
     } finally {
+      proxyResponse?.destroy();
       response?.destroy();
       request?.destroy();
     }
@@ -350,6 +361,10 @@ function textContent(bytes: Uint8Array, contentType: string): { text: string; da
 export async function fetchWebPage(url: string, config: WebFetchConfig, signal?: AbortSignal, deps: WebFetchDeps = {}): Promise<{ url: string; statusCode: number; text: string; truncated: boolean; fetchedAt: string; dateEvidence: WebFetchDateEvidence[] }> {
   if (!config || config.enabled !== true) fail('disabled');
   if (config.publicDns !== undefined && typeof config.publicDns !== 'boolean') fail('config');
+  let proxy: URL | undefined;
+  if (config.proxyUrl !== undefined && config.proxyUrl !== '') {
+    try { proxy = parseWebFetchProxyUrl(config.proxyUrl); } catch { fail('config'); }
+  }
   for (const [value, limit] of [[config.timeoutMs, 120_000], [config.maxResponseBytes, 10 * 1024 * 1024], [config.maxTextChars, 100_000]] as const) {
     if (!Number.isSafeInteger(value) || value < 1 || value > limit) fail('config');
   }
@@ -365,12 +380,18 @@ export async function fetchWebPage(url: string, config: WebFetchConfig, signal?:
     if (controller.signal.aborted) throw controller.signal.reason;
     const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
     const literalFamily = isIP(hostname);
-    const resolver = deps.lookup ?? (config.publicDns === true ? publicDnsLookup : (host: string) => lookup(host, { all: true, verbatim: true }));
+    const resolver = deps.lookup ?? (config.publicDns === true
+      ? (host: string, signal: AbortSignal) => publicDnsLookup(host, signal, proxy)
+      : (host: string) => lookup(host, { all: true, verbatim: true }));
     const addresses = literalFamily ? [{ address: hostname, family: literalFamily }]
       : await cancellable(resolver(hostname, controller.signal), controller.signal);
     if (!addresses.length || addresses.some(item => !publicAddress(item.address) || isIP(item.address) !== item.family)) fail('address');
     const address = addresses[0]!;
-    response = await cancellable((deps.transport ?? nativeTransport)({ url: parsed, address: address.address, family: address.family, signal: controller.signal }), controller.signal);
+    const transport = deps.transport ?? (proxy
+      ? (request: Parameters<typeof nativeTransport>[0]) => requestThroughWebFetchProxy({ ...request,
+        headers: { Accept: 'text/html, text/plain, application/xhtml+xml', 'Accept-Encoding': 'identity' } }, proxy)
+      : nativeTransport);
+    response = await cancellable<WebFetchResponse>(transport({ url: parsed, address: address.address, family: address.family, signal: controller.signal }), controller.signal);
     if (response.statusCode >= 300 && response.statusCode < 400) fail('redirect');
     if (response.statusCode < 200 || response.statusCode >= 300) fail('status');
     const type = response.headers['content-type'];

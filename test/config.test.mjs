@@ -66,6 +66,22 @@ test('配置不预选供应商，错误不泄露密钥', () => {
   assert.throws(() => readConfig({ PA_API_KEY: valid.PA_API_KEY }), error => !error.message.includes(valid.PA_API_KEY));
 });
 
+test('网页代理仅写入fetch配置，默认空且拒绝认证和非HTTP代理地址', () => {
+  assert.equal(readConfig(valid).fetch.proxyUrl, undefined);
+  assert.equal(readConfig({ ...valid, PA_FETCH_PROXY_URL: '  ' }).fetch.proxyUrl, undefined);
+  const configured = readConfig({ ...valid, PA_FETCH_PROXY_URL: ' http://127.0.0.1:17890 ' });
+  assert.equal(configured.fetch.proxyUrl, 'http://127.0.0.1:17890');
+  assert.equal(configured.baseUrl, undefined);
+  assert.equal(configured.search.proxyUrl, undefined);
+  for (const value of ['bad', 'https://127.0.0.1:17890', 'socks5://127.0.0.1:17890',
+    'http://user:proxy-secret@127.0.0.1', 'http://127.0.0.1/path', 'http://127.0.0.1?secret',
+    'http://127.0.0.1#secret', 'http://127.0.0.1/?', 'http://127.0.0.1/#', 'http://127.0.0.1:0',
+    'http:127.0.0.1', 'http://127.0.0.1/pa\npath', 'http://127.0.0.1/path/..', 'http://@127.0.0.1']) {
+    assert.throws(() => readConfig({ ...valid, PA_FETCH_PROXY_URL: value }), error =>
+      /PA_FETCH_PROXY_URL/.test(error.message) && !error.message.includes('proxy-secret'));
+  }
+});
+
 test('默认目录跟随项目且可配置，兼容服务地址显式保留', () => {
   const config = readConfig(valid, process.cwd());
   assert.equal(config.dataDir, resolve('.local/pa'));

@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import type { WebSearchConfig } from './web-search.js';
 import type { WebFetchConfig } from './web-fetch.js';
+import { parseWebFetchProxyUrl } from './web-fetch-proxy.js';
 
 export interface PaConfig {
   cwd: string;
@@ -113,8 +114,14 @@ export function readWebFetchConfig(env: NodeJS.ProcessEnv): WebFetchConfig {
   if (!['true', 'false'].includes(flag)) throw new Error('PA_FETCH_ENABLED 必须为 true 或 false。');
   const publicDns = env.PA_FETCH_PUBLIC_DNS?.trim() || 'false';
   if (!['true', 'false'].includes(publicDns)) throw new Error('PA_FETCH_PUBLIC_DNS 必须为 true 或 false。');
+  const proxyUrl = env.PA_FETCH_PROXY_URL?.trim();
+  if (proxyUrl) {
+    try { parseWebFetchProxyUrl(proxyUrl); }
+    catch { throw new Error('PA_FETCH_PROXY_URL 必须是无认证、路径、查询参数或片段的 HTTP 地址。'); }
+  }
   const config: WebFetchConfig = { enabled: flag === 'true',
     publicDns: publicDns === 'true',
+    ...(proxyUrl ? { proxyUrl } : {}),
     timeoutMs: positiveInteger(env, 'PA_FETCH_TIMEOUT_MS', 15000),
     maxResponseBytes: positiveInteger(env, 'PA_FETCH_MAX_BYTES', 1048576),
     maxTextChars: positiveInteger(env, 'PA_FETCH_MAX_CHARS', 8000) };

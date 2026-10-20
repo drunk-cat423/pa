@@ -1,0 +1,35 @@
+[Unit]
+Description=PA outbound web proxy (Mihomo)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=mihomo-pa
+Group=mihomo-pa
+WorkingDirectory=/var/lib/mihomo-pa
+ExecStart=/opt/mihomo-pa/mihomo -d /var/lib/mihomo-pa -f /etc/mihomo-pa/config.yaml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+UMask=0077
+StateDirectory=mihomo-pa
+StateDirectoryMode=0700
+RuntimeDirectory=mihomo-pa
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryHigh=96M
+MemoryMax=160M
+
+[Install]
+WantedBy=multi-user.target
