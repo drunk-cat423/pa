@@ -8,7 +8,7 @@ import test from 'node:test';
 import { openRecordedConversation, PersistenceError } from '../dist/conversation.js';
 import { estimateContext, openConversation } from '../dist/runtime.js';
 
-async function harness(t, { repeatedToolCall = false, truncatedSummary = false } = {}) {
+async function harness(t, { repeatedToolCall = false, truncatedSummary = false, contextWindow = 32768 } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-search-boundary-'));
   const requests = [];
   let callId = 0;
@@ -50,7 +50,7 @@ async function harness(t, { repeatedToolCall = false, truncatedSummary = false }
   };
 
   const config = { cwd: process.cwd(), dataDir, provider: 'pa-test', model: 'test', apiKey: 'fixture-key',
-    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, contextWindow: 32768,
+    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, contextWindow,
     maxOutputTokens: 1024, timeoutMs: 5000, loop: { maxModelCalls: 3, maxToolCalls: 8 },
     search: { enabled: true, budgetId: 'boundary', model: 'deepseek-flash', maxRequests: 2, maxUses: 2,
       maxTokens: 2048, timeoutMs: 1000, maxResults: 5 } };
@@ -97,7 +97,8 @@ test('长工具结果裁剪仍先保留摘要截断标记，不自动续搜或�
 
 test('搜索结果使最终请求超过窗口时发送前硬检查仍拦截', async t => {
   const companionTools = { prepareTurn: p => ({ prepared: true, mode: p.mode, saved: [] }), readHistory: () => [] };
-  const calibration = await harness(t);
+  // Allow enough tool-result space for search data to exceed the preparation schema itself.
+  const calibration = await harness(t, { contextWindow: 65536 });
   const probe = await openConversation(calibration.config, 'calibration', { enableSearch: true });
   await probe.prompt('搜索', { runId: 'probe', companionTools });
   const sizes = calibration.requests.map(body => estimateContext(body, calibration.config.contextWindow, calibration.config.maxOutputTokens).inputTokens);
@@ -106,7 +107,7 @@ test('搜索结果使最终请求超过窗口时发送前硬检查仍拦截', as
   const growth = sizes[2] - largestBeforeResults;
   assert.ok(growth > 0, JSON.stringify(sizes));
   await probe.close();
-  const fixture = await harness(t);
+  const fixture = await harness(t, { contextWindow: 65536 });
   const runtime = await openConversation(fixture.config, 'final-context-limit', { enableSearch: true });
   try {
     const reserve = fixture.config.maxOutputTokens + Math.max(128, Math.ceil(fixture.config.contextWindow * 0.01));

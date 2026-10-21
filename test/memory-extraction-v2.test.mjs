@@ -37,7 +37,7 @@ function fixture(t) {
 function proposal(input, summary = '继续讨论已确认的决定') {
   if (input.mode === 'profiles') return {profiles:input.profiles.map(profile => ({...profile,pendingResults:(profile.pending??[]).map(item => ({pendingId:item.id,status:'deferred'}))}))};
   if (input.mode === 'self') return {...emptyExtraction(input),selfProfile:{baseVersion:input.selfProfile.baseVersion,content:input.selfProfile.content,
-    sourceMessageIds:input.selfProfile.sourceMessageIds,pendingIds:[]}};
+    protocol:2,updates:[],pendingIds:[]}};
   return emptyExtraction(input,summary);
 }
 
@@ -118,14 +118,17 @@ test('profile cleanup, range Topic and summary stay in one transaction when a la
 });
 
 test('output-budget splitting retains third-party statements for a single-person profile step',async t=>{
-  const f=fixture(t);f.inbound('我是小乙','bob');const source=f.inbound('小乙一直喜欢绘画','alice');
+  const f=fixture(t);f.inbound('我是小乙','bob');const source=f.inbound('bob一直喜欢绘画','alice');
   const bob=f.store.autoMemory.personForActor(f.store.findActor(f.room.id,'bob'));let checked=false;
+  f.store.autoMemory.addProfilePending(bob,source,'bob一直喜欢绘画','third_party',{allowThirdParty:true});
   const worker=f.worker({extract:async input=>{
     if(input.mode===undefined)throw new MemoryInputTooLargeError('offline split');
     if(input.mode==='profiles')return {profiles:input.profiles.map(profile=>{
       if(profile.personId!==bob)return {...profile,pendingResults:[]};
       assert.ok(input.messages.some(message=>message.id===source));checked=true;
-      return {...profile,facts:[{content:'喜欢绘画',sourceType:'third_party',messageIds:[source]}],pendingResults:[]};
+      return {...profile,facts:[{content:'喜欢绘画',sourceType:'third_party',messageIds:[source]}],
+        updates:[{factIndex:0,baselineFactIndexes:[],evidence:[profile.pending[0].subject]}],
+        pendingResults:[{pendingId:profile.pending[0].id,status:'merged',factIndex:0}]};
     })};
     return proposal(input);
   }});
@@ -134,7 +137,7 @@ test('output-budget splitting retains third-party statements for a single-person
 });
 
 test('self pending splits before requests and a restart resumes only unfinished steps before atomic archival',async t=>{
-  const f=fixture(t);for(let i=0;i<12;i++){const source=f.inbound(`AI风格建议${i}`);f.store.autoMemory.selfProfile.addPending(source,`表达建议${i}`);}
+  const f=fixture(t);for(let i=0;i<12;i++){const source=f.inbound(`以后你的表达采用建议${i}`);f.store.autoMemory.selfProfile.addPending(source,`以后你的表达采用建议${i}`);}
   const settings={...config,memory:{...config.memory,maxOutputTokens:512}};
   const successes=[],attempts=[];let fail=true;
   const provider={extract:async input=>{
@@ -142,7 +145,7 @@ test('self pending splits before requests and a restart resumes only unfinished 
     const pending=input.selfProfile.pending;attempts.push(pending.map(item=>item.id));
     if(successes.length&&fail){fail=false;throw new Error('unknown provider result');}
     const result={...proposal(input),selfProfile:{baseVersion:input.selfProfile.baseVersion,content:'简洁的对话伙伴',
-      sourceMessageIds:[...new Set([...input.selfProfile.sourceMessageIds,...pending.map(item=>item.sourceMessageId)])],pendingIds:pending.map(item=>item.id)}};
+      protocol:2,updates:[],pendingIds:pending.map(item=>item.id)}};
     successes.push(pending.map(item=>item.id));return result;
   }};
   assert.ok(f.reserveMaterials());const first=f.worker(provider,settings);first.start();await assert.rejects(first.wait(undefined,10000,'materials'),/失败/);
@@ -151,7 +154,8 @@ test('self pending splits before requests and a restart resumes only unfinished 
   assert.equal(f.store.autoMemory.selfProfile.snapshot().pending.length,12);assert.equal(f.store.autoMemory.conversationContext(f.room.id).summaryVersion,0);
   await first.close();f.restart();const second=f.worker(provider,settings);second.retry(job.id);await second.wait(undefined,10000,'materials');
   assert.equal(successes.length,2);assert.equal(attempts.filter(ids=>ids.join()===successes[0].join()).length,1);
-  assert.equal(f.store.autoMemory.selfProfile.snapshot().pending.length,0);assert.equal(f.store.autoMemory.selfProfile.snapshot().sourceMessageIds.length,12);
+  assert.equal(f.store.autoMemory.selfProfile.snapshot().pending.length,0);assert.equal(f.store.autoMemory.selfProfile.snapshot().sourceMessageIds,undefined);
+  assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM self_profile_update_sources WHERE pending_id IS NOT NULL').get().n),12);
   assert.equal(f.inspect(db=>db.prepare('SELECT input_json FROM auto_memory_jobs WHERE id=?').get(job.id)).input_json,before.input_json);
   assert.equal(f.store.autoMemory.conversationContext(f.room.id).summaryVersion,0);
   assert.equal(second.info('materials').hasSummary,false);
@@ -174,7 +178,7 @@ test('v19 upgrade adds range metadata and backup without altering old exact Topi
   f.store.autoMemory.commit(job.id,job.leaseToken,{...emptyExtraction(input),ignoredMessageIds:[],topics:[{summary:'旧话题',messageIds:[id]}]});
   const before=f.inspect(db=>({messages:db.prepare('SELECT * FROM messages').all(),links:db.prepare('SELECT * FROM memory_topic_messages').all()}));
   f.store.close();f.inspect(db=>{downgradeSchema20(db);db.exec('DROP TABLE memory_topic_scopes; PRAGMA user_version=19;');});f.restart();
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),22);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),23);
   assert.ok(readdirSync(f.directory).some(name=>name.includes('.v19.')&&name.endsWith('.bak')));
   assert.deepEqual(f.inspect(db=>({messages:db.prepare('SELECT * FROM messages').all(),links:db.prepare('SELECT * FROM memory_topic_messages').all()})),before);
   const topic=f.store.autoMemory.searchTopics(f.room.id,{text:'旧话题'}).topics[0];assert.equal(topic.sourceRange,undefined);assert.deepEqual(topic.messageIds,[id]);

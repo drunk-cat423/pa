@@ -7,6 +7,8 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
 import { BackgroundMemory } from '../dist/auto-memory.js';
+import { randomUUID } from 'node:crypto';
+import { inferAiProfileEvidence } from '../dist/profile-attribution.js';
 
 function fixture(t) {
   const dir=mkdtempSync(join(tmpdir(),'pa-reclassification-')),path=join(dir,'pa.sqlite');
@@ -21,7 +23,9 @@ function fixture(t) {
     const input={eventId:`source-${++counter}`,senderId,modelInputText:`/self ${content}`};
     store.recordInbound(inRoom.id,input.modelInputText,input);
     const source=store.externalMessage(inRoom.id,input.eventId);
-    store.autoMemory.selfProfile.addPending(source.id,content);
+    // Historical pending may contain terms that current attribution checks reject.
+    inspect(db=>db.prepare('INSERT INTO self_profile_pending(id,content,source_message_id,created_at) VALUES (?,?,?,?)')
+      .run(randomUUID(),content,source.id,new Date().toISOString()));
     const pending=store.autoMemory.selfProfile.snapshot().pending.find(p=>p.sourceMessageId===source.id);
     return {source,pending,move:{pendingId:pending.id,expectedContent:content,key:'RSI'}};
   };
@@ -42,11 +46,12 @@ test('术语转入原群规则；保留原文、pending和旧版本，重启与�
     assert.deepEqual(db.prepare('SELECT * FROM self_profile_revisions WHERE revision=0').all(),before.revisions);
     const audit=db.prepare('SELECT * FROM self_profile_reclassifications').get();
     assert.equal(audit.source_message_id,term.source.id);assert.equal(audit.from_revision,0);assert.equal(audit.to_revision,1);
+    assert.equal(db.prepare('SELECT source_message_ids_json FROM self_profile_revisions WHERE revision=1').get().source_message_ids_json,'[]');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(),[]);
   });
   f.restart();
   assert.deepEqual(f.store.reclassifySelfProfileTerms([term.move],f.policy,0),{revision:1,moved:0});
-  f.store.autoMemory.selfProfile.addPending(term.source.id,term.pending.content);
+  assert.throws(()=>f.store.autoMemory.selfProfile.addPending(term.source.id,term.pending.content),/画像对象/);
   assert.deepEqual(f.store.autoMemory.selfProfile.snapshot().pending.map(p=>p.id),[style.pending.id]);
 });
 
@@ -75,29 +80,51 @@ test('目标已有更新版本时整批回滚，不能用历史约定覆盖新�
 });
 
 test('迁移验证预期原文、当前版本和计划；已有归档不做猜测式改写',t=>{
-  const f=fixture(t),term=f.note();
+  const f=fixture(t),term=f.note('你以后回答时rsi指的是recursive self improvement');
   assert.throws(()=>f.store.reclassifySelfProfileTerms([{...term.move,expectedContent:'虚构文字'}],f.policy,0),/原文不匹配/);
   assert.throws(()=>f.store.reclassifySelfProfileTerms([term.move],f.policy,3),/版本冲突/);
   assert.throws(()=>f.store.reclassifySelfProfileTerms([term.move,term.move],f.policy,0),/计划无效/);
   const snapshot=f.store.autoMemory.selfProfile.snapshot();
-  f.store.autoMemory.selfProfile.commit(snapshot,{baseVersion:0,content:'归档文字',sourceMessageIds:[term.source.id],pendingIds:[term.pending.id]},[]);
+  f.store.autoMemory.selfProfile.commit(snapshot,{protocol:2,baseVersion:0,content:'归档文字',updates:[],pendingIds:[term.pending.id]},[]);
   assert.throws(()=>f.store.reclassifySelfProfileTerms([term.move],f.policy,1),/已有归档/);
   assert.equal(f.store.autoMemory.selfProfile.snapshot().content,'归档文字');
 });
 
 test('不修改已捕获的后台输入；旧快照或原文不能把已迁移术语重新写入AI画像',t=>{
-  const f=fixture(t),term=f.note();
+  const f=fixture(t),term=f.note('你以后回答时rsi指的是recursive self improvement');
   f.store.autoMemory.reserveBatch(f.room.id,'capacity');
   const job=f.store.autoMemory.claimNext(f.room.id,{owner:'test',leaseMs:60000});
   const input=f.store.autoMemory.taskInput(job);
   const frozen=f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id));
   f.store.reclassifySelfProfileTerms([term.move],f.policy,0);
   assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id)),frozen);
-  const proposal={baseVersion:0,content:'RSI术语',sourceMessageIds:[term.source.id],pendingIds:[term.pending.id]};
+  const proposal={protocol:2,baseVersion:0,content:'RSI术语',updates:[inferAiProfileEvidence(term.source.id,term.source.text)],pendingIds:[term.pending.id]};
   assert.throws(()=>f.store.autoMemory.selfProfile.commit(input.selfProfile,proposal,input.messages),/已迁入群规则/);
   const next=f.store.autoMemory.selfProfile.snapshot();
   assert.throws(()=>f.store.autoMemory.selfProfile.commit(next,{...proposal,baseVersion:next.baseVersion,pendingIds:[]},input.messages),/已迁入群规则/);
   assert.equal(f.store.autoMemory.selfProfile.snapshot().content,'');
+});
+
+test('归档判断读取历史revision来源，当前画像无需携带来源数组',t=>{
+  const f=fixture(t),term=f.note();
+  f.inspect(db=>db.prepare('INSERT INTO self_profile_revisions VALUES (?,?,?,?)')
+    .run(1,'旧归档正文',JSON.stringify([term.source.id]),new Date().toISOString()));
+  const snapshot=f.store.autoMemory.selfProfile.snapshot();
+  assert.equal(Object.hasOwn(snapshot,'sourceMessageIds'),false);
+  assert.throws(()=>f.store.reclassifySelfProfileTerms([term.move],f.policy,1),/已有归档/);
+  assert.equal(f.store.autoMemory.selfProfile.snapshot().baseVersion,1);
+  assert.deepEqual(f.store.roomRules(f.room.id),[]);
+});
+
+test('独立更新来源已使用但pending仍未处理时，不能自动迁走该术语',t=>{
+  const f=fixture(t),term=f.note('你以后回答时rsi指的是recursive self improvement');
+  const snapshot=f.store.autoMemory.selfProfile.snapshot();
+  f.store.autoMemory.selfProfile.commit(snapshot,{protocol:2,baseVersion:0,content:'归档正文',pendingIds:[],
+    updates:[inferAiProfileEvidence(term.source.id,term.source.text)]},[{...term.source,role:'user'}]);
+  assert.equal(f.store.autoMemory.selfProfile.snapshot().pending.length,1);
+  f.inspect(db=>assert.equal(db.prepare('SELECT source_message_ids_json FROM self_profile_revisions WHERE revision=1').get().source_message_ids_json,'[]'));
+  assert.throws(()=>f.store.reclassifySelfProfileTerms([term.move],f.policy,1),/已有归档/);
+  assert.deepEqual(f.store.roomRules(f.room.id),[]);
 });
 
 test('迁移后在途范围任务保留冲突快照并拒绝普通重试，显式搁置后新任务可继续',async t=>{
@@ -110,8 +137,8 @@ test('迁移后在途范围任务保留冲突快照并拒绝普通重试，显�
       if(calls===1){started();await gate;}
       else assert.equal(input.selfProfile,undefined);
       return {topics:[],fragments:[],profiles:[],ignoredMessageIds:[],
-        ...(calls===1?{selfProfile:{baseVersion:input.selfProfile.baseVersion,content:term.pending.content,
-          sourceMessageIds:[term.source.id],pendingIds:[term.pending.id]}}:{})};
+        ...(calls===1?{selfProfile:{protocol:2,baseVersion:input.selfProfile.baseVersion,content:term.pending.content,
+          updates:[],pendingIds:[term.pending.id]}}:{})};
     }});
   try {
     f.store.autoMemory.reserveMaterialsIfDue(f.room.id,0);
@@ -164,7 +191,7 @@ test('v11升级只新增审计结构并保留历史，升级前创建一致性�
   f.store.close();
   f.inspect(db=>{downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results;DROP TABLE person_profile_revision_sources;DROP TABLE auto_memory_job_deferrals;DROP TABLE self_profile_reclassifications;PRAGMA user_version=11;');});
   f.restart();
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),22);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),23);
   assert.deepEqual(f.store.autoMemory.selfProfile.snapshot().pending,pending);
   assert.equal(f.store.externalMessage(f.room.id,term.source.eventId??'source-1').text,term.source.text);
   assert.ok(readdirSync(f.dir).some(name=>name.includes('.v11.')&&name.endsWith('.bak')));

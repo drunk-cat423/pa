@@ -7,8 +7,8 @@ import { MemoryError } from './memory-types.js';
 import type { MemoryChange, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, PrimaryPerson,
   FactPerson, SharedFactContext, SharedFactAttributionInput } from './memory-types.js';
 import type { ChannelRoute, ExternalRunInput, InboundMessage } from './channel-types.js';
-import { AutoMemoryStore, migrateAutoMemory, migrateMemoryRetrieval, migrateRollingContext, migrateMemoryPipelines, migrateMaterialBackfill } from './auto-memory-store.js';
-import { migrateSelfProfile } from './self-profile-store.js';
+import { AutoMemoryStore, migrateAutoMemory, migrateMemoryRetrieval, migrateRollingContext, migrateMemoryPipelines, migrateMaterialBackfill, migrateProfileAttribution } from './auto-memory-store.js';
+import { migrateSelfProfile, migrateSelfProfileUpdates } from './self-profile-store.js';
 import { memoryWords } from './memory-text.js';
 import { validateTurnPlan, type TurnPlan, type TurnReceipt } from './turn-plan.js';
 import { isMemoryOwner, type HarnessPolicy } from './harness-policy.js';
@@ -69,7 +69,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 22;
+const SCHEMA_VERSION = 23;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -485,6 +485,7 @@ export class ConversationStore {
       );`);
       if (version < 21) migrateMemoryPipelines(this.db);
       if (version < 22) migrateMaterialBackfill(this.db);
+      if (version < 23) { migrateProfileAttribution(this.db); migrateSelfProfileUpdates(this.db); }
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
@@ -942,6 +943,7 @@ export class ConversationStore {
       const canonical = JSON.stringify({ intent:plan.intent,mode:plan.mode,
         ...(plan.progressText === undefined ? {} : {progressText:plan.progressText}),updates:plan.updates.map(u=>({target:u.target,
         content:u.content,sourceType:u.sourceType??'third_party',senderId:u.senderId??null,key:u.key??null,
+        ...(u.subject===undefined?{}:{subject:u.subject}),
         ...(u.attribution === undefined ? {} : {attribution:u.attribution})})) });
       const previous = this.db.prepare('SELECT plan_json,receipt_json FROM turn_preparations WHERE source_message_id=?').get(sourceMessageId);
       if (previous) {
@@ -958,15 +960,15 @@ export class ConversationStore {
         if (['room_rule','room_memory'].includes(update.target) && source.room_type !== 'group') throw new MemoryError('群规则和群记忆只能在对应群聊中设置。');
         if (update.target === 'sender' || update.target === 'mentioned_person') {
           const subject = update.target === 'sender' ? String(source.actor_id) : this.findActor(conversationId,update.senderId!);
-          if (!subject || (update.target === 'mentioned_person' && !mentionedSenderIds.includes(update.senderId!)
-            && !String(source.text).includes(`<@${update.senderId}>`) && !String(source.text).includes(`<@!${update.senderId}>`))) {
+          if (!subject) {
             throw new MemoryError('请在当前消息明确 @ 要记录的已知群成员。');
           }
           this.autoMemory.addProfilePending(this.autoMemory.ensureActorPerson(subject),sourceMessageId,update.content,
-            update.target==='mentioned_person'?'third_party':update.sourceType??'third_party',
-            {allowThirdParty:update.target==='mentioned_person'});
+            update.target==='mentioned_person'?'third_party':'self',
+            {allowThirdParty:update.target==='mentioned_person',...(update.subject?{subject:update.subject}:{}),mentionedSenderIds});
           receipt.saved.push({target:update.target,status:'saved_pending'});
         } else if (update.target === 'ai_self') {
+          if(update.subject&&update.subject.subjectKind!=='ai') throw new MemoryError('AI画像更新对象不一致。');
           this.autoMemory.selfProfile.addPending(sourceMessageId,update.content,selfBudget);
           receipt.saved.push({target:update.target,status:'saved_pending'});
         } else if (update.target === 'room_rule') {
@@ -1169,6 +1171,8 @@ export class ConversationStore {
       VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(messageId, conversationId, actorId, text, createdAt, external?.modelInputText ?? null, external?.eventId ?? null,
         external?.senderName ?? null, external?.messageKind ?? 'chat', external?.sentAt === undefined ? null : normalizeMemoryTime(external.sentAt),external?.imageFailure ?? null);
+    if(external?.mentionedSenderIds?.length) this.db.prepare('INSERT INTO message_profile_context VALUES (?,?)')
+      .run(messageId,JSON.stringify([...new Set(external.mentionedSenderIds)]));
     const quote = external?.quote;
     const quoted = quote?.messageId ? this.quotedMessage(conversationId,quote.messageId)
       : quote?.referenceIndex ? this.quotedMessage(conversationId,quote.referenceIndex,true) : undefined;

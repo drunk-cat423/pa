@@ -1,5 +1,6 @@
 import type { SelfProfileSnapshot, SelfProfileProposal } from './self-profile-store.js';
 import type { MessageImage } from './image-context.js';
+import type { ProfileSubjectCandidate, ProfileSubjectEvidence } from './profile-attribution.js';
 export type { SelfProfileSnapshot, SelfProfileProposal } from './self-profile-store.js';
 
 export type AutoMemoryReason = 'count' | 'capacity' | 'idle' | 'interval' | 'backfill';
@@ -32,7 +33,8 @@ export interface ProfileFact {
   occurredAt?: string | null;
   expiresAt?: string | null;
 }
-export interface PersonProfilePending { id: string; content: string; sourceMessageId: string; sourceType: EvidenceType }
+export interface PersonProfilePending { id: string; content: string; sourceMessageId: string; sourceType: EvidenceType; subject?: ProfileSubjectEvidence }
+export interface ProfileFactUpdate { factIndex: number; baselineFactIndexes?: number[]; evidence: ProfileSubjectEvidence[] }
 export type ProfilePendingResult =
   | { pendingId: string; status: 'merged'; factIndex: number }
   | { pendingId: string; status: 'superseded'; replacementMessageId: string }
@@ -43,6 +45,7 @@ export interface PersonProfile {
   pending?: PersonProfilePending[];
   pendingIds?: string[];
   pendingResults?: ProfilePendingResult[];
+  updates?: ProfileFactUpdate[];
 }
 export interface AutoMemoryMessage {
   images?: MessageImage[];
@@ -50,6 +53,7 @@ export interface AutoMemoryMessage {
   id: string; conversationId: string; actorId?: string; personId?: string;
   contextSeq?: number; senderId?: string; senderName?: string; replyToSenderId?: string; replyToMessageId?: string;
   role: 'user' | 'assistant'; text: string; ingestSeq: number; createdAt: string; sentAt?: string;
+  mentionedSenderIds?: string[];
   runStatus?: string; deliveryStatus?: string; turnInputSeq?: number;
 }
 export interface AutoMemoryJob {
@@ -67,6 +71,9 @@ export interface AutoMemoryTaskInput {
   profileProtocol?: 2;
   /** New material tasks use archived profiles as the model's baseline; old evidence stays audit-only. */
   profileBaselineProtocol?: 1;
+  profileAttributionProtocol?: 1;
+  selfProfileProtocol?: 2;
+  profileSubjects?: ProfileSubjectCandidate[];
   mode?: 'messages' | 'profiles' | 'self';
   job: AutoMemoryJob; roomType: 'private' | 'group'; messages: AutoMemoryMessage[];
   previousSummary?: string; profiles: PersonProfile[]; selfProfile?: SelfProfileSnapshot;

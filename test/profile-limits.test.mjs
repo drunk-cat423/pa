@@ -36,9 +36,11 @@ test('soft thresholds signal consolidation, while normal source metadata does no
   assert.equal(profileCapacity(profile([], { personId: 'p'.repeat(12000) })).needsConsolidation, true);
 });
 
-test('hard limits include structure metadata, per-fact code points, and source count', () => {
+test('hard limits include structure metadata and per-fact code points, without a source-count quota', () => {
   assert.equal(profileCapacity(profile([fact('😀'.repeat(201))])).exceedsLimits, true);
-  assert.equal(profileCapacity(profile([fact('x', ['1', '2', '3', '4', '5', '6'])])).exceedsLimits, true);
+  assert.equal(profileCapacity(profile([fact('x', ['1', '2', '3', '4', '5', '6'])])).exceedsLimits, false);
+  assert.equal(profileCapacity(profile([fact('x', Array.from({ length: 50 }, (_, i) => `source-${i}`))])).exceedsLimits, false);
+  assert.equal(profileCapacity(profile([fact('x', ['s'.repeat(16000)])])).exceedsLimits, true);
   assert.equal(profileCapacity(profile([], { personId: 'p'.repeat(16000) })).exceedsLimits, true);
   assert.equal(profileCapacity(profile(Array.from({ length: 41 }, () => fact()))).exceedsLimits, true);
 });

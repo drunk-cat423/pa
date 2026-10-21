@@ -28,7 +28,7 @@ function fixture(t,roomType='group') {
     commit(job,output){store.autoMemory.commit(job.id,job.leaseToken,output??emptyExtraction(store.autoMemory.taskInput(job)));},
     inspect(fn){const db=new DatabaseSync(path);try{return fn(db);}finally{db.close();}},
     restart(mutate){store.close();if(mutate)this.inspect(mutate);store=new ConversationStore(path);},
-    pending(source,content='likes tea') {
+    pending(source,content='喜欢茶') {
       const person=store.autoMemory.personForActor(store.findActor(room.id,'alice'));
       store.autoMemory.addProfilePending(person,source.existingMessageId,content,'self');
       return store.autoMemory.profile(person).pending.at(-1);
@@ -86,8 +86,8 @@ test('successful callback cannot clear a newer in-flight schedule',t=>{
 });
 
 test('pending is observed separately from its old source and reservation cannot consume later pending',t=>{
-  const f=fixture(t),source=f.inbound('my profile');f.observe(0);f.observe(MEMORY_IDLE_MS);
-  const later=f.pending(source);f.store.autoMemory.selfProfile.addPending(source.existingMessageId,'please be concise');
+  const f=fixture(t),source=f.inbound('我喜欢茶，也希望你以后回答简洁一点');f.observe(0);f.observe(MEMORY_IDLE_MS);
+  const later=f.pending(source);f.store.autoMemory.selfProfile.addPending(source.existingMessageId,'你以后回答简洁一点');
   const first=f.claim(),input=f.input(first);
   assert.equal(input.profiles[0].pending.length,0);assert.equal(input.selfProfile.pending.length,0);
   f.observe(MEMORY_IDLE_MS+5);f.commit(first);f.restart();
@@ -181,7 +181,7 @@ test('v20 migration preserves every old job byte and lease, isolates unfinished 
 });
 
 test('migration distinguishes old deferred pending from pending added after its successful source batch',t=>{
-  const f=fixture(t),source=f.inbound('old source'),old=f.pending(source,'old deferred');
+  const f=fixture(t),source=f.inbound('我喜欢茶，也包含 old deferred 和 late pending'),old=f.pending(source,'old deferred');
   f.store.autoMemory.reserveBatch(f.room.id,'capacity');const legacy=f.claim('legacy'),input=f.input(legacy),output=emptyExtraction(input);
   output.profiles=input.profiles.map(profile=>({...profile,pendingResults:profile.pending.map(item=>({pendingId:item.id,status:'deferred'}))}));
   f.commit(legacy,output);const late=f.pending(source,'late pending');
@@ -193,7 +193,7 @@ test('migration distinguishes old deferred pending from pending added after its 
 });
 
 test('deferred pending joins a later genuinely new batch but never overlaps running fixed pending',t=>{
-  const f=fixture(t),source=f.inbound('source'),pending=f.pending(source);f.store.autoMemory.selfProfile.addPending(source.existingMessageId,'be concise');
+  const f=fixture(t),source=f.inbound('我喜欢茶；你以后回答简洁一点'),pending=f.pending(source);f.store.autoMemory.selfProfile.addPending(source.existingMessageId,'你以后回答简洁一点');
   f.observe(0);f.observe(MEMORY_IDLE_MS);const first=f.claim(),firstInput=f.input(first);
   f.inbound('arrived during call');f.observe(MEMORY_IDLE_MS+1);f.observe(MEMORY_IDLE_MS*2+1);
   const result=emptyExtraction(firstInput);result.profiles=firstInput.profiles.map(profile=>({...profile,

@@ -1,4 +1,16 @@
+export function downgradeSchema22(db) {
+  db.exec(`PRAGMA foreign_keys=OFF;
+    DROP TABLE IF EXISTS self_profile_update_sources;
+    DROP TABLE IF EXISTS self_profile_updates;
+    DROP TABLE IF EXISTS person_profile_subject_updates;
+    DROP TABLE IF EXISTS message_profile_context;`);
+  if (db.prepare('PRAGMA table_info(person_profile_pending)').all().some(column => column.name === 'subject_json')) {
+    db.exec('ALTER TABLE person_profile_pending DROP COLUMN subject_json;');
+  }
+}
+
 export function downgradeSchema21(db) {
+  downgradeSchema22(db);
   db.exec(`PRAGMA foreign_keys=OFF;
     DROP TABLE IF EXISTS material_backfill_pending_audit;
     DROP TABLE IF EXISTS material_backfill_jobs;

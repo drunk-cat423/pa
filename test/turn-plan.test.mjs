@@ -56,14 +56,14 @@ test('普通成员第二项越权时整批回滚，身份共享不获得管理�
 
 test('管理员能为明确@的成员记录第三方事实，来源不伪装成本人',t=>{
   const f=fixture(t);f.input('在的','member');
-  const text='你记一下这个人是ai<@member>',id=f.input(text);
-  f.store.prepareTurn(f.group.id,id,plan([{target:'mentioned_person',senderId:'member',content:text,sourceType:'self'}]),f.policy);
+  const text='<@member>是ai，你记一下',id=f.input(text);
+  f.store.prepareTurn(f.group.id,id,plan([{target:'mentioned_person',senderId:'member',content:text,sourceType:'self'}]),f.policy,['member']);
   const card=f.store.identityCard(f.group.id,'member',f.policy);
   assert.equal(card.displayName,'同名');assert.equal(card.isMaintainer,false);
   const note=f.store.autoMemory.profile(card.personId).pending[0];
   assert.equal(note.sourceType,'third_party');
   const other=f.input('请记录这个人','owner');
-  assert.throws(()=>f.store.prepareTurn(f.group.id,other,plan([{target:'mentioned_person',senderId:'member',content:'请记录这个人'}]),f.policy),/明确 @/);
+  assert.throws(()=>f.store.prepareTurn(f.group.id,other,plan([{target:'mentioned_person',senderId:'member',content:'请记录这个人'}]),f.policy),/对象/);
 });
 
 test('规则纠正保留旧版本、不同群和私聊相互隔离',t=>{

@@ -40,7 +40,22 @@ function personFor(f, senderId = 'alice') {
   return f.store.autoMemory.personForActor(f.store.findActor(f.room.id, senderId));
 }
 function extract(input, profiles) {
-  return { ...emptyExtraction(input), profiles };
+  const updated = profiles.map(profile => {
+    const baseline = input.profiles.find(item => item.personId === profile.personId);
+    const updates = [];
+    profile.facts.forEach((fact, factIndex) => {
+      const baselineFactIndexes = baseline?.facts.flatMap((previous, index) => previous.content === fact.content
+        && previous.sourceType === fact.sourceType ? [index] : []) ?? [];
+      const evidence = fact.messageIds.flatMap(messageId => {
+        const source = [...input.messages, ...(input.profileSources ?? [])].find(message => message.id === messageId);
+        if (!source || source.role !== 'user' || !/^\s*(?:我|本人)/u.test(source.text)) return [];
+        return [{ messageId, factQuote: source.text, subjectKind: 'self', subjectQuote: source.text.trim().startsWith('本人') ? '本人' : '我' }];
+      });
+      if (baselineFactIndexes.length || evidence.length) updates.push({ factIndex, baselineFactIndexes, evidence });
+    });
+    return { ...profile, updates };
+  });
+  return { ...emptyExtraction(input), profiles: updated };
 }
 function hash(value) { return createHash('sha256').update(value).digest('hex'); }
 
@@ -216,9 +231,9 @@ test('many captured pending sources join one fact without exceeding active sourc
 test('source inheritance uses original fact indexes and exact fact identity without cross-contamination', () => {
   const f = fixture();
   try {
-    const expiredSource = f.inbound('旧过期证据');
-    const sharedSource = f.inbound('A和B共享的代表来源');
-    const aOnlySource = f.inbound('仅属于A的额外来源');
+    const expiredSource = f.inbound('我曾有一条旧过期证据');
+    const sharedSource = f.inbound('我提供事实A和事实B共享的代表来源');
+    const aOnlySource = f.inbound('我提供事实A仅属于A的额外来源');
     const personId = personFor(f);
     f.store.autoMemory.addProfilePending(personId, aOnlySource.existingMessageId, '事实A', 'self');
     let current = batch(f);
@@ -253,10 +268,10 @@ test('source inheritance uses original fact indexes and exact fact identity with
   } finally { f.close(); }
 });
 
-test('v13 migration backup preserves archived legacy pending rows and current database advances to v14', () => {
+test('v13 migration backup preserves archived legacy pending rows and current database advances to v23', () => {
   const f = fixture();
   try {
-    const source = f.inbound('我喜欢读书');
+    const source = f.inbound('我喜欢读书，也有旧版已归档提醒');
     const personId = personFor(f);
     let current = batch(f);
     f.store.autoMemory.commit(current.job.id, current.job.leaseToken, extract(current.input, [{ personId, baseVersion: 0,
@@ -269,7 +284,7 @@ test('v13 migration backup preserves archived legacy pending rows and current da
       downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; PRAGMA user_version=13;');
     });
     f.restart();
-    assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),22);
+    assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),23);
     assert.deepEqual({ ...f.inspect(db => db.prepare('SELECT id,person_id,source_message_id,archived_revision,archived_at FROM person_profile_pending WHERE id=?').get(archived.id)) }, {
       id: archived.id, person_id: personId, source_message_id: source.existingMessageId, archived_revision: 1, archived_at: '2026-10-16T00:00:00Z',
     });
@@ -290,7 +305,7 @@ test('v13 migration backup preserves archived legacy pending rows and current da
 test('not-profile cleanup leaves an auditable hash and never fabricates a profile fact', () => {
   const f = fixture();
   try {
-    const source = f.inbound('今晚临时吃火锅');
+    const source = f.inbound('我今晚临时吃火锅');
     const personId = personFor(f);
     f.store.autoMemory.addProfilePending(personId, source.existingMessageId, '今晚临时吃火锅', 'self');
     const { job, input } = batch(f);
@@ -302,7 +317,7 @@ test('not-profile cleanup leaves an auditable hash and never fabricates a profil
     const receipt = f.inspect(db => db.prepare('SELECT * FROM person_profile_pending_results WHERE job_id=?').get(job.id));
     assert.equal(receipt.outcome, 'not_profile'); assert.equal(receipt.reason, 'temporary');
     assert.equal(receipt.content_hash, hash('今晚临时吃火锅'));
-    assert.equal(f.store.externalMessage(f.room.id, source.eventId).text, '今晚临时吃火锅');
+    assert.equal(f.store.externalMessage(f.room.id, source.eventId).text, '我今晚临时吃火锅');
     assert.equal(Object.hasOwn(receipt, 'content'), false);
   } finally { f.close(); }
 });

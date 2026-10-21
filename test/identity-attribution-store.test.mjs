@@ -138,7 +138,7 @@ test('旧schema18升级只增加旁表，完整备份原文和旧版本；旧共
   const before=f.inspect(db=>({messages:db.prepare('SELECT * FROM messages ORDER BY id').all(),versions:db.prepare('SELECT * FROM memory_revisions').all()}));
   f.store.close();f.inspect(db=>{downgradeSchema20(db);db.exec('DROP TABLE memory_topic_scopes; DROP TABLE memory_fact_attributions; PRAGMA user_version=18;');});
   f.restart();
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),22);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),23);
   const backups=readdirSync(f.directory).filter(name=>name.includes('.v18.')&&name.endsWith('.bak'));
   assert.equal(backups.length,1);
   const backup=new DatabaseSync(join(f.directory,backups[0]),{readOnly:true});

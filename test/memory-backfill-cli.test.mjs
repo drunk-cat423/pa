@@ -49,7 +49,7 @@ async function modelServer(t) {
     const input = JSON.parse(requests.at(-1).body.messages.findLast(message => message.role === 'user').content);
     const content = JSON.stringify(input.mode === 'profiles'
       ? { profiles: input.profiles.map(profile => ({ personId: profile.personId, baseVersion: profile.baseVersion,
-        facts: profile.facts, pendingResults: (profile.pending ?? []).map(item => ({ pendingId: item.id, status: 'deferred' })) })) }
+        facts: profile.facts, updates:[],pendingResults: (profile.pending ?? []).map(item => ({ pendingId: item.id, status: 'deferred' })) })) }
       : { topics: [], profiles: [] });
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     response.write(`data: ${JSON.stringify({ id: 'local-backfill', object: 'chat.completion.chunk', created: 1,

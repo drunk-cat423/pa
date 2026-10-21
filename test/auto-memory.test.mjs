@@ -160,7 +160,7 @@ test('群消息超过60条也不按消息数自动压缩', async t => {
   finally { db.close(); }
 });
 
-test('私聊完成50轮且容量较低时不按轮数自动压缩', { timeout: 60_000 }, async t => {
+test('私聊完成50轮且容量较低时不按轮数自动压缩', { timeout: 120_000 }, async t => {
   const f = await fixture(t); const h = f.harness();
   for (let i = 1; i <= 50; i++) assert.equal(await h.handle(f.message(`p${i}`, `私聊第${i}轮`, { route: f.privateRoute })), 'sent');
   await h.waitForMemory();

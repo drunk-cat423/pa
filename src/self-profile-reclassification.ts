@@ -43,7 +43,10 @@ export function reclassifySelfProfileTerms(db: DatabaseSync, snapshot: SelfProfi
       if (previous.conversation_id !== source.conversation_id || previous.rule_key !== key) throw new MemoryError('该条目的历史迁移去向不匹配。');
       continue;
     }
-    if (source.archived_revision !== null || snapshot.sourceMessageIds.includes(String(source.source_message_id))) {
+    const archivedSource = db.prepare(`SELECT 1 FROM self_profile_update_sources WHERE message_id=?
+      UNION ALL SELECT 1 FROM self_profile_revisions r,json_each(r.source_message_ids_json) s WHERE s.value=? LIMIT 1`)
+      .get(String(source.source_message_id), String(source.source_message_id));
+    if (source.archived_revision !== null || archivedSource) {
       throw new MemoryError('该术语已有归档内容，需先明确逐段修订，不能自动改写旧画像。');
     }
     pending.push({ pendingId: move.pendingId, key, content: move.expectedContent,
@@ -55,7 +58,7 @@ export function reclassifySelfProfileTerms(db: DatabaseSync, snapshot: SelfProfi
   const createdAt = new Date().toISOString();
   // Even an unchanged archived body gets a revision: its active pending projection changed.
   db.prepare('INSERT INTO self_profile_revisions VALUES (?,?,?,?)')
-    .run(revision, snapshot.content, JSON.stringify(snapshot.sourceMessageIds), createdAt);
+    .run(revision, snapshot.content, '[]', createdAt);
   for (const move of pending) {
     const old = db.prepare(`SELECT revision,content FROM room_rule_revisions
       WHERE conversation_id=? AND rule_key=? ORDER BY revision DESC LIMIT 1`).get(move.conversationId, move.key);

@@ -60,7 +60,7 @@ test('compression worker leaves existing Topics and profile untouched; materials
   const source = f.inbound('我喜欢喝茶');
   const actorId = f.store.externalMessage(f.room.id, source.eventId).actorId;
   const personId = f.store.autoMemory.ensureActorPerson(actorId);
-  f.store.autoMemory.addProfilePending(personId, source.existingMessageId, '我喜欢喝茶', 'third_party');
+  f.store.autoMemory.addProfilePending(personId, source.existingMessageId, '我喜欢喝茶', 'self');
 
   const provider = { extract: async input => {
     if (input.pipeline === 'materials') {
@@ -69,7 +69,8 @@ test('compression worker leaves existing Topics and profile untouched; materials
       base.profiles = input.profiles.map(profile => ({
         personId: profile.personId,
         baseVersion: profile.baseVersion,
-        facts: [{ content: '喜欢喝茶', sourceType: 'third_party', messageIds: [source.existingMessageId] }],
+        facts: [{ content: '喜欢喝茶', sourceType: 'self', messageIds: [source.existingMessageId] }],
+        updates:[{factIndex:0,baselineFactIndexes:[],evidence:[profile.pending[0].subject]}],
         pendingResults: [{ pendingId: profile.pending[0].id, status: 'merged', factIndex: 0 }],
       }));
       return base;

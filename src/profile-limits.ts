@@ -5,7 +5,6 @@ export const PERSON_PROFILE_LIMITS = Object.freeze({
   maxFactChars: 200,
   maxContentBytes: 6000,
   maxStructureBytes: 16000,
-  maxSourcesPerFact: 5,
   softRatio: 0.75,
 });
 
@@ -47,8 +46,7 @@ export function profileCapacity(profile: ProfileCapacityInput): ProfileCapacity 
       return invalidProfile();
     }
     contentBytes += Buffer.byteLength(fact.content, 'utf8');
-    if (Array.from(fact.content).length > PERSON_PROFILE_LIMITS.maxFactChars ||
-        fact.messageIds.length > PERSON_PROFILE_LIMITS.maxSourcesPerFact) {
+    if (Array.from(fact.content).length > PERSON_PROFILE_LIMITS.maxFactChars) {
       exceedsFactQualityLimit = true;
     }
   }

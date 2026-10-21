@@ -103,6 +103,30 @@ test('captured pending sources outside chat batch archive atomically and concurr
   }finally{f.close();}
 });
 
+test('six valid profile sources survive transactional commit while actor checks and frozen history remain intact',()=>{
+  const f=fixture();try {
+    const originals=Array.from({length:6},()=>f.inbound('我喜欢喝茶'));
+    const other=f.inbound('我喜欢咖啡','bob');
+    const job=batch(f), input=f.store.autoMemory.taskInput(job);
+    const baseline=input.profiles.find(p=>input.messages.some(m=>m.id===originals[0].existingMessageId&&m.personId===p.personId));
+    const frozen=f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id));
+    const profile={personId:baseline.personId,baseVersion:baseline.baseVersion,
+      facts:[{content:'喜欢喝茶',sourceType:'self',messageIds:originals.map(m=>m.existingMessageId)}]};
+    const invalid=structuredClone(profile);invalid.facts[0].messageIds.push(other.existingMessageId);
+    assert.throws(()=>f.store.autoMemory.commit(job.id,job.leaseToken,ignored(input,[invalid])),/本人|自述/);
+    assert.equal(f.store.autoMemory.profile(baseline.personId).baseVersion,baseline.baseVersion);
+    const result=validateExtract(ignored(input,[profile]),input);
+    f.store.autoMemory.commit(job.id,job.leaseToken,result);
+    const current=f.store.autoMemory.profile(baseline.personId);
+    assert.equal(current.facts[0].messageIds.length,6);
+    assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id)),frozen);
+    assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM messages').get().n),7);
+    assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM person_profile_revision_sources WHERE person_id=? AND revision=?')
+      .get(baseline.personId,current.baseVersion).n),6);
+    f.restart();assert.deepEqual(f.store.autoMemory.profile(baseline.personId).facts,current.facts);
+  }finally{f.close();}
+});
+
 test('pending IDs, person self evidence, other-person pending, assistant and field validation fail atomically',()=>{
   const f=fixture();try {
     const alice=f.inbound('我喜欢茶');const bob=f.inbound('我喜欢咖啡','bob');
@@ -128,8 +152,9 @@ test('v8 migration backs up and preserves archived legacy field metadata, identi
     const old=f.inbound('迁移前喜欢火锅；你的名字叫 PA');const actor=f.store.findActor(f.room.id,'alice');const person=f.store.autoMemory.personForActor(actor);
     const job=batch(f);const input=f.store.autoMemory.taskInput(job);f.store.autoMemory.fail(job.id,job.leaseToken,'offline');
     addPending(f,f.room.id,old.existingMessageId,'legacy-ai-name','ai_self','你的名字叫 PA');
-    const self=f.store.autoMemory.selfProfile.snapshot();
-    f.store.autoMemory.selfProfile.commit(self,{baseVersion:self.baseVersion,content:'名字叫 PA',sourceMessageIds:[old.existingMessageId],pendingIds:[self.pending[0].id]},[]);
+    // Seed the archived legacy state directly: this snapshot predates the current AI attribution protocol.
+    f.inspect(db=>db.prepare(`UPDATE self_profile_pending SET archived_revision=(SELECT revision FROM self_profile_revisions ORDER BY revision DESC LIMIT 1),archived_at=? WHERE source_message_id=?`)
+      .run('2026-10-16T00:00:00Z',old.existingMessageId));
     const style=f.inbound('回复要简洁');addPending(f,f.room.id,style.existingMessageId,'legacy-ai-style','ai_self','回复要简洁');
     const selfRows=f.inspect(db=>db.prepare('SELECT * FROM self_profile_pending ORDER BY id').all().map(row=>({...row})));
     const frozenBeforeMigration=f.inspect(db=>{
@@ -158,7 +183,7 @@ test('v8 migration backs up and preserves archived legacy field metadata, identi
     assert.equal(f.store.autoMemory.claimNext(f.room.id,{owner:'retry',leaseMs:60000,pipeline:'legacy'}),undefined);
     assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id)),frozenBeforeMigration);
     const current=f.inbound('查询历史');assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{query:'火锅'}).messages[0].id,old.existingMessageId);
-    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),22);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
+    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),23);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
   }finally{f.close();}
 });
 
@@ -208,6 +233,7 @@ test('background chunk splitting keeps captured pending evidence and archives on
       if(note) assert.equal(input.profileSources[0].text,'我喜欢阅读');
       const resultProfile={personId:p.personId,baseVersion:p.baseVersion,
         facts:note?[{content:'喜欢阅读',sourceType:'self',messageIds:[note.sourceMessageId]}]:p.facts,
+        updates:note?[{factIndex:0,baselineFactIndexes:[],evidence:[note.subject]}]:[],
         pendingResults:note?[{pendingId:note.id,status:'merged',factIndex:0}]:[]};
       const proposal={...emptyExtraction(input),profiles:[resultProfile]};
       validateExtract(proposal,input);

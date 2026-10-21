@@ -76,9 +76,10 @@ test('wire projection preserves roles, identity/reply relationships, chronology 
 test('new prompt sets bounded topics, full stable profiles, pending contracts and structure budget', () => {
   const { systemPrompt } = prepare(input);
   for (const text of ['最多8个Topic', '400个Unicode', '2000个Unicode', '最多40条facts', '6000字节', '16000字节',
-    '最多5个代表来源', 'pendingResults', 'superseded', 'replacementMessageId', '70%', '30%', '不能新写为人物事实或AI自我画像',
+    'pendingResults', 'superseded', 'replacementMessageId', '70%', '30%', '不能新写为人物事实或AI自我画像',
     '不增加与某个人的相处模式', '不要求管理者身份', '不把缺口当作已整理']) assert.ok(systemPrompt.includes(text), text);
   assert.doesNotMatch(systemPrompt, /每条必须出现在|必须进入 topics|"ignoredMessageIds":|"fragments":/);
+  assert.doesNotMatch(systemPrompt, /最多5个代表|挤入5个/);
 });
 
 test('frozen output budgets are projected and used by every relevant prompt limit', () => {
@@ -168,6 +169,31 @@ test('mode-specific response shapes reject unrelated output and self mode needs 
   assert.match(prepare(self).systemPrompt, /mode=self：只返回/);
   assert.match(prepare(profiles).systemPrompt, /mode=profiles：只返回/);
   assert.match(prepare(messages).systemPrompt, /profiles必须为\[\]/);
+});
+
+test('messages-only responses may omit the always-empty profiles field without relaxing other contracts', () => {
+  for (const roomType of ['private', 'group']) {
+    const messages = { ...input, pipeline: 'materials', roomType, mode: 'messages', profiles: [], selfProfile: undefined };
+    const raw = { topics: [{ summary: '本批有价值的话题' }] }, before = structuredClone(raw);
+    assert.deepEqual(parse(raw, messages), {
+      ignoredMessageIds: [], topics: [{ summary: raw.topics[0].summary, messageIds: [] }], fragments: [], profiles: [],
+    });
+    assert.deepEqual(raw, before);
+    assert.match(prepare(messages).systemPrompt, /mode=messages：只返回\{"topics":\[\{"summary":string\}\],"profiles":\[\]\}/);
+    for (const profiles of [null, {}, '', 0, [profileResult]]) {
+      assert.throws(() => parse({ ...raw, profiles }, messages), error => error.code === 'model_contract');
+    }
+    for (const extra of [{ selfProfile: selfResult }, { ignoredMessageIds: [] }, { continuationSummary: '越界摘要' }, { unexpected: [] }]) {
+      assert.throws(() => parse({ ...raw, ...extra }, messages), error => error.code === 'model_contract');
+    }
+    assert.throws(() => parse({}, messages), error => error.code === 'model_contract');
+    assert.throws(() => parse({ topics: null }, messages), error => error.code === 'model_contract');
+    for (const mode of [undefined, 'profiles', 'self']) {
+      assert.throws(() => parse(raw, { ...messages, mode }), error => error.code === 'model_contract');
+    }
+  }
+  const summaryStep = { ...input, roomType: 'private', mode: 'messages', selfProfile: undefined };
+  assert.equal(parse({ topics: [], continuationSummary: '续聊' }, summaryStep).continuationSummary, '续聊');
 });
 
 test('mapping scope follows each frozen input and retains downstream self-source permission checks', () => {

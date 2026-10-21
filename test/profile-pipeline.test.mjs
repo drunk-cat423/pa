@@ -57,7 +57,12 @@ test('new profile protocol rewrites from all frozen personal facts and preserves
   assert.throws(() => validateExtract({ ...ignored(input), profiles: [{ ...baseline, facts: [fact('借用他人的证据', 'bob-source', 'third_party')] }] }, crossPerson), /有效原始真人/);
   const mergedSources = { ...inputFor(), profileSources: Array.from({ length: 6 }, (_, i) => message(`source-${i}`)),
     profiles: [profile('alice', Array.from({ length: 6 }, (_, i) => fact(`旧${i}`, `source-${i}`)))] };
-  assert.throws(() => validateExtract({ ...ignored(mergedSources), profiles: [profile('alice', Array.from({ length: 6 }, (_, i) => fact('同一事实', `source-${i}`)))] }, mergedSources), /容量/);
+  const merged = validateExtract({ ...ignored(mergedSources), profiles: [profile('alice', Array.from({ length: 6 }, (_, i) => fact('同一事实', `source-${i}`)))] }, mergedSources);
+  assert.equal(merged.profiles[0].facts.length, 1);
+  assert.equal(merged.profiles[0].facts[0].messageIds.length, 6);
+  assert.throws(() => validateExtract({ ...ignored(mergedSources), profiles: [profile('alice', [
+    { ...fact('同一事实', 'source-0'), messageIds: [...merged.profiles[0].facts[0].messageIds, 'forged'] },
+  ])] }, mergedSources), /有效原始真人/);
 });
 
 test('modes enforce independent message coverage, private fragments, and profiles-only results', () => {

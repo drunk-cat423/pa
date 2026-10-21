@@ -24,7 +24,7 @@ export function assertMemoryOutputFits(input: AutoMemoryTaskInput, config: PaCon
   const tokens = Math.min(config.memory?.maxOutputTokens ?? config.maxOutputTokens ?? 8192, Math.floor(config.contextWindow / 4));
   let estimate = 96;
   const selfEstimate = input.selfProfile ? Math.min(2000, [...input.selfProfile.content].length) * 2
-    + input.selfProfile.sourceMessageIds.length * 8 + input.selfProfile.pending.length * 48 : 0;
+    + (input.selfProfile.sourceMessageIds?.length ?? 0) * 8 + input.selfProfile.pending.length * 48 : 0;
   if (input.mode === undefined && input.outputBudget) {
     estimate += (input.outputBudget.summaryCharacters + input.outputBudget.topicTotalCharacters) * 2
       + input.outputBudget.topicCount * 32;

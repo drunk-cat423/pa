@@ -7,7 +7,8 @@ import { selfProfileBudget, validateSelfProfileProposal } from './self-profile-s
 import { memoryFailure, memoryFailurePhase, MemoryProviderError } from './memory-diagnostics.js';
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
 import { assertProfileCapacity, profileCapacity } from './profile-limits.js';
-import { assertProfileEvidenceStrength, assertProfileProtocol, PersonProfileProtocolError, validateProfilePendingResults } from './profile-pending.js';
+import { assertProfileEvidenceStrength, assertLiveProfileProtocol, assertProfileProtocol, PersonProfileProtocolError, validateProfilePendingResults } from './profile-pending.js';
+import { accumulateProfileUpdates, normalizeProfileUpdates, validateProfileUpdates } from './profile-updates.js';
 import { assertMemoryOutputFits, assertMemorySourceRange, assertProcessedRanges, COMPACT_TOPIC_LIMITS,
   memoryOutputBudget, memorySourceRange, MemoryOutputBudgetError } from './memory-work.js';
 
@@ -133,6 +134,7 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
       || updated.has(profile.personId) || profile.baseVersion !== people.get(profile.personId)!.baseVersion
       || !Array.isArray(profile.facts) || (!mergedProfile && profile.facts.length > 200)) throw new Error('人物画像版本或结构无效。');
     updated.add(profile.personId);
+    validateProfileUpdates(profile as unknown as PersonProfile,people.get(profile.personId)!,input);
     profile.facts.forEach(item => fact(item, profile.personId as string, true));
     if (input.profileProtocol !== 2 && profile.pendingIds !== undefined && (!Array.isArray(profile.pendingIds) || new Set(profile.pendingIds).size !== profile.pendingIds.length
       || profile.pendingIds.some(id => {
@@ -172,6 +174,7 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
   return { ...result, ...(range ? { processedRanges: [range], topics: result.topics.map(topic => ({ ...topic, sourceRange: range })) } : {}),
     profiles: result.profiles.map(profile => {
     const normalized = { ...profile, facts: mergeProfileFacts(profile.facts) };
+    if(profile.updates) normalized.updates=normalizeProfileUpdates(profile,normalized.facts)!;
     if (input.profileProtocol === 2) {
       // Pending indices refer to the submitted array; exact duplicate merging can move them.
       if (Array.isArray(profile.pendingResults)) normalized.pendingResults = profile.pendingResults.map(outcome => {
@@ -196,6 +199,8 @@ interface WorkItem {
 interface Progress {
   version: 2 | 3;
   profileBaselineProtocol?: 1;
+  profileAttributionProtocol?: 1;
+  selfProfileProtocol?: 2;
   separateMaterialSteps?: true;
   remaining: WorkItem[];
   extract: ValidatedExtract;
@@ -352,7 +357,7 @@ export class BackgroundMemory {
         const input: AutoMemoryTaskInput = { ...captured, selfProfileBudgetBytes: selfProfileBudget(this.config.contextWindow),
           ...(captured.extractionProtocol === 2 ? { outputBudget: memoryOutputBudget(this.config, captured.pipeline) } : {}) };
         assertCurrentMemoryProtocol(input);
-        assertProfileProtocol(input);
+        assertLiveProfileProtocol(input);
         this.store.assertProfileEvidenceCurrent(input);
         const savedProgress = this.store.loadProgress(job.id, lease);
         const progress = this.readProgress(job, input, savedProgress, true);
@@ -403,6 +408,7 @@ export class BackgroundMemory {
           if (input.extractionProtocol === 2) progress.extract.processedRanges!.push(...(result.processedRanges ?? []));
           for (const profile of result.profiles) {
             const original = progress.profiles.find(old => old.personId === profile.personId)!;
+            if(input.profileAttributionProtocol===1) accumulateProfileUpdates(profile,original,input.profiles.find(old=>old.personId===profile.personId)!);
             const previous = progress.extract.profiles.find(old => old.personId === profile.personId);
             const decisions = new Map((profile.pendingResults ?? []).map(outcome => [outcome.pendingId, outcome]));
             for (const prior of previous?.pendingResults ?? []) {
@@ -435,7 +441,9 @@ export class BackgroundMemory {
             const pendingIds = [...new Set([...(progress.extract.selfProfile?.pendingIds ?? []), ...result.selfProfile.pendingIds])];
             const archivedSources = input.selfProfile?.pending.filter(item => pendingIds.includes(item.id)).map(item => item.sourceMessageId) ?? [];
             const mergedSelf = { ...result.selfProfile, pendingIds,
-              sourceMessageIds: [...new Set([...result.selfProfile.sourceMessageIds, ...archivedSources])] };
+              ...(input.selfProfile?.protocol===2
+                ? {updates:[...new Map([...(progress.extract.selfProfile?.updates??[]),...(result.selfProfile.updates??[])].map(update=>[JSON.stringify(update),update])).values()]}
+                : {sourceMessageIds: [...new Set([...(result.selfProfile.sourceMessageIds??[]), ...archivedSources])]}) };
             validateSelfProfileProposal(mergedSelf, input.selfProfile!, input.messages, input.selfProfileBudgetBytes);
             progress.extract.selfProfile = mergedSelf;
           }
@@ -518,7 +526,7 @@ export class BackgroundMemory {
     } else if (input.selfProfile && progress.extract.selfProfile) {
       const previous = progress.extract.selfProfile;
       chunk.selfProfile = { baseVersion: previous.baseVersion, content: previous.content,
-        sourceMessageIds: previous.sourceMessageIds,
+        ...(input.selfProfile.protocol===2?{protocol:2 as const}:{sourceMessageIds:previous.sourceMessageIds??[]}),
         pending: input.selfProfile.pending.filter(pending => !previous.pendingIds.includes(pending.id)) };
     }
     if (input.extractionProtocol === 2 && item.mode === 'self') {
@@ -573,6 +581,7 @@ export class BackgroundMemory {
       assertCurrentMemoryProtocol(existing);
       if (!record(existing) || existing.version !== (input.extractionProtocol === 2 ? 3 : 2)) throw new PersonProfileProtocolError();
       if (existing.profileBaselineProtocol !== input.profileBaselineProtocol) throw new PersonProfileProtocolError();
+      if(existing.profileAttributionProtocol!==input.profileAttributionProtocol||existing.selfProfileProtocol!==input.selfProfileProtocol) throw new PersonProfileProtocolError();
       if (!Array.isArray(existing.remaining) || !record(existing.extract)
         || !Array.isArray(existing.profiles)) throw new Error('后台整理检查点损坏。');
       if (existing.separateMaterialSteps !== undefined && (existing.separateMaterialSteps !== true
@@ -605,6 +614,8 @@ export class BackgroundMemory {
         : [{ messageIds, personIds: input.profiles.map(profile => profile.personId) }];
     return { version: input.extractionProtocol === 2 ? 3 : 2,
       ...(input.profileBaselineProtocol === 1 ? { profileBaselineProtocol: 1 as const } : {}),
+      ...(input.profileAttributionProtocol?{profileAttributionProtocol:input.profileAttributionProtocol}:{}),
+      ...(input.selfProfileProtocol?{selfProfileProtocol:input.selfProfileProtocol}:{}),
       ...(separateMaterialSteps ? { separateMaterialSteps: true as const } : {}),
       remaining, profiles: input.profiles,
       extract: { topics: [], fragments: [], profiles: [], ignoredMessageIds: [], ...(input.extractionProtocol === 2 ? { processedRanges: [] } : {}) },

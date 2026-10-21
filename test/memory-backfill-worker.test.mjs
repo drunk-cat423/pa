@@ -91,7 +91,7 @@ test('scoped run cannot pass an earlier material job and its wait terminates wit
 
 test('scoped pending-only worker processes person and self pending while retaining original message', async t => {
   const f = fixture(t);
-  const source = f.inbound('我喜欢乌龙茶，也建议回答简洁');
+  const source = f.inbound('我喜欢乌龙茶。你以后回答简洁');
   f.store.autoMemory.reserveMaterialsIfDue(f.room.id, 0);
   const sourceJob = f.store.autoMemory.reserveMaterialsIfDue(f.room.id, 600_000);
   const sourceClaim = f.store.autoMemory.claimNext(f.room.id, { owner: 'fixture', leaseMs: 60_000, pipeline: 'materials' });
@@ -100,8 +100,8 @@ test('scoped pending-only worker processes person and self pending while retaini
 
   const actorId = f.store.findActor(f.room.id, 'alice');
   const personId = f.store.autoMemory.ensureActorPerson(actorId);
-  f.store.autoMemory.addProfilePending(personId, source.existingMessageId, '喜欢乌龙茶', 'third_party');
-  f.store.autoMemory.selfProfile.addPending(source.existingMessageId, '回答简洁');
+  f.store.autoMemory.addProfilePending(personId, source.existingMessageId, '我喜欢乌龙茶', 'self');
+  f.store.autoMemory.selfProfile.addPending(source.existingMessageId, '你以后回答简洁');
   assert.equal(f.store.autoMemory.planMaterialBackfill(f.room.id).messageCount, 0);
   assert.equal(f.store.autoMemory.planMaterialBackfill(f.room.id).pendingCount, 2);
   const runId = f.reserve();
@@ -120,14 +120,15 @@ test('scoped pending-only worker processes person and self pending while retaini
       assert.equal(input.profiles[0].pending.length, 1);
       const pending = input.profiles[0].pending[0];
       result.profiles = [{ personId: input.profiles[0].personId, baseVersion: input.profiles[0].baseVersion,
-        facts: [{ content: '喜欢乌龙茶', sourceType: 'third_party', messageIds: [pending.sourceMessageId] }],
+        facts: [{ content: '喜欢乌龙茶', sourceType: 'self', messageIds: [pending.sourceMessageId] }],
+        updates:[{factIndex:0,baselineFactIndexes:[],evidence:[pending.subject]}],
         pendingResults: [{ pendingId: pending.id, status: 'merged', factIndex: 0 }] }];
     } else {
       assert.equal(input.mode, 'self');
       assert.equal(input.selfProfile.pending.length, 1);
       const pending = input.selfProfile.pending[0];
       result.selfProfile = { baseVersion: input.selfProfile.baseVersion, content: '回答简洁',
-        sourceMessageIds: [pending.sourceMessageId], pendingIds: [pending.id] };
+        protocol:2,updates:[],pendingIds: [pending.id] };
     }
     return result;
   });
@@ -144,7 +145,7 @@ test('scoped pending-only worker processes person and self pending while retaini
   const db = new DatabaseSync(f.path);
   try {
     const original = db.prepare('SELECT text FROM messages WHERE id=?').get(source.existingMessageId);
-    assert.equal(original.text, '我喜欢乌龙茶，也建议回答简洁');
+    assert.equal(original.text, '我喜欢乌龙茶。你以后回答简洁');
     assert.equal(db.prepare('SELECT count(*) AS count FROM messages').get().count, 1);
   } finally { db.close(); }
 });
@@ -155,8 +156,8 @@ test('separate material steps persist before calling, remove AI messages from pr
   const sourceTwo = f.inbound('我平时喜欢简洁回答');
   const actorId = f.store.findActor(f.room.id, 'alice');
   const personId = f.store.autoMemory.ensureActorPerson(actorId);
-  f.store.autoMemory.addProfilePending(personId, sourceOne.existingMessageId, '偏好乌龙茶', 'third_party');
-  f.store.autoMemory.addProfilePending(personId, sourceTwo.existingMessageId, '喜欢简洁回答', 'third_party');
+  f.store.autoMemory.addProfilePending(personId, sourceOne.existingMessageId, '偏好乌龙茶', 'self');
+  f.store.autoMemory.addProfilePending(personId, sourceTwo.existingMessageId, '喜欢简洁回答', 'self');
 
   f.store.autoMemory.reserveMaterialsIfDue(f.room.id, 0);
   const initialJob = f.store.autoMemory.reserveMaterialsIfDue(f.room.id, 600_000);
@@ -166,8 +167,9 @@ test('separate material steps persist before calling, remove AI messages from pr
   const initialProfile = initialInput.profiles[0];
   const initialOutput = emptyExtraction(initialInput);
   initialOutput.profiles = [{ personId, baseVersion: initialProfile.baseVersion,
-    facts: initialProfile.pending.map(pending => ({ content: pending.content, sourceType: 'third_party',
+    facts: initialProfile.pending.map(pending => ({ content: pending.content, sourceType: 'self',
       messageIds: [pending.sourceMessageId] })),
+    updates:initialProfile.pending.map((pending,index)=>({factIndex:index,baselineFactIndexes:[],evidence:[pending.subject]})),
     pendingResults: initialProfile.pending.map((pending, index) => ({ pendingId: pending.id, status: 'merged', factIndex: index })) }];
   f.store.autoMemory.commit(initialClaim.id, initialClaim.leaseToken, initialOutput);
   const existingFacts = f.store.autoMemory.profile(personId).facts;

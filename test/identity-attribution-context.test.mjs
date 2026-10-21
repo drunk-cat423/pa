@@ -65,8 +65,8 @@ function background(body) {
 
 test('归因纠正保留speaker/subjects/excluded，屏蔽旧证据且同昵称不合人、不扩画像或权限', async t => {
   const f = await fixture(t);
-  await f.harness.handle(f.message('chocolate-source', 'CHOCOLATE_ORIGINAL_BUG', { senderId: 'chocolate-id', mentioned: false }));
-  await f.harness.handle(f.message('owner-profile', 'OWNER_STABLE_PROFILE', { mentioned: false }));
+  await f.harness.handle(f.message('chocolate-source', '我喜欢黑巧克力 CHOCOLATE_STABLE_PROFILE CHOCOLATE_ORIGINAL_BUG', { senderId: 'chocolate-id', mentioned: false }));
+  await f.harness.handle(f.message('owner-profile', '我喜欢茶 OWNER_STABLE_PROFILE', { mentioned: false }));
   await f.harness.handle(f.message('statement-source', 'ROOM_SHARED_STATEMENT <@chocolate-id>', { mentioned: false }));
   await f.harness.handle(f.message('wrong-source', 'OWNER_WRONG_USER_CLAIM', { mentioned: false }));
   assert.equal(await f.harness.handle(f.message('first-question', 'FIRST_QUESTION')), 'sent');
@@ -83,7 +83,9 @@ test('归因纠正保留speaker/subjects/excluded，屏蔽旧证据且同昵称�
   assert.notEqual(ownerPerson, chocolatePerson);
   store.autoMemory.addProfilePending(ownerPerson, owner.id, 'OWNER_STABLE_PROFILE', 'self');
   store.autoMemory.addProfilePending(chocolatePerson, chocolate.id, 'CHOCOLATE_STABLE_PROFILE', 'self');
-  store.autoMemory.addProfilePending(ownerPerson, wrong.id, 'DERIVED_WRONG_PENDING', 'self');
+  // Historical row: older attribution saved this unrelated source under the owner's profile.
+  db.prepare(`INSERT INTO person_profile_pending(id,person_id,content,source_message_id,source_type,created_at)
+    VALUES ('legacy-wrong-pending',?,?,?,'self',?)`).run(ownerPerson, 'DERIVED_WRONG_PENDING', wrong.id, new Date().toISOString());
   db.prepare('UPDATE persons SET revision=1 WHERE id=?').run(ownerPerson);
   db.prepare('INSERT INTO person_profile_revisions VALUES (?,1,?,NULL,?)').run(ownerPerson,
     JSON.stringify([{ content: 'DERIVED_WRONG_ARCHIVED', sourceType: 'self', messageIds: [wrong.id] }]), new Date().toISOString());
@@ -147,7 +149,7 @@ test('归因纠正保留speaker/subjects/excluded，屏蔽旧证据且同昵称�
     assert.deepEqual(payload.topics, []);
     const history = conversationContext(body).messages;
     assert.equal(history.find(message => message.id === chocolate.id).personId, chocolatePerson);
-    assert.equal(history.find(message => message.id === chocolate.id).text, 'CHOCOLATE_ORIGINAL_BUG');
+    assert.equal(history.find(message => message.id === chocolate.id).text, '我喜欢黑巧克力 CHOCOLATE_STABLE_PROFILE CHOCOLATE_ORIGINAL_BUG');
     for (const id of [wrong.id, badAi.id]) {
       const message = history.find(message => message.id === id);
       assert.deepEqual(message.correctedBy, [correction.id]);

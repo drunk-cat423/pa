@@ -19,9 +19,9 @@ function fixture(t) {
   t.after(() => { store.close(); rmSync(directory,{recursive:true,force:true}); });
   return { get store() { return store; }, conversation, path,
     restart() { store.close(); store = new ConversationStore(path); },
-    inbound(text, senderId='alice') {
+    inbound(text, senderId='alice', mentionedSenderIds=[]) {
       const eventId=String(++sequence);
-      store.recordInbound(conversation.id,text,{eventId,senderId,modelInputText:text});
+      store.recordInbound(conversation.id,text,{eventId,senderId,modelInputText:text,mentionedSenderIds});
       return store.externalMessage(conversation.id,eventId).id;
     },
     batch() {
@@ -133,8 +133,8 @@ test('a captured third-party target is organized even when only its recorder spo
   const first=f.store.autoMemory.claimNext(f.conversation.id,{owner:'test',leaseMs:60000,pipeline:'materials'});
   f.store.autoMemory.commit(first.id,first.leaseToken,emptyExtraction(f.store.autoMemory.taskInput(first)));
   const bob=f.store.autoMemory.personForActor(f.store.findActor(f.conversation.id,'bob'));
-  const source=f.inbound('小乙喜欢绘画','owner');
-  f.store.autoMemory.addProfilePending(bob,source,'喜欢绘画','third_party',{allowThirdParty:true});
+  const source=f.inbound('<@bob>喜欢绘画','owner',['bob']);
+  f.store.autoMemory.addProfilePending(bob,source,'喜欢绘画','third_party',{allowThirdParty:true,mentionedSenderIds:['bob']});
   let captured;
   const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:2,timeoutMs:1000}},
     f.store.autoMemory,f.conversation.id,{extract:async input=>{
@@ -142,6 +142,7 @@ test('a captured third-party target is organized even when only its recorder spo
       const person=input.profiles.find(profile=>profile.personId===bob),pending=person.pending[0];
       return {topics:[],fragments:[],ignoredMessageIds:[],
         profiles:[{personId:bob,baseVersion:person.baseVersion,facts:[{content:'喜欢绘画',sourceType:'third_party',messageIds:[source]}],
+          updates:[{factIndex:0,baselineFactIndexes:[],evidence:[pending.subject]}],
           pendingResults:[{pendingId:pending.id,status:'merged',factIndex:0}]}]};
     }});
   f.store.autoMemory.reserveMaterialsIfDue(f.conversation.id,602000);
@@ -159,10 +160,10 @@ test('a captured third-party target is organized even when only its recorder spo
 test('room-scoped pending captured after an earlier batch is picked up without the target speaking again', t => {
   const f=fixture(t);f.inbound('我是小乙','bob');
   const bob=f.store.autoMemory.personForActor(f.store.findActor(f.conversation.id,'bob'));
-  const source=f.inbound('小乙喜欢绘画','owner');
+  const source=f.inbound('<@bob>喜欢绘画','owner',['bob']);
   const old=f.batch();f.store.autoMemory.commit(old.job.id,old.job.leaseToken,old.output);
   // Simulate prepare_turn landing after the old batch's immutable input was already captured.
-  f.store.autoMemory.addProfilePending(bob,source,'喜欢绘画','third_party',{allowThirdParty:true});
+  f.store.autoMemory.addProfilePending(bob,source,'喜欢绘画','third_party',{allowThirdParty:true,mentionedSenderIds:['bob']});
   const next=f.inbound('继续聊','owner');const batch=f.batch();
   assert.deepEqual(batch.input.messages.map(message=>message.id),[next]);
   const target=batch.input.profiles.find(profile=>profile.personId===bob);

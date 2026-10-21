@@ -10,6 +10,13 @@ export function assertProfileProtocol(input: AutoMemoryTaskInput): void {
   if (input.profileProtocol !== 2) throw new PersonProfileProtocolError();
   if (input.profileBaselineProtocol !== undefined && (input.profileBaselineProtocol !== 1
     || input.pipeline !== 'materials' || input.extractionProtocol !== 2)) throw new PersonProfileProtocolError();
+  if(input.profileAttributionProtocol!==undefined&&(input.profileAttributionProtocol!==1||input.pipeline!=='materials')) throw new PersonProfileProtocolError();
+  if(input.selfProfileProtocol!==undefined&&(input.selfProfileProtocol!==2||input.pipeline!=='materials')) throw new PersonProfileProtocolError();
+}
+export function assertLiveProfileProtocol(input:AutoMemoryTaskInput): void {
+  assertProfileProtocol(input);
+  if(input.pipeline==='materials'&&(input.profileAttributionProtocol!==1||input.selfProfileProtocol!==2
+    ||(input.selfProfile!==undefined&&input.selfProfile.protocol!==2))) throw new PersonProfileProtocolError();
 }
 
 /** Model visibility differs from frozen evidence retained for identity checks and audit. */

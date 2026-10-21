@@ -131,10 +131,11 @@ function storeFixture(t) {
   };
 }
 function archiveBaseline(f) {
-  const source = f.inbound('不可重发的已归档原文：我不喜欢吃辣');
+  const source = f.inbound('我不喜欢吃辣；不可重发的已归档原文');
   f.queue(); const job = f.claim(), input = f.store.autoMemory.taskInput(job), baseline = input.profiles[0];
   const value = { ...emptyExtraction(input), profiles: [{ ...baseline,
-    facts: [fact('不喜欢吃辣', source)], pendingResults: [] }] };
+    facts: [fact('不喜欢吃辣', source)], pendingResults: [], updates:[{factIndex:0,baselineFactIndexes:[],
+      evidence:[{messageId:source,factQuote:'我不喜欢吃辣',subjectKind:'self',subjectQuote:'我'}]}] }] };
   f.store.autoMemory.commit(job.id, job.leaseToken, validateExtract(value, input));
   return { source, personId: baseline.personId };
 }
@@ -152,7 +153,7 @@ test('durable material snapshots keep raw evidence for audit while later model r
   const frozen = f.inspect(db => db.prepare('SELECT input_json FROM auto_memory_jobs WHERE id=?').get(job.id).input_json);
   f.restart(); assert.equal(JSON.stringify(f.store.autoMemory.taskInput(job)), JSON.stringify(input));
   const rewritten = { ...emptyExtraction(input), profiles: input.profiles.map(profile => ({ ...profile,
-    facts: [fact('饮食偏好清淡，不吃辣', archived.source)], pendingResults: [] })) };
+    facts: [fact('饮食偏好清淡，不吃辣', archived.source)], pendingResults: [],updates:[{factIndex:0,baselineFactIndexes:[0],evidence:[]}] })) };
   f.store.autoMemory.commit(job.id, job.leaseToken, validateExtract(rewritten, input));
   assert.equal(f.store.autoMemory.profile(archived.personId).facts[0].content, '饮食偏好清淡，不吃辣');
   const after = f.inspect(db => ({ messages: db.prepare('SELECT * FROM messages ORDER BY rowid').all(),
@@ -167,11 +168,14 @@ test('durable material snapshots keep raw evidence for audit while later model r
 
 test('hiding evidence in the wire does not hide a frozen third-party source identity change from commit', t => {
   const f = storeFixture(t);
-  f.inbound('我是 Alice'); const bobSource = f.inbound('Alice 喜欢喝茶', 'bob');
+  f.inbound('我是 Alice'); const bobSource = f.inbound('alice喜欢喝茶', 'bob');
+  const aliceId=f.store.autoMemory.personForActor(f.store.findActor(f.room.id,'alice'));
+  f.store.autoMemory.addProfilePending(aliceId,bobSource,'alice喜欢喝茶','third_party',{allowThirdParty:true});
   f.queue(); let job = f.claim(), input = f.store.autoMemory.taskInput(job);
   const alice = input.profiles.find(profile => profile.personId === input.messages[0].personId);
   f.store.autoMemory.commit(job.id, job.leaseToken, validateExtract({ ...emptyExtraction(input), profiles: [{ ...alice,
-    facts: [fact('喜欢喝茶', bobSource, 'third_party')], pendingResults: [] }] }, input));
+    facts: [fact('喜欢喝茶', bobSource, 'third_party')], pendingResults: [{pendingId:alice.pending[0].id,status:'merged',factIndex:0}],
+    updates:[{factIndex:0,baselineFactIndexes:[],evidence:[alice.pending[0].subject]}] }] }, input));
   f.inbound('Alice 的新聊天'); f.queue(); job = f.claim(); input = f.store.autoMemory.taskInput(job);
   assert.ok(input.profileSources.some(item => item.id === bobSource));
   assert.doesNotMatch(prepare(input).userContent, /Alice 喜欢喝茶/);

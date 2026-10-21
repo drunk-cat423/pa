@@ -27,7 +27,7 @@ function fixture(t,roomType='group') {
     run(id){return store.autoMemory.materialBackfillRun(id);},
     claim(jobIds){return store.autoMemory.claimNext(room.id,{owner:'fixture',leaseMs:60000,pipeline:'materials',jobIds});},
     commit(job,output){store.autoMemory.commit(job.id,job.leaseToken,output??emptyExtraction(store.autoMemory.taskInput(job)));},
-    pending(source,content='stable preference') {
+    pending(source,content='喜欢茶') {
       const person=store.autoMemory.personForActor(store.findActor(room.id,'alice'));
       store.autoMemory.addProfilePending(person,source.existingMessageId,content,'self');return store.autoMemory.profile(person).pending.at(-1);
     },
@@ -81,15 +81,15 @@ test('backfill excludes actual legacy done members and every existing material m
 });
 
 test('reservation freezes visible cutoff and valid pending, preserving old blocked ownership audit and excluding newly owned pending',t=>{
-  const f=fixture(t),source=f.inbound('old isolated source'),pending=f.pending(source,'old profile pending');
-  f.store.autoMemory.selfProfile.addPending(source.existingMessageId,'AI concise');
+  const f=fixture(t),source=f.inbound('我有 old profile pending；你以后回答简洁一点'),pending=f.pending(source,'old profile pending');
+  f.store.autoMemory.selfProfile.addPending(source.existingMessageId,'你以后回答简洁一点');
   legacyJob(f,'old-failed',[source]);
   f.restart(db=>{downgradeSchema20(db);db.exec('PRAGMA user_version=20;');});
   const oldObserved=f.inspect(db=>rows(db,'auto_memory_material_observed_pending'));
   assert.equal(oldObserved.length,2);assert.ok(oldObserved.every(row=>row.blocked===1));
   const runId=f.reserve({maxMessages:1,maxPending:1}),run=f.run(runId);
   assert.equal(run.messageCount,1);assert.equal(run.pendingCount,2);assert.equal(run.batchCount,3);
-  const newer=f.inbound('after frozen cutoff');f.pending(newer,'new profile pending');
+  const newer=f.inbound('我有 new profile pending');f.pending(newer,'new profile pending');
   const after=f.plan();assert.equal(after.messageCount,1);assert.equal(after.pendingCount,1);assert.equal(after.excluded.materialPending,2);
   assert.equal(f.run(runId).cutoffContextSeq,run.cutoffContextSeq);
   assert.equal(f.run(runId).pendingCount,2);assert.equal(f.run(runId).retainedPending,2);
@@ -111,17 +111,17 @@ test('reservation freezes visible cutoff and valid pending, preserving old block
 });
 
 test('active pending filters exclude archived/obsolete purpose/reclassified and pending already captured by any new material job',t=>{
-  const f=fixture(t),source=f.inbound('profile source');f.pending(source,'owned pending');
+  const f=fixture(t),source=f.inbound('我有 owned pending');f.pending(source,'owned pending');
   f.store.autoMemory.reserveMaterialsIfDue(f.room.id,0);f.store.autoMemory.reserveMaterialsIfDue(f.room.id,600000);
   assert.equal(f.plan().pendingCount,0);assert.equal(f.plan().excluded.materialPending,1);
-  const archived=f.inbound('archived'),legacy=f.inbound('legacy purpose');f.pending(archived,'archived pending');f.pending(legacy,'old event pending');
+  const archived=f.inbound('我有 archived pending'),legacy=f.inbound('我有 old event pending');f.pending(archived,'archived pending');f.pending(legacy,'old event pending');
   f.inspect(db=>{
     db.exec(`INSERT OR IGNORE INTO person_profile_revisions(person_id,revision,facts_json,job_id,created_at)
       SELECT DISTINCT person_id,0,'[]',NULL,'fixture initial version' FROM person_profile_pending;`);
     db.prepare(`UPDATE person_profile_pending SET archived_revision=0 WHERE source_message_id=?`).run(archived.existingMessageId);
     db.prepare(`UPDATE person_profile_pending SET purpose='memory' WHERE source_message_id=?`).run(legacy.existingMessageId);
   });
-  const term=f.inbound('本群术语');f.store.autoMemory.selfProfile.addPending(term.existingMessageId,'本群术语');
+  const term=f.inbound('你以后把本群术语作为固定术语');f.store.autoMemory.selfProfile.addPending(term.existingMessageId,'你以后把本群术语作为固定术语');
   const entry=f.store.autoMemory.selfProfile.snapshot().pending.find(item=>item.sourceMessageId===term.existingMessageId);
   f.store.reclassifySelfProfileTerms([{pendingId:entry.id,expectedContent:entry.content,key:'term'}],{
     version:1,ownerBindings:[{route:{channel:'qq',accountId:'test',roomType:'group',roomId:'backfill'},senderId:'alice'}]},0);
@@ -129,18 +129,19 @@ test('active pending filters exclude archived/obsolete purpose/reclassified and 
 });
 
 test('successful bounded backfill commits captured person/self pending only and retains a later content window',t=>{
-  const f=fixture(t),source=f.inbound('I like tea and concise answers');f.pending(source,'likes tea');
-  f.store.autoMemory.selfProfile.addPending(source.existingMessageId,'concise answers');
-  const runId=f.reserve({maxPending:1}),run=f.run(runId),later=f.inbound('new evidence after cutoff');f.pending(later,'later pending');
+  const f=fixture(t),source=f.inbound('我喜欢茶，也希望你以后回答简洁一点');f.pending(source,'喜欢茶');
+  f.store.autoMemory.selfProfile.addPending(source.existingMessageId,'你以后回答简洁一点');
+  const runId=f.reserve({maxPending:1}),run=f.run(runId),later=f.inbound('我有 later pending');f.pending(later,'later pending');
   f.store.autoMemory.reserveMaterialsIfDue(f.room.id,100);
   for(const id of run.jobIds) {
     const job=f.claim(run.jobIds);assert.equal(job.id,id);
     const input=f.store.autoMemory.taskInput(job),output=emptyExtraction(input);
     output.profiles=input.profiles.filter(profile=>profile.pending.length).map(profile=>({personId:profile.personId,baseVersion:profile.baseVersion,
       facts:[...profile.facts,...profile.pending.map(item=>({content:item.content,sourceType:item.sourceType,messageIds:[item.sourceMessageId]}))],
+      updates:profile.pending.map((item,index)=>({factIndex:profile.facts.length+index,baselineFactIndexes:[],evidence:[item.subject]})),
       pendingResults:profile.pending.map((item,index)=>({pendingId:item.id,status:'merged',factIndex:profile.facts.length+index}))}));
-    if(input.selfProfile.pending.length) output.selfProfile={baseVersion:input.selfProfile.baseVersion,content:'回答简洁',
-      sourceMessageIds:[source.existingMessageId],pendingIds:input.selfProfile.pending.map(item=>item.id)};
+    if(input.selfProfile.pending.length) output.selfProfile={protocol:2,baseVersion:input.selfProfile.baseVersion,content:'回答简洁',
+      updates:[],pendingIds:input.selfProfile.pending.map(item=>item.id)};
     f.commit(job,output);
   }
   const finished=f.run(runId);assert.equal(finished.status.completed,3);assert.equal(finished.remainingMessages,0);
@@ -171,8 +172,8 @@ test('scoped claims never skip the lane predecessor, scoped status isolates runs
   assert.equal(f.store.autoMemory.conversationContext(f.room.id).summary,undefined);
 });
 
-for(const version of [18,21])test(`schema ${version}->22 preserves old rowids/JSON/leases/profiles and backup bytes while adding manual backfill`,t=>{
-  const f=fixture(t),source=f.inbound('original migration material');f.pending(source);
+for(const version of [18,21])test(`schema ${version}->23 preserves old rowids/JSON/leases/profiles and backup bytes while adding manual backfill`,t=>{
+  const f=fixture(t),source=f.inbound('我喜欢茶，保留 original migration material');f.pending(source,'喜欢茶');
   legacyJob(f,'old-running',[source],{status:'running',frozen:'{"frozen":"不可改"}',progress:'{"progress":"原样"}'});
   const tables=['messages','auto_memory_jobs','person_profile_pending','person_profile_revisions','self_profile_revisions'];
   let before;
@@ -186,9 +187,12 @@ for(const version of [18,21])test(`schema ${version}->22 preserves old rowids/JS
     db.exec(`PRAGMA user_version=${version};`);before=Object.fromEntries(tables.map(table=>[table,rows(db,table)]));
   });
   f.inspect(db=>{
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version,22);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version,23);
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(),[]);
-    for(const table of tables)assert.deepEqual(rows(db,table),version===18&&table==='auto_memory_jobs'?before[table].map(row=>({...row,pipeline:'legacy'})):before[table]);
+    for(const table of tables) {
+      const expected=version===18&&table==='auto_memory_jobs'?before[table].map(row=>({...row,pipeline:'legacy'})):before[table];
+      assert.deepEqual(rows(db,table),table==='person_profile_pending'?expected.map(row=>({...row,subject_json:null})):expected);
+    }
     if(version===18) {
       const isolated=db.prepare('SELECT * FROM auto_memory_legacy_isolations WHERE job_id=?').get('old-running');
       assert.equal(isolated.input_hash,sha(before.auto_memory_jobs[0].input_json));assert.equal(isolated.progress_hash,sha(before.auto_memory_jobs[0].progress_json));

@@ -166,7 +166,7 @@ test('v12 migration backs up the consistent original database before adding defe
     });
     const original=inspect(f,snapshot);
     f.store.close();inspect(f,db=>{downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; DROP TABLE auto_memory_job_deferrals; PRAGMA user_version=12;');});f.restart();
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),22);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),23);
     assert.deepEqual(inspect(f,snapshot),original);
     const backups=readdirSync(f.directory).filter(name=>name.includes('.v12.')&&name.endsWith('.bak'));
     assert.equal(backups.length,1);
@@ -197,7 +197,7 @@ test('expired worker is failed without automatic recall; explicit retry fences t
 
 test('chunk progress and input snapshot survive retry and reclaim; clearing rereads facts',()=>{
   const f=fixture();try {
-    const source=f.inbound('self fact');const actor=f.store.findActor(f.conversation.id,'alice');
+    const source=f.inbound('我有new self fact');const actor=f.store.findActor(f.conversation.id,'alice');
     f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const original=claim(f);
     const before=f.store.autoMemory.taskInput(original);f.store.autoMemory.saveProgress(original.id,original.leaseToken,{chunk:1,topics:[]});
     f.store.autoMemory.renewLease(original.id,original.leaseToken,120000);
@@ -262,7 +262,7 @@ test('uncertain and pending delivery never become private count rounds',()=>{
 
 test('unbound actors are isolated and configured multiple people share only explicit bindings',()=>{
   const f=fixture();try {
-    const alice=f.inbound('alice');const bob=f.inbound('bob','bob');const a=f.store.findActor(f.conversation.id,'alice');const b=f.store.findActor(f.conversation.id,'bob');
+    const alice=f.inbound('我喜欢tea','alice');const bob=f.inbound('我喜欢sports','bob');const a=f.store.findActor(f.conversation.id,'alice');const b=f.store.findActor(f.conversation.id,'bob');
     assert.notEqual(f.store.autoMemory.personForActor(a),f.store.autoMemory.personForActor(b));
     const route={...f.route,roomType:'private',roomId:'private'};const other=f.store.ensureConversation('private','/private.jsonl',route);
     const alias=f.store.ensureActor(other.id,'alias');
@@ -281,16 +281,16 @@ test('unbound actors are isolated and configured multiple people share only expl
 
 test('profile pending corrections captured after a batch stay pending for the next batch',()=>{
   const f=fixture();try {
-    const source=f.inbound('I drink tea'),actor=f.store.findActor(f.conversation.id,'alice'),person=f.store.autoMemory.personForActor(actor);
-    f.store.autoMemory.addProfilePending(person,source.existingMessageId,'tea','self');
+    const source=f.inbound('我平时喝茶'),actor=f.store.findActor(f.conversation.id,'alice'),person=f.store.autoMemory.personForActor(actor);
+    f.store.autoMemory.addProfilePending(person,source.existingMessageId,'喝茶','self');
     const bob=f.inbound('Alice likes coffee','bob');
     assert.throws(()=>f.store.autoMemory.addProfilePending(person,bob.existingMessageId,'coffee','self'),/实际发送者/);
     f.store.autoMemory.reserveBatch(f.conversation.id,'capacity');const worker=claim(f),baseline=f.store.autoMemory.taskInput(worker).profiles.find(p=>p.personId===person);
-    const correction=f.inbound('now water');f.store.autoMemory.addProfilePending(person,correction.existingMessageId,'water','self');
+    const correction=f.inbound('我现在改喝水');f.store.autoMemory.addProfilePending(person,correction.existingMessageId,'喝水','self');
     f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[{...baseline,
       pendingResults:baseline.pending.map(item=>({pendingId:item.id,status:'deferred'}))}]}));
     assert.deepEqual(f.store.autoMemory.profile(person).facts,[]);
-    assert.deepEqual(f.store.autoMemory.profile(person).pending.map(p=>p.content),['tea','water']);
+    assert.deepEqual(f.store.autoMemory.profile(person).pending.map(p=>p.content),['喝茶','喝水']);
   }finally{f.close();}
 });
 
@@ -298,15 +298,15 @@ test('older batch cannot produce fields or consume a newer uncaptured pending co
   const f=fixture();try {
     let old;for(let i=0;i<50;i++)old=f.inbound(`old tea statement ${i}`);
     f.store.autoMemory.reserveBatch(f.conversation.id,'count');
-    const latest=f.inbound('now water');const actor=f.store.findActor(f.conversation.id,'alice');
-    f.store.autoMemory.addProfilePending(f.store.autoMemory.personForActor(actor),latest.existingMessageId,'water','self');
+    const latest=f.inbound('我现在改喝水');const actor=f.store.findActor(f.conversation.id,'alice');
+    f.store.autoMemory.addProfilePending(f.store.autoMemory.personForActor(actor),latest.existingMessageId,'喝水','self');
     const worker=claim(f);const baseline=f.store.autoMemory.taskInput(worker).profiles[0];
     const stale={...baseline,facts:[{field:'diet',content:'tea',sourceType:'self',messageIds:[old.existingMessageId]}]};
     assert.throws(()=>f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[stale]})),/分类字段/);
     f.store.autoMemory.commit(worker.id,worker.leaseToken,ignored(f,worker,{profiles:[{...baseline,
       pendingResults:baseline.pending.map(item=>({pendingId:item.id,status:'deferred'}))}]}));
-    assert.equal(f.store.autoMemory.profileForActors(actor)[0].pending.at(-1).content,'water');
-    assert.equal(f.store.autoMemory.profileForActors(actor)[0].pending.at(-1).content,'water');
+    assert.equal(f.store.autoMemory.profileForActors(actor)[0].pending.at(-1).content,'喝水');
+    assert.equal(f.store.autoMemory.profileForActors(actor)[0].pending.at(-1).content,'喝水');
   }finally{f.close();}
 });
 
@@ -429,7 +429,7 @@ test('v5 incremental migration preserves original IDs, tombstones, primary ident
     assert.equal(inspect(f,db=>db.prepare('SELECT status,content FROM memories WHERE id=?').get(memory.id)).content,null);
     assert.equal(f.store.autoMemory.profile('original-person').facts[0].content,longLegacyFact);
     assert.equal([...longLegacyFact].length,24*'迁移前保留的旧画像事实'.length);
-    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),22);
+    assert.equal(inspect(f,db=>db.prepare('PRAGMA user_version').get().user_version),23);
     assert.deepEqual(inspect(f,db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
     assert.equal(readdirSync(f.directory).some(name=>name.includes('.v5.')&&name.endsWith('.bak')),true);
     f.inbound('new');assert.equal(f.store.autoMemory.reserveBatch(f.conversation.id,'capacity'),undefined);assert.equal(f.store.autoMemory.conversationContext(f.conversation.id).messages.at(-1).text,'new');

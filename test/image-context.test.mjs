@@ -36,7 +36,7 @@ test('QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、
       delta={role:'assistant',content:JSON.stringify({
         ...(input.extractionProtocol === 2 ? {} : {ignoredMessageIds:input.messages.filter(message=>message.role==='user').map(message=>message.id),fragments:[]}),
         topics:[],profiles:[],continuationSummary:`图中为一张小图，原图imageId=${imageId}`,
-        ...(input.selfProfile ? {selfProfile:{baseVersion:input.selfProfile.baseVersion,content:input.selfProfile.content,sourceMessageIds:[],pendingIds:[]}} : {})})};
+        ...(input.selfProfile ? {selfProfile:{baseVersion:input.selfProfile.baseVersion,content:input.selfProfile.content,updates:[],pendingIds:[]}} : {})})};
     }else{
       requests.push(body);
       const current=body.messages.filter(message=>message.role==='user').map(messageText).find(text=>text.includes('[本轮明确输入]'))??'';
