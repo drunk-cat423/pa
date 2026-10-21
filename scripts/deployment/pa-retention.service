@@ -1,0 +1,13 @@
+[Unit]
+Description=PA backup and release retention
+
+[Service]
+Type=oneshot
+TimeoutStartSec=10min
+User=root
+Group=root
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/bin/flock -n /run/lock/pa-storage.lock /opt/node-v24.15.0/bin/node /opt/pa/maintenance/storage/pa-storage.mjs prune --apply
+StandardOutput=journal
+StandardError=journal

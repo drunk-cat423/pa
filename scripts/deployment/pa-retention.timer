@@ -1,0 +1,10 @@
+[Unit]
+Description=Run PA retention daily
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+Unit=pa-retention.service
+
+[Install]
+WantedBy=timers.target

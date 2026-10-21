@@ -53,6 +53,41 @@ systemctl disable --now mysql.service
 
 更新使用新的发布目录，完成构建和检查后停服务、备份数据，再切换 current 并启动。配置和数据不随发布包替换。若只有代码回退可兼容现有 schema，切回旧代码即可；schema 回退需要同一停机快照中的 SQLite 与 Pi JSONL 一起恢复，不能分别拼接。不要重新启动本机实例与服务器实例同时试用。
 
+### 备份与发布保留规则
+
+统一使用 `/usr/local/sbin/pa-storage`，实现和 systemd 模板在 `scripts/deployment/`。完整快照只写入 `/var/backups/pa/snapshots/`；不再在 `/root/pa-*` 下另建数据副本。每份快照保存整个数据目录的 `data.tar.gz`、对应代码的 `source.tar.gz`（不含 node_modules）、私有配置和服务单元。完成校验后才写入带 SHA-256 的 `manifest.json` 并原子发布目录；`.partial-*` 和未知格式目录不参与自动删除。
+
+- 保留最近 **3 份完整快照**，并额外保留最近 **2 个标记过的升级检查点**，重叠只保留一份。检查点用于表结构迁移、资料流水线切换等需要恢复旧数据的操作；普通发布不标记检查点。
+- 发布代码保留 **current 和最近 2 个其他版本**。正在运行的进程、保留版本通过 node_modules 链接依赖的版本会受到保护；不能为凑够数量删断引用。依赖链接原文含 `..` 分量，或目标的祖先目录也是软链时，轮换会拒绝执行；应先整理成指向真实发布目录中 node_modules 的绝对链接。
+- 数据目录中的独立 `pa.sqlite.v*.bak` 仅保留最新 **1 份**，更早的迁移备份由完整快照覆盖。原始聊天、当前数据库、Pi JSONL、图片和诊断文件不由轮换程序删除。
+- 每天服务器时间 **04:30** 运行轮换；发布成功后也可手工运行。删除前核验保留快照的校验和、当前发布及 PA 运行进程；检查失败则停止。轮换记录写入 journald，不调用模型。
+
+安装运维入口和定时器（不修改 PA 服务单元）：
+
+```bash
+sudo install -d -m 700 /opt/pa/maintenance/storage /var/backups/pa/snapshots
+sudo install -m 755 scripts/deployment/pa-storage.mjs /opt/pa/maintenance/storage/pa-storage.mjs
+sudo install -m 755 scripts/deployment/pa-storage /usr/local/sbin/pa-storage
+sudo install -m 644 scripts/deployment/pa-retention.service scripts/deployment/pa-retention.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pa-retention.timer
+sudo pa-storage plan
+```
+
+发布、创建快照、切换 current 和轮换必须共用 `/run/lock/pa-storage.lock`。入口已取得该锁；执行整段发布脚本时应在外层取得一次锁，内部直接调用 Node 脚本，避免嵌套 flock。准备中的发布目录使用非 Git SHA 名称，构建完成后才改为最终 SHA 名称。先停止 PA，再创建快照；快照命令不会自行停止或启动服务，也不允许对正在运行的数据目录制作假定一致的副本：
+
+```bash
+sudo systemctl stop pa.service
+sudo pa-storage backup
+# 涉及需要回退数据的升级时，改用 backup --checkpoint before-schema-N。
+# 完成升级、切换 current 并启动 PA，确认正常后再执行：
+sudo pa-storage prune --apply
+sudo systemctl list-timers pa-retention.timer
+sudo journalctl -u pa-retention.service -n 20 --no-pager
+```
+
+恢复时先停止 PA，把同一快照中的数据库和 Pi 文件作为整个数据目录恢复，不能与现有会话文件混用；按需恢复该份配置及服务单元。旧发布目录已轮换时，使用同份 `source.tar.gz` 和 lockfile 重建依赖。升级检查点不是当前消息的副本，恢复旧快照会失去快照之后的变化。这些快照保存在同一台服务器，仅用于回退，不等于异地备份。
+
 ## PA 网页读取代理
 
 Mihomo 作为独立的 `mihomo-pa.service` 运行，只监听 `127.0.0.1:17890`，不启用 TUN、系统代理或公网代理入口。安装二进制位于 `/opt/mihomo-pa/mihomo`，私有配置位于 `/etc/mihomo-pa/config.yaml`，订阅缓存及节点选择位于 `/var/lib/mihomo-pa`。服务和不含凭证的配置模板见 `scripts/deployment/mihomo-pa.service`、`scripts/deployment/mihomo-pa.example.yaml`。安装时校验官方发布文件的 SHA-256；私有配置使用 root:mihomo-pa、640，缓存目录只允许服务账号访问。订阅每天直接刷新，已有缓存供重启时使用；真实订阅地址和节点凭证不得进入代码仓库或日志输出。

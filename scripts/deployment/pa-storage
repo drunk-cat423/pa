@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+exec /usr/bin/flock -n /run/lock/pa-storage.lock \
+  /opt/node-v24.15.0/bin/node /opt/pa/maintenance/storage/pa-storage.mjs "$@"

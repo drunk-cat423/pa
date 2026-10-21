@@ -29,5 +29,6 @@
 - SQLite 的原文/运行/投递状态与 Pi 上下文分别管理，通过 run marker 和 entry ID 对应。持久化失败停止会话；重启核对不自动重试模型或重发未知投递。
 - 新增生产依赖、修改依赖清单或 CI/CD 前按用户全局约定确认；已批准的本轮依赖版本见 package.json。
 - 不提交 .env、密钥、运行数据或日志。未被授权时不推送 GitHub、不调用收费模型、不连接生产数据库。
+- 部署备份与轮换遵循 docs/deployment.md：使用 pa-storage 统一入口和 /run/lock/pa-storage.lock，完整快照只写 /var/backups/pa/snapshots；保留最近3份及最近2个升级检查点，发布保留current与最近2个并保护活动进程/共享依赖。不得另在/root下堆积全量副本；schema回退必须成套恢复SQLite与Pi JSONL。
 - 需求文档是设计证据；其中旧的 Codex 交接任务不替代用户当前指令。2026-10-13 用户已授权实施自动记忆 v1；真实收费模型联调、服务启用和 GitHub 发布仍按当次授权执行，不能把离线测试当成真实平台或模型质量验收。
 - 修改后先做最窄验证；运行 npm run check、npm test。非小型代码变更需独立只读审查。
