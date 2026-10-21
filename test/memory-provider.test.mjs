@@ -7,6 +7,7 @@ import test from 'node:test';
 import { createMemoryProvider, MemoryInputTooLargeError, prepareMemoryExtraction, parseMemoryResponse } from '../dist/memory-provider.js';
 import { DiagnosticLog } from '../dist/diagnostics.js';
 import { replayDiagnosticCall } from '../dist/logs.js';
+import { personProfileCapacityPrompt } from '../dist/profile-limits.js';
 
 const output = {
   ignoredMessageIds: [], topics: [], fragments: [], profiles: [], continuationSummary: '继续讨论行程安排。',
@@ -33,10 +34,14 @@ test('pure offline request preparation omits worker leases and states the human-
 test('new profile preparation requests complete bounded replacement and typed pending decisions', () => {
   const prepared = prepareMemoryExtraction({ ...input, profileProtocol: 2 }, 100000);
   assert.match(prepared.systemPrompt, /facts 是该人的完整最终画像/);
-  assert.match(prepared.systemPrompt, /最多40条facts/);
-  assert.match(prepared.systemPrompt, /200个Unicode字符/);
-  assert.match(prepared.systemPrompt, /6000字节/);
+  assert.ok(prepared.systemPrompt.includes(personProfileCapacityPrompt()));
+  assert.match(prepared.systemPrompt, /最多80条facts/);
+  assert.match(prepared.systemPrompt, /120个Unicode字符/);
+  assert.match(prepared.systemPrompt, /8000字节/);
   assert.match(prepared.systemPrompt, /16000字节/);
+  assert.match(prepared.systemPrompt, /事实数达到60条/);
+  assert.match(prepared.systemPrompt, /正文达到6000字节/);
+  assert.match(prepared.systemPrompt, /完整JSON达到12000字节/);
   assert.match(prepared.systemPrompt, /pendingResults/);
   assert.doesNotMatch(prepared.systemPrompt, /"pendingIds"\?:string\[\]/);
   assert.match(prepared.systemPrompt, /not_profile/);

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { PaConfig } from './config.js';
 import { ObsoletePersonalMemoryError, assertCurrentMemoryProtocol, mergeProfileFacts, sameFact, sameFactContent, type AutoMemoryStore } from './auto-memory-store.js';
 import type { AutoMemoryJob, AutoMemoryTaskInput, AutoMemoryPipeline, ValidatedExtract, PersonProfile, ProfileFact } from './auto-memory-types.js';
@@ -6,11 +6,11 @@ import { createMemoryProvider, MemoryInputTooLargeError, type MemoryProvider } f
 import { selfProfileBudget, validateSelfProfileProposal } from './self-profile-store.js';
 import { memoryFailure, memoryFailurePhase, MemoryProviderError } from './memory-diagnostics.js';
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
-import { assertProfileCapacity, profileCapacity } from './profile-limits.js';
+import { assertProfileCapacity, PersonProfileCapacityError, profileCapacity } from './profile-limits.js';
 import { assertProfileEvidenceStrength, assertLiveProfileProtocol, assertProfileProtocol, PersonProfileProtocolError, validateProfilePendingResults } from './profile-pending.js';
 import { accumulateProfileUpdates, normalizeProfileUpdates, validateProfileUpdates } from './profile-updates.js';
 import { assertMemoryOutputFits, assertMemorySourceRange, assertProcessedRanges, COMPACT_TOPIC_LIMITS,
-  memoryOutputBudget, memorySourceRange, MemoryOutputBudgetError } from './memory-work.js';
+  memoryOutputBudget, memorySourceRange, MemoryOutputBudgetError, profileOutputTarget } from './memory-work.js';
 
 type Budget = { calls: number };
 const budgets = new WeakMap<PaConfig, Budget>();
@@ -21,8 +21,8 @@ function sharedBudget(config: PaConfig): Budget {
 }
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
-/** Reject malformed model output before any write; the store independently validates sources at commit. */
-export function validateExtract(value: unknown, input: AutoMemoryTaskInput, mergedProfile = false): ValidatedExtract {
+/** Capacity is checked only AFTER every person's structure, attribution and pending results are valid. */
+function validateExtractProposal(value: unknown, input: AutoMemoryTaskInput, mergedProfile = false): ValidatedExtract {
   const compact = input.extractionProtocol === 2;
   if (compact && input.mode === 'self' && record(value)) {
     const proposal = value;
@@ -184,10 +184,22 @@ export function validateExtract(value: unknown, input: AutoMemoryTaskInput, merg
           factIndex: normalized.facts.findIndex(fact => sameFactContent(fact, target)) } : outcome;
       });
       normalized.pendingResults = validateProfilePendingResults(normalized, people.get(profile.personId)!, input);
-      assertProfileCapacity(normalized);
     }
     return normalized;
   }) };
+}
+
+/** Reject malformed or oversized model output before any write; commit independently checks again. */
+export function validateExtract(value: unknown, input: AutoMemoryTaskInput, mergedProfile = false): ValidatedExtract {
+  const result = validateExtractProposal(value, input, mergedProfile);
+  if (input.profileProtocol === 2) result.profiles.forEach(profile => assertProfileCapacity({ ...profile, baseVersion: profile.baseVersion + 1 }));
+  return result;
+}
+
+class ProfileRefinementExhaustedError extends Error {
+  constructor(cause?: unknown) {
+    super('人物画像容量提炼未完成，保留批次并搁置。', { cause }); this.name = 'ProfileRefinementExhaustedError';
+  }
 }
 
 interface WorkItem {
@@ -206,7 +218,11 @@ interface Progress {
   extract: ValidatedExtract;
   profiles: PersonProfile[];
   summary?: string;
+  capacityRecovery?: { version: 1; workKey: string; result: ValidatedExtract; attemptedPersonIds: string[] };
 }
+
+const workKey = (item: WorkItem) => createHash('sha256').update(JSON.stringify(item)).digest('hex');
+const exceedsCapacity = (profile: PersonProfile) => profileCapacity({ ...profile, baseVersion: profile.baseVersion + 1 }).exceedsLimits;
 
 /** Local maintenance may drain a frozen set without observing or reserving new work. */
 export interface MemoryExecutionScope {
@@ -380,16 +396,38 @@ export class BackgroundMemory {
           try {
             phase = 'extract';
             this.diagnostics?.event(context, phase, 'started', { messageIds: chunk.messages.map(message => message.id) });
-            assertMemoryOutputFits(chunk, this.config);
-            const proposal = await this.request(signal => this.provider.extract(chunk, signal, { onCall: id => { callId = id; } }), () => Boolean(callId));
-            this.diagnostics?.event(context, phase, 'completed', undefined, callId);
-            phase = 'validate';
-            this.diagnostics?.event(context, phase, 'started', undefined, callId);
-            result = validateExtract(proposal, chunk);
+            if (progress.capacityRecovery) {
+              if (progress.capacityRecovery.workKey !== workKey(item)) throw new Error('画像容量提炼检查点不匹配。');
+              const saved = progress.capacityRecovery.result;
+              // Ranges are program-authored; regenerate them from this immutable step, not model fields.
+              result = validateExtractProposal({ ...saved, topics: saved.topics.map(({ sourceRange: _range, ...topic }) => topic) }, chunk);
+              progress.capacityRecovery.result = result;
+            } else {
+              assertMemoryOutputFits(chunk, this.config);
+              const proposal = await this.request(signal => this.provider.extract(chunk, signal, { onCall: id => { callId = id; } }), () => Boolean(callId));
+              this.diagnostics?.event(context, phase, 'completed', undefined, callId);
+              phase = 'validate';
+              this.diagnostics?.event(context, phase, 'started', undefined, callId);
+              result = validateExtractProposal(proposal, chunk);
+            }
             this.store.assertProfileEvidenceCurrent(input, result);
+            if (chunk.pipeline === 'materials' && chunk.profileAttributionProtocol === 1 && result.profiles.some(exceedsCapacity)) {
+              if (!progress.capacityRecovery) {
+                progress.capacityRecovery = { version: 1, workKey: workKey(item), result, attemptedPersonIds: [] };
+                phase = 'checkpoint';
+                this.store.saveProgress(job.id, lease, progress);
+                this.diagnostics?.event(context, 'profile_capacity', 'prepared', { personIds: result.profiles.filter(exceedsCapacity).map(profile => profile.personId) }, callId);
+              }
+              result = await this.refineProfiles(chunk, progress, job, context, (next, id) => { phase = next; callId = id; });
+            }
+            // Non-live/legacy tasks and the repaired result still have the same hard boundary.
+            if (chunk.profileProtocol === 2) result.profiles.forEach(profile => assertProfileCapacity({ ...profile, baseVersion: profile.baseVersion + 1 }));
             this.diagnostics?.event(context, phase, 'completed', undefined, callId);
           }
           catch (error) {
+            if (progress.capacityRecovery && (error instanceof MemoryInputTooLargeError || error instanceof MemoryOutputBudgetError)) {
+              throw new ProfileRefinementExhaustedError(error);
+            }
             if (!(error instanceof MemoryInputTooLargeError || error instanceof MemoryOutputBudgetError) || callId) throw error;
             const replacements = this.splitWork(item, chunk);
             if (!replacements) throw error;
@@ -400,6 +438,7 @@ export class BackgroundMemory {
             this.diagnostics?.event(context, phase, 'completed', { split: true });
             continue;
           }
+          delete progress.capacityRecovery;
           const offset = progress.extract.topics.length;
           progress.extract.topics.push(...result.topics);
           progress.extract.fragments.push(...result.fragments.map(fragment => ({ ...fragment,
@@ -466,13 +505,14 @@ export class BackgroundMemory {
         this.pipelineErrors.delete(pipeline);
         this.lastError = [...this.pipelineErrors.values()].at(-1);
       } catch (error) {
-        phase = memoryFailurePhase(error, phase);
+        const callError = error instanceof ProfileRefinementExhaustedError ? error.cause : error;
+        phase = memoryFailurePhase(callError, phase);
         let failure = error;
         try {
           if (!(error instanceof DiagnosticPersistenceError)) {
             this.diagnostics?.event(context, phase, 'failed', { failure: memoryFailure(error, phase) }, callId);
             if (callId) this.diagnostics?.finishCall(callId,
-              error instanceof MemoryProviderError && error.code === 'model_request' ? 'unknown' : 'failed',
+              callError instanceof MemoryProviderError && callError.code === 'model_request' ? 'unknown' : 'failed',
               phase, { failure: memoryFailure(error, phase) });
           }
         } catch (diagnosticError) { failure = diagnosticError; }
@@ -485,12 +525,62 @@ export class BackgroundMemory {
           // A compact task's protocol and completion receipts stay tied to its
           // original snapshot. A conflict requires an explicit replacement task.
           if (conflict && !compactTask) this.store.clearProgress(job.id, lease);
+          if (error instanceof ProfileRefinementExhaustedError && !this.diagnosticFailed && pipeline === 'materials') {
+            this.store.deferCapacityFailure(job.id, lease, this.lastError);
+            this.diagnostics?.event(context, 'profile_capacity', 'deferred', { reason: 'refinement_exhausted' }, callId);
+            continue;
+          }
           this.store.fail(job.id, lease, this.lastError);
         }
         // A failed/aborted request may have been billed or completed upstream. Only explicit retry may call again.
         return;
       }
     }
+  }
+
+  /** One extra, budgeted call per oversized person in this step; candidates never replace trusted baselines. */
+  private async refineProfiles(chunk: AutoMemoryTaskInput, progress: Progress, job: AutoMemoryJob, context: DiagnosticContext,
+    stage: (phase: string, callId?: string) => void): Promise<ValidatedExtract> {
+    const recovery = progress.capacityRecovery!;
+    for (const candidate of recovery.result.profiles.filter(exceedsCapacity)) {
+      if (recovery.attemptedPersonIds.includes(candidate.personId)) throw new ProfileRefinementExhaustedError();
+      const baseline = chunk.profiles.find(profile => profile.personId === candidate.personId)!;
+      const refinement: AutoMemoryTaskInput = { ...chunk, mode: 'profiles', profiles: [baseline],
+        profileRefinement: { candidate } };
+      delete refinement.selfProfile; delete refinement.previousSummary;
+      refinement.profileOutputTarget = profileOutputTarget(refinement, this.config);
+      // These checks do not consume the single opportunity, or trigger a provider request.
+      assertMemoryOutputFits(refinement, this.config);
+      if (this.closed || this.diagnosticFailed || (this.config.memory!.maxCalls > 0 && this.budget.calls >= this.config.memory!.maxCalls)) {
+        throw new Error('后台模型调用预算已用完或正在关闭。');
+      }
+      this.store.renewLease(job.id, job.leaseToken!, this.config.memory!.timeoutMs + 10000);
+      stage('checkpoint');
+      recovery.attemptedPersonIds.push(candidate.personId);
+      this.store.saveProgress(job.id, job.leaseToken!, progress);
+      let refinementCallId: string | undefined;
+      try {
+        stage('profile_refine');
+        this.diagnostics?.event(context, 'profile_refine', 'started', { personId: candidate.personId });
+        const proposal = await this.request(signal => this.provider.extract(refinement, signal, { onCall: id => {
+          refinementCallId = id; stage('profile_refine', id);
+        } }), () => Boolean(refinementCallId));
+        stage('validate', refinementCallId);
+        const result = validateExtract(proposal, refinement);
+        this.store.assertProfileEvidenceCurrent(chunk, result);
+        const profile = result.profiles[0]!;
+        recovery.result.profiles = recovery.result.profiles.map(previous => previous.personId === profile.personId ? profile : previous);
+        stage('checkpoint', refinementCallId);
+        this.store.saveProgress(job.id, job.leaseToken!, progress);
+        this.diagnostics?.event(context, 'profile_refine', 'completed', { personId: candidate.personId }, refinementCallId);
+        if (refinementCallId) this.diagnostics?.finishCall(refinementCallId, 'completed', 'validate');
+      } catch (error) {
+        // Never retry a timeout/unknown call. Preserve its consumed opportunity and frozen draft.
+        if (error instanceof PersonProfileCapacityError || error instanceof MemoryProviderError) throw new ProfileRefinementExhaustedError(error);
+        throw error;
+      }
+    }
+    return recovery.result;
   }
 
   private workInput(input: AutoMemoryTaskInput, progress: Progress, item: WorkItem): AutoMemoryTaskInput {
@@ -538,6 +628,7 @@ export class BackgroundMemory {
     }
     if (input.extractionProtocol === 2 && item.mode === 'messages') delete chunk.selfProfile;
     if (input.pipeline === 'materials') delete chunk.previousSummary;
+    if (chunk.mode === 'profiles' && chunk.profiles.length === 1) chunk.profileOutputTarget = profileOutputTarget(chunk, this.config);
     return chunk;
   }
 
@@ -586,6 +677,15 @@ export class BackgroundMemory {
         || !Array.isArray(existing.profiles)) throw new Error('后台整理检查点损坏。');
       if (existing.separateMaterialSteps !== undefined && (existing.separateMaterialSteps !== true
         || input.pipeline !== 'materials' || input.extractionProtocol !== 2)) throw new Error('后台整理检查点损坏。');
+      if (existing.capacityRecovery !== undefined) {
+        const recovery = existing.capacityRecovery;
+        if (input.pipeline !== 'materials' || input.profileAttributionProtocol !== 1 || !record(recovery)
+          || recovery.version !== 1 || typeof recovery.workKey !== 'string' || !record(recovery.result)
+          || !Array.isArray(recovery.attemptedPersonIds) || new Set(recovery.attemptedPersonIds).size !== recovery.attemptedPersonIds.length
+          || recovery.attemptedPersonIds.some(id => typeof id !== 'string' || !input.profiles.some(profile => profile.personId === id))) {
+          throw new Error('画像容量提炼检查点损坏。');
+        }
+      }
       const available = new Set(input.messages.map(message => message.id));
       const people = new Set(input.profiles.map(profile => profile.personId));
       const pendingIds = new Set([...input.profiles.flatMap(profile => (profile.pending ?? []).map(pending => pending.id)),

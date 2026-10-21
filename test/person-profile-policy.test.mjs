@@ -67,7 +67,7 @@ test('over-capacity commit rolls back raw messages, profile revision, pending qu
     f.store.autoMemory.addProfilePending(personId, source.existingMessageId, '喜欢茶', 'self');
     const { job, input } = batch(f);
     const baseline = input.profiles.find(profile => profile.personId === personId);
-    const oversized = Array.from({ length: 41 }, (_, index) => ({
+    const oversized = Array.from({ length: 81 }, (_, index) => ({
       content: `偏好${index}`,
       sourceType: 'self',
       messageIds: [source.existingMessageId],

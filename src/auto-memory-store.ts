@@ -1108,6 +1108,21 @@ export class AutoMemoryStore {
   fail(jobId:string,leaseToken:string,error:string): void {
     this.atomic(()=>{this.active(jobId,leaseToken);this.db.prepare("UPDATE auto_memory_jobs SET status='failed',error=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?").run(error,jobId);});
   }
+  /** Only exhausted live profile-capacity recovery may leave FIFO automatically; never mark it done. */
+  deferCapacityFailure(jobId:string,leaseToken:string,error:string): void {
+    this.atomic(()=>{
+      const row=this.active(jobId,leaseToken);
+      const input=row.input_json==null?undefined:parse<AutoMemoryTaskInput>(row.input_json);
+      const progress=row.progress_json==null?undefined:parse<{capacityRecovery?:{version?:number}}>(row.progress_json);
+      if(row.pipeline!=='materials'||!input||input.profileAttributionProtocol!==1||input.selfProfileProtocol!==2
+        ||progress?.capacityRecovery?.version!==1||!error.includes('[profile_refinement]')) throw new Error('只能自动搁置已保留现场的画像容量提炼任务。');
+      const reason='人物画像容量提炼未完成；自动搁置，保留原文、旧画像、pending、固定输入及进度，后续资料批次可继续。';
+      this.db.prepare("UPDATE auto_memory_jobs SET status='failed',error=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?")
+        .run(error,jobId);
+      this.db.prepare('INSERT INTO auto_memory_job_deferrals(job_id,reason,created_at,input_hash,progress_hash) VALUES (?,?,?,?,?)')
+        .run(jobId,reason,timestamp(),hash(String(row.input_json)),hash(String(row.progress_json)));
+    });
+  }
   retry(jobId:string): void {
     this.atomic(()=>{
       if(this.db.prepare('SELECT 1 FROM auto_memory_legacy_isolations WHERE job_id=?').get(jobId)) throw new Error('已隔离的旧整理任务不能重试。');

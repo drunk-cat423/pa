@@ -30,6 +30,12 @@ export function memoryFailure(error: unknown, phase: string): string {
     code = 'profile_protocol'; detail = '人物画像协议已变更；旧固定输入与进度已保留，需操作者处理。';
   } else if (error instanceof Error && error.name === 'PersonProfileCapacityError') {
     code = 'profile_capacity'; detail = '人物画像超过容量或格式限制；原文、版本和待整理条目保持不变。';
+  } else if (error instanceof Error && error.name === 'ProfileRefinementExhaustedError') {
+    code = 'profile_refinement'; detail = '人物画像容量提炼未完成；保留输入、进度和旧版本并搁置，后续资料批次可继续。';
+    if (error.cause instanceof MemoryProviderError) detail += ` 提炼原因=${error.cause.code}。`;
+    else if (error.cause instanceof Error && ['PersonProfileCapacityError', 'MemoryInputTooLargeError', 'MemoryOutputBudgetError'].includes(error.cause.name)) {
+      detail += ` 提炼原因=${error.cause.name}。`;
+    }
   } else if (error instanceof Error && error.name === 'MemoryOutputBudgetError') {
     code = 'output_budget'; detail = '预计输出超过预算，尚未提交模型；需要更小的整理步骤。';
   } else if (error instanceof Error && error.name === 'MemoryInputTooLargeError') {

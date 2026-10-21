@@ -80,6 +80,10 @@ export interface AutoMemoryTaskInput {
   deferredRanges?: { startSeq: number; endSeq: number }[];
   selfProfileBudgetBytes?: number;
   outputBudget?: { summaryCharacters: number; topicCount: number; topicCharacters: number; topicTotalCharacters: number };
+  /** A smaller convergence target for an indivisible profile step's actual output budget. */
+  profileOutputTarget?: { maxFacts: number; maxContentBytes: number; maxStructureBytes: number };
+  /** Validated for attribution, but NOT an archived baseline or permission to inherit new facts. */
+  profileRefinement?: { candidate: PersonProfile };
   profileSources?: AutoMemoryMessage[];
   excludedProfileSourceIds?: string[];
   profileFragments?: { personId: string; content: string; sourceType: EvidenceType; messageIds: string[] }[];

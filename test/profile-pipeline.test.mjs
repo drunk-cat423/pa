@@ -46,7 +46,7 @@ function workerFixture(t, input, extract, saved) {
 }
 
 test('new profile protocol rewrites from all frozen personal facts and preserves hard capacity after deduplication', () => {
-  const baseline = profile('alice', Array.from({ length: 30 }, (_, i) => fact(`历史事实${i}`, `old-${i}`)));
+  const baseline = profile('alice', Array.from({ length: 60 }, (_, i) => fact(`历史事实${i}`, `old-${i}`)));
   const input = { ...inputFor([baseline]), profileSources: baseline.facts.map((_, i) => message(`old-${i}`)) };
   assert.throws(() => validateExtract(ignored(input), input), /遗漏/);
   const result = validateExtract({ ...ignored(input), profiles: [{ ...baseline, facts: [fact('合并后的稳定偏好', 'old-29')] }] }, input);
@@ -102,7 +102,7 @@ test('profile rewrites cannot promote frozen third-party or inferred evidence to
 });
 
 test('normal batches make one combined call with complete facts; omitted mandatory compaction fails without retries', async t => {
-  const baseline = profile('alice', Array.from({ length: 35 }, (_, i) => fact(`事实${i}`, 'old')));
+  const baseline = profile('alice', Array.from({ length: 60 }, (_, i) => fact(`事实${i}`, 'old')));
   const input = { ...inputFor([baseline]), profileSources: [message('old')] };
   const calls = [];
   const f = workerFixture(t, input, async chunk => {
@@ -112,7 +112,7 @@ test('normal batches make one combined call with complete facts; omitted mandato
   f.worker.start(); await f.worker.wait();
   assert.equal(calls.length, 1);
   assert.equal(calls[0].mode, undefined);
-  assert.equal(calls[0].profiles[0].facts.length, 35);
+  assert.equal(calls[0].profiles[0].facts.length, 60);
   assert.equal(f.completed.profiles[0].facts.length, 1);
   let rejectedCalls = 0;
   const rejected = workerFixture(t, input, async chunk => { rejectedCalls++; return ignored(chunk); });

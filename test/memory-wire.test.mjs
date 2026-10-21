@@ -3,6 +3,7 @@ import test from 'node:test';
 import { prepareMemoryExtraction, parseMemoryResponse } from '../dist/memory-provider.js';
 import { memoryWireReferences } from '../dist/memory-wire.js';
 import { validateSelfProfileProposal } from '../dist/self-profile-store.js';
+import { personProfileCapacityPrompt } from '../dist/profile-limits.js';
 
 const id = number => `00000000-0000-4000-8000-${String(number).padStart(12, '0')}`;
 const message = (number, extra = {}) => ({ id: id(number), conversationId: id(90), role: 'user',
@@ -75,7 +76,9 @@ test('wire projection preserves roles, identity/reply relationships, chronology 
 
 test('new prompt sets bounded topics, full stable profiles, pending contracts and structure budget', () => {
   const { systemPrompt } = prepare(input);
-  for (const text of ['最多8个Topic', '400个Unicode', '2000个Unicode', '最多40条facts', '6000字节', '16000字节',
+  assert.ok(systemPrompt.includes(personProfileCapacityPrompt()));
+  for (const text of ['最多8个Topic', '400个Unicode', '2000个Unicode', '最多80条facts', '120个Unicode字符', '8000字节', '16000字节',
+    '事实数达到60条', '正文达到6000字节', '完整JSON达到12000字节',
     'pendingResults', 'superseded', 'replacementMessageId', '70%', '30%', '不能新写为人物事实或AI自我画像',
     '不增加与某个人的相处模式', '不要求管理者身份', '不把缺口当作已整理']) assert.ok(systemPrompt.includes(text), text);
   assert.doesNotMatch(systemPrompt, /每条必须出现在|必须进入 topics|"ignoredMessageIds":|"fragments":/);
@@ -91,6 +94,38 @@ test('frozen output budgets are projected and used by every relevant prompt limi
   }
   assert.deepEqual(JSON.parse(prepare(input).userContent).outputBudget,
     { summaryCharacters: 2000, topicCount: 8, topicCharacters: 400, topicTotalCharacters: 2000 });
+});
+
+test('profile refinement aliases the draft separately and keeps the original baseline and attribution indexes', () => {
+  const baseline = structuredClone(input.profiles[0]);
+  const task = { ...input, pipeline: 'materials', mode: 'profiles', profileBaselineProtocol: 1,
+    profileAttributionProtocol: 1, selfProfileProtocol: 2, profiles: [baseline], selfProfile: undefined,
+    profileOutputTarget: { maxFacts: 45, maxContentBytes: 4500, maxStructureBytes: 12000 },
+    profileRefinement: { candidate: { personId: baseline.personId, baseVersion: baseline.baseVersion,
+      facts: [{ content: '候选措辞'.repeat(40), sourceType: 'self', messageIds: [id(1), id(4)] }],
+      updates: [{ factIndex: 0, baselineFactIndexes: [0], evidence: [{ messageId: id(1), factQuote: '正文', subjectKind: 'self', subjectQuote: '我' }] }],
+      pendingResults: [{ pendingId: id(40), status: 'superseded', replacementMessageId: id(1) }] } },
+  };
+  const before = structuredClone(task), prepared = prepare(task), projected = JSON.parse(prepared.userContent);
+  assert.deepEqual(task, before);
+  assert.doesNotMatch(prepared.userContent, /00000000-0000-4000-8000-|secret-lease|obsolete/);
+  assert.deepEqual(projected.profiles[0].facts[0].content, baseline.facts[0].content);
+  assert.equal(projected.profiles[0].facts.length, 1);
+  const candidate = projected.profileRefinement.candidate;
+  const refs = memoryWireReferences(task);
+  assert.equal(candidate.personId, refs.people.get(baseline.personId));
+  assert.deepEqual(candidate.facts[0].messageIds, [refs.messages.get(id(1)), refs.messages.get(id(4))]);
+  assert.deepEqual(candidate.updates[0].baselineFactIndexes, [0]);
+  assert.equal(candidate.updates[0].evidence[0].messageId, refs.messages.get(id(1)));
+  assert.equal(candidate.pendingResults[0].pendingId, refs.pending.get(id(40)));
+  assert.equal(candidate.pendingResults[0].replacementMessageId, refs.messages.get(id(1)));
+  assert.equal(candidate.capacity.exceedsLimits, true);
+  assert.deepEqual(projected.profileOutputTarget, task.profileOutputTarget);
+  assert.match(prepared.systemPrompt, /只有一次修正机会/);
+  assert.match(prepared.systemPrompt, /不能引用草稿下标/);
+  assert.match(prepared.systemPrompt, /45条facts、正文4500/);
+  const decoded = parse({ profiles: [{ ...profileResult, updates: [], pendingResults: [] }] }, task);
+  assert.equal(decoded.profiles[0].personId, baseline.personId);
 });
 
 test('wire decoder restores only typed references and supplies internal legacy defaults', () => {

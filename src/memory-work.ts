@@ -1,5 +1,6 @@
 import type { AutoMemoryTaskInput, MemorySourceRange } from './auto-memory-types.js';
 import type { PaConfig } from './config.js';
+import { PERSON_PROFILE_TARGET } from './profile-limits.js';
 
 export const COMPACT_TOPIC_LIMITS = { count: 8, characters: 400, totalCharacters: 2000 } as const;
 
@@ -16,6 +17,18 @@ export function memoryOutputBudget(config: PaConfig, pipeline?: AutoMemoryTaskIn
   const topicTotalCharacters = pipeline === 'compression' ? 0 : Math.max(0, Math.min(COMPACT_TOPIC_LIMITS.totalCharacters, Math.floor(tokens * 0.16)));
   return { summaryCharacters, topicCount: Math.min(COMPACT_TOPIC_LIMITS.count, Math.floor(topicTotalCharacters / 120)),
     topicCharacters: Math.min(COMPACT_TOPIC_LIMITS.characters, topicTotalCharacters), topicTotalCharacters };
+}
+
+/** Tight output budgets ask for a more concise complete profile, never a sliced baseline. */
+export function profileOutputTarget(input: AutoMemoryTaskInput, config: PaConfig): NonNullable<AutoMemoryTaskInput['profileOutputTarget']> {
+  const tokens = Math.min(config.memory?.maxOutputTokens ?? config.maxOutputTokens ?? 8192, Math.floor(config.contextWindow / 4));
+  const profile = input.profiles[0]!;
+  const sourceCost = Math.min(150, profile.facts.reduce((sum, fact) => sum + fact.messageIds.length, 0)) * 8;
+  const available = Math.max(0, tokens * 0.9 - 96 - 128 - sourceCost - (profile.pending?.length ?? 0) * 64);
+  const ratio = Math.min(1, available / (PERSON_PROFILE_TARGET.maxContentBytes * 0.75 + PERSON_PROFILE_TARGET.maxFacts * 64));
+  return { maxFacts: Math.max(1, Math.floor(PERSON_PROFILE_TARGET.maxFacts * ratio)),
+    maxContentBytes: Math.max(1, Math.floor(PERSON_PROFILE_TARGET.maxContentBytes * ratio)),
+    maxStructureBytes: PERSON_PROFILE_TARGET.maxStructureBytes };
 }
 
 /** This is an output-risk estimate, not measured usage and never a claim about billing. */
@@ -35,8 +48,9 @@ export function assertMemoryOutputFits(input: AutoMemoryTaskInput, config: PaCon
     for (const profile of input.profiles) {
       // Plan for the bounded convergence target, not an unbounded legacy input.
       // Large existing profiles must still be able to become smaller.
-      const contentBytes = Math.min(4500, profile.facts.reduce((sum, fact) => sum + Buffer.byteLength(fact.content), 0));
-      const factCount = Math.min(30, profile.facts.length);
+      const target = input.profileOutputTarget ?? PERSON_PROFILE_TARGET;
+      const contentBytes = Math.min(target.maxContentBytes, profile.facts.reduce((sum, fact) => sum + Buffer.byteLength(fact.content), 0));
+      const factCount = Math.min(target.maxFacts, profile.facts.length);
       const sources = Math.min(150, profile.facts.reduce((sum, fact) => sum + fact.messageIds.length, 0));
       estimate += 128 + contentBytes * 0.75 + factCount * 64 + sources * 8 + (profile.pending?.length ?? 0) * 64;
     }
