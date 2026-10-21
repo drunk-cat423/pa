@@ -53,6 +53,12 @@ systemctl disable --now mysql.service
 
 更新使用新的发布目录，完成构建和检查后停服务、备份数据，再切换 current 并启动。配置和数据不随发布包替换。若只有代码回退可兼容现有 schema，切回旧代码即可；schema 回退需要同一停机快照中的 SQLite 与 Pi JSONL 一起恢复，不能分别拼接。不要重新启动本机实例与服务器实例同时试用。
 
+### 研究功能与 schema24
+
+研究功能首次部署将 schema23 升级到24，停机快照标记 `before-schema-24` 检查点。报告目录位于 `PA_DATA_DIR/research`，由现有整个数据目录备份一并保留。先在新发布目录完成构建及研究端到端检查；停止服务并完成快照后，以pa用户打开新版本ConversationStore迁移，核对原文和外键，再切换并启动。不能把旧schema23代码直接指向升级后的数据库。
+
+`PA_RESEARCH_ENABLED` 默认true，独立后台预算默认12次主模型、24次工具、其中6次搜索，单任务串行运行。复用当前模型和已启用的搜索/网页读取配置，无需新凭证。群聊与私聊只在原渠道白名单内接入；跨场景研究清单复用 `policy.json` 的可信人物绑定。启动就绪不等于真实研究质量或QQ文件客户端已验收，实际使用说明见 [research.md](research.md)。
+
 ### 备份与发布保留规则
 
 统一使用 `/usr/local/sbin/pa-storage`，实现和 systemd 模板在 `scripts/deployment/`。完整快照只写入 `/var/backups/pa/snapshots/`；不再在 `/root/pa-*` 下另建数据副本。每份快照保存整个数据目录的 `data.tar.gz`、对应代码的 `source.tar.gz`（不含 node_modules）、私有配置和服务单元。完成校验后才写入带 SHA-256 的 `manifest.json` 并原子发布目录；`.partial-*` 和未知格式目录不参与自动删除。
@@ -98,7 +104,7 @@ Mihomo 作为独立的 `mihomo-pa.service` 运行，只监听 `127.0.0.1:17890`�
 
 在 `/etc/pa/pa.env` 设置 `PA_FETCH_PROXY_URL=http://127.0.0.1:17890`；需要通过公共 DNS 解析网页目标时，同时设置 `PA_FETCH_PUBLIC_DNS=true`。这两个配置仅作用于 `web_fetch` 及其 DNS 查询，不配置 `HTTP_PROXY`、`HTTPS_PROXY` 或全局网络 agent。QQ Gateway、QQ API、DeepSeek 模型/整理/搜索 API 及图片上传继续使用原连接。DeepSeek 服务端原生搜索的出站网络由 DeepSeek 控制，不经过 PA 的代理。
 
-网页读取先解析并检查目标地址，再用 HTTP CONNECT 连接已验证的公网 IP；TLS 的服务器名、证书校验和 HTTP Host 保留原网页域名。代理不重新解析网页域名；内网地址、重定向和现有响应大小限制仍按原规则拒绝。代理连接失败时返回工具错误，不自动重试或改成直连。当前只支持无认证、无路径/查询/片段的 HTTP 代理 URL。
+网页读取先解析并检查目标地址，再用 HTTP CONNECT 连接已验证的公网 IP；TLS 的服务器名、证书校验和 HTTP Host 保留原网页域名。代理不重新解析网页域名；内网地址、重定向和现有响应大小限制仍按原规则拒绝。普通聊天读取失败不自动重试；独立研究任务对临时网络错误最多尝试两次，仍使用原代理，不回退直连。当前只支持无认证、无路径/查询/片段的 HTTP 代理 URL。
 
 验证时分别检查：Mihomo 仅监听回环；以 pa 用户调用实际 `fetchWebPage` 读取外网正文及公共 DNS；非公网地址仍被拒绝；PA 进程没有全局代理变量，QQ 重新就绪且 DeepSeek API 仍可直连。控制接口仅提供本机 Unix socket `/run/mihomo-pa/controller.sock`，可由服务器操作者检查节点及连接，不开放 HTTP 管理端口。此次接入无需修改 Nginx、Waline 或安全组。
 

@@ -1,5 +1,9 @@
 import { lstat, readFile } from 'node:fs/promises';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import { RESEARCH_TOOL_SPECS } from './research-tools.js';
+
+const recordedTools = new Set(['web_search', 'web_fetch', 'update_profile', 'read_history', 'read_image',
+  'answer_in_depth', 'prepare_turn', ...RESEARCH_TOOL_SPECS.map(tool => tool.name)]);
 
 export type RecordedTurn = {
   runId: string;
@@ -104,7 +108,7 @@ export async function readSessionEntries(file: string): Promise<SessionEntry[] |
         const message = entry.message;
         if (!message || typeof message !== 'object' || !('role' in message)
           || !['system', 'user', 'assistant', 'toolResult'].includes(String(message.role)) || !('content' in message)
-          || (message.role === 'toolResult' && (!('toolName' in message) || !['web_search', 'web_fetch', 'update_profile', 'read_history', 'answer_in_depth', 'prepare_turn'].includes(String(message.toolName))
+          || (message.role === 'toolResult' && (!('toolName' in message) || !recordedTools.has(String(message.toolName))
             || !('toolCallId' in message) || typeof message.toolCallId !== 'string' || !message.toolCallId
             || !('isError' in message) || typeof message.isError !== 'boolean'))
           || !validMessageContent(String(message.role), message.content)) {

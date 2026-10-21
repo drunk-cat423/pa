@@ -17,6 +17,8 @@ import { NO_OWNER_POLICY, type HarnessPolicy } from './harness-policy.js';
 import { imageMetadata, type ImageProjection, type ImageContent } from './image-context.js';
 import { ImageAssets } from './image-assets.js';
 import { DiagnosticLog } from './diagnostics.js';
+import type { ResearchToolContext } from './research-tools.js';
+import type { ResearchSender } from './research-service.js';
 
 export class PersistenceError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -28,7 +30,7 @@ export class PersistenceError extends Error {
 export interface RecordedConversation {
   prompt(text: string, external?: ExternalRunInput,
     onProgress?: (progress: { id: string; text: string; begin(mode: 'passive' | 'active', replySlot?: number): void }) => Promise<{ status: 'sent' | 'uncertain' | 'rejected'; externalMessageId?: string }>,
-    canSendProgress?: () => boolean): Promise<{ text: string; runId: string; deliveryId: string; referenceUrls?: readonly string[] }>;
+    canSendProgress?: () => boolean, sendResearch?: ResearchSender): Promise<{ text: string; runId: string; deliveryId: string; referenceUrls?: readonly string[] }>;
   ingest(text: string, external: ExternalRunInput): MemorySource | undefined;
   hasInbound(eventId: string): boolean;
   acknowledge(deliveryId: string, status: 'sent' | 'uncertain', externalMessageId?: string): void;
@@ -104,7 +106,8 @@ function memoryContext(memories: MemoryRecord[], channel = false): { content?: s
 }
 
 export async function openRecordedConversation(config: PaConfig, conversationKey: string, route?: ChannelRoute,
-  options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy } = {}): Promise<RecordedConversation> {
+  options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy;
+    researchContext?: (conversationId: string, sourceMessageId: string, send?: ResearchSender) => ResearchToolContext } = {}): Promise<RecordedConversation> {
   // Acquire the Pi conversation lock before inspecting or mutating its business records.
   const runtime = await openConversation(config, conversationKey, { enableSearch: Boolean(route), contextCalibrationScope: conversationKey });
   let store: ConversationStore | undefined;
@@ -273,7 +276,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
         for (const controller of preparations) controller.abort();
         await Promise.all([runtime.abort(), ...[...taskRuntimes].map(task => task.abort())]);
       },
-      prompt(text, external, onProgress, canSendProgress) {
+      prompt(text, external, onProgress, canSendProgress, sendResearch) {
         try { usable(); } catch (error) { return Promise.reject(error); }
         if (!external && active) return Promise.reject(new Error('此会话正在处理上一条消息，请等待完成。'));
         const controller = new AbortController();
@@ -514,6 +517,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
               ...(conversationContext ? { conversationContext } : {}),
               ...(recalled.content ? { memoryContext: recalled.content } : {}), memoryRefs: recalled.refs,
               ...(inputExternal ? { companionTools: {
+                ...(options.researchContext ? { research: options.researchContext(conversation.id, run.inputMessageId, sendResearch) } : {}),
                 prepareTurn: (plan: import('./turn-plan.js').TurnPlan) => persist(()=>openedStore.prepareTurn(
                   conversation.id,run.inputMessageId,plan,policy,inputExternal.mentionedSenderIds,
                   selfProfileBudget(runtime.estimate('').contextWindow)),text),

@@ -13,6 +13,7 @@ import { toPlainText } from './plain-text.js';
 import { appendReferenceUrls, splitReply, QQ_PASSIVE_REPLY_LIMIT } from './reply-chunks.js';
 import { splitMarkdown } from './markdown-chunks.js';
 import { ImageAssets, ImageAssetError } from './image-assets.js';
+import { ResearchService } from './research-service.js';
 
 export interface ChannelTransport {
   send(message: OutboundMessage): Promise<DeliveryResult>;
@@ -45,6 +46,7 @@ export class ChannelHarness {
   private readonly imageAssets: ImageAssets;
   private readonly admissions = new Map<string, Promise<unknown>>();
   private readonly admissionAbort = new AbortController();
+  private readonly research?: ResearchService;
 
   constructor(private readonly config: PaConfig, private readonly routes: ChannelRoute[],
     private readonly transport: ChannelTransport, private readonly maxCalls: number, policy: HarnessPolicy = NO_OWNER_POLICY,
@@ -56,9 +58,13 @@ export class ChannelHarness {
     this.allowed = new Set(routes.map(channelConversationKey));
     this.policy = validateHarnessPolicy(policy);
     this.imageAssets = new ImageAssets(config);
+    if (config.research?.enabled) this.research = new ResearchService(config, routes,
+      message => this.output(message.route, () => this.closed ? Promise.resolve({ status: 'rejected' as const }) : this.transport.send(message)),
+      () => { this.fatal = new Error('研究任务持久化失败。'); this.onTaskError?.(); });
   }
 
   info() { return { calls: this.calls, maxCalls: this.maxCalls, computing: this.computing, queued: this.pending.length,
+    ...(this.research ? { research: this.research.info() } : {}),
     memory: [...this.conversations].map(([key, conversation]) => ({ conversation: key, ...conversation.memoryStatus() })) }; }
 
   async waitForMemory(): Promise<void> {
@@ -70,9 +76,12 @@ export class ChannelHarness {
     while (this.jobs.size) await Promise.allSettled([...this.jobs]);
   }
 
+  async waitForResearch(): Promise<void> { await this.research?.wait(); }
+
   async start(): Promise<void> {
     if (!this.closed) {
       await Promise.all(this.routes.map(route => this.open(channelConversationKey(route), route)));
+      if (!this.closed) this.research?.start();
     }
   }
 
@@ -80,7 +89,8 @@ export class ChannelHarness {
     let pending = this.opening.get(key);
     if (!pending) {
       pending = openRecordedConversation(this.config, key, route,
-        { persons: configuredPersons(this.policy), policy: this.policy, ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}) });
+        { persons: configuredPersons(this.policy), policy: this.policy, ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}),
+          ...(this.research ? { researchContext: (conversationId, sourceId, send) => this.research!.context(conversationId, sourceId, send) } : {}) });
       this.opening.set(key, pending);
       pending.then(conversation => {
         this.conversations.set(key, conversation);
@@ -242,7 +252,14 @@ export class ChannelHarness {
           catch { return { status: 'uncertain' }; }
         });
       }, () => !this.closed && this.passiveAvailable(message, replyOffset)
-        && !this.outputs.has(channelConversationKey(message.route)));
+        && !this.outputs.has(channelConversationKey(message.route)), fileMessage => this.output(message.route, async () => {
+          if (this.closed) return { status: 'rejected' };
+          const mode = this.passiveAvailable(message, replyOffset) ? 'passive' : 'active';
+          const partIndex = mode === 'passive' ? replyOffset++ : 0;
+          try { return await this.transport.send({ ...fileMessage, route: message.route, deliveryMode: mode, partIndex,
+            ...(mode === 'passive' ? { replyToMessageId: message.eventId } : {}), plainText: true }); }
+          catch { return { status: 'uncertain' }; }
+        }));
     } catch (error) {
       if (error instanceof DuplicateMessageError) { this.calls--; conversation.finishTask(taskId, 'interrupted'); return 'duplicate'; }
       if (error instanceof RequestError) { conversation.finishTask(taskId, this.closed ? 'interrupted' : 'failed'); return 'failed'; }
@@ -296,6 +313,7 @@ export class ChannelHarness {
   async close(): Promise<void> {
     this.closed = true;
     this.admissionAbort.abort();
+    const researchClosing = this.research?.abort();
     for (const waiting of this.pending.splice(0)) waiting.resolve('ignored');
     // Abort model work first; in-flight transport receipts still need the open store.
     await Promise.all([...this.conversations.values()].map(conversation => conversation.abort()));
@@ -303,6 +321,8 @@ export class ChannelHarness {
     await Promise.allSettled(this.admissions.values());
     await Promise.all([...this.conversations.values()].map(conversation => conversation.abort()));
     await Promise.allSettled(this.jobs);
+    await researchClosing;
+    await this.research?.close();
     await Promise.allSettled(this.outputs.values());
     // An open operation already in progress may have completed after the first close pass.
     await Promise.all([...this.conversations.values()].map(conversation => conversation.close()));

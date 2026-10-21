@@ -40,7 +40,7 @@ const messages: Record<Failure, string> = {
 };
 
 export class WebFetchError extends Error {
-  constructor(readonly code: Failure) { super(messages[code]); this.name = 'WebFetchError'; }
+  constructor(readonly code: Failure, readonly statusCode?: number) { super(messages[code]); this.name = 'WebFetchError'; }
 }
 
 function fail(code: Failure): never { throw new WebFetchError(code); }
@@ -393,7 +393,7 @@ export async function fetchWebPage(url: string, config: WebFetchConfig, signal?:
       : nativeTransport);
     response = await cancellable<WebFetchResponse>(transport({ url: parsed, address: address.address, family: address.family, signal: controller.signal }), controller.signal);
     if (response.statusCode >= 300 && response.statusCode < 400) fail('redirect');
-    if (response.statusCode < 200 || response.statusCode >= 300) fail('status');
+    if (response.statusCode < 200 || response.statusCode >= 300) throw new WebFetchError('status', response.statusCode);
     const type = response.headers['content-type'];
     if (typeof type !== 'string' || !['text/html', 'text/plain', 'application/xhtml+xml'].includes(type.split(';')[0]!.trim().toLowerCase())) fail('type');
     const encoding = response.headers['content-encoding'];

@@ -55,6 +55,8 @@ export interface OutboundMessage {
   partIndex?: number;
   plainText?: boolean;
   markdown?: boolean;
+  /** Harness-authorized report bytes, never a model-supplied path or remote URL. */
+  file?: { name: string; data: Buffer };
 }
 
 export type DeliveryResult =

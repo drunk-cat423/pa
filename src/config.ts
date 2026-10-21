@@ -18,6 +18,7 @@ export interface PaConfig {
   memory?: AutoMemoryConfig;
   search?: WebSearchConfig;
   fetch?: WebFetchConfig;
+  research?: { enabled: boolean; maxModelCalls: number; maxToolCalls: number; maxSearchCalls: number };
 }
 
 export interface AutoMemoryConfig {
@@ -74,6 +75,14 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
   if (maxConcurrentTasks > 16) throw new Error('PA_MAX_CONCURRENT_TASKS 必须在 1 到 16 之间。');
   const loop = { maxModelCalls: positiveInteger(env, 'PA_LOOP_MAX_MODEL_CALLS', 6),
     maxToolCalls: positiveInteger(env, 'PA_LOOP_MAX_TOOL_CALLS', 8) };
+  const researchFlag = env.PA_RESEARCH_ENABLED?.trim() || 'true';
+  if (!['true', 'false'].includes(researchFlag)) throw new Error('PA_RESEARCH_ENABLED 必须为 true 或 false。');
+  const research = { enabled: researchFlag === 'true',
+    maxModelCalls: positiveInteger(env, 'PA_RESEARCH_MAX_MODEL_CALLS', 12),
+    maxToolCalls: positiveInteger(env, 'PA_RESEARCH_MAX_TOOL_CALLS', 24),
+    maxSearchCalls: positiveInteger(env, 'PA_RESEARCH_MAX_SEARCH_CALLS', 6) };
+  if (research.maxModelCalls < 2 || research.maxModelCalls > 50 || research.maxToolCalls > 100
+    || research.maxSearchCalls > research.maxToolCalls) throw new Error('研究预算要求模型2到50次、工具最多100次、搜索不超过工具次数。');
   if (maxOutputTokens >= contextWindow) {
     throw new Error('PA_MAX_OUTPUT_TOKENS 必须小于 PA_CONTEXT_WINDOW。');
   }
@@ -103,6 +112,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     timeoutMs,
     tasks: { maxConcurrent: maxConcurrentTasks },
     loop,
+    research,
     memory: readAutoMemoryConfig(env),
     search: readWebSearchConfig(env, provider!, baseUrl),
     fetch: readWebFetchConfig(env),

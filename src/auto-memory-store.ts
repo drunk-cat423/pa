@@ -734,10 +734,11 @@ export class AutoMemoryStore {
   }
   private messages(ids: readonly string[]): AutoMemoryMessage[] {
     return ids.map(id=>{
-      const r=this.db.prepare(`SELECT m.*,p.person_id,r.status AS run_status,d.status AS delivery_status,input.ingest_seq AS turn_input_seq,
-        context.seq AS context_seq,a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,r.input_message_id FROM messages m
+      const r=this.db.prepare(`SELECT m.*,p.person_id,coalesce(r.status,CASE WHEN rd.status='sent' THEN 'completed' END) AS run_status,coalesce(d.status,rd.status) AS delivery_status,input.ingest_seq AS turn_input_seq,
+        context.seq AS context_seq,a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,coalesce(r.input_message_id,rd.source_message_id) AS input_message_id FROM messages m
         LEFT JOIN actor_person_bindings p ON p.actor_id=m.actor_id LEFT JOIN agent_runs r ON r.input_message_id=m.id OR r.response_message_id=m.id
-        LEFT JOIN messages input ON input.id=r.input_message_id LEFT JOIN deliveries d ON d.message_id=m.id
+        LEFT JOIN research_deliveries rd ON rd.message_id=m.id
+        LEFT JOIN messages input ON input.id=coalesce(r.input_message_id,rd.source_message_id) LEFT JOIN deliveries d ON d.message_id=m.id
         LEFT JOIN actors a ON a.id=m.actor_id LEFT JOIN actors inputa ON inputa.id=input.actor_id
         LEFT JOIN conversation_context_messages context ON context.message_id=m.id WHERE m.id=?`).get(id)!;
       const images=this.db.prepare('SELECT metadata_json FROM message_images WHERE message_id=? ORDER BY ordinal').all(id)

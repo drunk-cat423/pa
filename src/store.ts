@@ -14,6 +14,7 @@ import { validateTurnPlan, type TurnPlan, type TurnReceipt } from './turn-plan.j
 import { isMemoryOwner, type HarnessPolicy } from './harness-policy.js';
 import { reclassifySelfProfileTerms, type SelfProfileTermMove } from './self-profile-reclassification.js';
 import { imageMetadata, type MessageImage } from './image-context.js';
+import { migrateResearch, ResearchStore } from './research-store.js';
 
 export interface ConversationRecord {
   id: string;
@@ -69,7 +70,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 23;
+const SCHEMA_VERSION = 24;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -186,6 +187,7 @@ function validateRevision(revision: number | undefined): void {
 export class ConversationStore {
   readonly databasePath: string;
   readonly autoMemory: AutoMemoryStore;
+  readonly research: ResearchStore;
   private readonly db: DatabaseSync;
   private closed = false;
   private transactionDepth = 0;
@@ -199,6 +201,7 @@ export class ConversationStore {
       this.db.function('history_tokens', { deterministic: true }, value => historyTokens(String(value ?? '')).join(' '));
       this.initialize();
       this.autoMemory = new AutoMemoryStore(this.db, operation => this.memoryTransaction(operation));
+      this.research = new ResearchStore(this.db, operation => this.memoryTransaction(operation), dirname(this.databasePath));
     } catch (error) {
       this.db.close();
       this.closed = true;
@@ -486,6 +489,7 @@ export class ConversationStore {
       if (version < 21) migrateMemoryPipelines(this.db);
       if (version < 22) migrateMaterialBackfill(this.db);
       if (version < 23) { migrateProfileAttribution(this.db); migrateSelfProfileUpdates(this.db); }
+      if (version < 24) migrateResearch(this.db);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
@@ -1022,15 +1026,16 @@ export class ConversationStore {
       const tokens = historyTokens(options.query ?? '');
       const match = [...new Set(tokens)].map(token => '"' + token.replaceAll('"','""') + '"').join(' OR ');
       const filtered = `SELECT m.id,m.role,m.text,m.ingest_seq,m.sent_at,m.created_at,m.sender_name,m.image_failure,
-        a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,r.input_message_id,r.response_message_id
+        a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,coalesce(r.input_message_id,rd.source_message_id) AS input_message_id,r.response_message_id
         ${match ? ',bm25(message_history_fts) AS score' : ''}
         FROM messages m LEFT JOIN actors a ON a.id=m.actor_id
         LEFT JOIN agent_runs r ON r.input_message_id=m.id OR r.response_message_id=m.id
-        LEFT JOIN messages input ON input.id=r.input_message_id LEFT JOIN actors inputa ON inputa.id=input.actor_id
+        LEFT JOIN research_deliveries rd ON rd.message_id=m.id
+        LEFT JOIN messages input ON input.id=coalesce(r.input_message_id,rd.source_message_id) LEFT JOIN actors inputa ON inputa.id=input.actor_id
         LEFT JOIN deliveries d ON d.message_id=m.id
         ${match ? 'JOIN message_history_fts ON message_history_fts.message_id=m.id' : ''}
         WHERE m.conversation_id=? AND m.ingest_seq<?
-          AND (m.role='user' OR (r.status='completed' AND d.status='sent' AND input.ingest_seq<?))
+          AND (m.role='user' OR ((r.status='completed' AND d.status='sent' OR rd.status='sent') AND input.ingest_seq<?))
           AND (? IS NULL OR CASE WHEN m.role='assistant' THEN input.actor_id ELSE m.actor_id END=?)
           AND (? IS NULL OR COALESCE(m.sent_at,m.created_at)<?)
           AND (? IS NULL OR COALESCE(m.sent_at,m.created_at)>?)`;
@@ -1122,7 +1127,10 @@ export class ConversationStore {
       UNION ALL SELECT v.id,'assistant',v.text,NULL,d.message_id FROM answer_page_views v
         JOIN deliveries d ON d.id=v.answer_id AND d.conversation_id=v.conversation_id
         WHERE v.conversation_id=? AND v.status='sent' AND v.${referenceIndex ? 'reference_index' : 'external_message_id'}=?
-      LIMIT 2`).all(referenceIndex ? 1 : 0, conversationId, externalId, externalId, conversationId, externalId, conversationId, externalId);
+      UNION ALL SELECT m.id,'assistant',m.text,NULL,m.id FROM research_deliveries rd
+        JOIN messages m ON m.id=rd.message_id
+        WHERE m.conversation_id=? AND rd.status='sent' AND rd.${referenceIndex ? 'reference_index' : 'external_message_id'}=?
+      LIMIT 2`).all(referenceIndex ? 1 : 0, conversationId, externalId, externalId, conversationId, externalId, conversationId, externalId, conversationId, externalId);
     if (rows.length !== 1) return undefined;
     const row = rows[0]!;
     const images = this.messageImages(conversationId,String(row.id));
@@ -1534,13 +1542,14 @@ export class ConversationStore {
     const selected = conversationRoute(conversationKey, route);
     const rows = this.db.prepare(`
       SELECT m.id, m.conversation_id AS conversationId, m.role, m.text, m.created_at AS createdAt,
-        m.pi_entry_id AS piEntryId, r.status AS runStatus, r.id AS runId, r.pi_session_file AS piSessionFile, d.status AS deliveryStatus, m.rowid AS rowId,
+        m.pi_entry_id AS piEntryId, coalesce(r.status,CASE WHEN rd.status='sent' THEN 'completed' END) AS runStatus, r.id AS runId, r.pi_session_file AS piSessionFile, coalesce(d.status,rd.status) AS deliveryStatus, m.rowid AS rowId,
         m.model_input_text AS modelInputText, m.external_event_id AS eventId, a.external_user_id AS senderId,
-        m.sender_name AS senderName, d.external_message_id AS externalMessageId, m.actor_id AS actorId, m.message_kind AS messageKind, m.ingest_seq AS ingestSeq, m.sent_at AS sentAt
+        m.sender_name AS senderName, coalesce(d.external_message_id,rd.external_message_id) AS externalMessageId, m.actor_id AS actorId, m.message_kind AS messageKind, m.ingest_seq AS ingestSeq, m.sent_at AS sentAt
       FROM messages m JOIN conversations c ON c.id = m.conversation_id
       JOIN rooms room ON room.id = c.room_id
       LEFT JOIN agent_runs r ON r.input_message_id = m.id OR r.response_message_id = m.id
       LEFT JOIN deliveries d ON d.message_id = m.id
+      LEFT JOIN research_deliveries rd ON rd.message_id=m.id
       LEFT JOIN actors a ON a.id = m.actor_id
       WHERE room.channel = ? AND room.account = ? AND room.room_type = ? AND room.external_chat_id = ?
       ORDER BY m.ingest_seq DESC LIMIT ?

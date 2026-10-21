@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { fetchWebPage, normalizeWebFetchUrl, type WebFetchConfig } from './web-fetch.js';
+import { createHash, randomUUID } from 'node:crypto';
+import { fetchWebPage, normalizeWebFetchUrl, WebFetchError, type WebFetchConfig } from './web-fetch.js';
 
 type Document = Awaited<ReturnType<typeof fetchWebPage>>;
 type FetchDocument = typeof fetchWebPage;
@@ -14,14 +14,15 @@ export class WebFetchReader {
   private budgetExhausted = false;
 
   constructor(private readonly config: WebFetchConfig,
-    private readonly budget: { maxResultBytes: number; maxReads: number; maxTotalBytes: number },
+    private readonly budget: { maxResultBytes: number; maxReads: number; maxTotalBytes: number;
+      maxNetworkAttempts?: 2; onNetworkAttempt?: (url: string, attempt: number) => void },
     private readonly fetchDocument: FetchDocument = fetchWebPage) {
     if (![budget.maxResultBytes, budget.maxReads, budget.maxTotalBytes, config.maxTextChars]
       .every(value => Number.isSafeInteger(value) && value > 0)) throw new Error('网页读取预算无效。');
   }
 
   async read(input: { url: string; cursor?: string }, prefix = '', signal?: AbortSignal,
-    allowContinuation = true): Promise<{ url: string; text: string }> {
+    allowContinuation = true): Promise<{ url: string; text: string; coverage: { offset: number; end: number; totalChars: number; contentHash: string } }> {
     if (this.disposed) throw new Error('本轮网页缓存已释放。');
     if (!this.config.enabled) throw new Error('网页读取未启用。');
     signal?.throwIfAborted();
@@ -35,7 +36,7 @@ export class WebFetchReader {
     const cached = Boolean(document);
     if (!document) {
       // Retain failures too: another call for this URL never becomes an implicit retry.
-      document = this.fetchDocument(url, this.config, signal);
+      document = this.fetchWithRetry(url, signal);
       this.documents.set(url, document);
     }
     const response = await document;
@@ -79,7 +80,22 @@ export class WebFetchReader {
       }
     }
     this.usedBytes += Buffer.byteLength(output, 'utf8');
-    return { url: response.url, text: output };
+    return { url: response.url, text: output, coverage: { offset, end: low, totalChars: text.length,
+      contentHash: createHash('sha256').update(text).digest('hex') } };
+  }
+
+  private async fetchWithRetry(url: string, signal?: AbortSignal): Promise<Document> {
+    for (let attempt = 1; ; attempt++) {
+      signal?.throwIfAborted();
+      this.budget.onNetworkAttempt?.(url, attempt);
+      try { return await this.fetchDocument(url, this.config, signal); }
+      catch (error) {
+        // Only transient transport failures: login/403/unsupported formats never benefit from blind retries.
+        if (signal?.aborted || attempt >= (this.budget.maxNetworkAttempts ?? 1)
+          || !(error instanceof WebFetchError) || (!['network', 'timeout'].includes(error.code)
+            && !(error.code === 'status' && (error.statusCode === 408 || error.statusCode === 429 || (error.statusCode ?? 0) >= 500)))) throw error;
+      }
+    }
   }
 
   dispose(): void {

@@ -7,6 +7,7 @@ const INTENTS = 1 << 25;
 const MAX_RECONNECTS = 5;
 const RECONNECT_DELAYS = [500, 1_000, 2_000, 4_000, 8_000] as const;
 const DEFINITE_HTTP_FAILURES = new Set([400, 401, 403, 404, 405, 429]);
+const MAX_REPORT_FILE_BYTES = 1024 * 1024;
 
 type JsonObject = Record<string, unknown>;
 
@@ -297,7 +298,20 @@ export class QQChannel {
     const partIndex = message.partIndex ?? 0;
     if (!Number.isSafeInteger(partIndex) || partIndex < 0 || (deliveryMode === 'passive' && partIndex >= 5)) return { status: 'rejected' };
     const content = message.markdown || message.plainText ? message.text : toPlainText(message.text);
-    if (!content.trim()) return { status: 'rejected' };
+    // Only the harness can supply these in-memory report exports. Do not accept
+    // paths/URLs or let a filename escape into a local/remote lookup operation.
+    const file = message.file;
+    if (file && (typeof file.name !== 'string' || !/\.(txt|md)$/i.test(file.name)
+      || file.name.startsWith('.') || /[\u0000-\u001f\u007f<>:"/\\|?*]/u.test(file.name)
+      || /[.\s]$/u.test(file.name) || Buffer.byteLength(file.name, 'utf8') > 180
+      || !Buffer.isBuffer(file.data) || file.data.length === 0 || file.data.length > MAX_REPORT_FILE_BYTES)) {
+      return { status: 'rejected' };
+    }
+    if (!file && !content.trim()) return { status: 'rejected' };
+    // Snapshot the bytes before token/network awaits; callers may release or
+    // reuse their Buffer once send has begun.
+    const fileName = file?.name;
+    const fileData = file?.data.toString('base64');
     let token: string;
     try {
       token = await this.getToken();
@@ -305,14 +319,31 @@ export class QQChannel {
       return (error as Partial<QQApiFailure>).definitelyRejected ? { status: 'rejected' } : { status: 'uncertain' };
     }
     if (this.closed) return { status: 'rejected' };
+    const scope = message.route.roomType === 'private' ? 'users' : 'groups';
+    const endpoint = `${API}/v2/${scope}/${encodeURIComponent(message.route.roomId)}`;
+    let fileInfo: string | undefined;
+    if (file) {
+      try {
+        const uploaded = await this.request(`${endpoint}/files`, token, {
+          file_type: 4, file_name: fileName, file_data: fileData, srv_send_msg: false,
+        });
+        if (!nonEmptyString(uploaded.file_info)) return { status: 'rejected' };
+        fileInfo = uploaded.file_info;
+      } catch (error) {
+        // srv_send_msg=false never publishes an attachment. A failed upload
+        // does not fall through to a text-only success or an implicit retry.
+        return (error as Partial<QQApiFailure>).definitelyRejected ? { status: 'rejected' } : { status: 'uncertain' };
+      }
+    }
+    if (this.closed) return { status: 'rejected' };
     let response: Response;
     try {
-      const scope = message.route.roomType === 'private' ? 'users' : 'groups';
       const payload = {
-        ...(message.markdown ? { msg_type: 2, markdown: { content } } : { msg_type: 0, content }),
+        ...(fileInfo ? { msg_type: 7, content, media: { file_info: fileInfo } }
+          : message.markdown ? { msg_type: 2, markdown: { content } } : { msg_type: 0, content }),
         ...(deliveryMode === 'passive' ? { msg_id: message.replyToMessageId, msg_seq: partIndex + 1 } : {}),
       };
-      response = await this.fetchImpl(`${API}/v2/${scope}/${encodeURIComponent(message.route.roomId)}/messages`, {
+      response = await this.fetchImpl(`${endpoint}/messages`, {
         method: 'POST', redirect: 'error',
         headers: { 'Content-Type': 'application/json', Authorization: `QQBot ${token}` },
         body: JSON.stringify(payload),
