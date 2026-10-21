@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp,  rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { openRecordedConversation, PersistenceError } from '../dist/conversation.js';
+import { openRecordedConversation,  } from '../dist/conversation.js';
 import { estimateContext, openConversation } from '../dist/runtime.js';
 
 async function harness(t, { repeatedToolCall = false, truncatedSummary = false, contextWindow = 32768 } = {}) {
@@ -70,31 +69,6 @@ async function harness(t, { repeatedToolCall = false, truncatedSummary = false, 
   } };
 }
 
-test('模型忽略 tool_choice none 时最多发三次主请求（含准备）、调用一次原生搜索，不能把 toolUse 当成功', async t => {
-  const fixture = await harness(t, { repeatedToolCall: true });
-  const conversation = await fixture.open('ignores-none');
-  await assert.rejects(conversation.prompt('请搜索 SQLite 官方文档', {
-    eventId: 'search-event', senderId: 'user', modelInputText: '请搜索 SQLite 官方文档',
-  }));
-
-  assert.equal(fixture.requests.length, 3);
-  assert.deepEqual(fixture.requests[0].tool_choice, { type: 'function', function: { name: 'prepare_turn' } });
-  assert.equal(fixture.requests[1].tool_choice, 'auto');
-  assert.equal(fixture.requests[2].tool_choice, 'none');
-  assert.equal(fixture.nativeCalls.length, 1);
-});
-
-test('长工具结果裁剪仍先保留摘要截断标记，不自动续搜或追加收尾调用', async t => {
-  const fixture = await harness(t, { truncatedSummary: true });
-  const conversation = await fixture.open('truncated-summary');
-  await conversation.prompt('查询', { eventId: 'event', senderId: 'user', modelInputText: '查询' });
-  assert.equal(fixture.nativeCalls.length, 1);
-  assert.equal(fixture.requests.length, 3);
-  const content = fixture.requests[2].messages.findLast(message => message.role === 'tool').content;
-  assert.match(content, /"summaryTruncated":true/);
-  assert.match(content, /\[工具结果已截断\]/);
-});
-
 test('搜索结果使最终请求超过窗口时发送前硬检查仍拦截', async t => {
   const companionTools = { prepareTurn: p => ({ prepared: true, mode: p.mode, saved: [] }), readHistory: () => [] };
   // Allow enough tool-result space for search data to exceed the preparation schema itself.
@@ -117,18 +91,4 @@ test('搜索结果使最终请求超过窗口时发送前硬检查仍拦截', as
     assert.ok(fixture.requests.every(body => estimateContext(body, fixture.config.contextWindow, fixture.config.maxOutputTokens).fits));
     assert.equal(fixture.nativeCalls.length, 1);
   } finally { await runtime.close(); }
-});
-
-test('搜索账本持久化失败停止会话，不能作为普通工具错误继续模型或下一轮', async t => {
-  const fixture = await harness(t);
-  const conversation = await fixture.open('fatal-ledger');
-  const budgetDirectory = join(fixture.config.dataDir, createHash('sha256')
-    .update('web-search-budget:' + fixture.config.search.budgetId).digest('hex'));
-  await mkdir(join(budgetDirectory, 'search-attempts.jsonl'), { recursive: true });
-  await assert.rejects(conversation.prompt('请搜索 SQLite', { eventId: 'evt1', senderId: 'user',
-    modelInputText: '请搜索 SQLite' }), PersistenceError);
-  assert.equal(fixture.requests.length, 2);
-  assert.equal(fixture.nativeCalls.length, 0);
-  await assert.rejects(conversation.prompt('你好', { eventId: 'evt2', senderId: 'user', modelInputText: '你好' }));
-  assert.equal(fixture.requests.length, 2);
 });

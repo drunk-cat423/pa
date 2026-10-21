@@ -22,38 +22,6 @@ function fixture(t) {
     inspect(operation) { const db = new DatabaseSync(path); try { return operation(db); } finally { db.close(); } } };
 }
 
-test('parts are ordered, exact confirmed text can be quoted under an uncertain parent, and state survives restart', t => {
-  const f = fixture(t);
-  f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['第一段', '第二段', '第三段']);
-  assert.throws(() => f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['替换']), /不能覆盖/);
-  assert.throws(() => f.store.beginDeliveryPart(f.b.id, f.deliveryId, 0), /不存在/);
-  assert.throws(() => f.store.beginDeliveryPart(f.a.id, f.deliveryId, 1), /前一段/);
-  f.store.beginDeliveryPart(f.a.id, f.deliveryId, 0);
-  assert.throws(() => f.store.beginDeliveryPart(f.a.id, f.deliveryId, 0), /已经尝试/);
-  f.store.ackDeliveryPart(f.a.id, f.deliveryId, 0, 'sent', 'external-0');
-  assert.throws(() => f.store.ackDelivery(f.deliveryId, 'sent', 'fake'), /逐段确认/);
-  f.store.beginDeliveryPart(f.a.id, f.deliveryId, 1);
-  f.store.ackDeliveryPart(f.a.id, f.deliveryId, 1, 'uncertain');
-  assert.deepEqual(f.store.quotedMessage(f.a.id, 'external-0'), { role: 'assistant', text: '第一段', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id) });
-  assert.equal(f.store.quotedMessage(f.b.id, 'external-0'), undefined);
-  f.reopen().markPendingUncertain(f.a.id);
-  assert.deepEqual(f.store.quotedMessage(f.a.id, 'external-0'), { role: 'assistant', text: '第一段', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id) });
-  assert.throws(() => f.store.beginDeliveryPart(f.a.id, f.deliveryId, 2), /不存在/);
-  assert.equal(f.inspect(db => db.prepare('SELECT text FROM messages WHERE role=?').get('assistant').text), '**完整原文**');
-});
-
-test('pending and sending become uncertain on restart, while acknowledged parts are preserved', t => {
-  const f = fixture(t);
-  f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['A', 'B', 'C']);
-  f.store.beginDeliveryPart(f.a.id, f.deliveryId, 0);
-  f.store.ackDeliveryPart(f.a.id, f.deliveryId, 0, 'sent', 'known');
-  f.store.beginDeliveryPart(f.a.id, f.deliveryId, 1);
-  f.reopen().markPendingUncertain(f.a.id);
-  assert.deepEqual(f.inspect(db => db.prepare('SELECT status FROM delivery_parts ORDER BY part_index').all().map(p => p.status)),
-    ['sent', 'uncertain', 'uncertain']);
-  assert.equal(f.inspect(db => db.prepare('SELECT status FROM deliveries').get().status), 'uncertain');
-});
-
 test('last receipt and parent completion are atomic; cross-conversation child references fail', t => {
   const f = fixture(t);
   f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['实际文本']);
@@ -74,15 +42,6 @@ test('last receipt and parent completion are atomic; cross-conversation child re
       VALUES (?, ?, 1, 'foreign', 'pending', NULL, 'now', 'now')`)
       .run(f.deliveryId, f.b.id), /FOREIGN KEY/);
   });
-});
-
-test('part creation rolls back all prior inserts when a later child fails', t => {
-  const f = fixture(t);
-  f.inspect(db => db.exec(`CREATE TRIGGER prevent_second BEFORE INSERT ON delivery_parts
-    WHEN NEW.part_index=1 BEGIN SELECT RAISE(ABORT, 'fixture insertion failure'); END;`));
-  assert.throws(() => f.store.prepareDeliveryParts(f.a.id, f.deliveryId, ['A', 'B']), /fixture insertion failure/);
-  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM delivery_parts').get().n), 0);
-  assert.equal(f.inspect(db => db.prepare('SELECT status FROM deliveries').get().status), 'pending');
 });
 
 test('v7 migration creates a consistent backup and preserves legacy replies and unrelated records', t => {

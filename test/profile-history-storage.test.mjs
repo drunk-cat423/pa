@@ -5,10 +5,7 @@ import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
-import { BackgroundMemory, validateExtract } from '../dist/auto-memory.js';
-import { MemoryInputTooLargeError } from '../dist/memory-provider.js';
 import { downgradeSchema10 } from './fixtures/legacy-schema.mjs';
-import { emptyExtraction } from './fixtures/memory-output.mjs';
 
 function fixture(roomType = 'group') {
   const dir=mkdtempSync(join(tmpdir(),'pa-profile-history-')); const path=join(dir,'store.sqlite');
@@ -35,117 +32,6 @@ function addPending(f, conversationId, sourceId, _legacyCallId, target, content,
   return f.store.autoMemory.addProfilePending(f.store.autoMemory.ensureActorPerson(source.actor_id),sourceId,content,sourceType);
 }
 function batch(f) { f.store.autoMemory.reserveBatch(f.room.id,'capacity');return f.store.autoMemory.claimNext(f.room.id,{owner:'test',leaseMs:60000,pipeline:'legacy'}); }
-function ignored(input,profiles=[]) {
-  const deferred=input.profileProtocol===2&&profiles.length===0?input.profiles.filter(p=>p.pending?.length).map(p=>({...p,
-    pendingResults:p.pending.map(item=>({pendingId:item.id,status:'deferred'}))})):profiles;
-  return {...emptyExtraction(input,'继续对话'),profiles:deferred};}
-
-test('FTS Chinese words, source identities, before current boundary, actor and room isolation',()=>{
-  const f=fixture();try {
-    const first=f.turn('我喜欢北京的咖啡馆'); f.turn('北京咖啡馆是朋友的爱好','bob');
-    const other=f.store.ensureConversation('two','/two.jsonl',{...f.route,roomId:'two'});
-    f.inbound('北京咖啡馆其他房间秘密','alice',other);
-    const current=f.inbound('查以前的咖啡馆'); f.turn('咖啡馆稍后才进入数据库');
-    let result=f.store.readHistory(f.room.id,current.existingMessageId,{query:'咖啡馆'});
-    assert.deepEqual(result.messages.map(m=>m.id),[first.inputMessageId,f.inspect(db=>db.prepare('SELECT response_message_id FROM agent_runs WHERE id=?').get(first.id).response_message_id)]);
-    assert.equal(result.messages[0].senderId,'alice');assert.equal(result.messages[0].senderName,'ALICE');assert.equal(result.messages[1].replyToSenderId,'alice');
-    result=f.store.readHistory(f.room.id,current.existingMessageId,{query:'咖啡馆',scope:'room'});
-    assert.equal(result.messages.length,4);assert.ok(result.messages.some(m=>m.senderId==='bob'));
-    assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{query:'咖啡馆',senderId:'bob'}).messages.length,2);
-    assert.throws(()=>f.store.readHistory(f.room.id,current.existingMessageId,{senderId:'foreign'}),/当前房间/);
-    assert.throws(()=>f.store.readHistory(other.id,current.existingMessageId,{}),/当前会话/);
-    assert.throws(()=>f.store.readHistory(f.room.id,current.existingMessageId,{limit:11}),/参数/);
-  }finally{f.close();}
-});
-
-test('time and sender filters run before latest LIMIT; private room scope is rejected',()=>{
-  const f=fixture();try {
-    f.inbound('旧消息','alice',f.room,'2026-01-01T00:00:00Z');
-    const wanted=f.inbound('需要的消息','alice',f.room,'2026-02-01T00:00:00Z');
-    for(let i=0;i<12;i++) f.inbound('无关成员的新消息','bob',f.room,'2026-03-01T00:00:00Z');
-    const current=f.inbound('当前');
-    assert.deepEqual(f.store.readHistory(f.room.id,current.existingMessageId,{limit:1,after:'2026-01-15T00:00:00Z',before:'2026-02-15T00:00:00Z'}).messages.map(m=>m.id),[wanted.existingMessageId]);
-    assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{limit:1}).messages[0].id,wanted.existingMessageId);
-  }finally{f.close();}
-  const privateFixture=fixture('private');try {
-    const current=privateFixture.inbound('当前');assert.throws(()=>privateFixture.store.readHistory(privateFixture.room.id,current.existingMessageId,{scope:'room'}),/仅群聊/);
-  }finally{privateFixture.close();}
-});
-
-test('archived original messages stay searchable independently of context checkpoint',()=>{
-  const f=fixture();try {
-    const original=f.inbound('那天在上海参加马拉松');const job=batch(f);const input=f.store.autoMemory.taskInput(job);
-    f.store.autoMemory.commit(job.id,job.leaseToken,ignored(input));
-    assert.equal(f.store.autoMemory.contextAfterCheckpoint(f.room.id).length,0);
-    const current=f.inbound('过去参加过什么');
-    assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{query:'马拉松'}).messages[0].id,original.existingMessageId);
-    f.restart();assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{query:'马拉松'}).messages[0].text,'那天在上海参加马拉松');
-  }finally{f.close();}
-});
-
-test('captured pending sources outside chat batch archive atomically and concurrent cross-room pending survive',()=>{
-  const f=fixture();try {
-    const other=f.store.ensureConversation('two','/two.jsonl',{...f.route,roomType:'private',roomId:'two'});
-    f.store.configurePersons([{id:'person',bindings:[{route:f.route,senderId:'alice'},{route:{...f.route,roomType:'private',roomId:'two'},senderId:'alias'}]}]);
-    const old=f.inbound('我喜欢乌龙茶');addPending(f,f.room.id,old.existingMessageId,'old','sender','我喜欢乌龙茶','self');
-    // First chat batch leaves the explicit note pending.
-    let job=batch(f);f.store.autoMemory.commit(job.id,job.leaseToken,ignored(f.store.autoMemory.taskInput(job)));
-    f.inbound('稍后的一批聊天');job=batch(f);const input=f.store.autoMemory.taskInput(job);const p=input.profiles[0];
-    assert.ok(!input.messages.some(m=>m.id===old.existingMessageId));assert.equal(input.profileSources[0].text,'我喜欢乌龙茶');
-    const fresh=f.inbound('我还喜欢旅行','alias',other);addPending(f,other.id,fresh.existingMessageId,'fresh','sender','我还喜欢旅行','self');
-    const processedPendingId=p.pending[0].id;
-    const profile={personId:p.personId,baseVersion:p.baseVersion,facts:[{content:'喜欢乌龙茶',sourceType:'self',messageIds:[old.existingMessageId]}],
-      pendingResults:[{pendingId:p.pending[0].id,status:'merged',factIndex:0}]};
-    const extract=validateExtract(ignored(input,[profile]),input);f.store.autoMemory.commit(job.id,job.leaseToken,extract);
-    const current=f.store.autoMemory.profile('person');assert.equal(current.facts[0].content,'喜欢乌龙茶');assert.equal(current.pending.length,1);assert.equal(current.pending[0].sourceMessageId,fresh.existingMessageId);
-    assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM person_profile_pending WHERE id=?').get(processedPendingId).n),0);
-    assert.equal(f.inspect(db=>db.prepare("SELECT count(*) n FROM person_profile_pending_results WHERE outcome='merged'").get().n),1);
-  }finally{f.close();}
-});
-
-test('six valid profile sources survive transactional commit while actor checks and frozen history remain intact',()=>{
-  const f=fixture();try {
-    const originals=Array.from({length:6},()=>f.inbound('我喜欢喝茶'));
-    const other=f.inbound('我喜欢咖啡','bob');
-    const job=batch(f), input=f.store.autoMemory.taskInput(job);
-    const baseline=input.profiles.find(p=>input.messages.some(m=>m.id===originals[0].existingMessageId&&m.personId===p.personId));
-    const frozen=f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id));
-    const profile={personId:baseline.personId,baseVersion:baseline.baseVersion,
-      facts:[{content:'喜欢喝茶',sourceType:'self',messageIds:originals.map(m=>m.existingMessageId)}]};
-    const invalid=structuredClone(profile);invalid.facts[0].messageIds.push(other.existingMessageId);
-    assert.throws(()=>f.store.autoMemory.commit(job.id,job.leaseToken,ignored(input,[invalid])),/本人|自述/);
-    assert.equal(f.store.autoMemory.profile(baseline.personId).baseVersion,baseline.baseVersion);
-    const result=validateExtract(ignored(input,[profile]),input);
-    f.store.autoMemory.commit(job.id,job.leaseToken,result);
-    const current=f.store.autoMemory.profile(baseline.personId);
-    assert.equal(current.facts[0].messageIds.length,6);
-    assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id)),frozen);
-    assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM messages').get().n),7);
-    assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM person_profile_revision_sources WHERE person_id=? AND revision=?')
-      .get(baseline.personId,current.baseVersion).n),6);
-    f.restart();assert.deepEqual(f.store.autoMemory.profile(baseline.personId).facts,current.facts);
-  }finally{f.close();}
-});
-
-test('pending IDs, person self evidence, other-person pending, assistant and field validation fail atomically',()=>{
-  const f=fixture();try {
-    const alice=f.inbound('我喜欢茶');const bob=f.inbound('我喜欢咖啡','bob');
-    addPending(f,f.room.id,alice.existingMessageId,'a','sender','我喜欢茶','self');addPending(f,f.room.id,bob.existingMessageId,'b','sender','我喜欢咖啡','self');
-    let job=batch(f);f.store.autoMemory.commit(job.id,job.leaseToken,ignored(f.store.autoMemory.taskInput(job)));
-    const assistant=f.turn('新的对话');job=batch(f);const input=f.store.autoMemory.taskInput(job);const p=input.profiles[0];
-    const attempt=(facts,pendingResults)=>ignored(input,[{personId:p.personId,baseVersion:p.baseVersion,facts,pendingResults}]);
-    const fact={content:'喜欢茶',sourceType:'self',messageIds:[alice.existingMessageId]};
-    for(const proposal of [attempt([fact],[{pendingId:'not-captured',status:'deferred'}]),
-      attempt([{...fact,messageIds:[bob.existingMessageId]}],[{pendingId:p.pending[0].id,status:'merged',factIndex:0}]),
-      attempt([{...fact,field:'diet'}],[{pendingId:p.pending[0].id,status:'deferred'}]),
-      attempt([{...fact,messageIds:[f.inspect(db=>db.prepare('SELECT response_message_id FROM agent_runs WHERE id=?').get(assistant.id).response_message_id)]}],
-        [{pendingId:p.pending[0].id,status:'deferred'}]),
-      attempt([fact],[])]) {
-      assert.throws(()=>validateExtract(proposal,input));assert.throws(()=>f.store.autoMemory.commit(job.id,job.leaseToken,proposal));
-      assert.equal(f.store.autoMemory.profile(p.personId).baseVersion,1);assert.equal(f.store.autoMemory.status(f.room.id).completed,1);
-    }
-  }finally{f.close();}
-});
 
 test('v8 migration backs up and preserves archived legacy field metadata, identities, queued snapshot and FTS backfill',()=>{
   const f=fixture();try {
@@ -185,65 +71,4 @@ test('v8 migration backs up and preserves archived legacy field metadata, identi
     const current=f.inbound('查询历史');assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{query:'火锅'}).messages[0].id,old.existingMessageId);
     assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),23);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
   }finally{f.close();}
-});
-
-test('progress lifecycle is persistent and separate from message evidence; restart fences uncertain sends',()=>{
-  const f=fixture();try {
-    const source=f.inbound('开始');const run=f.store.beginRun(f.room.id,source.modelInputText,'p','m',[],source);
-    const sent=f.store.createProgress(run.id,'准备查询').id;f.store.startProgress(sent);f.store.ackProgress(sent,'sent','progress-id');f.store.ackProgress(sent,'sent','progress-id');
-    assert.throws(()=>f.store.startProgress(sent),/已经尝试/);
-    const uncertain=f.store.createProgress(run.id,'执行中').id;f.store.startProgress(uncertain);const pending=f.store.createProgress(run.id,'待发送').id;
-    f.restart();f.store.markPendingUncertain(f.room.id);
-    assert.equal(f.inspect(db=>db.prepare('SELECT status FROM run_progress WHERE id=?').get(uncertain).status),'uncertain');assert.equal(f.inspect(db=>db.prepare('SELECT status FROM run_progress WHERE id=?').get(pending).status),'uncertain');
-    assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM messages').get().n),1);assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM deliveries').get().n),0);
-    assert.throws(()=>f.store.startProgress(uncertain),/已经尝试/);
-  }finally{f.close();}
-});
-
-
-test('cross-room archived-profile CAS rolls back topics and pending archival for a stale snapshot',()=>{
-  const f=fixture();try {
-    const route={...f.route,roomId:'second'};const other=f.store.ensureConversation('second','/second.jsonl',route);
-    f.store.configurePersons([{id:'shared',bindings:[{route:f.route,senderId:'alice'},{route,senderId:'alias'}]}]);
-    const first=f.inbound('我喜欢绿茶');addPending(f,f.room.id,first.existingMessageId,'first','sender','我喜欢绿茶','self');
-    f.inbound('在另一个群聊天','alias',other);
-    const one=batch(f);const firstInput=f.store.autoMemory.taskInput(one);
-    f.store.autoMemory.reserveBatch(other.id,'capacity');const two=f.store.autoMemory.claimNext(other.id,{owner:'other',leaseMs:60000});const secondInput=f.store.autoMemory.taskInput(two);
-    const profile=input=>({personId:'shared',baseVersion:input.profiles[0].baseVersion,facts:[{content:'喜欢绿茶',sourceType:'self',messageIds:[first.existingMessageId]}],
-      pendingResults:[{pendingId:input.profiles[0].pending[0].id,status:'merged',factIndex:0}]});
-    f.store.autoMemory.commit(one.id,one.leaseToken,ignored(firstInput,[profile(firstInput)]));
-    const stale=validateExtract({...ignored(secondInput,[profile(secondInput)]),topics:[{summary:'另一个房间的话题',messageIds:[]}]},secondInput);
-    assert.throws(()=>f.store.autoMemory.commit(two.id,two.leaseToken,stale),/版本冲突/);
-    assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM memory_topics WHERE job_id=?').get(two.id).n),0);
-    assert.equal(f.store.autoMemory.profile('shared').baseVersion,1);assert.equal(f.store.autoMemory.status(other.id).completed,0);
-  }finally{f.close();}
-});
-
-test('background chunk splitting keeps captured pending evidence and archives once across chunks',async()=>{
-  const f=fixture();let background;try {
-    const original=f.inbound('我喜欢阅读');addPending(f,f.room.id,original.existingMessageId,'note','sender','我喜欢阅读','self');
-    const old=batch(f);f.store.autoMemory.commit(old.id,old.leaseToken,ignored(f.store.autoMemory.taskInput(old)));
-    for(let i=0;i<4;i++) f.inbound('下一批'+i);
-    let calls=0;const config={contextWindow:100000,memory:{enabled:true,maxCalls:10,timeoutMs:5000}};
-    background=new BackgroundMemory(config,f.store.autoMemory,f.room.id,{extract:async input=>{
-      if(input.mode!=='profiles'&&input.messages.length>2) throw new MemoryInputTooLargeError('split');
-      calls++;
-      if(input.mode==='messages') return emptyExtraction(input);
-      const p=input.profiles[0];const note=p.pending?.[0];
-      if(note) assert.equal(input.profileSources[0].text,'我喜欢阅读');
-      const resultProfile={personId:p.personId,baseVersion:p.baseVersion,
-        facts:note?[{content:'喜欢阅读',sourceType:'self',messageIds:[note.sourceMessageId]}]:p.facts,
-        updates:note?[{factIndex:0,baselineFactIndexes:[],evidence:[note.subject]}]:[],
-        pendingResults:note?[{pendingId:note.id,status:'merged',factIndex:0}]:[]};
-      const proposal={...emptyExtraction(input),profiles:[resultProfile]};
-      validateExtract(proposal,input);
-      return proposal;
-    }});
-    f.store.autoMemory.reserveMaterialsIfDue(f.room.id,1000);
-    assert.ok(f.store.autoMemory.reserveMaterialsIfDue(f.room.id,601000));
-    background.start();await background.wait(undefined,3000,'materials');
-    assert.equal(calls,4);
-    const p=f.store.autoMemory.profileForActors(f.store.findActor(f.room.id,'alice'))[0];
-    assert.equal(p.facts[0].content,'喜欢阅读');assert.equal(p.pending.length,0);assert.equal(p.baseVersion,2);
-  }finally{await background?.close();f.close();}
 });

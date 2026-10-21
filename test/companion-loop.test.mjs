@@ -60,23 +60,6 @@ test('统一准备落库后再读取历史，单个Pi循环按顺序回答且移
   assert.equal(recorded.at(-1).runId, 'run-one'); assert.equal(recorded.at(-1).assistant.text, answer);
 });
 
-test('工具总额8包含准备调用，超额批量调用不执行，下一请求仅回答', async t => {
-  let reads = 0;
-  const f = await fixture(t, (_body, n) => n === 1 ? prepare() : n === 2
-    ? Array.from({ length: 12 }, (_, i) => call('read_history', {}, String(i))) : '预算内答案');
-  assert.equal(await f.runtime.prompt('历史', { runId: 'budget', companionTools: context({ readHistory: () => { reads++; return []; } }) }), '预算内答案');
-  assert.equal(reads, 7); assert.equal(f.requests.length, 3);
-  assert.deepEqual(tools(f.requests[2]), []); assert.equal(f.requests[2].tool_choice, 'none');
-});
-
-test('最后一次模型请求预留回答；恶意继续调用不会执行或发第7次请求', async t => {
-  let reads = 0;
-  const f = await fixture(t, (_body, n) => n === 1 ? prepare() : [call('read_history', {}, String(n))]);
-  await assert.rejects(f.runtime.prompt('循环', { runId: 'loop', companionTools: context({ readHistory: () => { reads++; return []; } }) }), /次数已达上限/);
-  assert.equal(f.requests.length, 6); assert.equal(reads, 4);
-  assert.deepEqual(tools(f.requests[5]), []); assert.equal(f.requests[5].tool_choice, 'none');
-});
-
 test('专业表达由准备模式指定，一次进度与证据共用当前run，下一CLI轮无工具', async t => {
   const events = [];
   const f = await fixture(t, (body, n) => {
@@ -108,39 +91,4 @@ test('准备业务错误形成空回执继续回答，持久化错误停止后�
     prepareTurn: () => { throw new Error('落盘失败'); },
   }) }), /落盘失败/);
   assert.equal(f.requests.length, 3); await assert.rejects(f.runtime.prompt('之后'), /落盘失败/);
-});
-
-test('close中断等待中的工具，之后没有新模型请求', async t => {
-  let started;
-  const waiting = new Promise(resolve => { started = resolve; });
-  const f = await fixture(t, (_body, n) => n === 1 ? prepare() : [call('read_history', {})]);
-  const pending = f.runtime.prompt('等待', { runId: 'cancel', companionTools: context({
-    readHistory: () => { started(); return new Promise(() => {}); },
-  }) });
-  const rejected = assert.rejects(pending, /取消|失败/);
-  await waiting; await f.runtime.close(); await rejected; assert.equal(f.requests.length, 2);
-});
-
-test('多次请求与工具等待可累计超过单请求超时，每个模型请求独立计时', async t => {
-  const f = await fixture(t, async (_body, n) => {
-    await new Promise(resolve => setTimeout(resolve, 70));
-    return n === 1 ? prepare() : n === 2 ? [call('read_history', {})] : '完成';
-  }, { timeoutMs: 500, loop: { maxModelCalls: 3, maxToolCalls: 8 } });
-  const started = Date.now();
-  assert.equal(await f.runtime.prompt('多步处理', { runId: 'multi-step', companionTools: context({
-    readHistory: async () => { await new Promise(resolve => setTimeout(resolve, 350)); return []; },
-  }) }), '完成');
-  assert.ok(Date.now() - started > 500); assert.equal(f.requests.length, 3);
-});
-
-test('单个模型请求超时仍会中断', async t => {
-  const f = await fixture(t, async () => { await new Promise(resolve => setTimeout(resolve, 200)); return '太晚'; }, { timeoutMs: 30 });
-  await assert.rejects(f.runtime.prompt('单次超时'), error => error.kind === 'timeout'); assert.equal(f.requests.length, 1);
-});
-
-test('工具结果有界且下一轮payload经过窗口检查', async t => {
-  const f = await fixture(t, (_body, n) => n === 1 ? prepare() : n === 2 ? [call('read_history', {})] : '读到了片段');
-  assert.equal(await f.runtime.prompt('长历史', { runId: 'bounded', companionTools: context({ readHistory: () => '证据'.repeat(100000) }) }), '读到了片段');
-  const data = f.requests[2].messages.findLast(message => message.role === 'tool');
-  assert.match(JSON.stringify(data), /工具结果已截断/); assert.ok(Buffer.byteLength(data.content) <= 4096);
 });

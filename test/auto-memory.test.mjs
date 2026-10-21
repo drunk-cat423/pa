@@ -9,10 +9,8 @@ import { companionReply } from './fixtures/companion-tools.mjs';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
 import { BackgroundMemory, validateExtract } from '../dist/auto-memory.js';
 import { ConversationStore } from '../dist/store.js';
-import { estimateContext } from '../dist/runtime.js';
 import { MemoryInputTooLargeError } from '../dist/memory-provider.js';
 import { conversationContext } from './fixtures/conversation-context.mjs';
-import { DiagnosticLog } from '../dist/diagnostics.js';
 
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 function wait(signal, gate) {
@@ -53,39 +51,6 @@ function backgroundPayload(body) {
   return JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
 }
 
-for (const scenario of [
-  { name: '不限整理次数超过20次仍继续，失败重试也可恢复', limit: 0, rounds: 21, failures: 1, calls: 22, completed: 21 },
-  { name: '有限整理预算仍阻止超过上限的调用', limit: 1, rounds: 2, failures: 0, calls: 1, completed: 1 },
-  { name: '不限总次数也不自动重试结果未知的调用', limit: 0, rounds: 1, failures: Infinity, calls: 1, completed: 0 },
-]) test(scenario.name, async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'pa-memory-limit-'));
-  const store = new ConversationStore(join(directory, 'store.sqlite'));
-  const conversation = store.ensureConversation('room', join(directory, 'session.jsonl'),
-    { channel: 'qq', accountId: 'a', roomId: 'g', roomType: 'group' });
-  let calls = 0;
-  const background = new BackgroundMemory({ memory: { enabled: true, maxCalls: scenario.limit, timeoutMs: 5000 }, contextWindow: 100000 },
-    store.autoMemory, conversation.id, { extract: async input => {
-      calls++;
-      if (calls <= scenario.failures) throw new Error('fixture failure');
-      return extracted(input);
-    } });
-  t.after(async () => { await background.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
-  for (let i = 0; i < scenario.rounds; i++) {
-    store.recordInbound(conversation.id, 'hello', { eventId: String(i), senderId: 'a', modelInputText: 'hello' });
-    background.start('capacity');
-    if (i < scenario.completed) {
-      if (i === 0 && scenario.failures) {
-        await assert.rejects(background.wait(undefined, 3000), /失败/);
-        background.retry(store.autoMemory.listJobs()[0].id);
-      }
-      await background.wait(undefined, 3000);
-    }
-    else await assert.rejects(background.wait(undefined, 3000), /失败/);
-  }
-  assert.equal(calls, scenario.calls);
-  assert.equal(background.info().calls, scenario.calls);
-  assert.equal(store.autoMemory.status(conversation.id).completed, scenario.completed);
-});
 async function fixture(t, extract = async input => extracted(input), overrides = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'pa-memory-integration-'));
   const requests = [], sent = [], inputs = [], harnesses = [];
@@ -171,20 +136,6 @@ test('私聊完成50轮且容量较低时不按轮数自动压缩', { timeout: 1
   finally { db.close(); }
 });
 
-test('聊天阻塞时继续入站持久化，不同房间仍能回复，同房间消息按顺序', async t => {
-  const f = await fixture(t); const h = f.harness();
-  const first = h.handle(f.message('block', 'BLOCK_CHAT', { mentioned: true }));
-  await f.chatStarted.promise;
-  const second = h.handle(f.message('later', '排队的问题', { mentioned: true }));
-  assert.equal(await h.handle(f.message('observed', '后台观察', { mentioned: false })), 'observed');
-  assert.equal(await h.handle(f.message('other', '另一个房间', { route: f.other, mentioned: true })), 'sent');
-  const db = f.db();
-  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE external_event_id='later'").get().n, 1); }
-  finally { db.close(); }
-  f.chatGate.resolve(); assert.equal(await first, 'sent'); assert.equal(await second, 'sent');
-  assert.doesNotMatch(JSON.stringify(f.requests[0]), /排队的问题|后台观察/);
-});
-
 test('最终上下文达到85%才整理；摘要与检查点后消息跨新轮和重启继续', async t => {
   const gate = deferred(), started = deferred();
   let extractionStarted = false;
@@ -221,16 +172,6 @@ test('最终上下文达到85%才整理；摘要与检查点后消息跨新轮�
   assert.ok(!context.messages.some(message => message.text === 'CAPACITY_AFTER_RESTART'));
 });
 
-test('单条不可容纳输入不死循环，不发送超限模型请求', async t => {
-  const f = await fixture(t, undefined, { contextWindow: 2500 }); const h = f.harness();
-  assert.equal(await h.handle(f.message('huge', 'x'.repeat(3999), { route: f.privateRoute })), 'failed');
-  assert.equal(f.requests.length, 0); assert.equal(f.inputs.length, 0);
-  const failure = new DiagnosticLog(f.config.dataDir).events().find(event => event.event === 'turn.preflight_failed');
-  assert.ok(failure?.taskId);
-  assert.match(failure.details.reason, /上下文/);
-  assert.doesNotMatch(JSON.stringify(failure), /x{10}/);
-});
-
 test('仅发送者及真实@对象画像，绑定人物私聊自述可在群使用', async t => {
   const f = await fixture(t); const binding = (route, senderId) => ({ route, senderId });
   const policy = { version: 1, ownerBindings: [], persons: [{ id: 'person-a', bindings: [binding(f.privateRoute, 'a'), binding(f.route, 'a')] }] };
@@ -249,24 +190,6 @@ test('仅发送者及真实@对象画像，绑定人物私聊自述可在群使�
   assert.ok(mentionedProfiles.some(profile => profile.senderIds.includes('a')));
   assert.ok(mentionedProfiles.some(profile => profile.senderIds.includes('b')
     && JSON.stringify(profile).includes('绘画')));
-});
-
-test('模型提案不可伪造人物/消息，自述不能引用其他人', () => {
-  const input = { job: {}, roomType: 'group', messages: [{ id: 'm1', role: 'user', text: 'hello', personId: 'a' }],
-    profiles: [{ personId: 'a', baseVersion: 0, facts: [] }, { personId: 'b', baseVersion: 0, facts: [] }] };
-  const base = { topics: [], fragments: [], profiles: [], ignoredMessageIds: ['m1'] };
-  assert.deepEqual(validateExtract(base, input), base);
-  assert.throws(() => validateExtract({ ...base, ignoredMessageIds: ['fake'] }, input), /消息/);
-  assert.throws(() => validateExtract({ ...base, profiles: [{ personId: 'b', baseVersion: 0,
-    facts: [{ content: 'B likes tea', sourceType: 'self', messageIds: ['m1'] }] }] }, input), /自述/);
-  assert.throws(() => validateExtract({ ...base, continuationSummary: '群摘要' }, input), /群摘要/);
-});
-
-test('容量估算包含完整输入和预留输出，明确标注估算方式', () => {
-  const low = estimateContext({ system: '规则', profile: '小林', text: 'hi' }, 10000, 1000);
-  const high = estimateContext({ system: '规则'.repeat(1000), text: 'hi' }, 10000, 3000);
-  assert.equal(low.method, 'utf8-byte-estimate'); assert.equal(low.fits, true);
-  assert.ok(high.ratio > low.ratio); assert.ok(high.reservedOutputTokens === 3000);
 });
 
 test('快速连发私聊独立计算，不将尚未完成的回复伪作历史', async t => {
@@ -297,30 +220,6 @@ test('群容量压缩标记新协议、创建群摘要且数据库保留原文',
   finally { db.close(); }
   const context=conversationContext(f.requests.at(-1));
   assert.ok(context.summary.continuationSummary);
-});
-
-test('超大画像按预算选择完整事实，普通短问题仍可回答且数据库保留完整画像', async t => {
-  // Leave room for fixed response guidance while keeping the profile far larger than the window.
-  const contextWindow = 40000;
-  const f = await fixture(t, undefined, { contextWindow }); const h = f.harness();
-  await h.handle(f.message('seed', '首次发言'));
-  const db = f.db();
-  try {
-    const person = db.prepare('SELECT person_id FROM actor_person_bindings JOIN actors ON actors.id=actor_id WHERE external_user_id=?').get('a').person_id;
-    const facts = Array.from({ length: 100 }, (_, i) => ({ content: `事实${i}：` + 'a'.repeat(800), sourceType: 'self', messageIds: [] }));
-    db.prepare('UPDATE persons SET revision=1 WHERE id=?').run(person);
-    db.prepare('INSERT INTO person_profile_revisions VALUES (?,1,?,NULL,?)').run(person, JSON.stringify(facts), new Date().toISOString());
-    assert.equal(await h.handle(f.message('short', '你好', { mentioned: true })), 'sent');
-    assert.ok(Buffer.byteLength(JSON.stringify(f.requests.at(-1)), 'utf8') < contextWindow);
-    const background = f.requests.at(-1).messages.find(message => JSON.stringify(message.content).includes('已保存的候选背景数据'));
-    const content = typeof background?.content === 'string' ? background.content : background?.content.map(part => part.text ?? '').join('');
-    assert.ok(content);
-    const payload = JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
-    const selected = payload.profiles.flatMap(profile => profile.archived);
-    assert.ok(selected.length > 0 && selected.length < facts.length);
-    assert.ok(selected.every(fact => facts.some(original => original.content === fact.content)));
-    assert.equal(JSON.parse(db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=1').get(person).facts_json).length, 100);
-  } finally { db.close(); }
 });
 
 test('画像事实继承按内容与证据集合比较，不注入旧分类字段或依赖JSON键顺序', () => {

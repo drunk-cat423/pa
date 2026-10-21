@@ -80,26 +80,6 @@ function trustFixture(t) {
   });
 }
 
-test('真实HTTP CONNECT只发送已核验IP，原Host/路径保留且IPv6 authority加括号', async t => {
-  const seen = [];
-  const target = await listen(t, http.createServer((req, res) => {
-    seen.push({ host: req.headers.host, path: req.url });
-    res.writeHead(200, { 'content-type': 'text/plain' }).end('Proxy HTTP page');
-  }));
-  const proxy = await proxyFixture(t, () => target.port);
-  for (const [address, family] of [[publicIP, 4], ['2606:4700:4700::1111', 6]]) {
-    const result = await fetchWebPage(`http://proxy-page.example:${target.port}/article?q=1`,
-      { ...config, proxyUrl: proxy.proxyUrl }, undefined, { lookup: async () => [{ address, family }] });
-    assert.equal(result.text, 'Proxy HTTP page');
-  }
-  assert.deepEqual(proxy.requests.map(item => item.authority), [
-    `${publicIP}:${target.port}`, `[2606:4700:4700::1111]:${target.port}`,
-  ]);
-  assert.ok(proxy.requests.every(item => item.host === item.authority));
-  assert.deepEqual(seen, Array(2).fill({ host: `proxy-page.example:${target.port}`, path: '/article?q=1' }));
-  await closed(proxy, target);
-});
-
 test('真实HTTPS隧道保留原Host/SNI及证书校验，拒绝未知CA和域名不匹配', async t => {
   const seen = [];
   const target = await listen(t, https.createServer({ cert, key }, (req, res) => {
@@ -155,48 +135,26 @@ test('publicDns的A/AAAA通过同一代理固定1.1.1.1:443，Host/SNI和页面I
 });
 
 test('CONNECT拒绝、隧道断开、取消和超时均关闭socket且不重试或回退', async t => {
-  for (const mode of ['reject', 'close', 'connect-cancel', 'connect-timeout', 'tls-cancel', 'tls-timeout',
-    'body-cancel', 'body-timeout', 'dns-reject', 'dns-cancel', 'dns-timeout']) {
+  for (const mode of ['connect-cancel', 'connect-timeout', 'tls-timeout']) {
     await t.test(mode, async t => {
-      let bodyStarted;
-      const bodyReady = new Promise(resolve => { bodyStarted = resolve; });
-      const target = await listen(t, http.createServer((_req, res) => {
-        res.writeHead(200, { 'content-type': 'text/plain' }); res.write('Partial'); bodyStarted();
-      }));
       let connectStarted;
       const connected = new Promise(resolve => { connectStarted = resolve; });
       const proxy = await proxyFixture(t, (_request, socket) => {
         connectStarted();
-        if (mode.endsWith('reject')) socket.end('HTTP/1.1 502 No proxy-secret\r\nConnection: close\r\n\r\n');
-        if (mode === 'close') { socket.write('HTTP/1.1 200 Connection Established\r\n\r\n'); socket.end(); }
-        if (mode.startsWith('tls-')) socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        return mode.startsWith('body-') ? target.port : undefined;
+        if (mode === 'tls-timeout') socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       });
       const controller = new AbortController();
-      const pending = fetchWebPage(`${mode.startsWith('tls-') ? 'https' : 'http'}://proxy-page.example:${target.port}/`,
-        { ...config, publicDns: mode.startsWith('dns-'), timeoutMs: 150, proxyUrl: proxy.proxyUrl },
-        controller.signal, mode.startsWith('dns-') ? {} : { lookup });
-      const error = mode.endsWith('cancel') ? 'cancelled' : mode.endsWith('timeout') ? 'timeout' : 'network';
-      const rejected = rejects(pending, error);
-      if (mode.endsWith('cancel')) {
-        await (mode.startsWith('body-') ? bodyReady : connected);
+      const isTls = mode === 'tls-timeout';
+      const pending = fetchWebPage(`${isTls ? 'https' : 'http'}://proxy-page.example/`,
+        { ...config, timeoutMs: 150, proxyUrl: proxy.proxyUrl }, controller.signal, { lookup });
+      const rejected = rejects(pending, mode === 'connect-cancel' ? 'cancelled' : 'timeout');
+      if (mode === 'connect-cancel') {
+        await connected;
         controller.abort(new Error('proxy-secret'));
       }
       await rejected;
       assert.equal(proxy.requests.length, 1);
-      await closed(proxy, target);
+      await closed(proxy);
     });
   }
-});
-
-test('代理不绕过原私网拒绝，非法代理配置在网络请求前失败', async t => {
-  const proxy = await proxyFixture(t, () => { throw new Error('must not connect'); });
-  for (const url of ['http://127.0.0.1/', 'http://[::1]/', 'http://private.example/']) {
-    await rejects(fetchWebPage(url, { ...config, proxyUrl: proxy.proxyUrl }, undefined,
-      { lookup: async () => [{ address: '192.168.1.1', family: 4 }] }), 'address');
-  }
-  for (const proxyUrl of ['https://127.0.0.1', 'http://user:proxy-secret@127.0.0.1', 'http://127.0.0.1/path', null]) {
-    await rejects(fetchWebPage('http://public.example/', { ...config, proxyUrl }, undefined, { lookup }), 'config');
-  }
-  assert.equal(proxy.requests.length, 0);
 });

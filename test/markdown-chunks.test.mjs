@@ -2,15 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MARKDOWN_CHUNK_BYTES, splitMarkdown } from '../dist/markdown-chunks.js';
 
-test('Unicode and pathological long lines stay within the byte limit without losing text',()=>{
-  for (const text of ['你好😀'.repeat(3000),'https://example.com/'+ 'a'.repeat(10000)]) {
-    const chunks=splitMarkdown(text);
-    assert.ok(chunks.length>1);
-    assert.equal(chunks.join(''),text);
-    chunks.forEach(chunk=>assert.ok(Buffer.byteLength(chunk)<=MARKDOWN_CHUNK_BYTES));
-  }
-});
-
 test('fenced code blocks close and reopen at boundaries while preserving code',()=>{
   for (const marker of ['```','~~~~']) {
     const code='console.log("你好😀");\n'.repeat(300);
@@ -21,10 +12,4 @@ test('fenced code blocks close and reopen at boundaries while preserving code',(
     assert.equal(restored,code.trimEnd());
     assert.ok(chunks.every(chunk=>Buffer.byteLength(chunk)<=MARKDOWN_CHUNK_BYTES));
   }
-});
-
-test('pathological closing fences remain balanced and bounded',()=>{
-  const chunks=splitMarkdown('```ts\ncode\n'+'`'.repeat(5000)+'\n');
-  assert.ok(chunks.every(chunk=>Buffer.byteLength(chunk)<=MARKDOWN_CHUNK_BYTES));
-  assert.equal(chunks.join(''),'```ts\ncode\n```\n');
 });

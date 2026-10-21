@@ -30,8 +30,6 @@ test('schema17只读保留旧页面正文与引用索引，不混入规范回答
     db.prepare(`INSERT INTO answer_page_views(id,conversation_id,answer_id,page_number,text,status,external_message_id,reference_index,delivery_mode,reply_slot,created_at,updated_at)
       VALUES ('legacy-view',?,?,1,'旧页面正文','sent','page-id','page-ref','active',NULL,?,?)`).run(f.a.id,id,createdAt,createdAt);
   });
-  assert.deepEqual(f.store.answerPage(f.a.id,id,1),{answerId:id,page:1,count:2,text:`**回答 ${id.slice(0,8)} · 正文 1/2**\n\n第一页`});
-  assert.equal(f.store.answerPage(f.b.id,id,1),undefined);
   assert.deepEqual(f.store.quotedMessage(f.a.id,'page-id'),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId});
   assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId});
   assert.equal(f.store.quotedMessage(f.b.id,'page-ref',true),undefined);

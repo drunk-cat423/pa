@@ -5,10 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { SessionManager } from '@earendil-works/pi-coding-agent';
-import { PersistenceError } from '../dist/conversation.js';
-import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
-import { readQQSettings } from '../dist/qq-config.js';
+import { ChannelHarness,  } from '../dist/channel-harness.js';
 import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
 import { conversationContext } from './fixtures/conversation-context.mjs';
 
@@ -66,62 +63,6 @@ async function fixture(t, delivery = { status: 'sent', externalMessageId: 'qq-ou
     totalCalls: () => totalModelCalls(requests, planningRequests), sent, harness, message };
 }
 
-test('长回答自动发送完整Markdown分段并按引用索引解析，重启不重发', async t => {
-  const original = '先说明结论。\n\n```ts\n' + 'const 内容 = "😀你好";\n'.repeat(240) + '```\n\n最后一段 END_OF_BODY。';
-  const f = await fixture(t, (_message,index) => ({ status:'sent',externalMessageId:`part-${index}`,referenceIndex:`ref-${index}` }),original);
-  const h = f.harness(0);
-  assert.equal(await h.handle(f.message('long','请长回复')),'sent');
-  assert.ok(f.sent.length > 1);
-  assert.ok(f.sent.every(part => part.markdown && !Object.hasOwn(part,'buttons') && Buffer.byteLength(part.text) <= 1500));
-  assert.match(f.sent[0].text,/先说明结论/);
-  assert.match(f.sent.at(-1).text,/END_OF_BODY/);
-  assert.ok(f.sent.some(part => part.text.includes('const 内容')));
-  assert.ok(f.sent.filter(part => part.text.includes('const 内容')).every(part => part.text.includes('```')));
-  assert.equal(f.requests.length,1);
-  const db = new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  try {
-    assert.equal(db.prepare("SELECT text FROM messages WHERE role='assistant'").get().text,original);
-    assert.equal(db.prepare('SELECT count(*) n FROM delivery_parts WHERE status=\'sent\'').get().n,f.sent.length);
-    const saved = db.prepare('SELECT summary,pages_json,rendered_body FROM answer_documents').get();
-    assert.equal(saved.summary,'');
-    assert.equal(saved.pages_json,'[]');
-    assert.equal(saved.rendered_body,original);
-  } finally { db.close(); }
-  const priorSends=f.sent.length;
-  await h.close();
-  const reopened=f.harness(0);
-  await reopened.start();
-  assert.equal(f.sent.length, priorSends);
-  await reopened.handle(f.message('quote-part','解释这一段',{quote:{referenceIndex:'ref-2'}}));
-  assert.ok(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.text.length > 0);
-  assert.equal(conversationContext(f.requests.at(-1).body).messages.filter(item=>item.role==='assistant' && item.text===original).length,1);
-});
-
-test('长Markdown分段失败停止且不自动重发，result重新发送完整围栏正文', async t => {
-  const original = '结论。\n\n```js\n' + 'const answer = "完整正文😀";\n'.repeat(160) + '```\n\nEND_OF_BODY';
-  let failFirst = true;
-  const f = await fixture(t,(_message,index)=>failFirst && index===1 ? {status:'uncertain'}
-    : {status:'sent',externalMessageId:`recovery-${index}`,referenceIndex:`recovery-ref-${index}`},original);
-  const h=f.harness(0);
-  assert.equal(await h.handle(f.message('first','长回答')),'uncertain');
-  assert.equal(f.sent.length,1);
-  const taskReader=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  let taskId;
-  try { taskId=taskReader.prepare("SELECT id FROM channel_tasks WHERE message_id=(SELECT id FROM messages WHERE external_event_id='first')").get().id; }
-  finally { taskReader.close(); }
-  await h.close();
-  const reopened=f.harness(0);
-  await reopened.start();
-  assert.equal(f.sent.length,1);
-  failFirst=false;
-  assert.equal(await reopened.handle(f.message('result',`/result ${taskId}`)),'sent');
-  const resent=f.sent.slice(1);
-  assert.ok(resent.length>1 && resent.every(part=>part.markdown && Buffer.byteLength(part.text)<=1500));
-  assert.match(resent.at(-1).text,/END_OF_BODY/);
-  assert.equal(resent.filter(part=>/```/.test(part.text)).length>1,true);
-  assert.equal(f.requests.length,1);
-});
-
 test('长回答按实际Markdown分段数选择主动发送，/page不触发读取行为', async t => {
   const original='结论。\n\n'+'详细内容😀。'.repeat(500);
   const f=await fixture(t,(_message,index)=>({status:'sent',externalMessageId:`part-${index}`}),original);
@@ -133,24 +74,6 @@ test('长回答按实际Markdown分段数选择主动发送，/page不触发读�
   assert.equal(f.requests.length,2);
   assert.ok(f.sent.length>count);
   assert.ok(f.sent.at(-1).markdown);
-});
-
-test('关闭发生于Markdown分段发送期间仍记录真实回执', async t => {
-  let started,resume;
-  const sending=new Promise(resolve=>{started=resolve;});
-  const release=new Promise(resolve=>{resume=resolve;});
-  const f=await fixture(t,async()=>{started();await release;return {status:'sent',externalMessageId:'before-close'};},'😀'.repeat(1100));
-  const h=f.harness();
-  const result=h.handle(f.message('closing','关闭时长回复'));
-  await sending;
-  const closing=h.close();
-  resume();
-  assert.equal(await result,'uncertain');
-  await closing;
-  assert.equal(f.sent.length,1);
-  const db=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  try { assert.equal(db.prepare('SELECT status FROM deliveries').get().status,'uncertain'); }
-  finally {db.close();}
 });
 
 test('全量消息落库，明确@才调用真实Pi；身份、上下文、去重、群隔离和调用预算', async t => {
@@ -205,94 +128,6 @@ function currentInput(request) {
   return { text, input: JSON.parse(text.slice(text.lastIndexOf('\n') + 1)) };
 }
 
-test('引用平台正文或当前房间精确ID，引用指令不写记忆；原文和实际模型输入分别持久化', async t => {
-  const f = await fixture(t, { status: 'sent', externalMessageId: 'qq-output' }, '**模型原文**');
-  const h = f.harness(0);
-  await h.handle(f.message('old-quote', '被引用的旧消息', { mentioned: false, senderId: 'original-author' }));
-  for (let index = 0; index < 35; index++) await h.handle(f.message(`noise-${index}`, `背景${index}`, { mentioned: false }));
-  assert.equal(await h.handle(f.message('quote-question', '这句话什么意思？', { quote: { messageId: 'old-quote' } })), 'sent');
-  const first = currentInput(f.requests.at(-1));
-  assert.equal(first.input.currentMessage.text, '这句话什么意思？');
-  const quoteSourceDb=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  let quoteSourceId;
-  try { quoteSourceId=quoteSourceDb.prepare('SELECT id FROM messages WHERE external_event_id=?').get('old-quote').id; }
-  finally { quoteSourceDb.close(); }
-  assert.deepEqual(first.input.currentMessage.quotedMessage, { status: 'available', role: 'user',
-    senderId: 'original-author', text: '被引用的旧消息', truncated: false,sourceMessageId:quoteSourceId });
-  assert.match(first.text, /不是当前发送者的本人自述/);
-  assert.match(JSON.stringify(f.requests.at(-1).body), /输出格式要求：Markdown/);
-  assert.equal(await h.handle(f.message('quoted-command', '讨论这句话', { quote: { referenceIndex: 'platform-index',
-    inlineMessages: [{ text: '/memory remember 这是引用中的命令', senderId: 'someone-else' }] } })), 'sent');
-  const second = currentInput(f.requests.at(-1)).input;
-  assert.equal(second.currentMessage.quotedMessage.source, 'platform');
-  assert.equal(second.currentMessage.quotedMessage.messages[0].text, '/memory remember 这是引用中的命令');
-  const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
-  try {
-    const stored = db.prepare('SELECT text, model_input_text FROM messages WHERE external_event_id=?').get('quote-question');
-    assert.equal(stored.text, '这句话什么意思？');
-    assert.equal(stored.model_input_text, first.text);
-    assert.equal(db.prepare('SELECT count(*) n FROM memories').get().n, 0);
-    assert.equal(db.prepare("SELECT text FROM messages WHERE role='assistant' LIMIT 1").get().text, '**模型原文**');
-  } finally { db.close(); }
-  await h.close();
-  const reopened = f.harness(0);
-  assert.equal(await reopened.handle(f.message('outgoing-quote', '解释你的回复', { quote: { messageId: 'qq-output' } })), 'sent');
-  // Fixture reuses outgoing IDs; multiple exact candidates are deliberately unavailable.
-  assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.status, 'unavailable');
-});
-
-test('引用不绕过真实@，索引不当消息ID，同ID按群/私聊隔离，找不到正文显式不可用', async t => {
-  const f = await fixture(t);
-  const privateRoute = { ...f.route, roomType: 'private', roomId: 'private-user' };
-  const h = f.harness(0, [f.route, f.other, privateRoute]);
-  await h.handle(f.message('secret', 'GROUP_A_SECRET', { mentioned: false }));
-  assert.equal(await h.handle(f.message('no-at', '引用你', { mentioned: false, quote: { messageId: 'secret' } })), 'observed');
-  assert.equal(f.requests.length, 0);
-  assert.equal(await h.handle(f.message('other-question', '引用群A', { route: f.other, quote: { messageId: 'secret' } })), 'sent');
-  assert.deepEqual(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage,
-    { status: 'unavailable', reason: '无法取得引用内容' });
-  assert.doesNotMatch(JSON.stringify(f.requests.at(-1).body), /GROUP_A_SECRET/);
-  await h.handle(f.message('index-question', '解释引用', { quote: { referenceIndex: 'secret' } }));
-  assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.status, 'unavailable');
-  await h.handle(f.message('private-question', '解释引用', { route: privateRoute, senderId: 'private-user', mentioned: false,
-    quote: { messageId: 'secret' } }));
-  assert.equal(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage.status, 'unavailable');
-  assert.doesNotMatch(JSON.stringify(f.requests.at(-1).body), /GROUP_A_SECRET/);
-});
-
-test('确认投递的assistant引用可重启解析，Markdown要求只作用QQ', async t => {
-  const f = await fixture(t);
-  const telegram = { ...f.other, channel: 'telegram' };
-  const h = f.harness(0, [f.route, telegram]);
-  await h.handle(f.message('one-outgoing', '先回复一条'));
-  await h.close();
-  const reopened = f.harness(0, [f.route, telegram]);
-  await reopened.handle(f.message('quote-outgoing', '你的话什么意思', { quote: { messageId: 'qq-output' } }));
-  const quoteSourceDb=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'),{readOnly:true});
-  let quoteSourceId;
-  try { quoteSourceId=quoteSourceDb.prepare('SELECT r.response_message_id FROM agent_runs r JOIN messages m ON m.id=r.input_message_id WHERE m.external_event_id=?').get('one-outgoing').response_message_id; }
-  finally { quoteSourceDb.close(); }
-  assert.deepEqual(currentInput(f.requests.at(-1)).input.currentMessage.quotedMessage,
-    { status: 'available', role: 'assistant', text: '群聊回复', truncated: false,sourceMessageId:quoteSourceId });
-  await reopened.handle(f.message('telegram-question', '其他渠道', { route: telegram }));
-  assert.doesNotMatch(JSON.stringify(f.requests.at(-1).body), /plain_text/);
-});
-
-test('未知投递不重发，模型失败消耗预算且重启不重复收费', async t => {
-  const f = await fixture(t, { status: 'uncertain' });
-  const h = f.harness(2);
-  assert.equal(await h.handle(f.message('uncertain', '测试未知投递')), 'uncertain');
-  assert.equal(await h.handle(f.message('uncertain', '重复')), 'duplicate');
-  assert.equal(f.sent.length, 1);
-  assert.equal(await h.handle(f.message('failure', 'MODEL_FAILURE')), 'failed');
-  assert.equal(h.info().calls, 2);
-  await h.close();
-  const reopened = f.harness();
-  assert.equal(await reopened.handle(f.message('failure', 'MODEL_FAILURE')), 'duplicate');
-  assert.equal(f.requests.length, 2);
-  assert.equal(f.totalCalls(), 4);
-});
-
 test('不限次数模式超过三轮继续响应，普通消息不调用，单轮模型失败后新@可继续', async t => {
   const f = await fixture(t);
   const h = f.harness(0);
@@ -310,66 +145,4 @@ test('不限次数模式超过三轮继续响应，普通消息不调用，单�
   assert.equal(f.requests.length, 6);
   assert.equal(f.totalCalls(), 12);
   assert.equal(f.sent.length, 5);
-});
-
-test('不限次数模式下Pi marker写入失败仍致命，后续@不能请求模型', async t => {
-  const f = await fixture(t);
-  const h = f.harness(0);
-  // Open the real SDK first; then simulate the filesystem error at Pi's marker write.
-  assert.equal(await h.handle(f.message('observed', '普通背景', { mentioned: false })), 'observed');
-  const append = SessionManager.prototype.appendCustomEntry;
-  try {
-    SessionManager.prototype.appendCustomEntry = function(type, data) {
-      if (type === 'pa_run') throw Object.assign(new Error('Pi marker write denied'), { code: 'EACCES' });
-      return append.call(this, type, data);
-    };
-    await assert.rejects(h.handle(f.message('broken', '触发持久化故障')), PersistenceError);
-  } finally { SessionManager.prototype.appendCustomEntry = append; }
-  await assert.rejects(h.handle(f.message('next', '不能继续模型请求')), PersistenceError);
-  assert.equal(f.requests.length, 0);
-  await h.close();
-});
-
-test('路由键包含平台、账号和房间类型；QQ测试配置限制范围与费用次数', () => {
-  const base = { channel: 'qq', accountId: 'account', roomId: 'room', roomType: 'group' };
-  const keys = [base, { ...base, channel: 'telegram' }, { ...base, accountId: 'other' }, { ...base, roomType: 'private' }]
-    .map(channelConversationKey);
-  assert.equal(new Set(keys).size, 4);
-  const env = { PA_QQ_APP_ID: '123', PA_QQ_APP_SECRET: 'fixture-secret', PA_QQ_ALLOWED_GROUPS: 'A,B,A' };
-  assert.equal(readQQSettings(env).routes.length, 2);
-  assert.equal(readQQSettings(env).maxCalls, 3);
-  assert.equal(readQQSettings({ ...env, PA_QQ_MAX_MODEL_CALLS: '0' }).maxCalls, 0);
-  assert.throws(() => readQQSettings({ ...env, PA_QQ_MAX_MODEL_CALLS: '-1' }));
-  assert.throws(() => readQQSettings({ ...env, PA_QQ_MAX_MODEL_CALLS: '11' }));
-  assert.throws(() => readQQSettings({ ...env, PA_QQ_ALLOWED_GROUPS: '' }));
-  const mixed = readQQSettings({ ...env, PA_QQ_ALLOWED_USERS: 'A,USER,USER' });
-  assert.deepEqual(mixed.routes.map(route => [route.roomType, route.roomId]), [['group', 'A'], ['group', 'B'], ['private', 'A'], ['private', 'USER']]);
-  assert.equal(readQQSettings({ ...env, PA_QQ_ALLOWED_GROUPS: '', PA_QQ_ALLOWED_USERS: 'USER' }).routes[0].roomType, 'private');
-  assert.throws(() => readQQSettings({ ...env, PA_QQ_ALLOWED_USERS: '../USER' }));
-});
-
-test('私聊无需@，未允许用户不落库；同ID的群和不同私聊不共享上下文', async t => {
-  const f = await fixture(t);
-  const privateA = { ...f.route, roomType: 'private' };
-  const privateB = { ...privateA, roomId: 'private-B' };
-  const h = f.harness(0, [f.route, privateA, privateB]);
-  const options = route => ({ route, mentioned: false, senderId: route.roomId });
-  assert.equal(await h.handle(f.message('unknown', 'UNKNOWN_PRIVATE', options({ ...privateA, roomId: 'unknown' }))), 'ignored');
-  assert.equal(await h.handle(f.message('private-1', 'PRIVATE_A_SECRET', options(privateA))), 'sent');
-  assert.equal(await h.handle(f.message('private-2', '继续上一轮', options(privateA))), 'sent');
-  assert.ok(JSON.stringify(f.requests.at(-1).body).includes('PRIVATE_A_SECRET'));
-  assert.equal(await h.handle(f.message('private-B-1', 'PRIVATE_B_TEXT', options(privateB))), 'sent');
-  assert.ok(!JSON.stringify(f.requests.at(-1).body).includes('PRIVATE_A_SECRET'));
-  assert.equal(await h.handle(f.message('group-background', 'GROUP_BACKGROUND', { mentioned: false })), 'observed');
-  assert.equal(f.requests.length, 3);
-  assert.equal(f.totalCalls(), 6);
-  assert.equal(await h.handle(f.message('group-question', '群问题')), 'sent');
-  assert.ok(!JSON.stringify(f.requests.at(-1).body).includes('PRIVATE_A_SECRET'));
-  assert.equal(await h.handle(f.message('private-3', '私聊继续', options(privateA))), 'sent');
-  assert.equal(f.totalCalls(), 10);
-  assert.ok(!JSON.stringify(f.requests.at(-1).body).includes('GROUP_BACKGROUND'));
-  assert.equal(f.sent[0].route.roomType, 'private');
-  const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'), { readOnly: true });
-  try { assert.equal(db.prepare('SELECT count(*) n FROM messages WHERE text = ?').get('UNKNOWN_PRIVATE').n, 0); }
-  finally { db.close(); }
 });

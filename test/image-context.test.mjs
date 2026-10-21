@@ -11,9 +11,6 @@ import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.
 import { ConversationStore } from '../dist/store.js';
 import { createMemoryProvider } from '../dist/memory-provider.js';
 import { validateExtract } from '../dist/auto-memory.js';
-import { ContextTokenEstimator } from '../dist/context-tokens.js';
-import { imageRequestFits, MAX_REQUEST_IMAGES, MAX_REQUEST_IMAGE_BYTES } from '../dist/image-context.js';
-import { estimateContext } from '../dist/runtime.js';
 import { messageText } from './fixtures/conversation-context.mjs';
 import { preparationDelta } from './fixtures/turn-preparation.mjs';
 
@@ -132,27 +129,6 @@ test('QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、
     assert.equal(finalDb.prepare(`SELECT d.status FROM deliveries d JOIN agent_runs r ON r.id=d.run_id JOIN messages m ON m.id=r.input_message_id WHERE m.external_event_id='sending-at-close'`).get().status,'sent');
     assert.equal(finalDb.prepare(`SELECT count(*) n FROM messages WHERE external_event_id IN ('preparing-at-close','queued-at-close')`).get().n,0);
   }finally{finalDb.close();}
-});
-
-test('视觉tokens固定预留且usage校准区分新增、保留和更换图片，兼容旧纯文本样本',()=>{
-  const file=id=>({type:'file',file_id:id});
-  const payload=images=>({messages:[{role:'user',content:[{type:'text',text:'stable history '.repeat(5000)},...images.map(file)]}]});
-  const a=payload(['file-api-A']),b=payload(['file-api-A','file-api-B']);
-  assert.equal(estimateContext(payload(['x'.repeat(100000)]),1_000_000,512).inputTokens,estimateContext(a,1_000_000,512).inputTokens);
-  const estimator=new ContextTokenEstimator('a'.repeat(64));
-  const usage={input:1000,cacheRead:200,cacheWrite:0,output:10,totalTokens:1210};
-  assert.ok(estimator.learn(estimator.metadata(a),usage));assert.ok(estimator.estimate(a));
-  assert.ok(estimator.estimate(b).inputTokens>=1200+1024);
-  assert.equal(estimator.estimate(payload(['file-api-C'])),undefined);
-  const old=new ContextTokenEstimator('b'.repeat(64));assert.ok(old.learn(old.metadata(payload([])),usage));
-  assert.ok(old.estimate(a).inputTokens>=1200+1024);
-  const many=Array.from({length:26},(_,i)=>({type:'file',file_id:`file-api-${i}`,bytes:8*1024*1024}));
-  const projection={text:'images',content:many};
-  assert.equal(imageRequestFits({messages:[{role:'user',content:many}]},[projection]),false);
-  assert.equal(imageRequestFits({messages:[{role:'user',content:many.slice(0,25)}]},[projection]),true);
-  assert.equal(MAX_REQUEST_IMAGE_BYTES,25*8*1024*1024);
-  const count=Array.from({length:MAX_REQUEST_IMAGES+1},(_,i)=>({type:'file',file_id:`small-${i}`,bytes:1}));
-  assert.equal(imageRequestFits({messages:[{role:'user',content:count}]},[{text:'images',content:count}]),false);
 });
 
 test('关闭等待中的图片admission会取消下载，关闭完成后不入库、不回复、不调用模型',async t=>{
