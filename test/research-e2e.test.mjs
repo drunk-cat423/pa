@@ -11,6 +11,7 @@ import test from 'node:test';
 import { ChannelHarness } from '../dist/channel-harness.js';
 import { QQChannel } from '../dist/qq-channel.js';
 import { ConversationStore } from '../dist/store.js';
+import { ResearchService } from '../dist/research-service.js';
 import { currentMessage, isPreparationRequest, preparationDelta } from './fixtures/turn-preparation.mjs';
 
 const sourceUrl = 'https://example.com/research-source';
@@ -147,6 +148,35 @@ async function fixture(t) {
   return { config, route, privateRoute, secondGroup, requests, pages, qqRequests, plans, workerPlans, phasePlans, inspect, harness, message, taskRows, errors,
     pageFails(value) { pageFails = value; }, pageText(value) { pageText = value; }, fileUnknown(value) { fileUnknown = value; } };
 }
+
+test('定点真实测试入口只领取指定批次，不运行其他队列、不通知QQ、不重试网页失败', async t => {
+  const f = await fixture(t); f.pageFails(true);
+  const store = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  const conversation = store.ensureConversation('trial', '/fixture/trial.jsonl', f.route);
+  store.recordInbound(conversation.id, '研究资料', { eventId: 'trial', senderId: 'alice', sentAt: new Date().toISOString(), modelInputText: '研究资料' });
+  const source = store.externalMessage(conversation.id, 'trial');
+  const target = store.research.create(conversation.id, source.id, { key: 'target', title: '仅此任务', goal: '读取原文', urls: [sourceUrl], requiresOriginal: true });
+  const other = store.research.create(conversation.id, source.id, { key: 'other', title: '其他队列', goal: '不能运行' });
+  const old = JSON.stringify(store.research.get(other.id));
+  assert.equal(store.research.claim(target.id, f.config.research, 2), undefined);
+  assert.equal(store.research.get(target.id).status, 'queued');
+  f.workerPlans.set('仅此任务', [call('web_fetch', { url: sourceUrl }), answer(sectionOutput('blocked', ''))]);
+  let sends = 0;
+  const service = new ResearchService(f.config, [f.route], async () => { sends++; return { status: 'rejected' }; }, () => {});
+  try {
+    const task = await service.runOnce(target.id, 1);
+    assert.equal(task.status, 'blocked'); assert.equal(f.pages.length, 1); assert.equal(sends, 0);
+    assert.equal(JSON.stringify(store.research.get(other.id)), old);
+    assert.ok(f.requests.every(request => request.worker.task.title === '仅此任务'));
+    assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_deliveries').get().n), 0);
+    await assert.rejects(() => service.runOnce(target.id, 1), /独立/);
+  } finally { await service.close(); }
+  const next = new ResearchService(f.config, [f.route], async () => ({ status: 'rejected' }), () => {});
+  const count = f.requests.length;
+  try { await assert.rejects(() => next.runOnce(target.id, 1), /不匹配/); }
+  finally { await next.close(); store.close(); }
+  assert.equal(f.requests.length, count);
+});
 
 test('研究端到端：模型建任务、跨群私聊本人清单与领取、他人隔离及历史边界', async t => {
   const f = await fixture(t), h = await f.harness();

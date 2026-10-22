@@ -39,6 +39,21 @@ export class ResearchService {
     this.store.research.recover();
     this.wake();
   }
+  /** Local operator entry: claim exactly one pre-authorized queued attempt.
+   * No queue pump, memory worker, notification or automatic network retry. */
+  async runOnce(id: string, expectedAttempt: number): Promise<ResearchTask> {
+    if (this.closed || this.store || this.active) throw new MemoryError('单任务研究必须使用独立且未启动的服务实例。');
+    this.store = new ConversationStore(join(this.config.dataDir, 'pa.sqlite'));
+    const task = this.store.research.get(id);
+    if (!task || task.status !== 'queued' || task.attempt !== expectedAttempt || !this.allowed.has(routeKey(task.route))) {
+      throw new MemoryError('单任务研究的编号、批次、状态或允许场景不匹配。');
+    }
+    const claimed = this.store.research.claim(id, this.config.research!, expectedAttempt);
+    if (!claimed) throw new MemoryError('指定研究批次未能领取，不重试。');
+    this.active = this.run(claimed, { notify: false, retryNetwork: false });
+    try { await this.active; return this.store.research.get(id)!; }
+    finally { this.active = undefined; this.activeTask = undefined; }
+  }
   info() { return { running: this.activeTask, failed: Boolean(this.fatal) }; }
   context(conversationId: string, sourceMessageId: string, send?: ResearchSender): ResearchToolContext {
     return { ...(this.store ? { target: this.store.research.targetContext(conversationId, sourceMessageId) } : {}),
@@ -103,7 +118,7 @@ export class ResearchService {
     this.store?.close(); this.store = undefined;
   }
 
-  private async run(task: ResearchTask): Promise<void> {
+  private async run(task: ResearchTask, options = { notify: true, retryNetwork: true }): Promise<void> {
     this.activeTask = task.id;
     const store = this.store!.research;
     const budget = this.config.research!;
@@ -117,7 +132,7 @@ export class ResearchService {
     // One cache and total read budget per attempt, surviving individual Pi cycles.
     const fetchReader = this.config.fetch?.enabled ? new WebFetchReader(this.config.fetch, {
       maxResultBytes: 16_000, maxReads: budget.maxToolCalls, maxTotalBytes: 16_000 * budget.maxToolCalls,
-      maxNetworkAttempts: 2, onNetworkAttempt: (url, attempt) => persist(() => store.checkpoint(task.id, task.attempt,
+      ...(options.retryNetwork ? { maxNetworkAttempts: 2 as const } : {}), onNetworkAttempt: (url, attempt) => persist(() => store.checkpoint(task.id, task.attempt,
         { ...current, evidence: { tool: 'web_fetch_network', input: { url, attempt } } })),
     }) : undefined;
     let finished: ResearchTask;
@@ -256,7 +271,7 @@ export class ResearchService {
     } finally {
       fetchReader?.dispose();
     }
-    if (!this.closed) await this.notify(finished);
+    if (!this.closed && options.notify) await this.notify(finished);
   }
 
   private async notify(task: ResearchTask): Promise<void> {

@@ -188,16 +188,16 @@ test('完整报告容量包含跨章缺口和去重来源，拒绝超限提案�
   }
 });
 
-test('schema24到25保留式迁移自动备份，旧任务证据报告及正文哈希保持', t => {
+test('schema24到26保留式迁移自动备份，旧任务证据报告及正文哈希保持', t => {
   const f=fixture(t), id=f.task.id; f.claim();
   f.store.research.checkpoint(id,1,{modelCalls:1,toolCalls:0,searchCalls:0,evidence:{tool:'fetch',input:{url:'https://example.com'},result:'旧证据'}});
   f.store.research.finish(id,1,{status:'completed',markdown:'# 旧正式报告\n\n历史内容',abstract:'旧摘要',keywords:['历史']});
   const tableNames=['research_tasks','research_attempts','research_evidence','research_reports'];
   const snapshots=()=>Object.fromEntries(tableNames.map(name=>[name,hash(JSON.stringify(f.db.prepare(`SELECT * FROM ${name}`).all()))]));
   const before=snapshots(), reportHash=hash(readFileSync(join(f.directory,'research',id,'1.md')));
-  f.db.exec(`DROP TABLE research_workflow_reviews; DROP TABLE research_workflow_versions; DROP TABLE research_workflow_sections;
+  f.db.exec(`DROP TABLE research_task_archives; DROP TABLE research_workflow_reviews; DROP TABLE research_workflow_versions; DROP TABLE research_workflow_sections;
     DROP TABLE research_workflow_plans; DROP TABLE research_workflow_cycles; PRAGMA user_version=24;`);
-  f.reopen(); assert.equal(f.db.prepare('PRAGMA user_version').get().user_version,25);
+  f.reopen(); assert.equal(f.db.prepare('PRAGMA user_version').get().user_version,26);
   assert.deepEqual(snapshots(),before); assert.equal(hash(readFileSync(join(f.directory,'research',id,'1.md'))),reportHash);
   const backups=readdirSync(f.directory).filter(name=>/^pa\.sqlite\.v24\..*\.bak$/.test(name)); assert.equal(backups.length,1);
   const backup=new DatabaseSync(join(f.directory,backups[0]),{readOnly:true});

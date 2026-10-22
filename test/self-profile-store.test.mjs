@@ -62,7 +62,7 @@ test('v6 migration backs up original data and preserves frozen job input while i
     });
     f.restart();
     inspect(f, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version,25);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version,26);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       for (const table of tables) assert.deepEqual(db.prepare(`SELECT rowid,* FROM ${table}`).all().map(({image_failure: _failure,...r}) => ({ ...r })), before[table]);
     });

@@ -49,6 +49,15 @@ export function migrateResearch(db: DatabaseSync): void {
   CREATE UNIQUE INDEX research_file_once ON research_deliveries(task_id,source_message_id,version) WHERE kind='file';`);
 }
 
+export function migrateResearchArchives(db: DatabaseSync): void {
+  db.exec(`CREATE TABLE research_task_archives (
+    task_id TEXT PRIMARY KEY REFERENCES research_tasks(id),
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    operator_actor_id TEXT NOT NULL REFERENCES actors(id), operator_person_id TEXT NOT NULL,
+    reason TEXT NOT NULL, created_at TEXT NOT NULL, snapshot_hash TEXT NOT NULL);`);
+}
+
 const timestamp = () => new Date().toISOString();
 const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const zeroUsage = () => ({ modelCalls: 0, toolCalls: 0, searchCalls: 0 });
@@ -140,7 +149,7 @@ export class ResearchStore {
     // Resolve trusted current identity bindings, including tasks created before a
     // person's group/private identities were explicitly linked. The stored person
     // remains the original ownership snapshot for audit, not an authorization cache.
-    let where = "coalesce(owner.person_id,'actor:' || t.actor_id)=?";
+    let where = "coalesce(owner.person_id,'actor:' || t.actor_id)=? AND NOT EXISTS (SELECT 1 FROM research_task_archives ar WHERE ar.task_id=t.id)";
     if (params.date !== undefined) { validDay(params.date); where += ` AND date(t.created_at,'+8 hours')=?`; bindings.push(params.date); }
     let from = 'research_tasks t LEFT JOIN actor_person_bindings owner ON owner.actor_id=t.actor_id', order = 't.created_at DESC,t.id DESC';
     if (params.query !== undefined && params.query.trim()) {
@@ -183,26 +192,55 @@ export class ResearchStore {
       usage:JSON.parse(String(row.usage_json)),evidence };
   }
 
+  /** Local operator interface only; task records and artifacts remain readable by their owner. */
+  archive(conversationId: string, sourceMessageId: string, input: { ids:string[]; reason:string }): { archivedIds:string[] } {
+    if (!Array.isArray(input.ids) || input.ids.length === 0) throw new MemoryError('请明确指定要归档的研究编号。');
+    const ids = [...new Set(input.ids)], reason = text(input.reason,'研究归档原因',2000);
+    return this.transaction(() => {
+      const operator = this.identity(conversationId,sourceMessageId);
+      for (const id of ids) {
+        const task = this.authorized(conversationId,sourceMessageId,id);
+        if (task.status === 'running') throw new MemoryError('正在运行的研究不能归档。');
+      }
+      const at = timestamp();
+      for (const id of ids) {
+        const row = this.db.prepare('SELECT * FROM research_tasks WHERE id=?').get(id)!;
+        this.db.prepare(`INSERT INTO research_task_archives(task_id,conversation_id,source_message_id,
+          operator_actor_id,operator_person_id,reason,created_at,snapshot_hash) VALUES(?,?,?,?,?,?,?,?)
+          ON CONFLICT(task_id) DO NOTHING`)
+          .run(id,conversationId,sourceMessageId,operator.actorId,operator.personId,reason,at,digest(JSON.stringify(row)));
+      }
+      return { archivedIds:ids };
+    });
+  }
+
+  private archived(id: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM research_task_archives WHERE task_id=?').get(id));
+  }
+
   queued(conversationIds?: readonly string[]): ResearchTask[] {
-    const ids = this.db.prepare("SELECT id,conversation_id FROM research_tasks WHERE status='queued' ORDER BY created_at,id").all()
+    const ids = this.db.prepare(`SELECT id,conversation_id FROM research_tasks t WHERE status='queued'
+      AND NOT EXISTS (SELECT 1 FROM research_task_archives ar WHERE ar.task_id=t.id) ORDER BY created_at,id`).all()
       .filter(row => !conversationIds || conversationIds.includes(String(row.conversation_id))).map(row => String(row.id));
     return ids.map(id => this.get(id)!);
   }
 
   pendingNotifications(conversationIds?: readonly string[]): ResearchTask[] {
     const rows = this.db.prepare(`SELECT t.id,t.conversation_id FROM research_tasks t
-      WHERE t.status NOT IN ('queued','running') AND NOT EXISTS (
+      WHERE t.status NOT IN ('queued','running') AND NOT EXISTS (SELECT 1 FROM research_task_archives ar WHERE ar.task_id=t.id) AND NOT EXISTS (
         SELECT 1 FROM research_deliveries d WHERE d.task_id=t.id AND d.attempt=t.attempt AND d.kind='notice')
       ORDER BY t.updated_at,t.id`).all();
     return rows.filter(row => !conversationIds || conversationIds.includes(String(row.conversation_id))).map(row => this.get(String(row.id))!);
   }
 
-  claim(id: string, budget: ResearchBudget): ResearchTask | undefined {
+  claim(id: string, budget: ResearchBudget, expectedAttempt?: number): ResearchTask | undefined {
     validId(id);
+    if (expectedAttempt !== undefined) integer(expectedAttempt,'研究预约批次',1,1_000_000);
     integer(budget.maxModelCalls,'研究模型次数',1,100); integer(budget.maxToolCalls,'研究工具次数',1,200); integer(budget.maxSearchCalls,'研究搜索次数',0,100);
     return this.transaction(() => {
       const task = this.get(id);
-      if (!task || task.status !== 'queued') return undefined;
+      if (!task || task.status !== 'queued' || this.archived(id)
+        || (expectedAttempt !== undefined && task.attempt !== expectedAttempt)) return undefined;
       const at = timestamp();
       this.db.prepare("UPDATE research_attempts SET status='running',budget_json=?,updated_at=? WHERE task_id=? AND attempt=? AND status='queued'")
         .run(JSON.stringify(budget),at,id,task.attempt);
@@ -278,6 +316,7 @@ export class ResearchStore {
     const key = text(input.key,'研究续作标识',80);
     return this.transaction(() => {
       const task = this.authorized(conversationId,sourceMessageId,input.id);
+      if (this.archived(task.id)) throw new MemoryError('该研究已归档，不能继续执行。');
       const existing = this.db.prepare('SELECT attempt FROM research_attempts WHERE task_id=? AND source_message_id=? AND action_key=?').get(task.id,sourceMessageId,key);
       if (existing) return task;
       if (task.status === 'queued' || task.status === 'running') throw new MemoryError('该研究正在排队或进行中，无需重复创建。');
@@ -366,6 +405,7 @@ export class ResearchStore {
 
   private reserve(task: ResearchTask, sourceMessageId: string, kind:'file'|'notice',version:number,format:string,attempt:number,body?:string): ResearchDelivery {
     return this.transaction(() => {
+      if (kind === 'notice' && this.archived(task.id)) throw new MemoryError('该研究已归档，不再自动通知。');
       const destination = this.db.prepare(`SELECT r.channel,r.account,r.room_type,r.external_chat_id FROM messages m
         JOIN conversations c ON c.id=m.conversation_id JOIN rooms r ON r.id=c.room_id
         WHERE m.id=? AND m.role='user'`).get(sourceMessageId);
