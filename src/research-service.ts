@@ -143,15 +143,15 @@ export class ResearchService {
         if (workflow.plan && workflow.sections.every(section => section.status === 'approved')) break;
         // Review a newly written chapter before spending on the next one. Blocked chapters
         // are revisited only by a new, explicitly requested attempt, never in a busy loop.
-        const section = workflow.sections.find(item => item.status === 'written')
-          ?? workflow.sections.find(item => item.status !== 'approved' && !blockedThisAttempt.has(item.id));
-        if (workflow.plan && !section) break;
-        const phase: ResearchPhase = !workflow.plan ? 'plan' : section!.status === 'written' ? 'review' : 'write';
+        const section = workflow.collected ? workflow.sections.find(item => item.status === 'written')
+          ?? workflow.sections.find(item => item.status !== 'approved' && !blockedThisAttempt.has(item.id)) : undefined;
+        if (workflow.plan && workflow.collected && !section) break;
+        const phase: ResearchPhase = !workflow.plan ? 'plan' : !workflow.collected ? 'collect' : section!.status === 'written' ? 'review' : 'write';
         const saved = persist(() => store.get(task.id)!);
         const material = saved.evidence.map((evidence, index) => ({ id: `e${index + 1}`, ...evidence }))
           .filter(evidence => ['web_fetch', 'web_search'].includes(evidence.tool));
         const previousMaterial = boundedText(JSON.stringify(material.slice(-24).map(item => ({ ...item,
-          result: item.result === undefined ? undefined : boundedText(JSON.stringify(item.result), 4500) }))), 45_000);
+          result: item.result === undefined ? undefined : boundedText(JSON.stringify(item.result), phase === 'write' ? 24_000 : 4500) }))), phase === 'write' ? 120_000 : 45_000);
         const reviewCoverage = new Map<string, { total: number; ranges: [number, number][] }>();
         const reviewSources = new Set<string>();
         let reviewBytes = 60_000;
@@ -175,7 +175,8 @@ export class ResearchService {
           ...(section ? { section: phase === 'review' ? section : sectionProjection(section),
             writeMode: section.status === 'draft' ? 'append' : 'replace' } : {}),
           budget: { modelCalls: budget.maxModelCalls - current.modelCalls, toolCalls: budget.maxToolCalls - current.toolCalls,
-            searchCalls: budget.maxSearchCalls - current.searchCalls },
+            searchCalls: budget.maxSearchCalls - current.searchCalls,
+            suggestedSections: Math.max(1, Math.min(3, Math.floor((budget.maxModelCalls - 3) / 2))) },
           ...(!workflow.plan && task.reportVersion ? { previousReport: boundedText(store.report(task.id, task.reportVersion).markdown, 12_000) } : {}) };
         const cycle = persist(() => store.workflow.begin(task.id, task.attempt, { phase, input,
           ...(section ? { sectionId: section.id, expectedVersion: section.version } : {}) }));
@@ -190,12 +191,14 @@ export class ResearchService {
         };
         let stopReason = 'unknown';
         const remaining = budget.maxModelCalls - current.modelCalls;
-        // Each writer cycle is small; reserve a call for review when possible.
-        const modelCalls = phase === 'write' ? Math.min(4, Math.max(1, remaining - 1)) : phase === 'review' ? Math.min(4, remaining) : 1;
+        // Collection stops after successful tool execution at its own boundary.
+        // Writing starts a clean, tool-free session and never inherits that loop.
+        const modelCalls = phase === 'collect' ? Math.min(8, Math.max(1, remaining - workflow.sections.filter(item => item.status !== 'approved').length * 2))
+          : phase === 'review' ? Math.min(4, remaining) : 1;
         try {
           this.runtime = await openConversation({ ...this.config, loop: { maxModelCalls: modelCalls, maxToolCalls: budget.maxToolCalls } },
             `research:${task.id}:${task.attempt}:cycle:${cycle}`, { enableSearch: true, research: {
-              phase, systemPrompt: researchStagePrompt(phase), maxToolCalls: budget.maxToolCalls - current.toolCalls,
+              phase, systemPrompt: researchStagePrompt(phase), maxToolCalls: phase === 'write' || phase === 'plan' ? 0 : budget.maxToolCalls - current.toolCalls,
               maxSearchCalls: budget.maxSearchCalls - current.searchCalls, record,
               ...(fetchReader ? { fetchReader } : {}),
               readMaterial: params => {
@@ -212,10 +215,13 @@ export class ResearchService {
             } });
           if (this.closed) throw new RequestError('研究服务正在关闭。', 'cancelled');
           const output = await this.runtime.prompt(JSON.stringify(input), { runId: randomUUID(), taskId: task.id, conversationId: task.conversationId });
-          persist(() => store.checkpoint(task.id, task.attempt, { ...current, evidence: { tool: 'report_draft',
+          persist(() => store.checkpoint(task.id, task.attempt, { ...current, evidence: { tool: phase === 'collect' ? 'collection_note' : 'report_draft',
             input: { attempt: task.attempt, cycle, phase, sectionId: section?.id, stopReason,
               truncated: stopReason === 'length', storedExcerpt: Buffer.byteLength(output) > 90_000 }, result: boundedText(output, 90_000) } }));
           if (phase === 'plan') persist(() => store.workflow.savePlan(task.id, task.attempt, cycle, parseResearchPlan(output, stopReason)));
+          else if (phase === 'collect') persist(() => store.workflow.saveCollection(task.id, task.attempt, cycle,
+            { reason: current.modelCalls - base.modelCalls >= modelCalls || current.toolCalls >= budget.maxToolCalls ? 'budget' : 'complete',
+              note: [...output].slice(0, 4000).join('') }));
           else if (phase === 'write') {
             const proposal = parseResearchSection(output, stopReason, section!, store.get(task.id)!.evidence);
             persist(() => store.workflow.saveSection(task.id, task.attempt, cycle, proposal));

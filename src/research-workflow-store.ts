@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { MemoryError } from './memory-types.js';
 import { assembleResearchReport } from './research-workflow.js';
-import type { ResearchCycleInput, ResearchPlan, ResearchReviewInput, ResearchSection, ResearchSectionInput, ResearchWorkflow } from './research-workflow-types.js';
+import type { ResearchCollectionInput, ResearchCycleInput, ResearchPlan, ResearchReviewInput, ResearchSection, ResearchSectionInput, ResearchWorkflow } from './research-workflow-types.js';
 
 export function migrateResearchWorkflow(db: DatabaseSync): void {
   db.exec(`CREATE TABLE research_workflow_plans (
@@ -40,6 +40,16 @@ export function migrateResearchWorkflow(db: DatabaseSync): void {
     FOREIGN KEY(task_id,cycle) REFERENCES research_workflow_cycles(task_id,cycle));`);
 }
 
+export function migrateResearchCollection(db: DatabaseSync): void {
+  db.exec(`CREATE TABLE research_collection_cycles (
+    task_id TEXT NOT NULL REFERENCES research_tasks(id), attempt INTEGER NOT NULL, cycle INTEGER NOT NULL CHECK(cycle>0),
+    input_json TEXT NOT NULL, input_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','unknown','interrupted')),
+    result_json TEXT, reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY(task_id,cycle), FOREIGN KEY(task_id,attempt) REFERENCES research_attempts(task_id,attempt));
+  CREATE UNIQUE INDEX research_collection_one_cycle ON research_collection_cycles(task_id) WHERE status='running';`);
+}
+
 const now = () => new Date().toISOString();
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 function bounded(value: unknown, name: string, max: number, empty = false): string {
@@ -72,8 +82,12 @@ export class ResearchWorkflowStore {
   load(id: string): ResearchWorkflow {
     taskId(id);
     const row = this.db.prepare('SELECT plan_json FROM research_workflow_plans WHERE task_id=?').get(id);
-    const nextCycle = Number(this.db.prepare('SELECT coalesce(max(cycle),0)+1 AS cycle FROM research_workflow_cycles WHERE task_id=?').get(id)?.cycle);
-    if (!row) return { sections: [], nextCycle };
+    const nextCycle = Number(this.db.prepare(`SELECT coalesce(max(cycle),0)+1 AS cycle FROM (
+      SELECT cycle FROM research_workflow_cycles WHERE task_id=? UNION ALL
+      SELECT cycle FROM research_collection_cycles WHERE task_id=?)`).get(id,id)?.cycle);
+    const collected = !!this.db.prepare(`SELECT 1 FROM research_collection_cycles c JOIN research_tasks t ON t.id=c.task_id AND t.attempt=c.attempt
+      WHERE c.task_id=? AND c.status='succeeded' LIMIT 1`).get(id);
+    if (!row) return { sections: [], nextCycle, collected };
     const plan = JSON.parse(String(row.plan_json)) as ResearchPlan;
     const sections: ResearchSection[] = plan.sections.map(section => {
       const current = this.db.prepare(`SELECT s.*,v.summary,v.sources_json,v.gaps_json,v.content_hash FROM research_workflow_sections s
@@ -91,18 +105,21 @@ export class ResearchWorkflowStore {
         gaps:JSON.parse(String(current.gaps_json ?? '[]')) as string[],
         ...(current.review_reason == null ? {} : {reviewReason:String(current.review_reason)}) };
     });
-    return { plan,sections,nextCycle };
+    return { plan,sections,nextCycle,collected };
   }
 
   begin(id: string, attempt: number, input: ResearchCycleInput): number {
     const inputJson = serialized(input.input,'研究周期输入',2_000_000);
     return this.transaction(() => {
       this.running(id,attempt);
-      if (!['plan','write','review'].includes(input.phase)) throw new MemoryError('研究周期阶段无效。');
+      if (!['plan','collect','write','review'].includes(input.phase)) throw new MemoryError('研究周期阶段无效。');
       const workflow = this.load(id);
-      if (this.db.prepare("SELECT 1 FROM research_workflow_cycles WHERE task_id=? AND status='running'").get(id)) throw new MemoryError('研究周期尚未结束，拒绝并发调用。');
+      if (this.db.prepare(`SELECT 1 FROM research_workflow_cycles WHERE task_id=? AND status='running'
+        UNION ALL SELECT 1 FROM research_collection_cycles WHERE task_id=? AND status='running' LIMIT 1`).get(id,id)) throw new MemoryError('研究周期尚未结束，拒绝并发调用。');
       if (input.phase === 'plan') {
         if (workflow.plan || input.sectionId !== undefined || input.expectedVersion !== undefined) throw new MemoryError('研究计划已固定或周期参数无效。');
+      } else if (input.phase === 'collect') {
+        if (!workflow.plan || input.sectionId !== undefined || input.expectedVersion !== undefined) throw new MemoryError('研究资料收集须先固定计划，且不能指定章节或版本。');
       } else {
         sectionId(input.sectionId); version(input.expectedVersion);
         const section = workflow.sections.find(item => item.id === input.sectionId);
@@ -111,9 +128,26 @@ export class ResearchWorkflowStore {
           throw new MemoryError('研究章节状态不允许本阶段操作。');
       }
       const at = now(), cycle = workflow.nextCycle;
+      if (input.phase === 'collect') {
+        this.db.prepare(`INSERT INTO research_collection_cycles(task_id,attempt,cycle,input_json,input_hash,status,created_at,updated_at)
+          VALUES(?,?,?,?,?,'running',?,?)`).run(id,attempt,cycle,inputJson,hash(inputJson),at,at);
+        return cycle;
+      }
       this.db.prepare(`INSERT INTO research_workflow_cycles(task_id,cycle,attempt,phase,section_id,expected_version,input_json,input_hash,status,created_at,updated_at)
         VALUES(?,?,?,?,?,?,?,?,'running',?,?)`).run(id,cycle,attempt,input.phase,input.sectionId ?? null,input.expectedVersion ?? null,inputJson,hash(inputJson),at,at);
       return cycle;
+    });
+  }
+
+  saveCollection(id: string, attempt: number, cycle: number, input: ResearchCollectionInput): void {
+    if (!input || !['complete','budget'].includes(input.reason)) throw new MemoryError('研究资料收集结束原因无效。');
+    const note = bounded(input.note,'研究资料收集说明',4000,true);
+    this.transaction(() => {
+      this.cycle(id,attempt,cycle,'collect');
+      const changed = this.db.prepare(`UPDATE research_collection_cycles SET status='succeeded',result_json=?,updated_at=?
+        WHERE task_id=? AND attempt=? AND cycle=? AND status='running'`)
+        .run(JSON.stringify({reason:input.reason,note}),now(),id,attempt,cycle);
+      if (Number(changed.changes) !== 1) throw new MemoryError('研究资料收集周期已结束。');
     });
   }
 
@@ -203,14 +237,19 @@ export class ResearchWorkflowStore {
     const normalized = bounded(reason,'研究周期错误',4000);
     if (typeof unknown !== 'boolean') throw new MemoryError('研究周期未知状态无效。');
     this.transaction(() => {
-      this.cycle(id,attempt,cycle);
-      this.db.prepare('UPDATE research_workflow_cycles SET status=?,reason=?,updated_at=? WHERE task_id=? AND cycle=?')
+      const table = this.cycle(id,attempt,cycle);
+      this.db.prepare(`UPDATE ${table} SET status=?,reason=?,updated_at=? WHERE task_id=? AND cycle=?`)
         .run(unknown ? 'unknown' : 'failed',normalized,now(),id,cycle);
     });
   }
 
   interrupt(id: string, attempt: number, reason: string): void {
-    this.db.prepare("UPDATE research_workflow_cycles SET status='interrupted',reason=?,updated_at=? WHERE task_id=? AND attempt=? AND status='running'").run(reason,now(),id,attempt);
+    taskId(id);
+    if (!Number.isSafeInteger(attempt) || attempt < 1 || !this.db.prepare('SELECT 1 FROM research_tasks WHERE id=? AND attempt=?').get(id,attempt))
+      throw new MemoryError('研究任务状态或执行批次已改变，拒绝迟到写入。');
+    for (const table of ['research_workflow_cycles','research_collection_cycles']) {
+      this.db.prepare(`UPDATE ${table} SET status='interrupted',reason=?,updated_at=? WHERE task_id=? AND attempt=? AND status='running'`).run(reason,now(),id,attempt);
+    }
   }
 
   assertComplete(id: string): void {
@@ -224,13 +263,15 @@ export class ResearchWorkflowStore {
       WHERE t.id=? AND t.attempt=? AND t.status='running' AND a.status='running'`).get(id,attempt)) throw new MemoryError('研究任务状态或执行批次已改变，拒绝迟到写入。');
   }
 
-  private cycle(id: string, attempt: number, cycle: number, phase?: string, section?: string, expectedVersion?: number): void {
+  private cycle(id: string, attempt: number, cycle: number, phase?: string, section?: string, expectedVersion?: number): 'research_workflow_cycles' | 'research_collection_cycles' {
     this.running(id,attempt);
     if (!Number.isSafeInteger(cycle) || cycle < 1) throw new MemoryError('研究周期编号无效。');
-    const row = this.db.prepare('SELECT * FROM research_workflow_cycles WHERE task_id=? AND cycle=? AND attempt=?').get(id,cycle,attempt);
+    const collection = this.db.prepare('SELECT *,\'collect\' AS phase,NULL AS section_id,NULL AS expected_version FROM research_collection_cycles WHERE task_id=? AND cycle=? AND attempt=?').get(id,cycle,attempt);
+    const row = collection ?? this.db.prepare('SELECT * FROM research_workflow_cycles WHERE task_id=? AND cycle=? AND attempt=?').get(id,cycle,attempt);
     if (!row || row.status !== 'running' || (phase !== undefined && (row.phase !== phase || (row.section_id ?? undefined) !== section || (row.expected_version ?? undefined) !== expectedVersion)))
       throw new MemoryError('研究周期已结束或固定阶段、章节、版本不匹配。');
     if (hash(String(row.input_json)) !== row.input_hash) throw new Error('研究周期固定输入校验失败。');
+    return collection ? 'research_collection_cycles' : 'research_workflow_cycles';
   }
 
   private succeeded(id: string, cycle: number): void {

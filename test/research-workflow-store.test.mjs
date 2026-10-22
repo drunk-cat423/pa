@@ -43,6 +43,74 @@ function fixture(t) {
   };
 }
 
+test('独立收集固定输入并原子完成，跨表周期编号及并发检查，章节保持不变', t => {
+  const f=fixture(t), id=f.task.id;
+  assert.deepEqual(f.workflow.load(id),{sections:[],nextCycle:1,collected:false});
+  f.claim();
+  assert.throws(()=>f.workflow.begin(id,1,{phase:'collect',input:{}}),/先固定计划/);
+  const planning=f.savePlan(), before=f.workflow.load(id).sections;
+  for (const extra of [{sectionId:'s1'},{expectedVersion:0}]) {
+    assert.throws(()=>f.workflow.begin(id,1,{phase:'collect',input:{},...extra}),/不能指定章节/);
+  }
+  const input={plan,materials:['已存在证据'],stage:'独立查资料'};
+  const cycle=f.workflow.begin(id,1,{phase:'collect',input}); assert.equal(cycle,planning+1);
+  assert.equal(f.workflow.load(id).collected,false);
+  assert.throws(()=>f.workflow.begin(id,1,{phase:'write',sectionId:'s1',expectedVersion:0,input:{}}),/拒绝并发/);
+  assert.throws(()=>f.workflow.begin(id,1,{phase:'collect',input:{}}),/拒绝并发/);
+  assert.throws(()=>f.workflow.savePlan(id,1,cycle,plan),/固定阶段/);
+  assert.throws(()=>f.workflow.saveCollection(id,1,cycle,{reason:'unknown',note:''}),/结束原因无效/);
+  assert.throws(()=>f.workflow.saveCollection(id,1,cycle,{reason:'complete',note:'🙂'.repeat(4001)}),/说明无效或过长/);
+  assert.equal(f.db.prepare('SELECT status,result_json FROM research_collection_cycles WHERE task_id=? AND cycle=?').get(id,cycle).result_json,null);
+  f.workflow.saveCollection(id,1,cycle,{reason:'budget',note:'预算已用完，保留已取得材料'});
+  const saved=f.db.prepare('SELECT * FROM research_collection_cycles WHERE task_id=? AND cycle=?').get(id,cycle);
+  assert.equal(saved.status,'succeeded'); assert.equal(saved.input_json,JSON.stringify(input)); assert.equal(saved.input_hash,hash(saved.input_json));
+  assert.deepEqual(JSON.parse(saved.result_json),{reason:'budget',note:'预算已用完，保留已取得材料'});
+  assert.equal(f.workflow.load(id).collected,true); assert.deepEqual(f.workflow.load(id).sections,before);
+  assert.throws(()=>f.workflow.saveCollection(id,1,cycle,{reason:'complete',note:'重复提交'}),/周期已结束/);
+  const writing=f.workflow.begin(id,1,{phase:'write',sectionId:'s1',expectedVersion:0,input:{}}); assert.equal(writing,cycle+1);
+  assert.throws(()=>f.workflow.begin(id,1,{phase:'collect',input:{}}),/拒绝并发/);
+  assert.throws(()=>f.workflow.saveCollection(id,1,writing,{reason:'complete',note:''}),/固定阶段/);
+  assert.deepEqual(f.db.prepare('PRAGMA foreign_key_check').all(),[]);
+});
+
+test('收集失败和未知请求不标记成功，固定输入哈希失败拒绝完成', t => {
+  const f=fixture(t), id=f.task.id; f.claim(); f.savePlan();
+  for (const unknown of [false,true]) {
+    const cycle=f.workflow.begin(id,1,{phase:'collect',input:{unknown}});
+    f.workflow.failCycle(id,1,cycle,'收集请求失败或结果未知',unknown);
+    const saved=f.db.prepare('SELECT * FROM research_collection_cycles WHERE task_id=? AND cycle=?').get(id,cycle);
+    assert.equal(saved.status,unknown?'unknown':'failed'); assert.equal(saved.result_json,null); assert.equal(f.workflow.load(id).collected,false);
+    assert.throws(()=>f.workflow.saveCollection(id,1,cycle,{reason:'complete',note:'迟到结果'}),/周期已结束/);
+  }
+  const cycle=f.workflow.begin(id,1,{phase:'collect',input:{frozen:'原始输入'}});
+  f.db.prepare('UPDATE research_collection_cycles SET input_json=? WHERE task_id=? AND cycle=?').run('{}',id,cycle);
+  assert.throws(()=>f.workflow.saveCollection(id,1,cycle,{reason:'complete',note:''}),/固定输入校验失败/);
+  assert.equal(f.workflow.load(id).collected,false);
+  assert.equal(f.db.prepare('SELECT status FROM research_collection_cycles WHERE task_id=? AND cycle=?').get(id,cycle).status,'running');
+});
+
+test('收集恢复保留检查点与既有章节，新attempt必须重新收集且拒绝旧提交', t => {
+  const f=fixture(t), id=f.task.id; f.claim(); f.savePlan(); f.write('保留历史章节','draft');
+  const success=f.workflow.begin(id,1,{phase:'collect',input:{existing:'历史材料'}});
+  f.workflow.saveCollection(id,1,success,{reason:'complete',note:'首轮已完成'});
+  const cycle=f.workflow.begin(id,1,{phase:'collect',input:{frozen:'中断时固定输入'}});
+  f.reopen(); f.store.research.recover();
+  const saved=f.db.prepare('SELECT * FROM research_collection_cycles WHERE task_id=? AND cycle=?').get(id,cycle);
+  assert.equal(saved.status,'interrupted'); assert.equal(saved.result_json,null); assert.equal(JSON.parse(saved.input_json).frozen,'中断时固定输入');
+  assert.equal(f.workflow.load(id).collected,true);
+  const source=f.message(); f.store.research.retry(f.conversation.id,source.id,{id,key:'continue-collection'}); f.claim();
+  assert.equal(f.workflow.load(id).collected,false); assert.equal(f.workflow.load(id).sections[0].markdown,'保留历史章节');
+  assert.throws(()=>f.workflow.saveCollection(id,1,cycle,{reason:'complete',note:'旧结果'}),/批次已改变/);
+  assert.throws(()=>f.workflow.failCycle(id,1,cycle,'旧结果'),/批次已改变/);
+  assert.throws(()=>f.workflow.interrupt(id,1,'旧批次中断'),/批次已改变/);
+  const next=f.workflow.begin(id,2,{phase:'collect',input:{reuse:'历史材料仍可复用'}}); assert.equal(next,cycle+1);
+  f.workflow.saveCollection(id,2,next,{reason:'complete',note:'新批次完成收集'});
+  f.reopen(); assert.equal(f.workflow.load(id).collected,true);
+  const pending=f.workflow.begin(id,2,{phase:'collect',input:{}});
+  f.store.research.finish(id,2,{status:'partial',markdown:'# 部分报告',abstract:'有已保存章节',keywords:[],reason:'保留未完资料'});
+  assert.equal(f.db.prepare('SELECT status FROM research_collection_cycles WHERE task_id=? AND cycle=?').get(id,pending).status,'interrupted');
+});
+
 test('固定计划、追加完整章节版本、评审修订历史及CAS拒绝', t => {
   const f=fixture(t), id=f.task.id;
   f.claim(); const planCycle=f.savePlan();
@@ -188,16 +256,16 @@ test('完整报告容量包含跨章缺口和去重来源，拒绝超限提案�
   }
 });
 
-test('schema24到26保留式迁移自动备份，旧任务证据报告及正文哈希保持', t => {
+test('schema24到27保留式迁移自动备份，旧任务证据报告及正文哈希保持', t => {
   const f=fixture(t), id=f.task.id; f.claim();
   f.store.research.checkpoint(id,1,{modelCalls:1,toolCalls:0,searchCalls:0,evidence:{tool:'fetch',input:{url:'https://example.com'},result:'旧证据'}});
   f.store.research.finish(id,1,{status:'completed',markdown:'# 旧正式报告\n\n历史内容',abstract:'旧摘要',keywords:['历史']});
   const tableNames=['research_tasks','research_attempts','research_evidence','research_reports'];
   const snapshots=()=>Object.fromEntries(tableNames.map(name=>[name,hash(JSON.stringify(f.db.prepare(`SELECT * FROM ${name}`).all()))]));
   const before=snapshots(), reportHash=hash(readFileSync(join(f.directory,'research',id,'1.md')));
-  f.db.exec(`DROP TABLE research_task_archives; DROP TABLE research_workflow_reviews; DROP TABLE research_workflow_versions; DROP TABLE research_workflow_sections;
+  f.db.exec(`DROP TABLE research_collection_cycles; DROP TABLE research_task_archives; DROP TABLE research_workflow_reviews; DROP TABLE research_workflow_versions; DROP TABLE research_workflow_sections;
     DROP TABLE research_workflow_plans; DROP TABLE research_workflow_cycles; PRAGMA user_version=24;`);
-  f.reopen(); assert.equal(f.db.prepare('PRAGMA user_version').get().user_version,26);
+  f.reopen(); assert.equal(f.db.prepare('PRAGMA user_version').get().user_version,27);
   assert.deepEqual(snapshots(),before); assert.equal(hash(readFileSync(join(f.directory,'research',id,'1.md'))),reportHash);
   const backups=readdirSync(f.directory).filter(name=>/^pa\.sqlite\.v24\..*\.bak$/.test(name)); assert.equal(backups.length,1);
   const backup=new DatabaseSync(join(f.directory,backups[0]),{readOnly:true});
@@ -206,4 +274,30 @@ test('schema24到26保留式迁移自动备份，旧任务证据报告及正文�
   } finally { backup.close(); }
   assert.equal(f.workflow.load(id).plan,undefined); assert.deepEqual(f.workflow.load(id).sections,[]);
   assert.match(f.store.research.report(id,1).markdown,/历史内容/);
+});
+
+test('schema26到27仅新增收集表，所有旧表结构和行、章节文件与正式报告均保持', t => {
+  const f=fixture(t), id=f.task.id; f.claim(); f.savePlan(); f.write('旧章节正文'); f.review();
+  f.store.research.checkpoint(id,1,{modelCalls:1,toolCalls:1,searchCalls:0,evidence:{tool:'fetch',input:{url:'https://example.com'},result:'旧材料内容'}});
+  f.store.research.finish(id,1,{status:'completed',markdown:'# 旧报告\n\n旧章节正文',abstract:'旧摘要',keywords:['资料']});
+  f.db.exec('DROP TABLE research_collection_cycles; PRAGMA user_version=26;');
+  const schemas=f.db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").all();
+  const tables=schemas.filter(row=>row.type==='table').map(row=>row.name);
+  const snapshots=db=>Object.fromEntries(tables.map(name=>[name,hash(JSON.stringify(db.prepare(`SELECT * FROM "${name}"`).all()))]));
+  const before=snapshots(f.db), paths=[join(f.directory,'research',id,'sections','s1','1.md'),join(f.directory,'research',id,'1.md'),join(f.directory,'research',id,'1.txt')];
+  const files=paths.map(path=>hash(readFileSync(path)));
+  f.reopen();
+  assert.equal(f.db.prepare('PRAGMA user_version').get().user_version,27);
+  assert.deepEqual(f.db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT IN ('research_collection_cycles','research_collection_one_cycle') ORDER BY name").all(),schemas);
+  assert.deepEqual(snapshots(f.db),before); assert.deepEqual(paths.map(path=>hash(readFileSync(path))),files);
+  assert.equal(f.workflow.load(id).collected,false); assert.equal(f.workflow.load(id).sections[0].status,'approved');
+  assert.equal(f.db.prepare('SELECT count(*) AS n FROM research_collection_cycles').get().n,0);
+  assert.deepEqual(f.db.prepare('PRAGMA foreign_key_check').all(),[]);
+  const backups=readdirSync(f.directory).filter(name=>/^pa\.sqlite\.v26\..*\.bak$/.test(name)); assert.equal(backups.length,1);
+  const backup=new DatabaseSync(join(f.directory,backups[0]),{readOnly:true});
+  try {
+    assert.equal(backup.prepare('PRAGMA user_version').get().user_version,26);
+    assert.deepEqual(snapshots(backup),before);
+    assert.equal(backup.prepare("SELECT name FROM sqlite_master WHERE name='research_collection_cycles'").get(),undefined);
+  } finally { backup.close(); }
 });

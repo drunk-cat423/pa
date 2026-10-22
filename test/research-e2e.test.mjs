@@ -54,13 +54,17 @@ async function fixture(t) {
           assert.deepEqual(body.thinking, { type: 'enabled' }); assert.equal(body.reasoning_effort, 'high');
           assert.equal(body.max_tokens, undefined); assert.equal(body.max_completion_tokens, undefined);
           assert.ok(['none', 'auto'].includes(body.tool_choice));
-          if (worker.phase === 'plan') {
+          if (worker.phase === 'plan' || worker.phase === 'write') {
             assert.equal(body.tool_choice, 'none'); assert.deepEqual(body.tools ?? [], []);
+            assert.ok(body.messages.every(message => message.role !== 'tool' && !message.tool_calls));
+          } else if (worker.phase === 'collect') {
+            assert.equal(worker.section, undefined);
           } else if (worker.phase === 'review') {
             assert.ok((body.tools ?? []).every(tool => tool.function.name === 'read_research_material'));
           }
         }
         if (!plan && worker?.phase === 'plan') step = answer(planOutput());
+        else if (!plan && worker?.phase === 'collect') step = answer('沿用已有材料，未补充新来源。');
         else if (!plan && worker?.phase === 'review') step = answer(reviewOutput());
         else {
           assert.ok(plan?.length, `没有为本次请求设置步骤：${message?.eventId ?? `${worker.task.title}:${worker.phase}`}`);
@@ -160,7 +164,8 @@ test('定点真实测试入口只领取指定批次，不运行其他队列、�
   const old = JSON.stringify(store.research.get(other.id));
   assert.equal(store.research.claim(target.id, f.config.research, 2), undefined);
   assert.equal(store.research.get(target.id).status, 'queued');
-  f.workerPlans.set('仅此任务', [call('web_fetch', { url: sourceUrl }), answer(sectionOutput('blocked', ''))]);
+  f.phasePlans.set('仅此任务:collect', [call('web_fetch', { url: sourceUrl }), answer('指定原文读取失败。')]);
+  f.workerPlans.set('仅此任务', [answer(sectionOutput('blocked', ''))]);
   let sends = 0;
   const service = new ResearchService(f.config, [f.route], async () => { sends++; return { status: 'rejected' }; }, () => {});
   try {
@@ -185,7 +190,8 @@ test('研究端到端：模型建任务、跨群私聊本人清单与领取、�
   assert.equal(f.taskRows().length, 0);
   f.plans.set('create', [call('create_research', { key: 'cua', title: 'CUA 部署', goal: '研究部署条件', urls: [sourceUrl], requiresOriginal: true }),
     body => { assert.equal(lastTool(body).saved, true); return answer('已加入研究清单。'); }]);
-  f.workerPlans.set('CUA 部署', [call('web_fetch', { url: sourceUrl }), body => {
+  f.phasePlans.set('CUA 部署:collect', [call('web_fetch', { url: sourceUrl }), answer('资料采集结束。')]);
+  f.workerPlans.set('CUA 部署', [body => {
     assert.match(JSON.stringify(body.messages), /PAGE_EVIDENCE/); return answer(sectionOutput());
   }]);
   const creation = f.message('create', '把 CUA 放进研究清单，研究部署条件并生成报告。');
@@ -194,7 +200,7 @@ test('研究端到端：模型建任务、跨群私聊本人清单与领取、�
   assert.equal(task.status, 'completed'); assert.equal(task.latest_version, 1); assert.equal(f.pages.length, 1);
   const assembled = await readFile(join(f.config.dataDir, 'research', task.id, '1.md'), 'utf8');
   assert.ok(assembled.includes(report)); assert.match(assembled, /CUA 部署/); assert.ok(assembled.includes(sourceUrl));
-  assert.deepEqual(f.requests.filter(request => request.worker).map(request => request.worker.phase), ['plan', 'write', 'write', 'review']);
+  assert.deepEqual(f.requests.filter(request => request.worker).map(request => request.worker.phase), ['plan', 'collect', 'collect', 'write', 'review']);
   assert.equal(await h.handle(creation), 'duplicate'); assert.equal(f.taskRows().length, 1);
   const today = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10);
   f.plans.set('list', [call('list_research', { date: today, query: 'CUA' }), body => {
@@ -254,14 +260,15 @@ test('研究端到端：模型建任务、跨群私聊本人清单与领取、�
   const messages = f.inspect(db => db.prepare('SELECT text FROM messages').all());
   assert.doesNotMatch(JSON.stringify(messages), /END_OF_REPORT_MARKER|PAGE_EVIDENCE/);
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM memory_topics').get().n), 0);
-  assert.equal(f.requests.filter(request => request.worker).length, 4);
+  assert.equal(f.requests.filter(request => request.worker).length, 5);
 });
 
 test('研究故障端到端：原文失败仅尝试两次、显式续作保留证据，未知发送和崩溃运行不自动重放', async t => {
   const f = await fixture(t), h = await f.harness(); f.pageFails(true);
   f.plans.set('create-blocked', [call('create_research', { key: 'original', title: '指定原文', goal: '总结指定原文', urls: [sourceUrl], requiresOriginal: true }),
     answer('已加入研究清单。')]);
-  f.workerPlans.set('指定原文', [call('web_fetch', { url: sourceUrl }), answer(sectionOutput('blocked'))]);
+  f.phasePlans.set('指定原文:collect', [call('web_fetch', { url: sourceUrl }), answer('指定原文读取失败。')]);
+  f.workerPlans.set('指定原文', [answer(sectionOutput('blocked'))]);
   assert.equal(await h.handle(f.message('create-blocked', `把这个链接加入研究清单，严格总结指定原文。 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
   let task = f.taskRows()[0]; assert.equal(task.status, 'blocked'); assert.equal(task.latest_version, null); assert.equal(f.pages.length, 2);
   const saved = f.inspect(db => db.prepare('SELECT evidence_json FROM research_evidence WHERE task_id=? ORDER BY attempt,ordinal').all(task.id));
@@ -271,10 +278,11 @@ test('研究故障端到端：原文失败仅尝试两次、显式续作保留�
   await writeFile(orphan, '事务提交前已写入的旧草稿，必须保留。');
   f.pageFails(false);
   f.plans.set('continue', [call('continue_research', { id: task.id, key: 'retry-original' }), answer('已安排继续研究。')]);
-  f.workerPlans.set('指定原文', [body => {
+  f.phasePlans.set('指定原文:collect', [body => {
     assert.match(userText(body), /network/);
     return call('web_fetch', { url: sourceUrl });
-  }, answer(sectionOutput())]);
+  }, answer('原文读取成功。')]);
+  f.workerPlans.set('指定原文', [answer(sectionOutput())]);
   assert.equal(await h.handle({ ...f.message('continue', `网络恢复了，请继续 ${task.id}`, 'alice-private'), route: f.privateRoute }), 'sent'); await h.waitForResearch();
   task = f.taskRows()[0]; assert.equal(task.status, 'completed', task.reason);
   assert.equal(task.attempt, 2); assert.equal(f.pages.length, 3);
@@ -317,7 +325,8 @@ test('章节报告不继承聊天输出上限，程序组装长正文；伪调�
   for (const [key, body] of [['long', longBody],
     ['pseudo', '我会继续读取源码。\n<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="web_fetch">']]) {
     f.plans.set(key, [call('create_research', { key, title: key, goal: '研究指定资料', urls: [sourceUrl] }), answer('已加入研究清单。')]);
-    f.workerPlans.set(key, [call('web_fetch', { url: sourceUrl }), request => {
+    f.phasePlans.set(`${key}:collect`, [call('web_fetch', { url: sourceUrl })]);
+    f.workerPlans.set(key, [request => {
       assert.equal(request.max_tokens, undefined); assert.equal(request.max_completion_tokens, undefined);
       assert.doesNotMatch(JSON.stringify(request.messages), /输出硬上限为4096|正文目标不超过2457/);
       assert.match(JSON.stringify(request.messages), /research_section/);
@@ -340,10 +349,11 @@ test('章节报告不继承聊天输出上限，程序组装长正文；伪调�
 });
 
 test('章节length保留完整元数据与草稿，下个写作周期append续写后审查，无额外最终模型调用', async t => {
-  const f = await fixture(t); f.config.research.maxModelCalls = 5;
+  const f = await fixture(t); f.config.research.maxModelCalls = 5; f.config.research.maxToolCalls = 1;
   const h = await f.harness(), first = '# 连续正文\n第一部分 LENGTH_PREFIX', second = '第二部分 LENGTH_SUFFIX';
   f.plans.set('cut', [call('create_research', { key: 'cut', title: '截断续写', goal: '根据原文完整写作', urls: [sourceUrl] }), answer('已加入。')]);
-  f.workerPlans.set('截断续写', [call('web_fetch', { url: sourceUrl }),
+  f.phasePlans.set('截断续写:collect', [call('web_fetch', { url: sourceUrl })]);
+  f.workerPlans.set('截断续写', [
     { answer: sectionOutput('written', first), stopReason: 'length' }, body => {
       assert.match(JSON.stringify(body.messages), /LENGTH_PREFIX/);
       return answer(sectionOutput('written', second));
@@ -357,11 +367,11 @@ test('章节length保留完整元数据与草稿，下个写作周期append续�
   const assembled = await readFile(join(f.config.dataDir, 'research', task.id, '1.md'), 'utf8');
   assert.ok(assembled.includes(first)); assert.ok(assembled.includes(second));
   assert.equal(assembled.split('LENGTH_PREFIX').length - 1, 1);
-  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['plan', 'write', 'write', 'write', 'review']);
+  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['plan', 'collect', 'write', 'write', 'review']);
   assert.equal(f.inspect(db => JSON.parse(db.prepare('SELECT usage_json FROM research_attempts WHERE task_id=?').get(task.id).usage_json).modelCalls), 5);
 });
 
-test('长原文跨write周期续读超过三页，共享游标只抓取一次并形成完整coverage', async t => {
+test('长原文在独立collect续读超过三页，共享游标只抓取一次并形成完整coverage', async t => {
   const f = await fixture(t); f.config.fetch.maxTextChars = 128;
   const page = 'PAGE_EVIDENCE ' + '0123456789'.repeat(60) + 'SOURCE_END'; f.pageText(page);
   const h = await f.harness(); let nextCursor;
@@ -371,18 +381,14 @@ test('长原文跨write周期续读超过三页，共享游标只抓取一次并
   };
   f.plans.set('long-source', [call('create_research', { key: 'long-source', title: '跨周期长原文', goal: '完整读取并核验长原文',
     urls: [sourceUrl], requiresOriginal: true }), answer('已加入。')]);
-  f.workerPlans.set('跨周期长原文', [call('web_fetch', { url: sourceUrl }), nextPage, nextPage, body => {
-    const last = lastTool(body); assert.equal(last.hasMore, true); assert.ok(last.nextCursor); nextCursor = last.nextCursor;
-    assert.equal(body.tool_choice, 'none');
-    return answer(sectionOutput('continue', '第一周期已读取前三页。', { gaps: ['尚需读取剩余原文'] }));
-  }, body => {
-    const input = JSON.parse(userText(body)); assert.equal(input.section.status, 'draft');
-    assert.ok(input.previousMaterial.includes(nextCursor));
-    return call('web_fetch', { url: sourceUrl, cursor: nextCursor });
-  }, nextPage, body => {
+  f.phasePlans.set('跨周期长原文:collect', [call('web_fetch', { url: sourceUrl }), nextPage, nextPage, nextPage, nextPage, body => {
     const last = lastTool(body); assert.equal(last.hasMore, false); assert.equal(last.nextCursor, null);
     assert.ok(last.text.endsWith('SOURCE_END'));
-    return answer(sectionOutput('written', '第二周期已读取最后两页，原文全部覆盖。'));
+    return answer('五页原文全部覆盖。');
+  }]);
+  f.workerPlans.set('跨周期长原文', [body => {
+    assert.match(userText(body), /SOURCE_END/); assert.ok(!body.messages.some(message => message.role === 'tool'));
+    return answer(sectionOutput('written', '五页原文全部覆盖后独立写作。'));
   }]);
   assert.equal(await h.handle(f.message('long-source', `加入研究清单并完整读取原文 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
   const task = f.taskRows()[0]; assert.equal(task.status, 'completed', task.reason);
@@ -398,7 +404,8 @@ test('长原文跨write周期续读超过三页，共享游标只抓取一次并
   }
   assert.equal(covered, page.length);
   const cycles = f.inspect(db => db.prepare('SELECT phase,status FROM research_workflow_cycles WHERE task_id=? ORDER BY cycle').all(task.id));
-  assert.deepEqual(cycles.map(c => [c.phase, c.status]), [['plan', 'succeeded'], ['write', 'succeeded'], ['write', 'succeeded'], ['review', 'succeeded']]);
+  assert.deepEqual(cycles.map(c => [c.phase, c.status]), [['plan', 'succeeded'], ['write', 'succeeded'], ['review', 'succeeded']]);
+  assert.deepEqual(f.inspect(db => db.prepare('SELECT status FROM research_collection_cycles WHERE task_id=?').all(task.id)).map(c => c.status), ['succeeded']);
   assert.equal(f.requests.filter(r => r.worker).length, 9);
 });
 
@@ -406,19 +413,22 @@ test('审查按章节来源取得完整旧材料，60KB首屏以外正文通过�
   const f = await fixture(t); f.config.contextWindow = 262144; f.config.research.maxModelCalls = 20;
   const page = 'OLD_SOURCE_START ' + 'a'.repeat(63950) + 'UNSEEN_SOURCE_TAIL'; f.pageText(page);
   const h = await f.harness(); let cursor, missingPages = 0;
-  const write = body => {
+  const collect = body => {
     const toolCount = body.messages.filter(message => message.role === 'tool').length;
     if (toolCount) {
       const latest = lastTool(body); cursor = latest.nextCursor;
-      if (!latest.hasMore) return answer(sectionOutput('written', '已完整读取长材料并写出结论。'));
+      if (!latest.hasMore) return answer('已完整读取长材料。');
       assert.ok(cursor);
-      if (toolCount === 3) return answer(sectionOutput('continue', '已读片段并保存，下一周期接续。'));
     }
     return call('web_fetch', { url: sourceUrl, ...(cursor ? { cursor } : {}) });
   };
   f.plans.set('review-tail', [call('create_research', { key: 'review-tail', title: '长材料审查', goal: '完整读取长材料并审查结论',
     urls: [sourceUrl], requiresOriginal: true }), answer('已加入。')]);
-  f.workerPlans.set('长材料审查', Array(11).fill(write));
+  f.phasePlans.set('长材料审查:collect', Array(8).fill(collect));
+  f.workerPlans.set('长材料审查', [body => {
+    assert.match(userText(body), /UNSEEN_SOURCE_TAIL/);
+    return answer(sectionOutput('written', '已完整读取长材料并写出结论。'));
+  }]);
   f.phasePlans.set('长材料审查:review', [body => {
     const input = JSON.parse(userText(body)); assert.ok(input.reviewMaterial.length >= 8);
     assert.ok(input.reviewMaterial.some(item => item.text.includes('OLD_SOURCE_START')));
@@ -441,6 +451,13 @@ test('审查按章节来源取得完整旧材料，60KB首屏以外正文通过�
   }]);
   assert.equal(await h.handle(f.message('review-tail', `加入研究清单并全文核验 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
   const task = f.taskRows()[0]; assert.equal(task.status, 'completed', task.reason); assert.deepEqual(f.pages, [sourceUrl]);
+  const workerRequests = f.requests.filter(r => r.worker);
+  const collectionRequests = workerRequests.filter(r => r.worker.phase === 'collect');
+  assert.equal(collectionRequests.length, 8);
+  assert.ok(collectionRequests.every(r => r.body.tool_choice === 'auto'));
+  const lastCollection = workerRequests.lastIndexOf(collectionRequests.at(-1));
+  assert.equal(workerRequests[lastCollection + 1].worker.phase, 'write');
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_collection_cycles WHERE task_id=?').get(task.id).n), 1);
   assert.equal(f.requests.filter(r => r.worker?.phase === 'review').length, 2);
   const readEvidence = f.inspect(db => db.prepare("SELECT evidence_json FROM research_evidence WHERE task_id=? AND json_extract(evidence_json,'$.tool')='read_research_material'")
     .all(task.id)).map(row => JSON.parse(row.evidence_json)).filter(item => item.result);
@@ -453,7 +470,8 @@ test('预算跨计划与多个章节周期累计，耗尽归档partial；显式�
   const h = await f.harness();
   f.plans.set('budget', [call('create_research', { key: 'budget', title: '分章预算', goal: '分章研究部署与限制', urls: [sourceUrl] }), answer('已加入。')]);
   f.phasePlans.set('分章预算:plan', [answer(planOutput(['部署条件', '适用限制']))]);
-  f.workerPlans.set('分章预算', [call('web_fetch', { url: sourceUrl }), answer(sectionOutput('written', 'APPROVED_CHAPTER_ONE'))]);
+  f.phasePlans.set('分章预算:collect', [call('web_fetch', { url: sourceUrl })]);
+  f.workerPlans.set('分章预算', [answer(sectionOutput('written', 'APPROVED_CHAPTER_ONE'))]);
   assert.equal(await h.handle(f.message('budget', `把部署条件和适用限制加入研究清单 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
   let task = f.taskRows()[0]; assert.equal(task.status, 'partial', task.reason); assert.equal(task.latest_version, 1);
   const firstReport = await readFile(join(f.config.dataDir, 'research', task.id, '1.md'), 'utf8');
@@ -464,6 +482,7 @@ test('预算跨计划与多个章节周期累计，耗尽归档partial；显式�
   assert.deepEqual(firstUsage, { modelCalls: 4, toolCalls: 1, searchCalls: 0 });
   const checkpointCount = f.requests.filter(r => r.worker).length;
   f.plans.set('resume-budget', [call('continue_research', { id: task.id, key: 'resume' }), answer('已安排继续。')]);
+  f.phasePlans.set('分章预算:collect', [answer('显式续作重新核对已有材料，无需新工具。')]);
   f.workerPlans.set('分章预算', [body => {
     const input = JSON.parse(userText(body)); assert.equal(input.phase, 'write'); assert.equal(input.section.id, 's2');
     assert.match(JSON.stringify(input.previousMaterial), /PAGE_EVIDENCE/);
@@ -473,7 +492,8 @@ test('预算跨计划与多个章节周期累计，耗尽归档partial；显式�
   assert.equal(await h.handle(f.message('resume-budget', `请继续研究 ${task.id}`)), 'sent'); await h.waitForResearch();
   task = f.taskRows()[0]; assert.equal(task.status, 'completed', task.reason); assert.equal(task.attempt, 2); assert.equal(task.latest_version, 2);
   const resumed = f.requests.filter(r => r.worker).slice(checkpointCount);
-  assert.deepEqual(resumed.map(r => [r.worker.phase, r.worker.section.id]), [['write', 's2'], ['review', 's2']]);
+  assert.deepEqual(resumed.map(r => [r.worker.phase, r.worker.section?.id]), [['collect', undefined], ['write', 's2'], ['review', 's2']]);
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_collection_cycles WHERE task_id=?').get(task.id).n), 2);
   assert.equal(await readFile(join(f.config.dataDir, 'research', task.id, '1.md'), 'utf8'), firstReport);
   const completed = await readFile(join(f.config.dataDir, 'research', task.id, '2.md'), 'utf8');
   assert.match(completed, /APPROVED_CHAPTER_ONE/); assert.match(completed, /SECOND_CHAPTER_AFTER_EXPLICIT_RESUME/);
@@ -481,10 +501,11 @@ test('预算跨计划与多个章节周期累计，耗尽归档partial；显式�
 });
 
 test('审查revise开启replace修订周期，旧章节和审查记录保持可核验', async t => {
-  const f = await fixture(t); f.config.research.maxModelCalls = 6;
+  const f = await fixture(t); f.config.research.maxModelCalls = 7;
   const h = await f.harness();
   f.plans.set('revise', [call('create_research', { key: 'revise', title: '修订检查点', goal: '核验并修订部署结论', urls: [sourceUrl] }), answer('已加入。')]);
-  f.workerPlans.set('修订检查点', [call('web_fetch', { url: sourceUrl }), answer(sectionOutput('written', 'OLD_CHAPTER_BEFORE_REVIEW')),
+  f.phasePlans.set('修订检查点:collect', [call('web_fetch', { url: sourceUrl }), answer('采集结束。')]);
+  f.workerPlans.set('修订检查点', [answer(sectionOutput('written', 'OLD_CHAPTER_BEFORE_REVIEW')),
     body => { assert.match(JSON.stringify(body.messages), /缺少关键限制/); return answer(sectionOutput('written', 'REPLACEMENT_VERIFIED_CHAPTER')); }]);
   f.phasePlans.set('修订检查点:review', [answer(reviewOutput('revise', '缺少关键限制，请修订全文。')), answer(reviewOutput())]);
   assert.equal(await h.handle(f.message('revise', `把部署问题加入研究清单 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
@@ -497,13 +518,13 @@ test('审查revise开启replace修订周期，旧章节和审查记录保持可�
   assert.doesNotMatch(assembled, /OLD_CHAPTER_BEFORE_REVIEW/); assert.match(assembled, /REPLACEMENT_VERIFIED_CHAPTER/);
   assert.deepEqual(f.inspect(db => db.prepare('SELECT verdict,version FROM research_workflow_reviews WHERE task_id=? ORDER BY cycle').all(task.id)).map(r => [r.verdict, r.version]),
     [['revise', 1], ['pass', 2]]);
-  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['plan', 'write', 'write', 'review', 'write', 'review']);
+  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['plan', 'collect', 'collect', 'write', 'review', 'write', 'review']);
 });
 
 test('计划格式错误与未知provider错误保留失败周期，不自动重试或转为完成', async t => {
   const f = await fixture(t), h = await f.harness();
   f.phasePlans.set('计划格式错误:plan', [answer('{"sections":')]);
-  f.workerPlans.set('未知请求', [{ httpError: true }]);
+  f.phasePlans.set('未知请求:collect', [{ httpError: true }]);
   for (const [key, title, expectedCalls] of [['bad-plan', '计划格式错误', 1], ['unknown', '未知请求', 2]]) {
     f.plans.set(key, [call('create_research', { key, title, goal: '研究原文资料', urls: [sourceUrl] }), answer('已加入。')]);
     const before = f.requests.filter(r => r.worker).length;
@@ -511,7 +532,8 @@ test('计划格式错误与未知provider错误保留失败周期，不自动重
     const task = f.taskRows().find(task => task.title === title); assert.equal(task.status, 'failed', task.reason);
     assert.equal(task.attempt, 1); assert.equal(task.latest_version, null);
     assert.equal(f.requests.filter(r => r.worker).length - before, expectedCalls);
-    const cycles = f.inspect(db => db.prepare('SELECT status FROM research_workflow_cycles WHERE task_id=? ORDER BY cycle').all(task.id));
+    if (title === '未知请求') assert.deepEqual(f.requests.filter(r => r.worker?.task.title === title).map(r => r.worker.phase), ['plan', 'collect']);
+    const cycles = f.inspect(db => db.prepare('SELECT cycle,status FROM research_workflow_cycles WHERE task_id=? UNION ALL SELECT cycle,status FROM research_collection_cycles WHERE task_id=? ORDER BY cycle').all(task.id, task.id));
     assert.ok(cycles.length); assert.ok(['failed', 'unknown'].includes(cycles.at(-1).status));
     const count = f.requests.length; await h.waitForResearch(); assert.equal(f.requests.length, count);
   }

@@ -120,14 +120,14 @@ test('按当前可信绑定授权跨房间归档，历史所有权快照和其�
   assert.throws(()=>f.store.research.archive(alias.conversationId,alias.id,{ids:[task.id],reason:'旧绑定已撤销'}),/没有属于你的/);
 });
 
-test('schema25迁移到26完整保留旧研究及文件并保存旧数据库备份', t=>{
+test('schema25迁移到27完整保留旧研究及文件并保存旧数据库备份', t=>{
   const f=fixture(t), report=f.create('legacy-report'), queued=f.create('legacy-queued');f.finish(report,'completed');
-  f.db.exec('DROP TABLE research_task_archives; PRAGMA user_version=25;');
+  f.db.exec('DROP TABLE research_collection_cycles; DROP TABLE research_task_archives; PRAGMA user_version=25;');
   const before=f.snapshot(), beforeFiles=f.files();
   f.reopen();
-  assert.equal(f.db.prepare('PRAGMA user_version').get().user_version,26);
+  assert.equal(f.db.prepare('PRAGMA user_version').get().user_version,27);
   assert.deepEqual(f.db.prepare('PRAGMA foreign_key_check').all(),[]);
-  assert.deepEqual(f.snapshot(),before);assert.deepEqual(f.files(),beforeFiles);
+  assert.deepEqual(f.snapshot(),{...before,research_collection_cycles:hash('[]')});assert.deepEqual(f.files(),beforeFiles);
   assert.deepEqual(f.store.research.queued().map(task=>task.id),[queued.id]);
   assert.equal(f.store.research.list(f.conversation.id,f.source.id).total,2);
   const backups=readdirSync(f.directory).filter(name=>/^pa\.sqlite\.v25\..*\.bak$/.test(name));assert.equal(backups.length,1);

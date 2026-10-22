@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { DiagnosticLog } from '../dist/diagnostics.js';
 import { openConversation } from '../dist/runtime.js';
@@ -16,7 +17,7 @@ async function fixture(t, respond, overrides = {}) {
     try {
       let raw = ''; for await (const part of request) raw += part;
       const body = JSON.parse(raw); requests.push(body);
-      const step = respond(body, requests.length);
+      const step = await respond(body, requests.length);
       if (step.error) {
         response.writeHead(500, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ error: { message: 'fixture request failed' } })); return;
@@ -59,7 +60,7 @@ function assertThinking(body) {
   assert.ok(['auto', 'none'].includes(body.tool_choice));
 }
 
-for (const phase of ['plan', 'review']) test(`研究${phase}零工具额度时high思考并使用阶段提示`, async t => {
+for (const phase of ['plan', 'write', 'review']) test(`研究${phase}零工具额度时high思考并使用阶段提示`, async t => {
   const events = [], final = [];
   const f = await fixture(t, () => ({ reasoning: ['阶段分析'], answer: '{"stage":"result"}' }));
   const runtime = await f.open(phase, { phase, systemPrompt: `STAGE_${phase.toUpperCase()}`,
@@ -74,7 +75,7 @@ for (const phase of ['plan', 'review']) test(`研究${phase}零工具额度时hi
   assert.equal(events.filter(event => event.kind === 'model_request').length, 1);
 });
 
-test('研究write只读材料计预算，SDK工具循环完整回传reasoning_content，最后关闭工具', async t => {
+test('研究collect只读材料计预算，SDK工具循环完整回传reasoning_content，预算收尾不追加模型请求', async t => {
   const events = [], materialReads = [], firstReasoning = '第一段思考\n完整保留。', secondReasoning = '第二轮思考';
   const f = await fixture(t, (_body, number) => number <= 2 ? {
     reasoning: number === 1 ? ['第一段思考\n', '完整保留。'] : [secondReasoning],
@@ -82,35 +83,75 @@ test('研究write只读材料计预算，SDK工具循环完整回传reasoning_co
       name: 'read_research_material', arguments: JSON.stringify({ id: 'material-a', ...(number === 2 ? { offset: 20 } : {}) }),
     } }] },
   } : { reasoning: ['最终分析'], answer: '# 研究正文' });
-  const runtime = await f.open('write', { phase: 'write', systemPrompt: '只输出研究正文。', maxToolCalls: 2,
+  const final = [];
+  const runtime = await f.open('collect', { phase: 'collect', systemPrompt: '只采集研究材料。', maxToolCalls: 2,
+    onFinalResponse: response => final.push(response),
     maxSearchCalls: 6, record: event => events.push(event), readMaterial: params => {
       materialReads.push(params); return { text: '绑定材料正文', nextOffset: 20 };
     } });
-  assert.equal(await runtime.prompt('写本节', { runId: 'write' }), '# 研究正文');
-  assert.equal(f.requests.length, 3); f.requests.forEach(assertThinking);
+  assert.equal(await runtime.prompt('查资料', { runId: 'collect' }), '');
+  assert.equal(f.requests.length, 2); f.requests.forEach(assertThinking);
   assert.deepEqual(f.requests[0].tools.map(tool => tool.function.name).sort(), ['read_research_material', 'web_fetch', 'web_search']);
   const spec = f.requests[0].tools.find(tool => tool.function.name === 'read_research_material').function.parameters;
   assert.deepEqual(Object.keys(spec.properties).sort(), ['id', 'offset']); assert.equal(spec.additionalProperties, false);
   assert.deepEqual(materialReads, [{ id: 'material-a' }, { id: 'material-a', offset: 20 }]);
   assert.equal(f.requests[1].messages.find(message => message.role === 'assistant').reasoning_content, firstReasoning);
-  assert.deepEqual(f.requests[2].messages.filter(message => message.role === 'assistant').map(message => message.reasoning_content),
-    [firstReasoning, secondReasoning]);
-  assert.equal(f.requests[2].tool_choice, 'none'); assert.deepEqual(f.requests[2].tools, []);
+  assert.equal(f.requests[1].tool_choice, 'auto');
+  assert.deepEqual(final, [{ stopReason: 'toolUse' }]);
   assert.ok(events.some(event => event.kind === 'tool_result' && event.tool === 'read_research_material' && event.toolCalls === 2));
-  const calls = f.log.calls({ traceId: 'write' }); assert.equal(calls.length, 3);
+  const calls = f.log.calls({ traceId: 'collect' }); assert.equal(calls.length, 2);
   assert.ok(calls.every(call => call.status === 'completed' && call.usage.output === 20));
   const responses = calls.map(call => f.log.artifact(call.callId, 'response'));
   assert.ok(responses.some(response => response.content.some(part => part.type === 'thinking'
     && part.thinking === firstReasoning && part.thinkingSignature === 'reasoning_content')));
 });
 
-test('研究最后一次模型请求关闭工具，write允许零工具额度', async t => {
-  const f = await fixture(t, () => ({ answer: '结果' }), { loop: { maxModelCalls: 1, maxToolCalls: 8 } });
-  const runtime = await f.open('last-call', { phase: 'write', maxSearchCalls: 1, record() {} });
+test('write始终没有工具，单次模型调用且不带采集会话的工具历史', async t => {
+  const f = await fixture(t, () => ({ answer: '结果' }));
+  const runtime = await f.open('last-call', { phase: 'write', maxSearchCalls: 1, record() {},
+    readMaterial() { throw new Error('write不可读取材料'); } });
   assert.equal(await runtime.prompt('研究输入'), '结果');
   assertThinking(f.requests[0]); assert.deepEqual(f.requests[0].tools, []); assert.equal(f.requests[0].tool_choice, 'none');
+  assert.ok(f.requests[0].messages.every(message => message.role !== 'tool' && !message.tool_calls));
   const noTool = await f.open('zero-tool', { phase: 'write', maxToolCalls: 0, maxSearchCalls: 1, record() {} });
   await noTool.prompt('研究输入'); assert.deepEqual(f.requests[1].tools, []);
+});
+
+test('collect最后一次请求保持auto并执行整批真实抓取与材料工具，只发送一次请求', async t => {
+  const url = 'https://example.com/source', events = [], final = [], reads = [];
+  let fetches = 0;
+  const f = await fixture(t, () => ({ reasoning: ['本次直接读取两份材料'], delta: { role: 'assistant', tool_calls: [
+    { index: 0, id: 'fetch-final', type: 'function', function: { name: 'web_fetch', arguments: JSON.stringify({ url }) } },
+    { index: 1, id: 'material-final', type: 'function', function: { name: 'read_research_material', arguments: '{"id":"e1"}' } },
+  ] } }), { loop: { maxModelCalls: 1, maxToolCalls: 8 } });
+  const reader = new WebFetchReader(f.config.fetch, { maxResultBytes: 16000, maxReads: 2, maxTotalBytes: 32000 },
+    async () => { fetches++; return { url, text: '实际抓取器返回的原文' }; });
+  t.after(() => reader.dispose());
+  const runtime = await f.open('collect-one-call', { phase: 'collect', fetchReader: reader, maxToolCalls: 2,
+    maxSearchCalls: 0, record: event => events.push(event), onFinalResponse: response => final.push(response),
+    readMaterial(params) { reads.push(params); return { text: '绑定材料正文' }; } });
+  assert.equal(await runtime.prompt('采集两份来源', { runId: 'collect-one-call' }), '');
+  assert.equal(f.requests.length, 1); assertThinking(f.requests[0]); assert.equal(f.requests[0].tool_choice, 'auto');
+  assert.equal(fetches, 1); assert.deepEqual(reads, [{ id: 'e1' }]);
+  assert.deepEqual(events.filter(event => event.kind === 'tool_result').map(event => event.tool), ['web_fetch', 'read_research_material']);
+  assert.deepEqual(final, [{ stopReason: 'toolUse' }]);
+  assert.deepEqual(f.log.calls({ traceId: 'collect-one-call' }).map(call => call.status), ['completed']);
+  const write = await f.open('write-clean-session', { phase: 'write', maxSearchCalls: 0, record() {} });
+  // The fixture deliberately returns forbidden calls: write ends after one call and executes neither.
+  await assert.rejects(write.prompt('仅依据正文材料写章节'));
+  assert.equal(f.requests.length, 2); assert.deepEqual(f.requests[1].tools, []); assert.equal(f.requests[1].tool_choice, 'none');
+  assert.ok(f.requests[1].messages.every(message => message.role !== 'tool' && !message.tool_calls));
+  assert.equal(fetches, 1); assert.equal(reads.length, 1);
+});
+
+test('collect纯文本伪工具不执行，阶段note按Unicode边界限8000字节', async t => {
+  let reads = 0;
+  const fake = '<｜DSML｜function_calls><invoke name="read_research_material">材料</invoke></｜DSML｜function_calls>';
+  const f = await fixture(t, () => ({ answer: fake + '😀'.repeat(4000) }));
+  const runtime = await f.open('text-only', { phase: 'collect', maxSearchCalls: 0, record() {}, readMaterial() { reads++; } });
+  const note = await runtime.prompt('采集');
+  assert.equal(reads, 0); assert.equal(f.requests.length, 1); assert.ok(note.startsWith(fake));
+  assert.ok(Buffer.byteLength(note, 'utf8') <= 8000); assert.ok(!note.includes('\uFFFD'));
 });
 
 test('64K思考预留超过低窗口时发送前拒绝，不计入已发送请求', async t => {
@@ -133,10 +174,62 @@ test('生产DeepSeek前台仍关闭思考且强制prepare_turn', async t => {
   assert.ok(f.requests.every(body => body.thinking?.type === 'disabled' && body.max_tokens === 4096));
 });
 
-test('研究请求失败不自动重试', async t => {
+for (const phase of ['plan', 'collect', 'write']) test(`研究${phase}请求失败不自动重试或当作采集完成`, async t => {
   const f = await fixture(t, () => ({ error: true }));
-  const runtime = await f.open('failed', { phase: 'plan', maxSearchCalls: 0, record() {} });
+  const final = [];
+  const runtime = await f.open('failed', { phase, maxSearchCalls: 0, record() {}, onFinalResponse: response => final.push(response) });
   await assert.rejects(runtime.prompt('研究输入')); assert.equal(f.requests.length, 1);
+  assert.deepEqual(final, []);
+});
+
+test('collect工具结果持久化失败保留失败，不追加请求或发出成功回执', async t => {
+  const final = [];
+  const f = await fixture(t, () => ({ delta: { role: 'assistant', tool_calls: [
+    { index: 0, id: 'persist', type: 'function', function: { name: 'read_research_material', arguments: '{"id":"e1"}' } },
+  ] } }), { loop: { maxModelCalls: 1, maxToolCalls: 8 } });
+  const runtime = await f.open('persist-failed', { phase: 'collect', maxSearchCalls: 0,
+    record(event) { if (event.kind === 'tool_result') throw new Error('fixture persistence failed'); },
+    readMaterial: () => ({ text: '不能丢失的材料' }), onFinalResponse: response => final.push(response) });
+  await assert.rejects(runtime.prompt('采集'), /fixture persistence failed/);
+  assert.equal(f.requests.length, 1); assert.deepEqual(final, []);
+});
+
+test('collect早期SDK工具失败立即结束且拒绝，不让后续模型回复掩盖失败', async t => {
+  const final = [];
+  let reads = 0;
+  const f = await fixture(t, (_body, number) => number === 1 ? { delta: { role: 'assistant', tool_calls: [
+    { index: 0, id: 'bad-material', type: 'function', function: { name: 'read_research_material',
+      arguments: '{"id":"e1","offset":-1}' } },
+  ] } } : { answer: '不应追加的成功回复' });
+  const runtime = await f.open('early-tool-failed', { phase: 'collect', maxSearchCalls: 0, record() {},
+    readMaterial() { reads++; return { text: '不应读取' }; }, onFinalResponse: response => final.push(response) });
+  await assert.rejects(runtime.prompt('采集', { runId: 'early-tool-failed' }), /采集工具执行失败/);
+  assert.equal(reads, 0); assert.equal(f.requests.length, 1); assert.deepEqual(final, []);
+});
+
+test('collect最后请求超时保持unknown且不自动重试', async t => {
+  const final = [];
+  const f = await fixture(t, async () => { await delay(100); return { answer: '迟到结果' }; },
+    { loop: { maxModelCalls: 1, maxToolCalls: 8 }, timeoutMs: 30 });
+  const runtime = await f.open('collect-timeout', { phase: 'collect', maxSearchCalls: 0, record() {},
+    onFinalResponse: response => final.push(response) });
+  await assert.rejects(runtime.prompt('采集', { runId: 'collect-timeout' }), error => error.kind === 'timeout');
+  assert.equal(f.requests.length, 1); assert.deepEqual(final, []);
+  assert.deepEqual(f.log.calls({ traceId: 'collect-timeout' }).map(call => call.status), ['unknown']);
+});
+
+test('collect取消最后请求不伪装预算完成或追加请求', async t => {
+  const final = [];
+  let started;
+  const requestStarted = new Promise(resolve => { started = resolve; });
+  const f = await fixture(t, async () => { started(); await delay(100); return { answer: '迟到结果' }; },
+    { loop: { maxModelCalls: 1, maxToolCalls: 8 } });
+  const runtime = await f.open('collect-cancel', { phase: 'collect', maxSearchCalls: 0, record() {},
+    onFinalResponse: response => final.push(response) });
+  const rejected = assert.rejects(runtime.prompt('采集', { runId: 'collect-cancel' }), error => error.kind === 'cancelled');
+  await requestStarted; await runtime.abort(); await rejected;
+  assert.equal(f.requests.length, 1); assert.deepEqual(final, []);
+  assert.deepEqual(f.log.calls({ traceId: 'collect-cancel' }).map(call => call.status), ['unknown']);
 });
 
 test('DeepSeek生产provider研究请求同样启用high思考', async t => {
@@ -161,9 +254,9 @@ test('材料工具拒绝taskId和path，不把调用者提供的身份或路径�
     { index: 0, id: 'extra-fields', type: 'function', function: { name: 'read_research_material',
       arguments: JSON.stringify({ id: 'material', taskId: 'other-task', path: '../other' }) } },
   ] } } : { answer: '不读取未授权材料' });
-  const runtime = await f.open('material-schema', { phase: 'write', maxSearchCalls: 0, record() {}, readMaterial() { reads++; } });
-  assert.equal(await runtime.prompt('读材料'), '不读取未授权材料'); assert.equal(reads, 0);
-  assert.equal(f.requests.length, 2);
+  const runtime = await f.open('material-schema', { phase: 'collect', maxSearchCalls: 0, record() {}, readMaterial() { reads++; } });
+  await assert.rejects(runtime.prompt('读材料'), /采集工具执行失败/); assert.equal(reads, 0);
+  assert.equal(f.requests.length, 1);
 });
 
 test('review可多轮只读材料，禁止搜索和抓取，最后一轮工具关闭', async t => {
@@ -186,26 +279,27 @@ test('review可多轮只读材料，禁止搜索和抓取，最后一轮工具�
 test('共享网页读取器跨runtime保留游标，单周期最后工具仍可续读且只抓取一次', async t => {
   const url = 'https://example.com/long-source', page = '0123456789'.repeat(16), coverages = [];
   let cursor, fetches = 0;
-  const f = await fixture(t, (body, number) => number % 2 === 1 ? { delta: {
+  const f = await fixture(t, (_body, number) => ({ delta: {
     role: 'assistant', tool_calls: [{ index: 0, id: `page-${number}`, type: 'function', function: {
       name: 'web_fetch', arguments: JSON.stringify({ url, ...(cursor ? { cursor } : {}) }),
     } }],
-  } } : (() => {
-    const raw = body.messages.findLast(message => message.role === 'tool').content;
-    const result = JSON.parse(raw.slice(raw.lastIndexOf('\n') + 1)); cursor = result.nextCursor;
-    return { answer: '本周期检查点' };
-  })(), { loop: { maxModelCalls: 2, maxToolCalls: 8 } });
+  } }), { loop: { maxModelCalls: 1, maxToolCalls: 8 } });
   const reader = new WebFetchReader({ ...f.config.fetch, maxTextChars: 40 },
     { maxResultBytes: 16000, maxReads: 4, maxTotalBytes: 64000 }, async () => { fetches++; return { url, text: page }; });
   t.after(() => reader.dispose());
   for (let cycle = 0; cycle < 4; cycle++) {
-    const runtime = await f.open(`shared-cycle-${cycle}`, { phase: 'write', fetchReader: reader, maxToolCalls: 1,
-      maxSearchCalls: 0, record(event) { if (event.kind === 'tool_result' && event.tool === 'web_fetch') coverages.push(event.result.coverage); } });
-    assert.equal(await runtime.prompt('读取下一片段'), '本周期检查点');
+    const runtime = await f.open(`shared-cycle-${cycle}`, { phase: 'collect', fetchReader: reader, maxToolCalls: 1,
+      maxSearchCalls: 0, record(event) { if (event.kind === 'tool_result' && event.tool === 'web_fetch') {
+        coverages.push(event.result.coverage);
+        const text = event.result.text;
+        cursor = JSON.parse(text.slice(text.lastIndexOf('\n') + 1)).nextCursor;
+      } } });
+    assert.equal(await runtime.prompt('读取下一片段'), '');
     await runtime.close();
     assert.equal(Boolean(cursor), cycle < 3);
   }
   assert.equal(fetches, 1); assert.equal(coverages.length, 4);
+  assert.equal(f.requests.length, 4); assert.ok(f.requests.every(body => body.tool_choice === 'auto'));
   assert.deepEqual(coverages.map(range => [range.offset, range.end]), [[0, 40], [40, 80], [80, 120], [120, 160]]);
   assert.ok(coverages.every(range => range.totalChars === page.length && range.contentHash === coverages[0].contentHash));
 });

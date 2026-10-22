@@ -36,7 +36,7 @@ test('v11升级只新增审计结构并保留历史，升级前创建一致性�
   f.store.close();
   f.inspect(db=>{downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results;DROP TABLE person_profile_revision_sources;DROP TABLE auto_memory_job_deferrals;DROP TABLE self_profile_reclassifications;PRAGMA user_version=11;');});
   f.restart();
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),26);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),27);
   assert.deepEqual(f.store.autoMemory.selfProfile.snapshot().pending,pending);
   assert.equal(f.store.externalMessage(f.room.id,term.source.eventId??'source-1').text,term.source.text);
   assert.ok(readdirSync(f.dir).some(name=>name.includes('.v11.')&&name.endsWith('.bak')));

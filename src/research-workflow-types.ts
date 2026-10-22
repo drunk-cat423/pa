@@ -1,4 +1,4 @@
-export type ResearchPhase = 'plan' | 'write' | 'review';
+export type ResearchPhase = 'plan' | 'collect' | 'write' | 'review';
 export interface ResearchPlanSection { id: string; title: string; objective: string; acceptance: string }
 export interface ResearchPlan { version: 1; sections: ResearchPlanSection[] }
 export type ResearchSectionStatus = 'pending' | 'draft' | 'written' | 'approved' | 'needs_revision' | 'blocked';
@@ -6,7 +6,8 @@ export interface ResearchSection extends ResearchPlanSection {
   version: number; status: ResearchSectionStatus; markdown: string; summary: string; sources: string[]; gaps: string[];
   reviewReason?: string;
 }
-export interface ResearchWorkflow { plan?: ResearchPlan; sections: ResearchSection[]; nextCycle: number }
+export interface ResearchWorkflow { plan?: ResearchPlan; sections: ResearchSection[]; nextCycle: number; collected: boolean }
+export interface ResearchCollectionInput { reason: 'complete' | 'budget'; note: string }
 export interface ResearchCycleInput {
   phase: ResearchPhase; sectionId?: string; expectedVersion?: number; input: unknown;
 }

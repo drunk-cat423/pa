@@ -62,7 +62,7 @@ test('真实v9迁移先备份，保留原文、已确认分段和旧canonical运
     assert.deepEqual(backup.prepare('PRAGMA foreign_key_check').all(), []);
     assert.equal(backup.prepare("SELECT name FROM pragma_table_info('agent_runs') WHERE name='pi_session_file'").get(), undefined);
   } finally { backup.close(); }
-  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),26);
+  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),27);
   assert.deepEqual(f.store.unfinishedRuns(f.other.id), [pendingRun]);
   assert.equal(f.store.quotedMessage(f.conversation.id, 'old-external').text, '原有已发送文本');
   assert.equal(f.inspect(db => db.prepare('SELECT text FROM messages WHERE id=?').get(result.messageId).text), '**原始答案**');

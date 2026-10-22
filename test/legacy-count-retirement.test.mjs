@@ -110,7 +110,7 @@ test('retiring the failed + queued + deferred count backlog preserves evidence a
 test('schema15 upgrade backs up original evidence and never retires or reserves work automatically',t=>{
   const f=fixture(t);f.count('PRIVATE_RAW_TEXT');f.fail();const original=evidence(f);
   f.inspect(db=>{downgradeSchema15(db);db.exec('PRAGMA user_version=15');});f.restart();
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),26);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),27);
   assert.deepEqual(evidence(f),original);
   assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM auto_memory_job_retirements').get().n),0);
   assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM auto_memory_context_jobs').get().n),0);
