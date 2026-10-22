@@ -15,6 +15,7 @@ import { isMemoryOwner, type HarnessPolicy } from './harness-policy.js';
 import { reclassifySelfProfileTerms, type SelfProfileTermMove } from './self-profile-reclassification.js';
 import { imageMetadata, type MessageImage } from './image-context.js';
 import { migrateResearch, ResearchStore } from './research-store.js';
+import { migrateResearchWorkflow } from './research-workflow-store.js';
 
 export interface ConversationRecord {
   id: string;
@@ -70,7 +71,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 24;
+const SCHEMA_VERSION = 25;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -490,6 +491,7 @@ export class ConversationStore {
       if (version < 22) migrateMaterialBackfill(this.db);
       if (version < 23) { migrateProfileAttribution(this.db); migrateSelfProfileUpdates(this.db); }
       if (version < 24) migrateResearch(this.db);
+      if (version < 25) migrateResearchWorkflow(this.db);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');

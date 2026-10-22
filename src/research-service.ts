@@ -6,8 +6,11 @@ import { ConversationStore } from './store.js';
 import { openConversation, RequestError, type ConversationRuntime } from './runtime.js';
 import { MemoryError } from './memory-types.js';
 import { normalizeWebFetchUrl } from './web-fetch.js';
+import { WebFetchReader } from './web-fetch-reader.js';
 import type { ResearchToolContext, ResearchToolName, ResearchRuntimeEvent } from './research-tools.js';
-import type { CreateResearchInput, ResearchListParams, ResearchReadParams, ResearchTask, ResearchFinishInput } from './research-types.js';
+import type { CreateResearchInput, ResearchListParams, ResearchReadParams, ResearchTask } from './research-types.js';
+import { assembleResearchReport, hasFetchedSource, isResearchSourceMaterial, parseResearchPlan, parseResearchReview, parseResearchSection, researchSources, researchStagePrompt } from './research-workflow.js';
+import type { ResearchPhase, ResearchSection } from './research-workflow-types.js';
 
 export type ResearchSender = (message: Pick<OutboundMessage, 'text' | 'file'>) => Promise<DeliveryResult>;
 const routeKey = (route: ChannelRoute) => JSON.stringify([route.channel, route.accountId, route.roomType, route.roomId]);
@@ -38,7 +41,8 @@ export class ResearchService {
   }
   info() { return { running: this.activeTask, failed: Boolean(this.fatal) }; }
   context(conversationId: string, sourceMessageId: string, send?: ResearchSender): ResearchToolContext {
-    return { execute: (name, params) => this.execute(conversationId, sourceMessageId, name, params, send) };
+    return { ...(this.store ? { target: this.store.research.targetContext(conversationId, sourceMessageId) } : {}),
+      execute: (name, params) => this.execute(conversationId, sourceMessageId, name, params, send) };
   }
   private async execute(conversationId: string, sourceMessageId: string, name: ResearchToolName, params: unknown,
     send?: ResearchSender): Promise<unknown> {
@@ -105,58 +109,152 @@ export class ResearchService {
     const budget = this.config.research!;
     let current = { modelCalls: 0, toolCalls: 0, searchCalls: 0 };
     let persistenceFailed = false;
-    const record = (event: ResearchRuntimeEvent) => {
-      current = { modelCalls: event.modelCalls, toolCalls: event.toolCalls, searchCalls: event.searchCalls };
-      try { store.checkpoint(task.id, task.attempt, { ...current,
-        ...(event.tool ? { evidence: { tool: event.tool, input: event.input, result: event.result,
-          ...(event.error ? { error: event.error } : {}) } } : {}) }); }
-      catch (error) { persistenceFailed = !(error instanceof MemoryError); throw error; }
+    let activeCycle: number | undefined;
+    const persist = <T>(operation: () => T): T => {
+      try { return operation(); } catch (error) { persistenceFailed = !(error instanceof MemoryError); throw error; }
     };
-    // Resume only confirmed material, never replay a partially completed paid call.
-    const prior = task.evidence.filter(e => e.result !== undefined && e.tool !== 'report_draft').slice(-24);
-    const materialBytes = Math.max(1024, Math.min(60_000, Math.floor((this.config.contextWindow - this.config.maxOutputTokens - 16_000) / 3)));
-    const previousMaterial = boundedText(JSON.stringify(prior), materialBytes);
-    const input = JSON.stringify({ task: { id: task.id, title: task.title, goal: task.goal,
-      originalRequest: task.originalText, urls: task.urls, requiresOriginal: task.requiresOriginal },
-      researchedAt: new Date().toISOString(), previousMaterial, budget,
-      ...(task.reportVersion ? { previousReport: boundedText(store.report(task.id, task.reportVersion).markdown, materialBytes) } : {}) });
+    const blockedThisAttempt = new Set<string>();
+    // One cache and total read budget per attempt, surviving individual Pi cycles.
+    const fetchReader = this.config.fetch?.enabled ? new WebFetchReader(this.config.fetch, {
+      maxResultBytes: 16_000, maxReads: budget.maxToolCalls, maxTotalBytes: 16_000 * budget.maxToolCalls,
+      maxNetworkAttempts: 2, onNetworkAttempt: (url, attempt) => persist(() => store.checkpoint(task.id, task.attempt,
+        { ...current, evidence: { tool: 'web_fetch_network', input: { url, attempt } } })),
+    }) : undefined;
     let finished: ResearchTask;
     try {
-      this.runtime = await openConversation({ ...this.config,
-        loop: { maxModelCalls: budget.maxModelCalls, maxToolCalls: budget.maxToolCalls } },
-      `research:${task.id}:${task.attempt}`, { enableSearch: true, research: { maxSearchCalls: budget.maxSearchCalls, record } });
+      while (current.modelCalls < budget.maxModelCalls) {
+        if (this.closed) throw new RequestError('研究服务正在关闭。', 'cancelled');
+        const workflow = persist(() => store.workflow.load(task.id));
+        if (workflow.plan && workflow.sections.every(section => section.status === 'approved')) break;
+        // Review a newly written chapter before spending on the next one. Blocked chapters
+        // are revisited only by a new, explicitly requested attempt, never in a busy loop.
+        const section = workflow.sections.find(item => item.status === 'written')
+          ?? workflow.sections.find(item => item.status !== 'approved' && !blockedThisAttempt.has(item.id));
+        if (workflow.plan && !section) break;
+        const phase: ResearchPhase = !workflow.plan ? 'plan' : section!.status === 'written' ? 'review' : 'write';
+        const saved = persist(() => store.get(task.id)!);
+        const material = saved.evidence.map((evidence, index) => ({ id: `e${index + 1}`, ...evidence }))
+          .filter(evidence => ['web_fetch', 'web_search'].includes(evidence.tool));
+        const previousMaterial = boundedText(JSON.stringify(material.slice(-24).map(item => ({ ...item,
+          result: item.result === undefined ? undefined : boundedText(JSON.stringify(item.result), 4500) }))), 45_000);
+        const reviewCoverage = new Map<string, { total: number; ranges: [number, number][] }>();
+        const reviewSources = new Set<string>();
+        let reviewBytes = 60_000;
+        const reviewMaterial = phase !== 'review' ? [] : material.filter(item => isResearchSourceMaterial(item, section!.sources)).map(item => {
+          const evidence = saved.evidence[Number(item.id.slice(1)) - 1]!;
+          for (const url of researchSources([evidence])) reviewSources.add(url);
+          const encoded = JSON.stringify(evidence), points = [...encoded];
+          const end = Buffer.byteLength(encoded) <= reviewBytes ? points.length : Math.min(points.length, Math.floor(reviewBytes / 4));
+          const text = points.slice(0, end).join('');
+          reviewBytes -= Buffer.byteLength(text);
+          reviewCoverage.set(item.id, { total: points.length, ranges: end ? [[0, end]] : [] });
+          return { id: item.id, text, totalChars: points.length, hasMore: end < points.length,
+            ...(end < points.length ? { nextOffset: end } : {}) };
+        });
+        const input = { task: { id: task.id, title: task.title, goal: task.goal, originalRequest: task.originalText,
+          urls: task.urls, requiresOriginal: task.requiresOriginal }, phase, researchedAt: new Date().toISOString(),
+          previousMaterial: phase === 'review' ? undefined : previousMaterial,
+          ...(phase === 'review' ? { reviewMaterial } : {}),
+          materialIndex: material.map(item => ({ id: item.id, tool: item.tool, input: item.input, error: item.error })).slice(-64),
+          plan: workflow.plan, progress: workflow.sections.map(({ id, title, status, summary }) => ({ id, title, status, summary })),
+          ...(section ? { section: phase === 'review' ? section : sectionProjection(section),
+            writeMode: section.status === 'draft' ? 'append' : 'replace' } : {}),
+          budget: { modelCalls: budget.maxModelCalls - current.modelCalls, toolCalls: budget.maxToolCalls - current.toolCalls,
+            searchCalls: budget.maxSearchCalls - current.searchCalls },
+          ...(!workflow.plan && task.reportVersion ? { previousReport: boundedText(store.report(task.id, task.reportVersion).markdown, 12_000) } : {}) };
+        const cycle = persist(() => store.workflow.begin(task.id, task.attempt, { phase, input,
+          ...(section ? { sectionId: section.id, expectedVersion: section.version } : {}) }));
+        activeCycle = cycle;
+        const base = { ...current };
+        const record = (event: ResearchRuntimeEvent) => {
+          current = { modelCalls: base.modelCalls + event.modelCalls, toolCalls: base.toolCalls + event.toolCalls,
+            searchCalls: base.searchCalls + event.searchCalls };
+          persist(() => store.checkpoint(task.id, task.attempt, { ...current,
+            ...(event.tool ? { evidence: { tool: event.tool, input: event.input, result: event.result,
+              ...(event.error ? { error: event.error } : {}) } } : {}) }));
+        };
+        let stopReason = 'unknown';
+        const remaining = budget.maxModelCalls - current.modelCalls;
+        // Each writer cycle is small; reserve a call for review when possible.
+        const modelCalls = phase === 'write' ? Math.min(4, Math.max(1, remaining - 1)) : phase === 'review' ? Math.min(4, remaining) : 1;
+        try {
+          this.runtime = await openConversation({ ...this.config, loop: { maxModelCalls: modelCalls, maxToolCalls: budget.maxToolCalls } },
+            `research:${task.id}:${task.attempt}:cycle:${cycle}`, { enableSearch: true, research: {
+              phase, systemPrompt: researchStagePrompt(phase), maxToolCalls: budget.maxToolCalls - current.toolCalls,
+              maxSearchCalls: budget.maxSearchCalls - current.searchCalls, record,
+              ...(fetchReader ? { fetchReader } : {}),
+              readMaterial: params => {
+                if (!/^e[1-9][0-9]*$/u.test(params.id)) throw new MemoryError('材料编号无效。');
+                const evidence = store.get(task.id)!.evidence[Number(params.id.slice(1)) - 1];
+                if (!evidence || !['web_fetch', 'web_search'].includes(evidence.tool)) throw new MemoryError('该材料不属于当前任务的联网资料。');
+                const text = JSON.stringify(evidence), points = [...text], offset = params.offset ?? 0;
+                if (!Number.isSafeInteger(offset) || offset < 0 || offset > points.length) throw new MemoryError('材料读取位置无效。');
+                const end = Math.min(points.length, offset + 2800);
+                reviewCoverage.get(params.id)?.ranges.push([offset, end]);
+                return { id: params.id, text: points.slice(offset, end).join(''), offset, totalChars: points.length,
+                  ...(end < points.length ? { nextOffset: end } : {}) };
+              }, onFinalResponse: response => { stopReason = response.stopReason; },
+            } });
+          if (this.closed) throw new RequestError('研究服务正在关闭。', 'cancelled');
+          const output = await this.runtime.prompt(JSON.stringify(input), { runId: randomUUID(), taskId: task.id, conversationId: task.conversationId });
+          persist(() => store.checkpoint(task.id, task.attempt, { ...current, evidence: { tool: 'report_draft',
+            input: { attempt: task.attempt, cycle, phase, sectionId: section?.id, stopReason,
+              truncated: stopReason === 'length', storedExcerpt: Buffer.byteLength(output) > 90_000 }, result: boundedText(output, 90_000) } }));
+          if (phase === 'plan') persist(() => store.workflow.savePlan(task.id, task.attempt, cycle, parseResearchPlan(output, stopReason)));
+          else if (phase === 'write') {
+            const proposal = parseResearchSection(output, stopReason, section!, store.get(task.id)!.evidence);
+            persist(() => store.workflow.saveSection(task.id, task.attempt, cycle, proposal));
+            if (proposal.status === 'blocked') blockedThisAttempt.add(section!.id);
+          } else {
+            const review = parseResearchReview(output, stopReason, section!);
+            const evidence = store.get(task.id)!.evidence;
+            const originalPages = fetchedPages(evidence);
+            if (review.verdict === 'pass' && (section!.sources.some(url => !reviewSources.has(url))
+              || [...reviewCoverage.values()].some(value => !rangesCover(value.ranges, value.total)))) {
+              review.verdict = 'blocked'; review.reason = '本章所引资料的后半部分尚未进入本次审查上下文，不能仅审查摘录开头即通过。';
+            } else if (review.verdict === 'pass' && task.requiresOriginal
+              && (!task.urls.length || task.urls.some(url => !fullyRead(originalPages, normalizeWebFetchUrl(url))))) {
+              review.verdict = 'blocked'; review.reason = '指定原始资料尚未完整读取；保留章节，补充原文后才可继续核验。';
+            } else if (review.verdict === 'pass' && !hasFetchedSource(section!, evidence)) {
+              review.verdict = 'blocked'; review.reason = '本章尚无实际读取的网页来源，不能仅凭模型审查通过完成归档。';
+            }
+            persist(() => store.workflow.saveReview(task.id, task.attempt, cycle, review));
+            if (review.verdict === 'blocked') blockedThisAttempt.add(section!.id);
+          }
+          activeCycle = undefined;
+        } finally {
+          const runtime = this.runtime; this.runtime = undefined;
+          await runtime?.close();
+        }
+      }
       if (this.closed) throw new RequestError('研究服务正在关闭。', 'cancelled');
-      const output = await this.runtime.prompt(input, { runId: randomUUID(), taskId: task.id, conversationId: task.conversationId });
-      // Keep the actual final output even when the model fails the report contract.
-      try { store.checkpoint(task.id, task.attempt, { ...current,
-        evidence: { tool: 'report_draft', input: { attempt: task.attempt }, result: boundedText(output, 90_000) } }); }
-      catch (error) { persistenceFailed = !(error instanceof MemoryError); throw error; }
-      const report = parseReport(output);
+      const workflow = persist(() => store.workflow.load(task.id));
       const allEvidence = store.get(task.id)!.evidence;
-      const pages = allEvidence.filter(e => e.tool === 'web_fetch' && e.result && typeof e.result === 'object'
-        && 'url' in e.result && 'text' in e.result).map(e => e.result as { url: string; coverage?: Coverage });
+      const pages = fetchedPages(allEvidence);
       const hasSearchEvidence = allEvidence.some(e => e.tool === 'web_search' && e.result && typeof e.result === 'object'
         && (('summary' in e.result && typeof e.result.summary === 'string' && e.result.summary.trim())
           || ('sources' in e.result && Array.isArray(e.result.sources) && e.result.sources.length > 0)));
-      if (task.requiresOriginal && (!task.urls.length || task.urls.some(url => !fullyRead(pages, normalizeWebFetchUrl(url))))) {
-        report.status = 'blocked'; report.reason = '指定原始资料尚未完整读取；已保留研究材料，请补充正文或明确要求重试。';
-      } else if (!pages.length && !hasSearchEvidence) {
-        report.status = 'blocked'; report.reason = '尚未取得可用的联网资料；已保留研究进度，请检查联网配置、补充资料或明确要求重试。';
-      } else if (report.status === 'completed' && !pages.length) {
-        report.status = 'partial'; report.reason = '尚未读取可核验的原始网页，仅保留阶段性结论。';
-      }
-      if (report.status === 'blocked') { delete report.markdown; delete report.abstract; delete report.keywords; }
-      try { finished = store.finish(task.id, task.attempt, report); }
-      catch (error) { persistenceFailed = !(error instanceof MemoryError); throw error; }
+      const originalMissing = task.requiresOriginal && (!task.urls.length || task.urls.some(url => !fullyRead(pages, normalizeWebFetchUrl(url))));
+      const done = Boolean(workflow.plan) && workflow.sections.every(section => section.status === 'approved');
+      const reason = originalMissing ? '指定原始资料尚未完整读取；章节、材料和检查点已保存，需补充资料或明确要求继续。'
+        : !pages.length && !hasSearchEvidence ? '尚未取得可用的联网资料；已保留研究进度，需补充资料或明确要求继续。'
+        : current.modelCalls >= budget.maxModelCalls ? '本批模型调用预算用完，尚有章节未完成或未通过审查；已保存检查点，需明确要求继续。'
+        : '尚有章节因证据不足未通过审查；已保存检查点，需补充资料或明确要求继续。';
+      const hasText = workflow.sections.some(section => section.markdown.trim());
+      const report = !originalMissing && (pages.length || hasSearchEvidence) && hasText
+        ? assembleResearchReport(task, workflow, done ? 'completed' : 'partial', done ? undefined : reason)
+        : { status: 'blocked' as const, reason };
+      finished = persist(() => store.finish(task.id, task.attempt, report));
     } catch (error) {
       if (persistenceFailed) throw error;
-      // Provider errors, invalid final JSON and interruption preserve all confirmed evidence.
+      if (activeCycle !== undefined) persist(() => store.workflow.failCycle(task.id, task.attempt, activeCycle!,
+        error instanceof MemoryError ? error.message : '调用未确认成功；不自动重复，需检查原始诊断。', !(error instanceof MemoryError)));
+      // Unknown provider outcomes and invalid contracts stop this attempt, not a paid retry.
       finished = store.finish(task.id, task.attempt, { status: this.closed ? 'interrupted' : 'failed',
         reason: this.closed ? '服务停止，执行已中断；不会自动重复模型调用。'
-          : error instanceof ReportFormatError || error instanceof MemoryError ? error.message : '研究调用未成功完成；已有资料和调用记录已保留，需明确要求继续。' });
+          : error instanceof MemoryError ? error.message : '研究调用未成功完成；已有资料和调用记录已保留，需明确要求继续。' });
     } finally {
-      const runtime = this.runtime; this.runtime = undefined;
-      await runtime?.close();
+      fetchReader?.dispose();
     }
     if (!this.closed) await this.notify(finished);
   }
@@ -175,7 +273,22 @@ export class ResearchService {
   }
 }
 
+function sectionProjection(section: ResearchSection): ResearchSection & { markdownIsTail: boolean } {
+  const tail = section.status === 'draft' && [...section.markdown].length > 8000;
+  return { ...section, markdown: tail ? [...section.markdown].slice(-8000).join('') : section.markdown, markdownIsTail: tail };
+}
+
 interface Coverage { offset: number; end: number; totalChars: number; contentHash: string }
+function rangesCover(ranges: [number, number][], total: number): boolean {
+  let end = 0;
+  for (const range of [...ranges].sort((a, b) => a[0] - b[0])) { if (range[0] > end) return false; end = Math.max(end, range[1]); }
+  return end >= total;
+}
+function fetchedPages(evidence: ResearchTask['evidence']): { url: string; coverage?: Coverage }[] {
+  return evidence.filter(e => e.tool === 'web_fetch' && !e.error && e.result && typeof e.result === 'object'
+    && 'url' in e.result && typeof e.result.url === 'string' && 'text' in e.result
+    && typeof e.result.text === 'string' && e.result.text.trim()).map(e => e.result as { url: string; coverage?: Coverage });
+}
 function fullyRead(pages: { url: string; coverage?: Coverage }[], url: string): boolean {
   const ranges = pages.filter(page => page.url === url && page.coverage).map(page => page.coverage!);
   // A source can change between attempts: only merge ranges from identical text.
@@ -190,21 +303,4 @@ function fullyRead(pages: { url: string; coverage?: Coverage }[], url: string): 
     if (total > 0 && covered >= total) return true;
   }
   return false;
-}
-
-class ReportFormatError extends Error {}
-function parseReport(raw: string): ResearchFinishInput {
-  let value: Record<string, unknown>;
-  try { value = JSON.parse(raw.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/, '$1')); }
-  catch { throw new ReportFormatError('模型未返回可归档的报告结构；草稿已保留，可明确要求继续。'); }
-  if (!value || !['completed', 'partial', 'blocked'].includes(String(value.status))
-    || typeof value.abstract !== 'string' || !value.abstract.trim() || [...value.abstract].length > 1200
-    || typeof value.markdown !== 'string' || !value.markdown.trim() || Buffer.byteLength(value.markdown) > 500_000 || [...value.markdown].length > 200_000
-    || typeof value.reason !== 'string' || value.reason.length > 2000
-    || !Array.isArray(value.keywords) || value.keywords.length > 20
-    || value.keywords.some(k => typeof k !== 'string' || !k.trim() || [...k].length > 60)) {
-    throw new ReportFormatError('报告结构或容量不符合约定；草稿已保留，可明确要求继续。');
-  }
-  return { status: value.status as 'completed' | 'partial' | 'blocked', markdown: value.markdown,
-    abstract: value.abstract, keywords: value.keywords as string[], ...(value.reason.trim() ? { reason: value.reason } : {}) };
 }

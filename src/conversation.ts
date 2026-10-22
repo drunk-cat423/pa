@@ -19,6 +19,7 @@ import { ImageAssets } from './image-assets.js';
 import { DiagnosticLog } from './diagnostics.js';
 import type { ResearchToolContext } from './research-tools.js';
 import type { ResearchSender } from './research-service.js';
+import { researchUrls } from './research-target.js';
 
 export class PersistenceError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -517,6 +518,8 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
               ...(conversationContext ? { conversationContext } : {}),
               ...(recalled.content ? { memoryContext: recalled.content } : {}), memoryRefs: recalled.refs,
               ...(inputExternal ? { companionTools: {
+                ...(config.fetch?.enabled && /能(?:不能|否)?.{0,12}(?:看|读)|(?:读|看|打开|访问)(?:一下|下|这个|链接|网页|仓库)|(?:总结|分析).{0,12}(?:网页|链接|仓库)/u.test(text)
+                  && researchUrls(text).length === 1 ? { verifyLink: researchUrls(text)[0] } : {}),
                 ...(options.researchContext ? { research: options.researchContext(conversation.id, run.inputMessageId, sendResearch) } : {}),
                 prepareTurn: (plan: import('./turn-plan.js').TurnPlan) => persist(()=>openedStore.prepareTurn(
                   conversation.id,run.inputMessageId,plan,policy,inputExternal.mentionedSenderIds,

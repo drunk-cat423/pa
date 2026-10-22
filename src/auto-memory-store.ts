@@ -10,6 +10,7 @@ import { assertMemorySourceRange, assertProcessedRanges, COMPACT_TOPIC_LIMITS } 
 import { memoryScheduleDue, noteMemoryContent } from './memory-schedule.js';
 import { inferPersonProfileEvidence, resolveProfileSubject, type ProfileSubjectCandidate, type ProfileSubjectEvidence } from './profile-attribution.js';
 import { validateProfileUpdates } from './profile-updates.js';
+import { MemoryProposalRejectedError } from './memory-diagnostics.js';
 
 const timestamp = () => new Date().toISOString();
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -1122,6 +1123,23 @@ export class AutoMemoryStore {
         .run(error,jobId);
       this.db.prepare('INSERT INTO auto_memory_job_deferrals(job_id,reason,created_at,input_hash,progress_hash) VALUES (?,?,?,?,?)')
         .run(jobId,reason,timestamp(),hash(String(row.input_json)),hash(String(row.progress_json)));
+    });
+  }
+  /** Only a rejected fresh model proposal may release materials FIFO; never alter its frozen evidence. */
+  deferProposalFailure(jobId:string,leaseToken:string,rejection:MemoryProposalRejectedError,error:string): void {
+    if(!(rejection instanceof MemoryProposalRejectedError)) throw new Error('只能自动搁置明确拒绝的模型提案。');
+    this.atomic(()=>{
+      const row=this.active(jobId,leaseToken);
+      const input=row.input_json==null?undefined:parse<AutoMemoryTaskInput>(row.input_json);
+      if(row.pipeline!=='materials'||input?.pipeline!=='materials'||input.extractionProtocol!==2) {
+        throw new Error('只能自动搁置当前资料任务的模型提案。');
+      }
+      assertCurrentMemoryProtocol(input);assertLiveProfileProtocol(input);
+      const reason='本次模型结构、对象或证据提案被拒绝；自动搁置，保留原文、旧画像、pending、固定输入及进度，后续资料批次可继续。';
+      this.db.prepare("UPDATE auto_memory_jobs SET status='failed',error=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?")
+        .run(error,jobId);
+      this.db.prepare('INSERT INTO auto_memory_job_deferrals(job_id,reason,created_at,input_hash,progress_hash) VALUES (?,?,?,?,?)')
+        .run(jobId,reason,timestamp(),hash(String(row.input_json)),row.progress_json==null?null:hash(String(row.progress_json)));
     });
   }
   retry(jobId:string): void {

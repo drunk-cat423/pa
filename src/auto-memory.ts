@@ -4,7 +4,7 @@ import { ObsoletePersonalMemoryError, assertCurrentMemoryProtocol, mergeProfileF
 import type { AutoMemoryJob, AutoMemoryTaskInput, AutoMemoryPipeline, ValidatedExtract, PersonProfile, ProfileFact } from './auto-memory-types.js';
 import { createMemoryProvider, MemoryInputTooLargeError, type MemoryProvider } from './memory-provider.js';
 import { selfProfileBudget, validateSelfProfileProposal } from './self-profile-store.js';
-import { memoryFailure, memoryFailurePhase, MemoryProviderError } from './memory-diagnostics.js';
+import { isRejectedMemoryResponse, memoryFailure, memoryFailurePhase, MemoryProposalRejectedError, MemoryProviderError } from './memory-diagnostics.js';
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
 import { assertProfileCapacity, PersonProfileCapacityError, profileCapacity } from './profile-limits.js';
 import { assertProfileEvidenceStrength, assertLiveProfileProtocol, assertProfileProtocol, PersonProfileProtocolError, validateProfilePendingResults } from './profile-pending.js';
@@ -20,6 +20,30 @@ function sharedBudget(config: PaConfig): Budget {
   return budget;
 }
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/** A model's version mismatch must not be mistaken for a recoverable content rejection. */
+class ProposalVersionConflictError extends Error {}
+
+function validateFreshProposal(value: unknown, input: AutoMemoryTaskInput): ValidatedExtract {
+  // Check snapshot/protocol failures outside the recoverable, pure model-output boundary.
+  assertCurrentMemoryProtocol(input);
+  assertLiveProfileProtocol(input);
+  if (record(value)) {
+    for (const profile of Array.isArray(value.profiles) ? value.profiles : []) {
+      if (!record(profile)) continue;
+      const baseline = input.profiles.find(item => item.personId === profile.personId);
+      if (baseline && profile.baseVersion !== baseline.baseVersion) throw new ProposalVersionConflictError('人物画像输入版本冲突。');
+    }
+    if (record(value.selfProfile) && input.selfProfile && value.selfProfile.baseVersion !== input.selfProfile.baseVersion) {
+      throw new ProposalVersionConflictError('自我画像输入版本冲突。');
+    }
+  }
+  try { return validateExtractProposal(value, input); }
+  catch (error) {
+    if (error instanceof ObsoletePersonalMemoryError || error instanceof PersonProfileProtocolError) throw error;
+    throw new MemoryProposalRejectedError(error);
+  }
+}
 
 /** Capacity is checked only AFTER every person's structure, attribution and pending results are valid. */
 function validateExtractProposal(value: unknown, input: AutoMemoryTaskInput, mergedProfile = false): ValidatedExtract {
@@ -344,6 +368,7 @@ export class BackgroundMemory {
       if (controller.signal.aborted) throw new Error('后台调用已取消。');
       return result;
     } catch (error) {
+      if (controller.signal.aborted) throw new Error('后台调用已取消。');
       if (error instanceof MemoryInputTooLargeError && !hasCall()) this.budget.calls--;
       throw error;
     }
@@ -404,11 +429,17 @@ export class BackgroundMemory {
               progress.capacityRecovery.result = result;
             } else {
               assertMemoryOutputFits(chunk, this.config);
-              const proposal = await this.request(signal => this.provider.extract(chunk, signal, { onCall: id => { callId = id; } }), () => Boolean(callId));
+              let proposal: unknown;
+              try {
+                proposal = await this.request(signal => this.provider.extract(chunk, signal, { onCall: id => { callId = id; } }), () => Boolean(callId));
+              } catch (error) {
+                if (chunk.pipeline === 'materials' && isRejectedMemoryResponse(error)) throw new MemoryProposalRejectedError(error);
+                throw error;
+              }
               this.diagnostics?.event(context, phase, 'completed', undefined, callId);
               phase = 'validate';
               this.diagnostics?.event(context, phase, 'started', undefined, callId);
-              result = validateExtractProposal(proposal, chunk);
+              result = chunk.pipeline === 'materials' ? validateFreshProposal(proposal, chunk) : validateExtractProposal(proposal, chunk);
             }
             this.store.assertProfileEvidenceCurrent(input, result);
             if (chunk.pipeline === 'materials' && chunk.profileAttributionProtocol === 1 && result.profiles.some(exceedsCapacity)) {
@@ -505,7 +536,7 @@ export class BackgroundMemory {
         this.pipelineErrors.delete(pipeline);
         this.lastError = [...this.pipelineErrors.values()].at(-1);
       } catch (error) {
-        const callError = error instanceof ProfileRefinementExhaustedError ? error.cause : error;
+        const callError = error instanceof ProfileRefinementExhaustedError || error instanceof MemoryProposalRejectedError ? error.cause : error;
         phase = memoryFailurePhase(callError, phase);
         let failure = error;
         try {
@@ -528,6 +559,11 @@ export class BackgroundMemory {
           if (error instanceof ProfileRefinementExhaustedError && !this.diagnosticFailed && pipeline === 'materials') {
             this.store.deferCapacityFailure(job.id, lease, this.lastError);
             this.diagnostics?.event(context, 'profile_capacity', 'deferred', { reason: 'refinement_exhausted' }, callId);
+            continue;
+          }
+          if (error instanceof MemoryProposalRejectedError && !this.diagnosticFailed && pipeline === 'materials') {
+            this.store.deferProposalFailure(job.id, lease, error, this.lastError);
+            this.diagnostics?.event(context, 'model_proposal', 'deferred', { reason: 'proposal_rejected' }, callId);
             continue;
           }
           this.store.fail(job.id, lease, this.lastError);
@@ -566,7 +602,8 @@ export class BackgroundMemory {
           refinementCallId = id; stage('profile_refine', id);
         } }), () => Boolean(refinementCallId));
         stage('validate', refinementCallId);
-        const result = validateExtract(proposal, refinement);
+        const result = validateFreshProposal(proposal, refinement);
+        if (refinement.profileProtocol === 2) result.profiles.forEach(profile => assertProfileCapacity({ ...profile, baseVersion: profile.baseVersion + 1 }));
         this.store.assertProfileEvidenceCurrent(chunk, result);
         const profile = result.profiles[0]!;
         recovery.result.profiles = recovery.result.profiles.map(previous => previous.personId === profile.personId ? profile : previous);
@@ -576,7 +613,7 @@ export class BackgroundMemory {
         if (refinementCallId) this.diagnostics?.finishCall(refinementCallId, 'completed', 'validate');
       } catch (error) {
         // Never retry a timeout/unknown call. Preserve its consumed opportunity and frozen draft.
-        if (error instanceof PersonProfileCapacityError || error instanceof MemoryProviderError) throw new ProfileRefinementExhaustedError(error);
+        if (error instanceof PersonProfileCapacityError || isRejectedMemoryResponse(error)) throw new ProfileRefinementExhaustedError(error);
         throw error;
       }
     }

@@ -59,6 +59,12 @@ systemctl disable --now mysql.service
 
 `PA_RESEARCH_ENABLED` 默认true，独立后台预算默认12次主模型、24次工具、其中6次搜索，单任务串行运行。复用当前模型和已启用的搜索/网页读取配置，无需新凭证。群聊与私聊只在原渠道白名单内接入；跨场景研究清单复用 `policy.json` 的可信人物绑定。启动就绪不等于真实研究质量或QQ文件客户端已验收，实际使用说明见 [research.md](research.md)。
 
+### 分阶段研究与 schema25
+
+从schema24升级时，在服务停止、MainPID为0后创建完整快照并标记 `before-schema-25`。新版本以pa用户打开ConversationStore，增量创建研究计划、周期、章节版本和审查表；旧研究档案、失败批次、固定输入、已有进度和原文不改写。迁移前后核对旧表内容哈希、数据文件哈希、完整性和外键。仅切换代码并重启，不调用continue/retry、回填或重放命令；失败研究任务不会被自动领取，失败整理任务也不会因本次升级被重试。
+
+研究high思考与分章调度由代码生效，仍使用已有模型、凭证、允许场景及预算配置。不得为了部署初始化新的机器人凭证或覆盖生产env/policy。服务器只构建和核验迁移，不重复已在本地完成的回归。启动后确认当前发布SHA、schema25、QQ就绪，并核对历史失败批次及调用记录未增加。旧schema24代码不能直接用于升级后的数据库回退；需要恢复同一完整快照。
+
 ### 备份与发布保留规则
 
 统一使用 `/usr/local/sbin/pa-storage`，实现和 systemd 模板在 `scripts/deployment/`。完整快照只写入 `/var/backups/pa/snapshots/`；不再在 `/root/pa-*` 下另建数据副本。每份快照保存整个数据目录的 `data.tar.gz`、对应代码的 `source.tar.gz`（不含 node_modules）、私有配置和服务单元。完成校验后才写入带 SHA-256 的 `manifest.json` 并原子发布目录；`.partial-*` 和未知格式目录不参与自动删除。

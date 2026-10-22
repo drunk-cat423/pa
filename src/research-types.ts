@@ -21,12 +21,13 @@ export interface ResearchList {
   total: number; offset: number; nextOffset?: number;
   items: { id: string; title: string; status: ResearchStatus; createdAt: string; reportVersion?: number; abstract?: string; reason?: string }[];
 }
-export interface ResearchReadParams { id: string; version?: number; offset?: number; limit?: number }
+export interface ResearchReadParams { id: string; version?: number; offset?: number; limit?: number; draft?: boolean }
 export interface ResearchReport {
   id: string; version: number; title: string; abstract: string; keywords: string[]; createdAt: string;
   status: 'completed' | 'partial'; markdown: string;
 }
 export interface ResearchReadResult {
+  draft?: boolean;
   id: string; version?: number; title: string; status: ResearchStatus; abstract?: string; createdAt: string;
   text: string; offset: number; totalChars: number; nextOffset?: number; reason?: string;
 }

@@ -7,6 +7,18 @@ export class MemoryProviderError extends Error {
   }
 }
 
+/** Created only at the fresh response / pure proposal-validation boundary. */
+export class MemoryProposalRejectedError extends Error {
+  constructor(cause: unknown) {
+    super('本次模型提案未通过检查，保留批次并搁置。', { cause });
+    this.name = 'MemoryProposalRejectedError';
+  }
+}
+
+export function isRejectedMemoryResponse(error: unknown): error is MemoryProviderError {
+  return error instanceof MemoryProviderError && ['model_length', 'model_empty', 'model_json', 'model_contract'].includes(error.code);
+}
+
 export function memoryFailurePhase(error: unknown, fallback: string): string {
   if (!(error instanceof MemoryProviderError)) return fallback;
   if (error.code === 'model_json') return 'parse';
@@ -16,6 +28,9 @@ export function memoryFailurePhase(error: unknown, fallback: string): string {
 }
 
 export function memoryFailure(error: unknown, phase: string): string {
+  if (error instanceof MemoryProposalRejectedError) {
+    return `[model_proposal_rejected] phase=${phase}; 本次模型提案被拒绝；保留输入、进度和pending并搁置，后续资料批次可继续。 原因=${memoryFailure(error.cause, phase)}`;
+  }
   const message = error instanceof Error ? error.message : '';
   let code = 'unexpected';
   let detail = '未分类异常；调用结果可能未知，需人工检查后重试。';

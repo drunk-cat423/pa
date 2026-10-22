@@ -73,7 +73,7 @@ test('v13 migration backup preserves archived legacy pending rows and current da
       downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; PRAGMA user_version=13;');
     });
     f.restart();
-    assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),24);
+    assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),25);
     assert.deepEqual({ ...f.inspect(db => db.prepare('SELECT id,person_id,source_message_id,archived_revision,archived_at FROM person_profile_pending WHERE id=?').get(archived.id)) }, {
       id: archived.id, person_id: personId, source_message_id: source.existingMessageId, archived_revision: 1, archived_at: '2026-10-16T00:00:00Z',
     });

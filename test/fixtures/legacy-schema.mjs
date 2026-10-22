@@ -1,4 +1,9 @@
 export function downgradeSchema22(db) {
+  db.exec(`DROP TABLE IF EXISTS research_workflow_reviews;
+    DROP TABLE IF EXISTS research_workflow_versions;
+    DROP TABLE IF EXISTS research_workflow_sections;
+    DROP TABLE IF EXISTS research_workflow_plans;
+    DROP TABLE IF EXISTS research_workflow_cycles;`);
   db.exec(`PRAGMA foreign_keys=OFF;
     DROP TABLE IF EXISTS research_deliveries;
     DROP TABLE IF EXISTS research_report_fts;

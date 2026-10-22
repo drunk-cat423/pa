@@ -4,6 +4,8 @@ import { dirname, join, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { memoryWords } from './memory-text.js';
 import { MemoryError } from './memory-types.js';
+import { researchTargetContext, validateResearchTarget, type ResearchTargetContext } from './research-target.js';
+import { ResearchWorkflowStore } from './research-workflow-store.js';
 import type { ResearchBudget, ResearchDelivery, ResearchDeliveryStatus, ResearchEvidence, ResearchFinishInput,
   ResearchList, ResearchListParams, ResearchProgress, ResearchReadParams, ResearchReadResult, ResearchReport,
   ResearchStatus, ResearchTask, CreateResearchInput } from './research-types.js';
@@ -69,8 +71,10 @@ function validDay(day: string): void {
 /** Research artifacts have their own ledger; none are written to chat, Topic or profiles here. */
 export class ResearchStore {
   private readonly root: string;
+  readonly workflow: ResearchWorkflowStore;
   constructor(private readonly db: DatabaseSync, private readonly transaction: <T>(operation: () => T) => T, dataDir: string) {
     this.root = join(resolve(dataDir), 'research');
+    this.workflow = new ResearchWorkflowStore(db,transaction,dataDir);
   }
 
   private identity(conversationId: string, sourceMessageId: string): { actorId: string; personId: string } {
@@ -90,6 +94,10 @@ export class ResearchStore {
     return task;
   }
 
+  targetContext(conversationId: string, sourceMessageId: string): ResearchTargetContext {
+    return researchTargetContext(this.db, conversationId, sourceMessageId);
+  }
+
   create(conversationId: string, sourceMessageId: string, input: CreateResearchInput): ResearchTask {
     const identity = this.identity(conversationId,sourceMessageId);
     const key = text(input.key,'研究条目标识',80), title = text(input.title,'研究标题',160), goal = text(input.goal,'研究目标',6000);
@@ -102,13 +110,18 @@ export class ResearchStore {
       return source;
     });
     const requiresOriginal = input.requiresOriginal ?? false;
-    const serialized = JSON.stringify({ title, goal, urls, requiresOriginal });
+    const content = { title, goal, urls, requiresOriginal };
     return this.transaction(() => {
       const existing = this.db.prepare('SELECT id,input_json FROM research_tasks WHERE source_message_id=? AND item_key=?').get(sourceMessageId,key);
       if (existing) {
-        if (existing.input_json !== serialized) throw new MemoryError('同一来源的研究条目标识已用于不同内容。');
+        const saved = JSON.parse(String(existing.input_json)) as typeof content;
+        if (JSON.stringify({ title:saved.title, goal:saved.goal, urls:saved.urls, requiresOriginal:saved.requiresOriginal }) !== JSON.stringify(content))
+          throw new MemoryError('同一来源的研究条目标识已用于不同内容。');
         return this.get(String(existing.id))!;
       }
+      const target = this.targetContext(conversationId, sourceMessageId);
+      validateResearchTarget(target, title, goal, urls);
+      const serialized = JSON.stringify({ ...content, targetBinding: target });
       const id = `R${randomUUID().replaceAll('-','')}`, createdAt = timestamp();
       this.db.prepare(`INSERT INTO research_tasks(id,conversation_id,source_message_id,actor_id,person_id,item_key,input_json,
         title,goal,urls_json,requires_original,status,attempt,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',1,?,?)`)
@@ -223,6 +236,7 @@ export class ResearchStore {
   finish(id: string, attempt: number, input: ResearchFinishInput): ResearchTask {
     const task = this.running(id,attempt);
     if (!['completed','partial','blocked','failed','interrupted'].includes(input.status)) throw new MemoryError('研究结束状态无效。');
+    if (input.status === 'completed' && this.workflow.load(id).plan) this.workflow.assertComplete(id);
     const reason = input.reason === undefined ? null : text(input.reason,'研究说明',2000);
     let report: { version:number; abstract:string; keywords:string[]; hash:string; at:string } | undefined;
     if (input.markdown !== undefined) {
@@ -246,6 +260,7 @@ export class ResearchStore {
     } else if (input.status === 'completed' || input.status === 'partial') throw new MemoryError('完成状态必须先保存报告正文。');
     return this.transaction(() => {
       this.running(id,attempt);
+      if (input.status === 'completed' && this.workflow.load(id).plan) this.workflow.assertComplete(id);
       const at = timestamp();
       if (report) this.db.prepare('INSERT INTO research_reports VALUES(?,?,?,?,?,?,?,?)')
         .run(id,report.version,attempt,input.status,report.abstract,JSON.stringify(report.keywords),report.hash,report.at);
@@ -253,6 +268,7 @@ export class ResearchStore {
         .run(input.status,reason,at,id,attempt);
       this.db.prepare('UPDATE research_tasks SET status=?,reason=?,latest_version=coalesce(?,latest_version),updated_at=? WHERE id=?')
         .run(input.status,reason,report?.version ?? null,at,id);
+      this.workflow.interrupt(id,attempt,reason ?? '研究批次已结束，未提交周期保留供检查。');
       this.updateIndex(id);
       return this.get(id)!;
     });
@@ -265,6 +281,7 @@ export class ResearchStore {
       const existing = this.db.prepare('SELECT attempt FROM research_attempts WHERE task_id=? AND source_message_id=? AND action_key=?').get(task.id,sourceMessageId,key);
       if (existing) return task;
       if (task.status === 'queued' || task.status === 'running') throw new MemoryError('该研究正在排队或进行中，无需重复创建。');
+      if (task.status === 'completed' && this.workflow.load(task.id).plan) throw new MemoryError('该研究的固定计划已全部完成；新增目标或更新时效资料请创建新任务，旧报告保持不变。');
       const attempt = task.attempt+1, at = timestamp();
       this.db.prepare('INSERT INTO research_attempts(task_id,attempt,source_message_id,action_key,status,usage_json,created_at,updated_at) VALUES(?,?,?,?,\'queued\',?,?,?)')
         .run(task.id,attempt,sourceMessageId,key,JSON.stringify(zeroUsage()),at,at);
@@ -279,6 +296,7 @@ export class ResearchStore {
       const at = timestamp(), reason = '服务中断；已保存资料与调用计数，需明确要求继续，不自动重发未知模型请求。';
       for (const row of tasks) {
         if (conversationIds && !conversationIds.includes(String(row.conversation_id))) continue;
+        this.workflow.interrupt(String(row.id),Number(row.attempt),reason);
         this.db.prepare("UPDATE research_tasks SET status='interrupted',reason=?,updated_at=? WHERE id=?").run(reason,at,String(row.id));
         this.db.prepare("UPDATE research_attempts SET status='interrupted',reason=?,updated_at=? WHERE task_id=? AND attempt=?").run(reason,at,String(row.id),Number(row.attempt));
       }
@@ -291,6 +309,22 @@ export class ResearchStore {
   read(conversationId: string, sourceMessageId: string, params: ResearchReadParams): ResearchReadResult {
     const task = this.authorized(conversationId,sourceMessageId,params.id);
     const offset = integer(params.offset ?? 0,'报告读取位置',0,200_000), limit = integer(params.limit ?? 4000,'报告读取长度',1,6000);
+    if (params.draft !== undefined && typeof params.draft !== 'boolean') throw new MemoryError('草稿读取参数无效。');
+    if (params.draft) {
+      if (params.version !== undefined) throw new MemoryError('草稿不能指定正式报告版本。');
+      const workflow = this.workflow.load(task.id);
+      const sectionDraft = workflow.sections.some(section => section.markdown.trim()) ? workflow.sections.map(section =>
+        `## ${section.title}\n\n状态：${section.status}；章节版本：${section.version}\n\n${section.markdown || '尚未写作。'}`
+      ).join('\n\n') : undefined;
+      const draft = sectionDraft ?? task.evidence.findLast(item => item.tool === 'report_draft' && typeof item.result === 'string')?.result as string | undefined;
+      if (!draft?.trim()) return { id:task.id,title:task.title,status:task.status,createdAt:task.createdAt,draft:true,
+        text:'没有已保存的研究草稿；草稿不是正式报告。',offset:0,totalChars:0,...(task.reason ? { reason:task.reason } : {}) };
+      const points = [...draft], end = Math.min(points.length,offset+limit);
+      const label = draft.endsWith('[此材料片段已截断]') ? '未归档草稿，不是正式报告；原始草稿已截断' : '未归档草稿，不是正式报告';
+      return { id:task.id,title:task.title,status:task.status,createdAt:task.createdAt,draft:true,
+        text:`【${label}】\n${points.slice(offset,end).join('')}`,offset,totalChars:points.length,
+        ...(end < points.length ? { nextOffset:end } : {}),...(task.reason ? { reason:task.reason } : {}) };
+    }
     const version = params.version ?? task.reportVersion;
     if (version === undefined) return { id:task.id,title:task.title,status:task.status,createdAt:task.createdAt,text:'报告尚未生成。',offset:0,totalChars:0,...(task.reason ? {reason:task.reason} : {}) };
     const report = this.report(task.id,version);
