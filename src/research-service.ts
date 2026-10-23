@@ -10,6 +10,7 @@ import { WebFetchReader } from './web-fetch-reader.js';
 import type { ResearchToolContext, ResearchToolName, ResearchRuntimeEvent } from './research-tools.js';
 import type { ContinueResearchInput, CreateResearchInput, ResearchListParams, ResearchReadParams, ResearchTask } from './research-types.js';
 import { toPlainText } from './plain-text.js';
+import { projectResearchMaterials, withMaterialOmissionGap } from './research-materials.js';
 import { assembleResearchReport, hasFetchedSource, isResearchSourceMaterial, lightweightResearchPlan, parseResearchPlan, parseResearchReview, parseResearchSection, researchSources, researchStagePrompt } from './research-workflow.js';
 import type { ResearchPhase, ResearchSection } from './research-workflow-types.js';
 
@@ -174,7 +175,9 @@ export class ResearchService {
         const material = saved.evidence.map((evidence, index) => ({ id: `e${index + 1}`, ...evidence }))
           .filter(evidence => ['web_fetch', 'web_search', ...(lightweight ? ['read_research_material'] : [])].includes(evidence.tool)
             && (!lightweight || evidence.result !== undefined || evidence.error !== undefined));
-        const previousMaterial = lightweight ? lightweightMaterials(material) : boundedText(JSON.stringify(material.slice(-24).map(item => ({ ...item,
+        const materialQuery = {goal:task.goal,followups:task.followups,gaps:workflow.sections.flatMap(item=>item.gaps)};
+        const lightweightProjection = lightweight && phase !== 'review' ? projectResearchMaterials(material,materialQuery,phase==='collect'?'collect':'write') : undefined;
+        const previousMaterial = lightweightProjection ?? boundedText(JSON.stringify(material.slice(-24).map(item => ({ ...item,
           result: item.result === undefined ? undefined : boundedText(JSON.stringify(item.result), phase === 'write' ? 24_000 : 4500) }))), phase === 'write' ? 120_000 : 45_000);
         const reviewCoverage = new Map<string, { total: number; ranges: [number, number][] }>();
         const reviewSources = new Set<string>();
@@ -197,8 +200,11 @@ export class ResearchService {
           previousMaterial: phase === 'review' ? undefined : previousMaterial,
           ...(lightweight ? { collectionNote: boundedText(String(saved.evidence.findLast(item => item.tool === 'collection_note')?.result ?? ''), 8000) } : {}),
           ...(phase === 'review' ? { reviewMaterial } : {}),
-          materialIndex: material.slice(lightweight ? -24 : -64).map(item => ({ id: item.id, tool: item.tool,
-            input: lightweight ? boundedText(JSON.stringify(item.input), 1000) : item.input, error: item.error })),
+          // Projection entries already carry exact evidence IDs and source URLs.
+          // Only errors need a separate small index in the lightweight flow.
+          materialIndex: (lightweight ? material.filter(item=>item.error).slice(-8) : material.slice(-64)).map(item => ({ id: item.id, tool: item.tool,
+            input: lightweight ? boundedText(JSON.stringify(item.input), 1000) : item.input, error: item.error,
+            ...(lightweight && item.error && item.result!==undefined ? {failure:boundedText(JSON.stringify(item.result),1000)}:{}) })),
           plan: workflow.plan, progress: workflow.sections.map(({ id, title, status, summary }) => ({ id, title, status, summary })),
           ...(section ? { section: phase === 'review' ? section : sectionProjection(section),
             writeMode: section.status === 'draft' ? 'append' : 'replace' } : {}),
@@ -229,6 +235,15 @@ export class ResearchService {
             `research:${task.id}:${task.attempt}:cycle:${cycle}`, { enableSearch: true, research: {
               phase, systemPrompt: researchStagePrompt(phase, lightweight), maxToolCalls: phase === 'write' || phase === 'plan' ? 0 : budget.maxToolCalls - current.toolCalls,
               maxSearchCalls: budget.maxSearchCalls - current.searchCalls, record,
+              ...(lightweight ? {compactResearchContext:true,resolveMaterialReference:(tool:string,toolInput:unknown,result:unknown)=>{
+                const evidence=store.get(task.id)!.evidence;
+                if(tool==='read_research_material' && result && typeof result==='object' && 'id' in result && typeof result.id==='string' && /^e[1-9][0-9]*$/.test(result.id)) {
+                  const original=evidence[Number(result.id.slice(1))-1];
+                  return original && ['web_fetch','web_search'].includes(original.tool) ? {id:result.id}:undefined;
+                }
+                const index=evidence.findLastIndex(item=>item.tool===tool&&JSON.stringify(item.input)===JSON.stringify(toolInput)&&JSON.stringify(item.result)===JSON.stringify(result));
+                return index>=0?{id:`e${index+1}`}:undefined;
+              }}:{}),
               ...(fetchReader ? { fetchReader } : {}),
               readMaterial: params => {
                 if (!/^e[1-9][0-9]*$/u.test(params.id)) throw new MemoryError('材料编号无效。');
@@ -253,6 +268,7 @@ export class ResearchService {
               note: [...output].slice(0, 4000).join('') }));
           else if (phase === 'write') {
             const proposal = parseResearchSection(output, stopReason, section!, store.get(task.id)!.evidence);
+            if (lightweightProjection) proposal.gaps = withMaterialOmissionGap(proposal.gaps,lightweightProjection.requiredOmissionCount);
             persist(() => store.workflow.saveSection(task.id, task.attempt, cycle, proposal));
             if (proposal.status === 'blocked') blockedThisAttempt.add(section!.id);
             // One answer, not a review/rewrite loop. Only an actual incomplete
@@ -355,22 +371,6 @@ export class ResearchService {
 function sectionProjection(section: ResearchSection): ResearchSection & { markdownIsTail: boolean } {
   const tail = section.status === 'draft' && [...section.markdown].length > 8000;
   return { ...section, markdown: tail ? [...section.markdown].slice(-8000).join('') : section.markdown, markdownIsTail: tail };
-}
-
-/** Small, explicitly partial projections; originals and read cursors stay in evidence. */
-function lightweightMaterials(material: (ResearchTask['evidence'][number] & { id: string })[]) {
-  const entries: { id: string; tool: string; sources: string[]; excerpt: string; truncated: boolean }[] = [];
-  let bytes = 0;
-  for (const item of material.slice(-16).reverse()) {
-    const original = JSON.stringify(item);
-    const excerpt = boundedText(original, 6000);
-    const entry = { id: item.id, tool: item.tool, sources: [...researchSources([item])].slice(0, 5), excerpt, truncated: excerpt !== original };
-    const size = Buffer.byteLength(JSON.stringify(entry));
-    if (bytes + size > 40_000) continue;
-    bytes += size; entries.unshift(entry);
-  }
-  return { entries, omittedRecords: material.length - entries.length,
-    notice: '这里只是有界材料片段，截断或省略不表示相关内容已被核验。需要补读时在采集阶段按材料编号读取。' };
 }
 
 interface Coverage { offset: number; end: number; totalChars: number; contentHash: string }

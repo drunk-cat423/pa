@@ -53,6 +53,9 @@ export interface ResearchRuntimeEvent {
 export interface ResearchRuntimeOptions {
   phase?: 'plan' | 'collect' | 'write' | 'review';
   systemPrompt?: string;
+  /** Lightweight collection only; projects older persisted tool bodies on the wire. */
+  compactResearchContext?: boolean;
+  resolveMaterialReference?(tool: string, input: unknown, result: unknown): { id: string } | undefined;
   readMaterial?(params: { id: string; offset?: number }): unknown | Promise<unknown>;
   /** Owned by the task attempt; its document cache and cursors outlive one cycle. */
   fetchReader?: WebFetchReader;
