@@ -317,6 +317,7 @@ export class ResearchStore {
     return this.transaction(() => {
       const task = this.authorized(conversationId,sourceMessageId,input.id);
       if (this.archived(task.id)) throw new MemoryError('该研究已归档，不能继续执行。');
+      if (this.contentExpired(task.id)) throw new MemoryError('该研究资料已按30天保留规则清理；如需再次研究，请创建新任务。');
       const existing = this.db.prepare('SELECT attempt FROM research_attempts WHERE task_id=? AND source_message_id=? AND action_key=?').get(task.id,sourceMessageId,key);
       if (existing) return task;
       if (task.status === 'queued' || task.status === 'running') throw new MemoryError('该研究正在排队或进行中，无需重复创建。');
@@ -352,6 +353,13 @@ export class ResearchStore {
     if (params.draft) {
       if (params.version !== undefined) throw new MemoryError('草稿不能指定正式报告版本。');
       const workflow = this.workflow.load(task.id);
+      if (this.contentExpired(task.id) || workflow.sections.some(section => section.contentExpired)) {
+        const text = '此任务的研究内容已按30天保留规则清理；任务记录、失败原因、调用用量和清理审计仍保留。';
+        const points = [...text], end = Math.min(points.length, offset + limit);
+        return { id:task.id,title:task.title,status:task.status,createdAt:task.createdAt,draft:true,
+          text:points.slice(offset,end).join(''),offset,totalChars:points.length,
+          ...(end < points.length ? {nextOffset:end} : {}),...(task.reason ? {reason:task.reason} : {}) };
+      }
       const sectionDraft = workflow.sections.some(section => section.markdown.trim()) ? workflow.sections.map(section =>
         `## ${section.title}\n\n状态：${section.status}；章节版本：${section.version}\n\n${section.markdown || '尚未写作。'}`
       ).join('\n\n') : undefined;
@@ -374,15 +382,33 @@ export class ResearchStore {
   }
 
   report(id: string, version: number): ResearchReport {
+    return this.transaction(() => this.reportSnapshot(id,version));
+  }
+
+  private contentExpired(id: string, path?: string): boolean {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_retention_runs'").get()) return false;
+    if (path) return !!this.db.prepare(`SELECT 1 FROM research_retention_runs r, json_each(r.plan_json,'$.candidates') c,
+      json_each(c.value,'$.files') f WHERE r.status IN ('pending','done')
+      AND json_extract(c.value,'$.taskId')=? AND json_extract(f.value,'$.path')=? LIMIT 1`).get(id,path);
+    return !!this.db.prepare(`SELECT 1 FROM research_retention_runs r, json_each(r.plan_json,'$.candidates') c
+      WHERE r.status IN ('pending','done') AND json_extract(c.value,'$.taskId')=? LIMIT 1`).get(id);
+  }
+
+  private reportSnapshot(id: string, version: number): ResearchReport {
     validId(id); integer(version,'报告版本',1,1_000_000);
     const row = this.db.prepare('SELECT r.*,t.title FROM research_reports r JOIN research_tasks t ON t.id=r.task_id WHERE r.task_id=? AND r.version=?').get(id,version);
     if (!row) throw new MemoryError('该版本的研究报告不存在。');
+    if (this.contentExpired(id,`research/${id}/${version}.md`)) throw new MemoryError('该研究报告已按30天保留规则清理；任务记录及调用用量仍保留。');
     const data = this.readFile(id,version,'md');
     if (digest(data) !== row.content_hash) throw new Error('研究报告校验失败，保留文件供检查。');
     return {id,version,title:String(row.title),abstract:String(row.abstract),keywords:JSON.parse(String(row.keywords_json)),createdAt:String(row.created_at),status:row.status as 'completed'|'partial',markdown:data.toString('utf8')};
   }
 
   reserveDelivery(conversationId: string, sourceMessageId: string, input: { id:string; version?:number; format:'txt'|'md' }): ResearchDelivery {
+    return this.transaction(() => this.reserveDeliverySnapshot(conversationId,sourceMessageId,input));
+  }
+
+  private reserveDeliverySnapshot(conversationId: string, sourceMessageId: string, input: { id:string; version?:number; format:'txt'|'md' }): ResearchDelivery {
     const task = this.authorized(conversationId,sourceMessageId,input.id);
     if (!['txt','md'].includes(input.format)) throw new MemoryError('报告文件格式须为 txt 或 md。');
     const version = input.version ?? task.reportVersion;

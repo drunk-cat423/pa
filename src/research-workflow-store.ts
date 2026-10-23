@@ -80,6 +80,10 @@ export class ResearchWorkflowStore {
   }
 
   load(id: string): ResearchWorkflow {
+    return this.transaction(() => this.loadSnapshot(id));
+  }
+
+  private loadSnapshot(id: string): ResearchWorkflow {
     taskId(id);
     const row = this.db.prepare('SELECT plan_json FROM research_workflow_plans WHERE task_id=?').get(id);
     const nextCycle = Number(this.db.prepare(`SELECT coalesce(max(cycle),0)+1 AS cycle FROM (
@@ -89,13 +93,22 @@ export class ResearchWorkflowStore {
       WHERE c.task_id=? AND c.status='succeeded' LIMIT 1`).get(id);
     if (!row) return { sections: [], nextCycle, collected };
     const plan = JSON.parse(String(row.plan_json)) as ResearchPlan;
+    // Cleanup retains version metadata. Its committed manifest, not a missing
+    // file, is the authority for identifying intentionally expired drafts.
+    const expiredFiles = new Set<string>();
+    if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_retention_runs'").get()) {
+      for (const file of this.db.prepare(`SELECT json_extract(f.value,'$.path') AS path
+        FROM research_retention_runs r, json_each(r.plan_json,'$.candidates') c, json_each(c.value,'$.files') f
+        WHERE r.status IN ('pending','done') AND json_extract(c.value,'$.taskId')=?`).all(id)) expiredFiles.add(String(file.path));
+    }
     const sections: ResearchSection[] = plan.sections.map(section => {
       const current = this.db.prepare(`SELECT s.*,v.summary,v.sources_json,v.gaps_json,v.content_hash FROM research_workflow_sections s
         LEFT JOIN research_workflow_versions v ON v.task_id=s.task_id AND v.section_id=s.section_id AND v.version=s.version
         WHERE s.task_id=? AND s.section_id=?`).get(id,section.id);
       if (!current) throw new Error('研究计划章节记录缺失。');
       let markdown = '';
-      if (Number(current.version) > 0) {
+      const contentExpired = expiredFiles.has(`research/${id}/sections/${section.id}/${Number(current.version)}.md`);
+      if (Number(current.version) > 0 && !contentExpired) {
         const bytes = this.readFile(id,section.id,Number(current.version));
         if (hash(bytes) !== current.content_hash) throw new Error('研究章节校验失败，保留文件供检查。');
         markdown = bytes.toString('utf8');
@@ -103,7 +116,8 @@ export class ResearchWorkflowStore {
       return { ...section,version:Number(current.version),status:current.status as ResearchSection['status'],markdown,
         summary:String(current.summary ?? ''),sources:JSON.parse(String(current.sources_json ?? '[]')) as string[],
         gaps:JSON.parse(String(current.gaps_json ?? '[]')) as string[],
-        ...(current.review_reason == null ? {} : {reviewReason:String(current.review_reason)}) };
+        ...(current.review_reason == null ? {} : {reviewReason:String(current.review_reason)}),
+        ...(contentExpired ? {contentExpired:true} : {}) };
     });
     return { plan,sections,nextCycle,collected };
   }

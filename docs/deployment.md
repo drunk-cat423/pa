@@ -71,7 +71,7 @@ schema26研究清单归档升级同样先停服务并创建 `before-schema-26` �
 
 schema27仅增加独立资料采集周期表；部署前快照标记 `before-schema-27`，核对全部旧表/文件未改。真实新流程验证需使用已授权的单项预算；明确从头重做时归档旧试验、新建同目标任务，不把旧材料或已失败的工具历史带入纯写作会话。
 
-轻量调研及聊天归档升级仍为schema27，无须触发清理迁移。研究材料保留工具的 `pa-research-retention.service`/`.timer` 仅以preview模式安装，每日04:45检查；不得改成run/apply。部署只切换代码、同步明确授权的预算并正常重启，不重试历史失败任务，保留私有配置/人物绑定。详见[研究清理说明](research-retention.md)。
+轻量调研及聊天归档升级仍为schema27，无须触发清理迁移。研究材料保留工具的 `pa-research-retention.service`/`.timer` 模板以preview为安全默认，每日04:45执行；服务器已于2026-10-23经明确授权通过 `actual-cleanup.conf` drop-in启用run/apply，后续部署应保留此已批准配置并核对有效ExecStart，不自动覆盖或改变模式。部署不重试历史失败任务，保留私有配置/人物绑定。详见[研究清理说明](research-retention.md)。
 
 统一使用 `/usr/local/sbin/pa-storage`，实现和 systemd 模板在 `scripts/deployment/`。完整快照只写入 `/var/backups/pa/snapshots/`；不再在 `/root/pa-*` 下另建数据副本。每份快照保存整个数据目录的 `data.tar.gz`、对应代码的 `source.tar.gz`（不含 node_modules）、私有配置和服务单元。完成校验后才写入带 SHA-256 的 `manifest.json` 并原子发布目录；`.partial-*` 和未知格式目录不参与自动删除。
 

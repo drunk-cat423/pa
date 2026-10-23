@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const DAY = 86400000;
 const TABLE = 'research_retention_runs';
+const POLICY = 'research-content-30d-v3';
 const hash = value => createHash('sha256').update(value).digest('hex');
 const fail = message => { throw new Error(message); };
 const tables = ['research_tasks', 'research_attempts', 'research_workflow_plans', 'research_workflow_cycles',
@@ -64,7 +65,7 @@ function recoveryHash(db, taskId) {
   // change its immutable research payload. These normal actions must not strand
   // a cleanup that has already committed; all execution/content state remains fenced.
   delete rows.research_deliveries;
-  delete rows.research_task_archives;
+  if (rows.research_tasks[0]?.status !== 'failed') delete rows.research_task_archives;
   return hash(JSON.stringify(rows));
 }
 
@@ -85,60 +86,68 @@ function timestamp(value) {
 function buildPlan(db, root, identity, now) {
   const createdAt = now.toISOString(), cutoff = now.getTime() - 30 * DAY;
   const candidates = [], skipped = [];
-  const done = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(TABLE)
-    ? db.prepare(`SELECT plan_json,status FROM ${TABLE}`).all().flatMap(row => JSON.parse(row.plan_json).candidates.map(c => [c.taskId, row.status])) : [];
-  const cleaned = new Map(done);
+  const runs = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(TABLE)
+    ? db.prepare(`SELECT plan_json,status FROM ${TABLE}`).all().map(row => ({ ...row, plan:JSON.parse(row.plan_json) })) : [];
   for (const task of db.prepare('SELECT * FROM research_tasks ORDER BY id').all()) {
     const skip = reason => skipped.push({ taskId: task.id, reason });
     if (!/^R[0-9a-f]{32}$/.test(task.id)) { skip('invalid_task_id'); continue; }
-    if (cleaned.has(task.id)) { skip(cleaned.get(task.id) === 'done' ? 'already_cleaned' : 'cleanup_pending'); continue; }
-    if (task.status !== 'completed') { skip('unfinished_protected'); continue; }
+    const prior = runs.filter(run => run.plan.candidates.some(c => c.taskId === task.id));
+    if (prior.some(run => run.status === 'pending')) { skip('cleanup_pending'); continue; }
+    if (prior.some(run => run.plan.policy === POLICY)) { skip('already_cleaned'); continue; }
     const rows = records(db, task.id);
-    if (rows.research_workflow_plans.length !== 1) { skip('legacy_without_fixed_plan_protected'); continue; }
+    const archivedFailure = task.status === 'failed' && rows.research_task_archives.length === 1;
+    if (task.status !== 'completed' && !archivedFailure) { skip('unfinished_protected'); continue; }
     if (rows.research_workflow_cycles.some(r => r.status === 'running') || rows.research_collection_cycles.some(r => r.status === 'running')
       || rows.research_attempts.some(r => r.status === 'running' || r.status === 'queued')
       || rows.research_deliveries.some(r => r.status === 'sending')) { skip('active_work_protected'); continue; }
     let eligibleSince;
     try {
-      const completed = rows.research_attempts.find(r => r.attempt === task.attempt && r.status === 'completed');
+      const completed = rows.research_attempts.find(r => r.attempt === task.attempt && r.status === task.status);
       if (!completed) throw new Error('missing completed attempt');
-      eligibleSince = new Date(Math.max(timestamp(task.updated_at), timestamp(completed.updated_at),
-        ...rows.research_task_archives.map(r => timestamp(r.created_at)))).toISOString();
+      eligibleSince = archivedFailure ? new Date(timestamp(rows.research_task_archives[0].created_at)).toISOString()
+        : new Date(Math.max(timestamp(task.updated_at), timestamp(completed.updated_at))).toISOString();
     } catch { skip('invalid_completion_time'); continue; }
     if (Date.parse(eligibleSince) > cutoff) { skip('retention_30_days'); continue; }
     try {
       const reportRows = rows.research_reports;
-      if (!reportRows.length || !reportRows.some(r => r.version === task.latest_version && r.status === 'completed')) throw new Error('missing final report');
-      const protectedFiles = [];
+      if (!archivedFailure && (!reportRows.length || !reportRows.some(r => r.version === task.latest_version && r.status === 'completed'))) throw new Error('missing final report');
+      if (task.latest_version !== null && !reportRows.some(r => r.version === task.latest_version)) throw new Error('missing latest report');
+      const protectedFiles = [], files = [];
+      // Previous policies removed only some artifacts. Accept missing files only
+      // when an already completed, immutable cleanup manifest records their hash.
+      const removed = new Map(prior.flatMap(run => run.plan.candidates.filter(c => c.taskId === task.id).flatMap(c => c.files)).map(file => [file.path,file.sha256]));
+      const addFile = (path, expectedHash) => {
+        if (removed.get(path) === expectedHash && !inspect(join(root,path),true)) return;
+        files.push(fileInfo(root,path,expectedHash));
+      };
       for (const report of reportRows) {
         if (!Number.isSafeInteger(report.version) || report.version < 1) throw new Error('invalid report version');
-        for (const ext of ['md','txt']) protectedFiles.push(fileInfo(root, `research/${task.id}/${report.version}.${ext}`, report.content_hash));
+        for (const ext of ['md','txt']) addFile(`research/${task.id}/${report.version}.${ext}`, report.content_hash);
       }
       const sections = rows.research_workflow_sections;
-      const plan = JSON.parse(rows.research_workflow_plans[0].plan_json);
-      if (!Array.isArray(plan.sections) || plan.sections.length !== sections.length || !sections.length
-        || plan.sections.some(s => !sections.some(r => r.section_id === s.id))) throw new Error('invalid sections');
-      const files = [];
+      const plan = rows.research_workflow_plans.length ? JSON.parse(rows.research_workflow_plans[0].plan_json) : undefined;
+      if (plan ? !Array.isArray(plan.sections) || plan.sections.length !== sections.length || !sections.length
+        || plan.sections.some(s => !sections.some(r => r.section_id === s.id)) : sections.length > 0) throw new Error('invalid sections');
       for (const section of sections) {
-        if (!/^s[1-8]$/.test(section.section_id) || section.version < 1) throw new Error('invalid section');
+        if (!/^s[1-8]$/.test(section.section_id) || !Number.isSafeInteger(section.version) || section.version < 0
+          || (!archivedFailure && section.version < 1)) throw new Error('invalid section');
         const versions = rows.research_workflow_versions.filter(v => v.section_id === section.section_id);
-        if (!versions.some(v => v.version === section.version)) throw new Error('missing current version');
+        if (section.version > 0 && !versions.some(v => v.version === section.version)) throw new Error('missing current version');
         for (const version of versions) {
           if (!Number.isSafeInteger(version.version) || version.version < 1) throw new Error('invalid version');
-          const file = fileInfo(root, `research/${task.id}/sections/${section.section_id}/${version.version}.md`, version.content_hash);
-          (version.version === section.version ? protectedFiles : files).push(file);
+          addFile(`research/${task.id}/sections/${section.section_id}/${version.version}.md`, version.content_hash);
         }
       }
       const databasePayloadBytes = rows.research_evidence.reduce((n, r) => n + Buffer.byteLength(r.evidence_json), 0)
         + rows.research_workflow_cycles.reduce((n, r) => n + Buffer.byteLength(r.input_json), 0)
         + rows.research_collection_cycles.reduce((n, r) => n + Buffer.byteLength(r.input_json) + Buffer.byteLength(r.result_json ?? ''), 0);
-      candidates.push({ taskId: task.id, eligibleSince, rowsHash: hash(JSON.stringify(rows)), files, protectedFiles,
+      candidates.push({ taskId: task.id, cleanupKind: archivedFailure ? 'archived_failure' : 'completed', eligibleSince, rowsHash: hash(JSON.stringify(rows)), files, protectedFiles,
         evidenceCount: rows.research_evidence.length,
         snapshotCount: rows.research_workflow_cycles.length + rows.research_collection_cycles.length,
         databasePayloadBytes, fileBytes: files.reduce((n, f) => n + f.bytes, 0) });
     } catch { skip('missing_or_unsafe_artifacts'); }
   }
-  return { version: 1, dataDir: root, database: identity, createdAt, retainDays: 30, candidates, skipped };
+  return { version: 1, policy: POLICY, dataDir: root, database: identity, createdAt, retainDays: 30, candidates, skipped };
 }
 
 /** Read-only: no application Store initialization, schema migration, or audit writes. */
@@ -152,7 +161,12 @@ export function previewResearchCleanup(dataDir, { now = new Date() } = {}) {
   } finally { db.close(); }
 }
 
-function tombstone(value, cleanupId) {
+function tombstone(value, cleanupId, priorCleanupIds) {
+  try {
+    const previous = JSON.parse(value);
+    if (previous.retained === false && priorCleanupIds.has(previous.cleanupId)
+      && /^[0-9a-f]{64}$/.test(previous.sha256) && Number.isSafeInteger(previous.bytes)) return value;
+  } catch {}
   return JSON.stringify({ retained: false, cleanupId, sha256: hash(value), bytes: Buffer.byteLength(value) });
 }
 
@@ -161,8 +175,8 @@ function validatePendingFiles(root, plan, allowMissing) {
     if (!/^R[0-9a-f]{32}$/.test(candidate.taskId)) fail('清理任务编号无效。');
     for (const file of candidate.protectedFiles) fileInfo(root, file.path, file.sha256);
     for (const file of candidate.files) {
-      const prefix = `research/${candidate.taskId}/sections/`;
-      if (!file.path.startsWith(prefix) || !/^s[1-8]\/[1-9][0-9]*\.md$/.test(file.path.slice(prefix.length))) fail('清理文件路径越界。');
+      const prefix = `research/${candidate.taskId}/`;
+      if (!file.path.startsWith(prefix) || !/^(?:sections\/s[1-8]\/[1-9][0-9]*\.md|[1-9][0-9]*\.(?:md|txt))$/.test(file.path.slice(prefix.length))) fail('清理文件路径越界。');
       if (!inspect(join(root, file.path), allowMissing)) continue;
       fileInfo(root, file.path, file.sha256);
     }
@@ -196,15 +210,17 @@ export function applyResearchCleanup(dataDir, plan, { now = new Date(), afterCom
           status TEXT NOT NULL CHECK(status IN ('pending','done')), created_at TEXT NOT NULL, completed_at TEXT);`);
         for (const candidate of actual.candidates) {
           const id = candidate.taskId;
+          const priorCleanupIds = new Set(db.prepare(`SELECT r.id FROM ${TABLE} r, json_each(r.plan_json,'$.candidates') c
+            WHERE r.status='done' AND json_extract(c.value,'$.taskId')=?`).all(id).map(row => row.id));
           for (const row of db.prepare('SELECT * FROM research_evidence WHERE task_id=?').all(id)) {
             db.prepare('UPDATE research_evidence SET evidence_json=? WHERE task_id=? AND attempt=? AND ordinal=?')
-              .run(tombstone(row.evidence_json, cleanupId), id, row.attempt, row.ordinal);
+              .run(tombstone(row.evidence_json, cleanupId, priorCleanupIds), id, row.attempt, row.ordinal);
           }
           for (const table of ['research_workflow_cycles','research_collection_cycles']) {
             for (const row of db.prepare(`SELECT * FROM ${table} WHERE task_id=?`).all(id)) {
-              db.prepare(`UPDATE ${table} SET input_json=? WHERE task_id=? AND cycle=?`).run(tombstone(row.input_json, cleanupId), id, row.cycle);
+              db.prepare(`UPDATE ${table} SET input_json=? WHERE task_id=? AND cycle=?`).run(tombstone(row.input_json, cleanupId, priorCleanupIds), id, row.cycle);
               if (table === 'research_collection_cycles' && row.result_json !== null) {
-                db.prepare(`UPDATE ${table} SET result_json=? WHERE task_id=? AND cycle=?`).run(tombstone(row.result_json, cleanupId), id, row.cycle);
+                db.prepare(`UPDATE ${table} SET result_json=? WHERE task_id=? AND cycle=?`).run(tombstone(row.result_json, cleanupId, priorCleanupIds), id, row.cycle);
               }
             }
           }

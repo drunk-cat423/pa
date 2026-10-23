@@ -6,6 +6,7 @@ export type ResearchSectionStatus = 'pending' | 'draft' | 'written' | 'approved'
 export interface ResearchSection extends ResearchPlanSection {
   version: number; status: ResearchSectionStatus; markdown: string; summary: string; sources: string[]; gaps: string[];
   reviewReason?: string;
+  contentExpired?: boolean;
 }
 export interface ResearchWorkflow { plan?: ResearchPlan; sections: ResearchSection[]; nextCycle: number; collected: boolean }
 export interface ResearchCollectionInput { reason: 'complete' | 'budget'; note: string }

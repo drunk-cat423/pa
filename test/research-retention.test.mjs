@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -11,6 +11,31 @@ import { ConversationStore } from '../dist/store.js';
 const hash = value => createHash('sha256').update(value).digest('hex');
 const budget = { maxModelCalls:12,maxToolCalls:24,maxSearchCalls:6 };
 const plan = { version:1,sections:[{id:'s1',title:'证据',objective:'核对原文',acceptance:'结论有来源'}] };
+const retentionTables = ['research_tasks','research_attempts','research_workflow_plans','research_workflow_cycles',
+  'research_collection_cycles','research_workflow_sections','research_workflow_versions','research_workflow_reviews',
+  'research_reports','research_deliveries','research_evidence','research_task_archives'];
+
+function retentionRecoveryHash(db, taskId) {
+  const rows = Object.fromEntries(retentionTables.map(table=>[
+    table,db.prepare(`SELECT * FROM ${table} WHERE ${table==='research_tasks'?'id':'task_id'}=? ORDER BY rowid`).all(taskId)
+  ]));
+  delete rows.research_deliveries;
+  if (rows.research_tasks[0]?.status !== 'failed') delete rows.research_task_archives;
+  return hash(JSON.stringify(rows));
+}
+
+function retentionTombstones(db, taskId) {
+  const fields = {research_evidence:['evidence_json'],research_workflow_cycles:['input_json'],
+    research_collection_cycles:['input_json','result_json']}, result = [];
+  for (const [table,columns] of Object.entries(fields)) for (const column of columns) {
+    for (const row of db.prepare(`SELECT rowid,* FROM ${table} WHERE task_id=? ORDER BY rowid`).all(taskId)) {
+      if (row[column] !== null && JSON.parse(row[column]).retained === false) {
+        result.push({table,rowid:row.rowid,column,value:row[column]});
+      }
+    }
+  }
+  return result;
+}
 
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(),'pa-research-retention-')), path = join(directory,'pa.sqlite');
@@ -72,7 +97,7 @@ function files(root) {
   return result;
 }
 
-test('preview is read-only and applies the exact 30-day boundary plus protections', t => {
+test('preview is read-only and expires completed content from completion time at the exact 30-day boundary', t => {
   const f = fixture(t), now = new Date('2026-10-23T00:00:00.000Z');
   const boundary = f.complete('boundary',{at:'2026-09-23T00:00:00.000Z'});
   const recentlyArchived = f.complete('recent-archive',{at:'2026-09-01T00:00:00.000Z',archivedAt:'2026-09-24T00:00:00.000Z'});
@@ -86,20 +111,22 @@ test('preview is read-only and applies the exact 30-day boundary plus protection
   assert.equal(hash(readFileSync(f.path)),dbHash);
   assert.deepEqual(Object.fromEntries(Object.entries(files(f.directory)).filter(([path])=>path.startsWith('research/'))),beforeFiles);
   assert.equal(f.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_retention_runs'").get(),undefined);
-  assert.deepEqual(result.candidates.map(row=>row.taskId),[boundary.id]);
-  assert.equal(result.candidates[0].eligibleSince,'2026-09-23T00:00:00.000Z');
-  assert.equal(result.candidates[0].protectedFiles.length,3);
-  assert.equal(result.candidates[0].files.length,1);
-  assert.ok(result.skipped.some(row=>row.taskId===recentlyArchived.id && row.reason==='retention_30_days'));
+  assert.deepEqual(new Set(result.candidates.map(row=>row.taskId)),new Set([boundary.id,recentlyArchived.id,legacy.id]));
+  const boundaryCandidate = result.candidates.find(row=>row.taskId===boundary.id);
+  const recentArchiveCandidate = result.candidates.find(row=>row.taskId===recentlyArchived.id);
+  const legacyCandidate = result.candidates.find(row=>row.taskId===legacy.id);
+  assert.equal(boundaryCandidate.eligibleSince,'2026-09-23T00:00:00.000Z');
+  assert.equal(boundaryCandidate.protectedFiles.length,0);
+  assert.equal(boundaryCandidate.files.length,4);
+  assert.equal(recentArchiveCandidate.eligibleSince,'2026-09-01T00:00:00.000Z');
+  assert.equal(legacyCandidate.files.length,2);
   assert.ok(result.skipped.some(row=>row.taskId===partial.id && row.reason==='unfinished_protected'));
-  assert.ok(result.skipped.some(row=>row.taskId===legacy.id && row.reason==='legacy_without_fixed_plan_protected'));
 });
 
-test('apply tombstones database payloads, removes only old section versions, preserves reports and current files', t => {
+test('apply tombstones database payloads and removes all completed reports and section versions', t => {
   const f = fixture(t), task = f.complete('apply',{archived:false});
   const root = join(f.directory,'research',task.id), report = join(root,'1.md');
-  const reportHash = hash(readFileSync(report));
-  const current = join(root,'sections','s1','2.md'), currentHash = hash(readFileSync(current));
+  const current = join(root,'sections','s1','2.md');
   const oldSection = join(root,'sections','s1','1.md');
   const orphanSection = join(root,'sections','s1','orphan.md');
   writeFileSync(orphanSection,'无版本元数据的孤儿文件');
@@ -110,9 +137,11 @@ test('apply tombstones database payloads, removes only old section versions, pre
   assert.equal(result.status,'done');
   assert.equal(existsSync(oldSection),false);
   assert.equal(readFileSync(orphanSection,'utf8'),'无版本元数据的孤儿文件');
-  assert.equal(hash(readFileSync(report)),reportHash);
-  assert.equal(hash(readFileSync(join(root,'1.txt'))),reportHash);
-  assert.equal(hash(readFileSync(current)),currentHash);
+  assert.equal(existsSync(report),false);
+  assert.equal(existsSync(join(root,'1.txt')),false);
+  assert.equal(existsSync(current),false);
+  assert.equal(existsSync(oldSection),false);
+  assert.equal(f.store.research.workflow.load(task.id).sections[0].contentExpired,true);
   const evidence = f.db.prepare('SELECT evidence_json FROM research_evidence WHERE task_id=?').get(task.id).evidence_json;
   const tombstone = JSON.parse(evidence);
   assert.equal(tombstone.retained,false);
@@ -123,10 +152,34 @@ test('apply tombstones database payloads, removes only old section versions, pre
   assert.equal(f.db.prepare('SELECT count(*) n FROM research_workflow_versions WHERE task_id=?').get(task.id).n,2);
 });
 
-test('apply preserves messages and person records plus archived partial, failed, queued, and running tasks', t => {
+test('expired legacy completed content is reported as cleaned and cannot be read, sent, or retried', t => {
+  const f = fixture(t), task = f.complete('expired-legacy',{withPlan:false,archived:false,at:'2026-09-01T00:00:00.000Z'});
+  f.db.prepare('UPDATE research_attempts SET usage_json=? WHERE task_id=? AND attempt=1')
+    .run(JSON.stringify({modelCalls:2,toolCalls:1,searchCalls:1}),task.id);
+  const now = new Date('2026-10-23T00:00:00.000Z'), cleanupPlan = previewResearchCleanup(f.directory,{now});
+  assert.deepEqual(cleanupPlan.candidates.map(row=>row.taskId),[task.id]);
+  applyResearchCleanup(f.directory,cleanupPlan,{now});
+
+  const savedTask = f.db.prepare('SELECT status,reason,latest_version FROM research_tasks WHERE id=?').get(task.id);
+  assert.equal(savedTask.status,'completed');
+  assert.equal(savedTask.reason,null);
+  assert.equal(savedTask.latest_version,1);
+  assert.deepEqual(JSON.parse(f.db.prepare('SELECT usage_json FROM research_attempts WHERE task_id=?').get(task.id).usage_json),
+    {modelCalls:2,toolCalls:1,searchCalls:1});
+  assert.equal(f.store.externalMessage(f.conversation.id,'event-1').text,'调研资料整理');
+  assert.throws(()=>f.store.research.read(f.conversation.id,f.source.id,{id:task.id}),/清理/);
+  assert.throws(()=>f.store.research.report(task.id,1),/清理/);
+  const deliveryCount = f.db.prepare('SELECT count(*) n FROM research_deliveries WHERE task_id=?').get(task.id).n;
+  assert.throws(()=>f.store.research.reserveDelivery(f.conversation.id,f.source.id,{id:task.id,format:'md'}),/清理/);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM research_deliveries WHERE task_id=?').get(task.id).n,deliveryCount);
+  assert.throws(()=>f.store.research.retry(f.conversation.id,f.source.id,{id:task.id,key:'retry-after-expiry'}),/清理/);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM research_attempts WHERE task_id=?').get(task.id).n,1);
+});
+
+test('apply preserves messages and person records plus partial, unarchived failed, queued, and running tasks', t => {
   const f = fixture(t), task = f.complete('only-complete-candidate',{archived:false});
   const partial = f.complete('partial-protected',{status:'partial'});
-  const failed = f.complete('failed-protected',{status:'failed'});
+  const failed = f.complete('failed-protected',{status:'failed',archived:false});
   const queued = f.create('queued-protected');
   f.store.research.archive(f.conversation.id,f.source.id,{ids:[queued.id],reason:'归档排队任务'});
   const running = f.create('running-protected');
@@ -151,9 +204,72 @@ test('apply preserves messages and person records plus archived partial, failed,
   assert.equal(f.store.research.get(running.id).status,'running');
 });
 
+test('failed cleanup eligibility uses archive age, including tasks without a plan or report', t => {
+  const f = fixture(t), now = new Date('2026-10-23T00:00:00.000Z');
+  const oldFailure = f.complete('old-failure',{status:'failed',withPlan:false,at:'2026-10-20T00:00:00.000Z',archivedAt:'2026-09-23T00:00:00.000Z'});
+  const recentFailure = f.complete('recent-failure',{status:'failed',withPlan:false,at:'2026-08-01T00:00:00.000Z',archivedAt:'2026-09-24T00:00:00.000Z'});
+  const unarchivedFailure = f.complete('unarchived-failure',{status:'failed',withPlan:false,archived:false,at:'2026-08-01T00:00:00.000Z'});
+
+  const result = previewResearchCleanup(f.directory,{now});
+
+  assert.deepEqual(result.candidates.map(row=>row.taskId),[oldFailure.id]);
+  assert.equal(result.candidates[0].eligibleSince,'2026-09-23T00:00:00.000Z');
+  assert.ok(result.skipped.some(row=>row.taskId===recentFailure.id && row.reason==='retention_30_days'));
+  assert.ok(result.skipped.some(row=>row.taskId===unarchivedFailure.id && row.reason==='unfinished_protected'));
+});
+
+test('failed archived cleanup keeps causes and usage, and expires reports and every versioned draft', t => {
+  const f = fixture(t), task = f.complete('failed-artifacts',{status:'failed'}), now = new Date('2026-10-23T00:00:00.000Z');
+  const root = join(f.directory,'research',task.id), draft = join(root,'sections','s1','1.md');
+  const currentDraft = join(root,'sections','s1','2.md');
+  const reportText = '# 保留的历史报告\n\n失败前已保存的报告。';
+  const reportHash = hash(reportText);
+  writeFileSync(join(root,'1.md'),reportText); writeFileSync(join(root,'1.txt'),reportText);
+  f.db.prepare(`INSERT INTO research_reports(task_id,version,attempt,status,abstract,keywords_json,content_hash,created_at)
+    VALUES(?,1,1,'partial','保留的报告摘要','["资料"]',?,?)`).run(task.id,reportHash,task.updatedAt);
+
+  const planResult = previewResearchCleanup(f.directory,{now});
+  assert.deepEqual(planResult.candidates.map(row=>row.taskId),[task.id]);
+  assert.equal(planResult.candidates[0].files.length,4);
+  assert.equal(planResult.candidates[0].protectedFiles.length,0);
+  assert.throws(()=>applyResearchCleanup(f.directory,planResult,{now,afterCommit(){throw new Error('failed-task cleanup crash');}}),/failed-task cleanup crash/);
+  assert.equal(existsSync(currentDraft),true);
+  assert.equal(f.store.research.workflow.load(task.id).sections[0].contentExpired,true);
+  assert.match(f.store.research.read(f.conversation.id,f.source.id,{id:task.id,draft:true}).text,/清理/);
+  const cleanup = applyResearchCleanup(f.directory,planResult,{now});
+
+  assert.equal(cleanup.status,'done');
+  assert.equal(existsSync(draft),false);
+  assert.equal(existsSync(currentDraft),false);
+  assert.equal(existsSync(join(root,'1.md')),false);
+  assert.equal(existsSync(join(root,'1.txt')),false);
+  assert.equal(f.db.prepare('SELECT reason FROM research_tasks WHERE id=?').get(task.id).reason,'保留未完成研究');
+  assert.deepEqual(JSON.parse(f.db.prepare('SELECT usage_json FROM research_attempts WHERE task_id=?').get(task.id).usage_json),
+    {modelCalls:2,toolCalls:1,searchCalls:1});
+  assert.equal(f.db.prepare('SELECT count(*) n FROM research_reports WHERE task_id=?').get(task.id).n,1);
+  assert.equal(f.store.externalMessage(f.conversation.id,`event-1`).text,'调研资料整理');
+
+  const workflow = f.store.research.workflow.load(task.id);
+  assert.equal(workflow.sections[0].version,2);
+  assert.equal(workflow.sections[0].contentExpired,true);
+  const draftResult = f.store.research.read(f.conversation.id,f.source.id,{id:task.id,draft:true});
+  assert.match(draftResult.text,/清理|已过期/);
+  assert.doesNotMatch(draftResult.text,/ENOENT|no such file/i);
+
+  const resumed = runResearchCleanup(f.directory,{now});
+  assert.equal(resumed.result.status,'empty');
+  assert.equal(applyResearchCleanup(f.directory,planResult,{now}).repeated,true);
+});
+
 test('stale database state, tampered plans, and changed file hashes are rejected without deleting artifacts', t => {
   const f = fixture(t), stale = f.complete('stale');
   const stalePlan = previewResearchCleanup(f.directory,{now:new Date('2026-10-23T00:00:00.000Z')});
+  const legacyPreview = structuredClone(stalePlan);
+  delete legacyPreview.policy;
+  for (const candidate of legacyPreview.candidates) delete candidate.cleanupKind;
+  assert.throws(()=>applyResearchCleanup(f.directory,legacyPreview,{now:new Date('2026-10-23T00:00:00.000Z')}),/计划|协议|修改/);
+  assert.ok(existsSync(join(f.directory,'research',stale.id,'sections','s1','1.md')));
+  assert.equal(f.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_retention_runs'").get(),undefined);
   f.db.prepare("UPDATE research_tasks SET reason='changed after preview' WHERE id=?").run(stale.id);
   assert.throws(()=>applyResearchCleanup(f.directory,stalePlan,{now:new Date('2026-10-23T00:00:00.000Z')}),/过期|修改/);
   assert.ok(existsSync(join(f.directory,'research',stale.id,'sections','s1','1.md')));
@@ -184,6 +300,55 @@ test('committed cleanup resumes after a post-commit crash and repeated apply is 
   const repeated = applyResearchCleanup(f.directory,planResult,{now});
   assert.equal(repeated.status,'done');
   assert.equal(repeated.repeated,true);
+});
+
+test('a committed legacy v1 pending plan resumes by its manifest, then v3 expires remaining content', t => {
+  const f = fixture(t), task = f.complete('legacy-pending'), now = new Date('2026-10-23T00:00:00.000Z');
+  const currentPlan = previewResearchCleanup(f.directory,{now});
+  assert.throws(()=>applyResearchCleanup(f.directory,currentPlan,{now,afterCommit(){throw new Error('pause after commit');}}),/pause after commit/);
+
+  const legacyPlan = structuredClone(currentPlan);
+  delete legacyPlan.policy;
+  for (const candidate of legacyPlan.candidates) {
+    delete candidate.cleanupKind;
+    candidate.protectedFiles = [...candidate.protectedFiles,...candidate.files.filter(file=>!file.path.endsWith('/sections/s1/1.md'))];
+    candidate.files = candidate.files.filter(file=>file.path.endsWith('/sections/s1/1.md'));
+  }
+  const legacyJson = JSON.stringify(legacyPlan), legacyId = hash(legacyJson);
+  for (const [table,column] of [['research_evidence','evidence_json'],['research_workflow_cycles','input_json'],
+    ['research_collection_cycles','input_json'],['research_collection_cycles','result_json']]) {
+    for (const row of f.db.prepare(`SELECT rowid,${column} value FROM ${table} WHERE task_id=?`).all(task.id)) {
+      if (row.value === null) continue;
+      const value = JSON.parse(row.value);
+      if (value.retained === false) {
+        value.cleanupId = legacyId;
+        f.db.prepare(`UPDATE ${table} SET ${column}=? WHERE rowid=?`).run(JSON.stringify(value),row.rowid);
+      }
+    }
+  }
+  const legacyTombstones = retentionTombstones(f.db,task.id);
+  assert.ok(legacyTombstones.length > 0);
+  assert.ok(legacyTombstones.every(row=>JSON.parse(row.value).cleanupId===legacyId));
+  f.db.prepare('UPDATE research_retention_runs SET id=?,plan_json=?,post_hashes_json=?')
+    .run(legacyId,legacyJson,JSON.stringify({[task.id]:retentionRecoveryHash(f.db,task.id)}));
+
+  const recovered = applyResearchCleanup(f.directory,legacyPlan,{now});
+
+  assert.equal(recovered.status,'done');
+  assert.equal(recovered.cleanupId,legacyId);
+  assert.equal(existsSync(join(f.directory,'research',task.id,'sections','s1','1.md')),false);
+  assert.equal(existsSync(join(f.directory,'research',task.id,'sections','s1','2.md')),true);
+  assert.equal(existsSync(join(f.directory,'research',task.id,'1.md')),true);
+  assert.equal(f.db.prepare('SELECT status FROM research_retention_runs WHERE id=?').get(legacyId).status,'done');
+
+  const upgraded = previewResearchCleanup(f.directory,{now});
+  assert.deepEqual(upgraded.candidates.map(row=>row.taskId),[task.id]);
+  assert.ok(upgraded.candidates[0].files.some(file=>file.path===`research/${task.id}/sections/s1/2.md`));
+  assert.ok(upgraded.candidates[0].files.some(file=>file.path===`research/${task.id}/1.md`));
+  assert.equal(applyResearchCleanup(f.directory,upgraded,{now}).status,'done');
+  assert.deepEqual(retentionTombstones(f.db,task.id),legacyTombstones);
+  assert.equal(existsSync(join(f.directory,'research',task.id,'sections','s1','2.md')),false);
+  assert.equal(existsSync(join(f.directory,'research',task.id,'1.md')),false);
 });
 
 test('pending cleanup rejects a changed old file without deleting the changed bytes', t => {
@@ -218,7 +383,7 @@ test('pending cleanup rejects a symlink or junction replacing a section parent a
   assert.equal(f.db.prepare('SELECT status FROM research_retention_runs').get().status,'pending');
 });
 
-test('future preview plans and changed protected report or current files are rejected before any write', t => {
+test('future preview plans and changed report or current files are rejected before any write', t => {
   for (const kind of ['future','report','current-section']) {
     const f = fixture(t), task = f.complete(`protected-${kind}`), previewAt = new Date('2026-10-23T00:00:00.000Z');
     const cleanupPlan = previewResearchCleanup(f.directory,{now:kind==='future'
@@ -255,26 +420,24 @@ test('an unarchived completed task remains eligible and database failures roll b
   assert.equal(existsSync(oldSection),true);
 });
 
-test('pending cleanup resumes after a local report delivery and scheduled run cleans the frozen candidate', t => {
+test('pending cleanup blocks new report delivery after commit and resumes without a receipt', t => {
   const f = fixture(t), task = f.complete('delivery-during-recovery'), now = new Date('2026-10-23T00:00:00.000Z');
   const cleanupPlan = previewResearchCleanup(f.directory,{now});
   const reportPath = join(f.directory,'research',task.id,'1.md');
-  const reportHash = hash(readFileSync(reportPath));
   assert.throws(()=>applyResearchCleanup(f.directory,cleanupPlan,{now,afterCommit(){throw new Error('pause after commit');}}),/pause after commit/);
 
-  const reservation = f.store.research.reserveDelivery(f.conversation.id,f.source.id,{id:task.id,format:'md'});
-  assert.equal(reservation.shouldSend,true);
-  f.store.research.finishDelivery(reservation.deliveryId,'sent','local-test-delivery');
-  assert.equal(f.db.prepare('SELECT status FROM research_deliveries WHERE id=?').get(reservation.deliveryId).status,'sent');
-  assert.equal(hash(readFileSync(reportPath)),reportHash);
+  assert.throws(()=>f.store.research.reserveDelivery(f.conversation.id,f.source.id,{id:task.id,format:'md'}),/清理/);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM research_deliveries WHERE task_id=?').get(task.id).n,0);
 
   const run = runResearchCleanup(f.directory,{now});
 
   assert.equal(run.resumed.length,1);
   assert.equal(run.resumed[0].status,'done');
   assert.equal(run.result.status,'empty');
-  assert.equal(hash(readFileSync(reportPath)),reportHash);
-  assert.equal(hash(readFileSync(join(f.directory,'research',task.id,'1.txt'))),reportHash);
+  assert.equal(existsSync(reportPath),false);
+  assert.equal(existsSync(join(f.directory,'research',task.id,'1.txt')),false);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM research_deliveries WHERE task_id=?').get(task.id).n,0);
   assert.equal(existsSync(join(f.directory,'research',task.id,'sections','s1','1.md')),false);
+  assert.equal(existsSync(join(f.directory,'research',task.id,'sections','s1','2.md')),false);
   assert.equal(f.db.prepare('SELECT status FROM research_retention_runs').get().status,'done');
 });
