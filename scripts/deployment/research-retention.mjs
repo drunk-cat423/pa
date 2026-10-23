@@ -3,10 +3,11 @@ import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, unlinkSync } f
 import { dirname, join, parse, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { researchEvidence, validateResearchEvidence } from './research-retention-evidence.mjs';
 
 const DAY = 86400000;
 const TABLE = 'research_retention_runs';
-const POLICY = 'research-content-30d-v3';
+const POLICY = 'research-content-and-evidence-30d-v4';
 const hash = value => createHash('sha256').update(value).digest('hex');
 const fail = message => { throw new Error(message); };
 const tables = ['research_tasks', 'research_attempts', 'research_workflow_plans', 'research_workflow_cycles',
@@ -69,9 +70,9 @@ function recoveryHash(db, taskId) {
   return hash(JSON.stringify(rows));
 }
 
-function fileInfo(root, path, expectedHash) {
+function fileInfo(root, path, expectedHash, maxBytes = 2_000_000) {
   const stat = inspect(join(root, path));
-  if (!stat.isFile() || stat.nlink !== 1 || stat.size > 2_000_000) fail('研究文件不是独立常规文件或超过容量。');
+  if (!stat.isFile() || stat.nlink !== 1 || stat.size > maxBytes) fail('研究文件不是独立常规文件或超过容量。');
   const sha256 = hash(readFileSync(join(root, path)));
   if (sha256 !== expectedHash) fail('研究文件哈希与数据库不一致。');
   return { path, sha256, bytes: stat.size };
@@ -81,6 +82,11 @@ function timestamp(value) {
   const time = Date.parse(value);
   if (!Number.isFinite(time) || new Date(time).toISOString() !== value) fail('研究保留时间无效。');
   return time;
+}
+
+function ordinarySessions(db, root) {
+  return new Set(db.prepare(`SELECT pi_session_file FROM conversations UNION SELECT pi_session_file FROM agent_runs
+    WHERE pi_session_file IS NOT NULL`).all().map(row=>resolve(root,String(row.pi_session_file))));
 }
 
 function buildPlan(db, root, identity, now) {
@@ -141,7 +147,16 @@ function buildPlan(db, root, identity, now) {
       const databasePayloadBytes = rows.research_evidence.reduce((n, r) => n + Buffer.byteLength(r.evidence_json), 0)
         + rows.research_workflow_cycles.reduce((n, r) => n + Buffer.byteLength(r.input_json), 0)
         + rows.research_collection_cycles.reduce((n, r) => n + Buffer.byteLength(r.input_json) + Buffer.byteLength(r.result_json ?? ''), 0);
+      const evidence = researchEvidence(root,task,rows,removed), ordinary = ordinarySessions(db,root);
+      // A transient session lock must not become a permanently skipped artifact
+      // in an otherwise completed cleanup. Reconsider the task on a later run.
+      if (evidence.excluded.some(item=>item.reason === 'session_locked')) { skip('active_research_session'); continue; }
+      for (const file of evidence.files) {
+        if (file.kind === 'pi_session' && ordinary.has(resolve(root,file.path))) evidence.excluded.push({path:file.path,reason:'ordinary_session_protected'});
+        else files.push(file);
+      }
       candidates.push({ taskId: task.id, cleanupKind: archivedFailure ? 'archived_failure' : 'completed', eligibleSince, rowsHash: hash(JSON.stringify(rows)), files, protectedFiles,
+        evidence:{diagnostics:evidence.diagnostics,excluded:evidence.excluded},
         evidenceCount: rows.research_evidence.length,
         snapshotCount: rows.research_workflow_cycles.length + rows.research_collection_cycles.length,
         databasePayloadBytes, fileBytes: files.reduce((n, f) => n + f.bytes, 0) });
@@ -170,16 +185,24 @@ function tombstone(value, cleanupId, priorCleanupIds) {
   return JSON.stringify({ retained: false, cleanupId, sha256: hash(value), bytes: Buffer.byteLength(value) });
 }
 
-function validatePendingFiles(root, plan, allowMissing) {
+function validatePendingFiles(db, root, plan, allowMissing) {
   for (const candidate of plan.candidates) {
     if (!/^R[0-9a-f]{32}$/.test(candidate.taskId)) fail('清理任务编号无效。');
     for (const file of candidate.protectedFiles) fileInfo(root, file.path, file.sha256);
     for (const file of candidate.files) {
       const prefix = `research/${candidate.taskId}/`;
-      if (!file.path.startsWith(prefix) || !/^(?:sections\/s[1-8]\/[1-9][0-9]*\.md|[1-9][0-9]*\.(?:md|txt))$/.test(file.path.slice(prefix.length))) fail('清理文件路径越界。');
+      const researchFile = file.path.startsWith(prefix) && /^(?:sections\/s[1-8]\/[1-9][0-9]*\.md|[1-9][0-9]*\.(?:md|txt))$/.test(file.path.slice(prefix.length));
+      const diagnosticFile = candidate.evidence && file.kind === 'diagnostic' && candidate.evidence.diagnostics?.callIds.includes(file.callId)
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(file.callId)
+        && ['request','response','input'].includes(file.artifact) && file.path === `diagnostics/calls/${file.callId}/${file.artifact}.json`;
+      const sessionFile = candidate.evidence && file.kind === 'pi_session'
+        && new RegExp(`^research:${candidate.taskId}:[1-9][0-9]*(?::cycle:[1-9][0-9]*)?$`).test(file.sessionKey)
+        && file.path === `${hash(file.sessionKey)}/session.jsonl` && !ordinarySessions(db,root).has(resolve(root,file.path));
+      if (!researchFile && !diagnosticFile && !sessionFile) fail('清理文件路径越界。');
       if (!inspect(join(root, file.path), allowMissing)) continue;
-      fileInfo(root, file.path, file.sha256);
+      fileInfo(root, file.path, file.sha256, sessionFile ? 128*1024*1024 : diagnosticFile ? 16*1024*1024 : 2_000_000);
     }
+    validateResearchEvidence(root,candidate,records(db,candidate.taskId),allowMissing,ordinarySessions(db,root));
   }
 }
 
@@ -201,7 +224,7 @@ export function applyResearchCleanup(dataDir, plan, { now = new Date(), afterCom
         const actual = buildPlan(db, root, identity, new Date(generated));
         if (JSON.stringify(actual) !== planJson) fail('清理预览已过期或被修改，未清理任何数据。');
         if (!actual.candidates.length) { db.exec('ROLLBACK'); return { cleanupId, status: 'empty', tasks: 0 }; }
-        validatePendingFiles(root, actual, false);
+        validatePendingFiles(db, root, actual, false);
         // This table belongs to the maintenance tool, not the application schema.
         // Its creation and payload replacement are in the same main-db transaction.
         db.exec(`CREATE TABLE IF NOT EXISTS ${TABLE} (
@@ -235,7 +258,7 @@ export function applyResearchCleanup(dataDir, plan, { now = new Date(), afterCom
         for (const candidate of plan.candidates) {
           if (postHashes[candidate.taskId] !== recoveryHash(db, candidate.taskId)) fail('待清理任务状态已变化，保留文件待检查。');
         }
-        validatePendingFiles(root, plan, true);
+        validatePendingFiles(db, root, plan, true);
       }
       db.exec('COMMIT');
     } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; }
@@ -248,11 +271,11 @@ export function applyResearchCleanup(dataDir, plan, { now = new Date(), afterCom
       for (const candidate of plan.candidates) {
         if (JSON.parse(run.post_hashes_json)[candidate.taskId] !== recoveryHash(db, candidate.taskId)) fail('清理提交后任务已变化。');
       }
-      validatePendingFiles(root, plan, true);
+      validatePendingFiles(db, root, plan, true);
       for (const candidate of plan.candidates) for (const file of candidate.files) {
         const path = join(root, file.path);
         if (!inspect(path, true)) continue;
-        fileInfo(root, file.path, file.sha256);
+        fileInfo(root, file.path, file.sha256, file.kind === 'pi_session' ? 128*1024*1024 : file.kind === 'diagnostic' ? 16*1024*1024 : 2_000_000);
         unlinkSync(path);
         if (process.platform !== 'win32') { const fd = openSync(dirname(path), 'r'); try { fsyncSync(fd); } finally { closeSync(fd); } }
       }

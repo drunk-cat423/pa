@@ -58,6 +58,7 @@ export class DiagnosticPersistenceError extends Error {
 export const DIAGNOSTIC_MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
 const MAX_EVENT_BYTES = 256 * 1024;
 const VERSION = 1;
+const RETENTION_NOTICE = '研究诊断正文已按30天保留规则清理；调用用量/失败阶段/审计仍保留，无法离线重放。';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const names = new Set(['request', 'response', 'input']);
 const digest = (data: Uint8Array) => createHash('sha256').update(data).digest('hex');
@@ -274,6 +275,43 @@ export class DiagnosticLog {
     return JSON.parse(String(row.record_json)) as DiagnosticCallRecord;
   }
 
+  /** Read the committed cleanup manifest without creating or migrating the business database. */
+  private artifactExpired(callId: string, name: 'request' | 'response' | 'input', ref: DiagnosticArtifactRef): boolean {
+    const databasePath = resolve(this.root, '..', 'pa.sqlite');
+    inspectPath(databasePath);
+    if (!existsSync(databasePath)) return false;
+    const stat = lstatSync(databasePath);
+    if (!stat.isFile() || stat.nlink !== 1) fail('业务数据库路径类型无效，已拒绝读取诊断清理审计。');
+    for (const suffix of ['-wal','-shm','-journal']) {
+      const sidecar = databasePath + suffix;
+      inspectPath(sidecar);
+      if (existsSync(sidecar)) {
+        const state = lstatSync(sidecar);
+        if (!state.isFile() || state.nlink !== 1) fail('业务数据库附属路径无效，已拒绝读取诊断清理审计。');
+      }
+    }
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const hasTable = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_retention_runs'").get();
+      if (!hasTable) return false;
+      const rows = database.prepare("SELECT plan_json FROM research_retention_runs WHERE status IN ('pending','done')").all();
+      const expectedPath = `diagnostics/calls/${callId}/${name}.json`;
+      for (const row of rows) {
+        const plan = JSON.parse(String(row.plan_json)) as { candidates?: unknown };
+        if (!Array.isArray(plan.candidates)) continue;
+        for (const candidate of plan.candidates) {
+          if (!candidate || typeof candidate !== 'object' || !Array.isArray((candidate as { files?: unknown }).files)) continue;
+          for (const file of (candidate as { files: unknown[] }).files) {
+            if (!file || typeof file !== 'object') continue;
+            const entry = file as { path?: unknown; kind?: unknown; sha256?: unknown; bytes?: unknown };
+            if (entry.kind === 'diagnostic' && entry.path === expectedPath && entry.sha256 === ref.sha256 && entry.bytes === ref.bytes) return true;
+          }
+        }
+      }
+      return false;
+    } finally { database.close(); }
+  }
+
   private persistCall(database: DatabaseSync, record: DiagnosticCallRecord): void {
     database.prepare(`INSERT INTO calls(call_id,job_id,task_id,trace_id,record_json) VALUES (?,?,?,?,?)
       ON CONFLICT(call_id) DO UPDATE SET record_json=excluded.record_json`).run(record.callId, record.jobId ?? null,
@@ -453,7 +491,17 @@ export class DiagnosticLog {
         if (!ref) fail('诊断证据不存在。');
         if (ref.path !== `calls/${callId}/${name}.json` || !/^[0-9a-f]{64}$/.test(ref.sha256)
           || !Number.isSafeInteger(ref.bytes) || ref.bytes < 0 || ref.bytes > DIAGNOSTIC_MAX_ARTIFACT_BYTES) fail('诊断证据引用无效。');
-        const data = safeRead(join(this.root, 'calls', callId, `${name}.json`), DIAGNOSTIC_MAX_ARTIFACT_BYTES);
+        if (this.artifactExpired(callId, name, ref)) fail(RETENTION_NOTICE);
+        let data: Buffer;
+        try { data = safeRead(join(this.root, 'calls', callId, `${name}.json`), DIAGNOSTIC_MAX_ARTIFACT_BYTES); }
+        catch (error) {
+          // Cleanup commits its manifest before unlinking. Recheck after a failed read
+          // to classify the narrow commit/read race without guessing from ENOENT.
+          try { if (this.artifactExpired(callId, name, ref)) fail(RETENTION_NOTICE); } catch (auditError) {
+            if (auditError instanceof DiagnosticPersistenceError && auditError.message === RETENTION_NOTICE) throw auditError;
+          }
+          throw error;
+        }
         if (data.length !== ref.bytes || digest(data) !== ref.sha256) fail('诊断证据哈希或长度不一致，已拒绝重放。');
         return JSON.parse(data.toString());
       }, () => fail('诊断调用不存在。'));
