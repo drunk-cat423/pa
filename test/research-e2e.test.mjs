@@ -128,7 +128,7 @@ async function fixture(t) {
   const secondGroup = { ...route, roomId: 'another-group' };
   const config = { cwd: directory, dataDir: join(directory, 'data'), provider: 'fixture', model: 'fixture', apiKey: 'local-key',
     baseUrl: `http://127.0.0.1:${server.address().port}/v1`, contextWindow: 131072, maxOutputTokens: 4096, timeoutMs: 5000,
-    research: { enabled: true, maxModelCalls: 12, maxToolCalls: 24, maxSearchCalls: 6 },
+    research: { enabled: true, maxModelCalls: 16, maxToolCalls: 24, maxSearchCalls: 6 },
     fetch: { enabled: true, publicDns: true, timeoutMs: 1000, maxResponseBytes: 1048576, maxTextChars: 8000 } };
   const inspect = operation => {
     const db = new DatabaseSync(join(config.dataDir, 'pa.sqlite'), { readOnly: true });
@@ -151,6 +151,33 @@ async function fixture(t) {
   });
   return { config, route, privateRoute, secondGroup, requests, pages, qqRequests, plans, workerPlans, phasePlans, inspect, harness, message, taskRows, errors,
     pageFails(value) { pageFails = value; }, pageText(value) { pageText = value; }, fileUnknown(value) { fileUnknown = value; } };
+}
+
+async function runLegacyTask(f, { key, title, goal, urls = [sourceUrl], requiresOriginal = false, sections = ['研究结论'] }) {
+  const store = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  let task;
+  try {
+    const conversation = store.ensureConversation(`legacy-${key}`, join(f.config.cwd, `${key}.jsonl`), f.route);
+    store.recordInbound(conversation.id, `历史章节计划：${title}`, { eventId: `legacy-${key}`, senderId: 'alice',
+      sentAt: new Date().toISOString(), modelInputText: `历史章节计划：${title}` });
+    const source = store.externalMessage(conversation.id, `legacy-${key}`);
+    task = store.research.create(conversation.id, source.id, { key, title, goal, urls, requiresOriginal });
+    // These tests exercise jobs created by the prior chapter/review protocol.
+    // Persist a real v1 plan cycle, then interrupt and explicitly resume it to
+    // produce a legal historical queued task before running its new attempt.
+    const claimed = store.research.claim(task.id, f.config.research);
+    assert.ok(claimed);
+    const planCycle = store.research.workflow.begin(task.id, task.attempt, { phase: 'plan', input: { fixture: 'historical-v1' } });
+    const plan = { version: 1, sections: sections.map((title, index) => ({ id: `s${index + 1}`, title,
+      objective: `核验${title}并回答用户问题`, acceptance: '依据实际来源解释结论与限制' })) };
+    store.research.workflow.savePlan(task.id, task.attempt, planCycle, plan);
+    store.research.finish(task.id, task.attempt, { status: 'interrupted', reason: 'fixture: 保存 version 1 历史计划后模拟进程中断。' });
+    task = store.research.retry(task.conversationId, task.sourceMessageId, { id: task.id, key: 'legacy-resume' });
+  } finally { store.close(); }
+
+  const service = new ResearchService(f.config, [f.route], async () => ({ status: 'rejected' }), () => {});
+  try { return await service.runOnce(task.id, task.attempt); }
+  finally { await service.close(); }
 }
 
 test('定点真实测试入口只领取指定批次，不运行其他队列、不通知QQ、不重试网页失败', async t => {
@@ -200,7 +227,9 @@ test('研究端到端：模型建任务、跨群私聊本人清单与领取、�
   assert.equal(task.status, 'completed'); assert.equal(task.latest_version, 1); assert.equal(f.pages.length, 1);
   const assembled = await readFile(join(f.config.dataDir, 'research', task.id, '1.md'), 'utf8');
   assert.ok(assembled.includes(report)); assert.match(assembled, /CUA 部署/); assert.ok(assembled.includes(sourceUrl));
-  assert.deepEqual(f.requests.filter(request => request.worker).map(request => request.worker.phase), ['plan', 'collect', 'collect', 'write', 'review']);
+  assert.deepEqual(f.requests.filter(request => request.worker).map(request => request.worker.phase), ['collect', 'collect', 'write']);
+  assert.equal(f.inspect(db => JSON.parse(db.prepare('SELECT plan_json FROM research_workflow_plans WHERE task_id=?').get(task.id).plan_json).version), 2);
+  assert.equal(f.inspect(db => db.prepare("SELECT count(*) n FROM research_workflow_cycles WHERE task_id=? AND phase='review'").get(task.id).n), 0);
   assert.equal(await h.handle(creation), 'duplicate'); assert.equal(f.taskRows().length, 1);
   const today = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10);
   f.plans.set('list', [call('list_research', { date: today, query: 'CUA' }), body => {
@@ -260,7 +289,7 @@ test('研究端到端：模型建任务、跨群私聊本人清单与领取、�
   const messages = f.inspect(db => db.prepare('SELECT text FROM messages').all());
   assert.doesNotMatch(JSON.stringify(messages), /END_OF_REPORT_MARKER|PAGE_EVIDENCE/);
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM memory_topics').get().n), 0);
-  assert.equal(f.requests.filter(request => request.worker).length, 5);
+  assert.equal(f.requests.filter(request => request.worker).length, 3);
 });
 
 test('研究故障端到端：原文失败仅尝试两次、显式续作保留证据，未知发送和崩溃运行不自动重放', async t => {
@@ -318,6 +347,130 @@ test('研究故障端到端：原文失败仅尝试两次、显式续作保留�
   assert.match(f.inspect(db => db.prepare('SELECT evidence_json FROM research_evidence WHERE task_id=?').get(interrupted.id).evidence_json), /已保存的资料/);
 });
 
+test('聊天归档仅限本人且拒绝运行中任务，跨场景幂等移除并保留原资料和报告', async t => {
+  const f = await fixture(t), h = await f.harness();
+  f.plans.set('archive-create', [call('create_research', { key: 'archive-create', title: '归档测试', goal: '解释资料', urls: [sourceUrl] }), answer('已加入。')]);
+  f.phasePlans.set('归档测试:collect', [call('web_fetch', { url: sourceUrl }), answer('资料足够。')]);
+  f.workerPlans.set('归档测试', [answer(sectionOutput())]);
+  assert.equal(await h.handle(f.message('archive-create', `加入研究清单 ${sourceUrl}`)), 'sent');
+  await h.waitForResearch();
+  const task = f.taskRows()[0]; assert.equal(task.status, 'completed');
+  const file = join(f.config.dataDir, 'research', task.id, '1.md'), originalFile = await readFile(file, 'utf8');
+  const store = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  let queued, running, other, originalTask;
+  try {
+    originalTask = store.research.get(task.id);
+    queued = store.research.create(task.conversation_id, task.source_message_id, { key: 'queued-archive', title: '等待任务', goal: '待处理', urls: [sourceUrl] });
+    running = store.research.create(task.conversation_id, task.source_message_id, { key: 'running-archive', title: '运行任务', goal: '执行中', urls: [sourceUrl] });
+    store.research.claim(running.id, f.config.research);
+    store.recordInbound(task.conversation_id, 'Bob 的研究', { eventId: 'bob-research', senderId: 'bob', sentAt: new Date().toISOString(), modelInputText: 'Bob 的研究' });
+    const bob = store.externalMessage(task.conversation_id, 'bob-research');
+    other = store.research.create(task.conversation_id, bob.id, { key: 'bob', title: '他人任务', goal: '不能越权' });
+  } finally { store.close(); }
+  const workerCount = f.requests.filter(r => r.worker).length;
+  for (const [event, id, sender, pattern] of [
+    ['bob-archive', task.id, 'bob', /没有属于你的/],
+    ['alice-archive-other', other.id, 'alice', /没有属于你的/],
+    ['archive-running', running.id, 'alice', /正在运行/],
+  ]) {
+    f.plans.set(event, [call('archive_research', { id }), body => {
+      assert.match(JSON.stringify(body.messages.at(-1)), pattern); return answer('此任务无法移除。');
+    }]);
+    assert.equal(await h.handle(f.message(event, `把 ${id} 从清单移除`, sender)), 'sent');
+  }
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_task_archives').get().n), 0);
+  let firstAudit;
+  for (const [event, id] of [['archive-own', task.id], ['archive-queued', queued.id], ['archive-repeat', task.id]]) {
+    f.plans.set(event, [call('archive_research', { id }), body => {
+      assert.deepEqual(lastTool(body), { archivedIds: [id], archived: true, materialsRetained: true, reportsRetained: true });
+      return answer('已更新了你的研究清单，该项已移除，资料和报告仍保留。');
+    }]);
+    assert.equal(await h.handle({ ...f.message(event, `移除 ${id}`, 'alice-private'), route: f.privateRoute }), 'sent');
+    const audit = f.inspect(db => db.prepare('SELECT * FROM research_task_archives WHERE task_id=?').get(task.id));
+    if (event === 'archive-own') firstAudit = audit;
+    if (event === 'archive-repeat') assert.deepEqual(audit, firstAudit);
+  }
+  const audits = f.inspect(db => db.prepare('SELECT * FROM research_task_archives ORDER BY task_id').all());
+  assert.equal(audits.length, 2); assert.ok(audits.every(row => row.operator_person_id === 'alice-person'));
+  f.plans.set('archived-list', [call('list_research', {}), body => {
+    const result = lastTool(body); assert.equal(result.total, 1); assert.equal(result.items[0].id, running.id);
+    return answer('清单中只剩运行中的任务。');
+  }]);
+  assert.equal(await h.handle(f.message('archived-list', '目前的研究清单')), 'sent');
+  f.plans.set('archived-read', [call('read_research', { id: task.id, limit: 120 }), body => {
+    assert.equal(lastTool(body).text, [...originalFile].slice(0, 120).join(''));
+    return call('continue_research', { id: task.id, key: 'archived-continue' });
+  }, body => { assert.match(JSON.stringify(body.messages.at(-1)), /已归档/); return answer('报告仍可读取，已归档任务不能继续执行。'); }]);
+  assert.equal(await h.handle({ ...f.message('archived-read', `读取并继续 ${task.id}`, 'alice-private'), route: f.privateRoute }), 'sent');
+  const reopened = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  try {
+    assert.deepEqual(reopened.research.get(task.id), originalTask);
+    assert.equal(reopened.research.get(running.id).status, 'running');
+    assert.equal(reopened.research.get(queued.id).status, 'queued');
+    assert.equal(reopened.research.claim(queued.id, f.config.research), undefined);
+    assert.ok(!reopened.research.pendingNotifications().some(item => [task.id, queued.id].includes(item.id)));
+  } finally { reopened.close(); }
+  assert.equal(await readFile(file, 'utf8'), originalFile);
+  assert.equal(f.requests.filter(r => r.worker).length, workerCount);
+});
+
+test('轻量采集最多用到写作预留前，最后一个模型调用用于正文', async t => {
+  const f = await fixture(t); f.config.research.maxModelCalls = 2;
+  const h = await f.harness();
+  f.plans.set('reserve', [call('create_research', { key: 'reserve', title: '预算预留', goal: '依据指定原文回答',
+    urls: [sourceUrl], requiresOriginal: true }), answer('已加入。')]);
+  f.phasePlans.set('预算预留:collect', [call('web_fetch', { url: sourceUrl }), answer('指定资料已读取。')]);
+  f.workerPlans.set('预算预留', [body => {
+    assert.equal(JSON.parse(userText(body)).phase, 'write');
+    assert.match(userText(body), /PAGE_EVIDENCE/);
+    return answer(sectionOutput());
+  }]);
+  assert.equal(await h.handle(f.message('reserve', `研究 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
+  const task = f.taskRows()[0]; assert.equal(task.status, 'completed', task.reason);
+  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['collect', 'write']);
+  assert.deepEqual(f.inspect(db => JSON.parse(db.prepare('SELECT usage_json FROM research_attempts WHERE task_id=?').get(task.id).usage_json)),
+    { modelCalls: 2, toolCalls: 1, searchCalls: 0 });
+  const cycles = f.inspect(db => db.prepare('SELECT phase,input_json FROM research_workflow_cycles WHERE task_id=? ORDER BY cycle').all(task.id));
+  assert.deepEqual(cycles.map(row => row.phase), ['plan', 'write']);
+  assert.match(cycles[0].input_json, /"origin":"program".*"protocol":2/);
+});
+
+test('轻量正文保留核心缺口为partial，成功写作后不触发章节复审', async t => {
+  const f = await fixture(t), h = await f.harness();
+  f.plans.set('gaps', [call('create_research', { key: 'gaps', title: '尚存缺口', goal: '比较方案并标注未知项', urls: [sourceUrl] }), answer('已加入。')]);
+  f.phasePlans.set('尚存缺口:collect', [call('web_fetch', { url: sourceUrl }), answer('已取得候选材料。')]);
+  f.workerPlans.set('尚存缺口', [answer(sectionOutput('written', '可确认部分已整理。', { gaps: ['缺少不同版本的官方成本数据。'] }))]);
+  assert.equal(await h.handle(f.message('gaps', `比较相关方案 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
+  const task = f.taskRows()[0]; assert.equal(task.status, 'partial', task.reason); assert.equal(task.latest_version, 1);
+  const version = f.inspect(db => db.prepare('SELECT status,gaps_json FROM research_workflow_versions WHERE task_id=?').get(task.id));
+  assert.equal(version.status, 'written'); assert.deepEqual(JSON.parse(version.gaps_json), ['缺少不同版本的官方成本数据。']);
+  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['collect', 'collect', 'write']);
+  assert.equal(f.inspect(db => db.prepare("SELECT count(*) n FROM research_workflow_cycles WHERE task_id=? AND phase='review'").get(task.id).n), 0);
+});
+
+test('轻量采集六次上限保留未读原文缺口，模型written不能绕过完整原文要求', async t => {
+  const f = await fixture(t); f.config.fetch.maxTextChars = 128;
+  f.pageText('START ' + '0123456789'.repeat(100) + 'UNREAD_END');
+  const h = await f.harness();
+  f.plans.set('limited-original', [call('create_research', { key: 'limited-original', title: '原文尚未读完',
+    goal: '完整读取指定原文后解释', urls: [sourceUrl], requiresOriginal: true }), answer('已加入。')]);
+  const next = body => {
+    const result = lastTool(body); assert.equal(result.hasMore, true);
+    return call('web_fetch', { url: sourceUrl, cursor: result.nextCursor });
+  };
+  f.phasePlans.set('原文尚未读完:collect', [call('web_fetch', { url: sourceUrl }), next, next, next, next, next]);
+  f.workerPlans.set('原文尚未读完', [answer(sectionOutput('written', '模型声称已经完整解释。'))]);
+  assert.equal(await h.handle(f.message('limited-original', `完整阅读并后台解释 ${sourceUrl}`)), 'sent');
+  await h.waitForResearch();
+  const task = f.taskRows()[0]; assert.equal(task.status, 'blocked'); assert.match(task.reason, /尚未完整读取/);
+  assert.equal(task.latest_version, null); assert.deepEqual(f.pages, [sourceUrl]);
+  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), [...Array(6).fill('collect'), 'write']);
+  const usage = f.inspect(db => JSON.parse(db.prepare('SELECT usage_json FROM research_attempts WHERE task_id=?').get(task.id).usage_json));
+  assert.deepEqual(usage, { modelCalls: 7, toolCalls: 6, searchCalls: 0 });
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_workflow_versions WHERE task_id=?').get(task.id).n), 1);
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_workflow_reviews WHERE task_id=?').get(task.id).n), 0);
+});
+
 test('章节报告不继承聊天输出上限，程序组装长正文；伪调用保留失败草稿且不重试', async t => {
   const f = await fixture(t); f.config.research.maxModelCalls = 4;
   const h = await f.harness();
@@ -325,7 +478,7 @@ test('章节报告不继承聊天输出上限，程序组装长正文；伪调�
   for (const [key, body] of [['long', longBody],
     ['pseudo', '我会继续读取源码。\n<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="web_fetch">']]) {
     f.plans.set(key, [call('create_research', { key, title: key, goal: '研究指定资料', urls: [sourceUrl] }), answer('已加入研究清单。')]);
-    f.phasePlans.set(`${key}:collect`, [call('web_fetch', { url: sourceUrl })]);
+    f.phasePlans.set(`${key}:collect`, [call('web_fetch', { url: sourceUrl }), answer('必要资料已经取得。')]);
     f.workerPlans.set(key, [request => {
       assert.equal(request.max_tokens, undefined); assert.equal(request.max_completion_tokens, undefined);
       assert.doesNotMatch(JSON.stringify(request.messages), /输出硬上限为4096|正文目标不超过2457/);
@@ -338,7 +491,7 @@ test('章节报告不继承聊天输出上限，程序组装长正文；伪调�
   assert.equal(long.status, 'completed', long.reason);
   assert.ok((await readFile(join(f.config.dataDir, 'research', long.id, '1.md'), 'utf8')).includes(longBody));
   assert.equal(pseudo.status, 'failed'); assert.match(pseudo.reason, /工具调用文本|未返回有效元数据/);
-  const workerCount = f.requests.filter(r => r.worker).length; assert.equal(workerCount, 7);
+  const workerCount = f.requests.filter(r => r.worker).length; assert.equal(workerCount, 6);
   f.plans.set('draft', [call('read_research', { id: pseudo.id, draft: true }), request => {
     const result = lastTool(request); assert.equal(result.draft, true); assert.match(result.text, /DSML/);
     return answer('草稿未形成报告，其中的工具调用没有执行。');
@@ -348,7 +501,7 @@ test('章节报告不继承聊天输出上限，程序组装长正文；伪调�
   assert.equal(f.requests.filter(r => r.message).every(r => (r.body.max_tokens ?? r.body.max_completion_tokens) === 4096), true);
 });
 
-test('章节length保留完整元数据与草稿，下个写作周期append续写后审查，无额外最终模型调用', async t => {
+test('轻量正文length保留完整元数据与草稿，在剩余预算内append续写，不触发审查', async t => {
   const f = await fixture(t); f.config.research.maxModelCalls = 5; f.config.research.maxToolCalls = 1;
   const h = await f.harness(), first = '# 连续正文\n第一部分 LENGTH_PREFIX', second = '第二部分 LENGTH_SUFFIX';
   f.plans.set('cut', [call('create_research', { key: 'cut', title: '截断续写', goal: '根据原文完整写作', urls: [sourceUrl] }), answer('已加入。')]);
@@ -367,14 +520,15 @@ test('章节length保留完整元数据与草稿，下个写作周期append续�
   const assembled = await readFile(join(f.config.dataDir, 'research', task.id, '1.md'), 'utf8');
   assert.ok(assembled.includes(first)); assert.ok(assembled.includes(second));
   assert.equal(assembled.split('LENGTH_PREFIX').length - 1, 1);
-  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['plan', 'collect', 'write', 'write', 'review']);
-  assert.equal(f.inspect(db => JSON.parse(db.prepare('SELECT usage_json FROM research_attempts WHERE task_id=?').get(task.id).usage_json).modelCalls), 5);
+  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['collect', 'write', 'write']);
+  assert.equal(f.inspect(db => JSON.parse(db.prepare('SELECT usage_json FROM research_attempts WHERE task_id=?').get(task.id).usage_json).modelCalls), 3);
+  assert.equal(f.inspect(db => db.prepare("SELECT count(*) n FROM research_workflow_cycles WHERE task_id=? AND phase='review'").get(task.id).n), 0);
 });
 
 test('长原文在独立collect续读超过三页，共享游标只抓取一次并形成完整coverage', async t => {
   const f = await fixture(t); f.config.fetch.maxTextChars = 128;
   const page = 'PAGE_EVIDENCE ' + '0123456789'.repeat(60) + 'SOURCE_END'; f.pageText(page);
-  const h = await f.harness(); let nextCursor;
+  let nextCursor;
   const nextPage = body => {
     const last = lastTool(body); assert.equal(last.hasMore, true); assert.ok(last.nextCursor);
     nextCursor = last.nextCursor; return call('web_fetch', { url: sourceUrl, cursor: nextCursor });
@@ -390,8 +544,9 @@ test('长原文在独立collect续读超过三页，共享游标只抓取一次�
     assert.match(userText(body), /SOURCE_END/); assert.ok(!body.messages.some(message => message.role === 'tool'));
     return answer(sectionOutput('written', '五页原文全部覆盖后独立写作。'));
   }]);
-  assert.equal(await h.handle(f.message('long-source', `加入研究清单并完整读取原文 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
-  const task = f.taskRows()[0]; assert.equal(task.status, 'completed', task.reason);
+  const task = await runLegacyTask(f, { key: 'long-source', title: '跨周期长原文', goal: '完整读取并核验长原文',
+    urls: [sourceUrl], requiresOriginal: true });
+  assert.equal(task.status, 'completed', task.reason);
   assert.deepEqual(f.pages, [sourceUrl]);
   const fetched = f.inspect(db => db.prepare("SELECT evidence_json FROM research_evidence WHERE task_id=? AND json_extract(evidence_json,'$.tool')='web_fetch'")
     .all(task.id)).map(row => JSON.parse(row.evidence_json)).filter(e => e.result?.coverage);
@@ -406,13 +561,13 @@ test('长原文在独立collect续读超过三页，共享游标只抓取一次�
   const cycles = f.inspect(db => db.prepare('SELECT phase,status FROM research_workflow_cycles WHERE task_id=? ORDER BY cycle').all(task.id));
   assert.deepEqual(cycles.map(c => [c.phase, c.status]), [['plan', 'succeeded'], ['write', 'succeeded'], ['review', 'succeeded']]);
   assert.deepEqual(f.inspect(db => db.prepare('SELECT status FROM research_collection_cycles WHERE task_id=?').all(task.id)).map(c => c.status), ['succeeded']);
-  assert.equal(f.requests.filter(r => r.worker).length, 9);
+  assert.equal(f.requests.filter(r => r.worker).length, 8);
 });
 
 test('审查按章节来源取得完整旧材料，60KB首屏以外正文通过只读材料分页后才通过', async t => {
   const f = await fixture(t); f.config.contextWindow = 262144; f.config.research.maxModelCalls = 20;
   const page = 'OLD_SOURCE_START ' + 'a'.repeat(63950) + 'UNSEEN_SOURCE_TAIL'; f.pageText(page);
-  const h = await f.harness(); let cursor, missingPages = 0;
+  let cursor, missingPages = 0;
   const collect = body => {
     const toolCount = body.messages.filter(message => message.role === 'tool').length;
     if (toolCount) {
@@ -422,8 +577,6 @@ test('审查按章节来源取得完整旧材料，60KB首屏以外正文通过�
     }
     return call('web_fetch', { url: sourceUrl, ...(cursor ? { cursor } : {}) });
   };
-  f.plans.set('review-tail', [call('create_research', { key: 'review-tail', title: '长材料审查', goal: '完整读取长材料并审查结论',
-    urls: [sourceUrl], requiresOriginal: true }), answer('已加入。')]);
   f.phasePlans.set('长材料审查:collect', Array(8).fill(collect));
   f.workerPlans.set('长材料审查', [body => {
     assert.match(userText(body), /UNSEEN_SOURCE_TAIL/);
@@ -449,8 +602,9 @@ test('审查按章节来源取得完整旧材料，60KB首屏以外正文通过�
     assert.ok(JSON.stringify(readResults).includes('UNSEEN_SOURCE_TAIL'));
     return answer(reviewOutput('pass', '已逐页取得所引用原材料全文，结论与来源一致。'));
   }]);
-  assert.equal(await h.handle(f.message('review-tail', `加入研究清单并全文核验 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
-  const task = f.taskRows()[0]; assert.equal(task.status, 'completed', task.reason); assert.deepEqual(f.pages, [sourceUrl]);
+  const task = await runLegacyTask(f, { key: 'review-tail', title: '长材料审查', goal: '完整读取长材料并审查结论',
+    urls: [sourceUrl], requiresOriginal: true });
+  assert.equal(task.status, 'completed', task.reason); assert.deepEqual(f.pages, [sourceUrl]);
   const workerRequests = f.requests.filter(r => r.worker);
   const collectionRequests = workerRequests.filter(r => r.worker.phase === 'collect');
   assert.equal(collectionRequests.length, 8);
@@ -465,23 +619,24 @@ test('审查按章节来源取得完整旧材料，60KB首屏以外正文通过�
   assert.ok(readEvidence.some(item => item.result.text.includes('UNSEEN_SOURCE_TAIL')));
 });
 
-test('预算跨计划与多个章节周期累计，耗尽归档partial；显式继续复用计划和approved章节', async t => {
-  const f = await fixture(t); f.config.research.maxModelCalls = 4;
-  const h = await f.harness();
-  f.plans.set('budget', [call('create_research', { key: 'budget', title: '分章预算', goal: '分章研究部署与限制', urls: [sourceUrl] }), answer('已加入。')]);
-  f.phasePlans.set('分章预算:plan', [answer(planOutput(['部署条件', '适用限制']))]);
+test('旧版version1章节计划沿用跨预算与审查流程；显式继续复用approved章节', async t => {
+  const f = await fixture(t); f.config.research.maxModelCalls = 3;
   f.phasePlans.set('分章预算:collect', [call('web_fetch', { url: sourceUrl })]);
   f.workerPlans.set('分章预算', [answer(sectionOutput('written', 'APPROVED_CHAPTER_ONE'))]);
-  assert.equal(await h.handle(f.message('budget', `把部署条件和适用限制加入研究清单 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
-  let task = f.taskRows()[0]; assert.equal(task.status, 'partial', task.reason); assert.equal(task.latest_version, 1);
+  let task = await runLegacyTask(f, { key: 'budget', title: '分章预算', goal: '分章研究部署与限制', sections: ['部署条件', '适用限制'] });
+  assert.equal(task.status, 'partial', task.reason); assert.equal(task.reportVersion, 1);
   const firstReport = await readFile(join(f.config.dataDir, 'research', task.id, '1.md'), 'utf8');
   assert.match(firstReport, /APPROVED_CHAPTER_ONE/);
-  const firstCycles = f.inspect(db => db.prepare('SELECT phase,section_id FROM research_workflow_cycles WHERE task_id=? ORDER BY cycle').all(task.id));
-  assert.deepEqual(firstCycles.map(c => [c.phase, c.section_id]), [['plan', null], ['write', 's1'], ['review', 's1']]);
-  const firstUsage = f.inspect(db => JSON.parse(db.prepare('SELECT usage_json FROM research_attempts WHERE task_id=? AND attempt=1').get(task.id).usage_json));
-  assert.deepEqual(firstUsage, { modelCalls: 4, toolCalls: 1, searchCalls: 0 });
+  const firstCycles = f.inspect(db => db.prepare('SELECT phase,section_id FROM research_workflow_cycles WHERE task_id=? AND attempt=2 ORDER BY cycle').all(task.id));
+  assert.deepEqual(firstCycles.map(c => [c.phase, c.section_id]), [['write', 's1'], ['review', 's1']]);
+  assert.equal(f.inspect(db => db.prepare("SELECT count(*) n FROM research_workflow_cycles WHERE task_id=? AND phase='plan' AND status='succeeded'").get(task.id).n), 1);
+  const firstUsage = f.inspect(db => JSON.parse(db.prepare('SELECT usage_json FROM research_attempts WHERE task_id=? AND attempt=2').get(task.id).usage_json));
+  assert.deepEqual(firstUsage, { modelCalls: 3, toolCalls: 1, searchCalls: 0 });
+
   const checkpointCount = f.requests.filter(r => r.worker).length;
-  f.plans.set('resume-budget', [call('continue_research', { id: task.id, key: 'resume' }), answer('已安排继续。')]);
+  const store = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  try { task = store.research.retry(task.conversationId, task.sourceMessageId, { id: task.id, key: 'resume' }); }
+  finally { store.close(); }
   f.phasePlans.set('分章预算:collect', [answer('显式续作重新核对已有材料，无需新工具。')]);
   f.workerPlans.set('分章预算', [body => {
     const input = JSON.parse(userText(body)); assert.equal(input.phase, 'write'); assert.equal(input.section.id, 's2');
@@ -489,8 +644,9 @@ test('预算跨计划与多个章节周期累计，耗尽归档partial；显式�
     assert.match(JSON.stringify(input.progress), /部署条件/);
     return answer(sectionOutput('written', 'SECOND_CHAPTER_AFTER_EXPLICIT_RESUME'));
   }]);
-  assert.equal(await h.handle(f.message('resume-budget', `请继续研究 ${task.id}`)), 'sent'); await h.waitForResearch();
-  task = f.taskRows()[0]; assert.equal(task.status, 'completed', task.reason); assert.equal(task.attempt, 2); assert.equal(task.latest_version, 2);
+  const service = new ResearchService(f.config, [f.route], async () => ({ status: 'rejected' }), () => {});
+  try { task = await service.runOnce(task.id, task.attempt); } finally { await service.close(); }
+  assert.equal(task.status, 'completed', task.reason); assert.equal(task.attempt, 3); assert.equal(task.reportVersion, 2);
   const resumed = f.requests.filter(r => r.worker).slice(checkpointCount);
   assert.deepEqual(resumed.map(r => [r.worker.phase, r.worker.section?.id]), [['collect', undefined], ['write', 's2'], ['review', 's2']]);
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_collection_cycles WHERE task_id=?').get(task.id).n), 2);
@@ -500,16 +656,14 @@ test('预算跨计划与多个章节周期累计，耗尽归档partial；显式�
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_workflow_plans WHERE task_id=?').get(task.id).n), 1);
 });
 
-test('审查revise开启replace修订周期，旧章节和审查记录保持可核验', async t => {
+test('旧版version1章节计划的审查revise开启replace周期，历史版本保持可核验', async t => {
   const f = await fixture(t); f.config.research.maxModelCalls = 7;
-  const h = await f.harness();
-  f.plans.set('revise', [call('create_research', { key: 'revise', title: '修订检查点', goal: '核验并修订部署结论', urls: [sourceUrl] }), answer('已加入。')]);
   f.phasePlans.set('修订检查点:collect', [call('web_fetch', { url: sourceUrl }), answer('采集结束。')]);
   f.workerPlans.set('修订检查点', [answer(sectionOutput('written', 'OLD_CHAPTER_BEFORE_REVIEW')),
     body => { assert.match(JSON.stringify(body.messages), /缺少关键限制/); return answer(sectionOutput('written', 'REPLACEMENT_VERIFIED_CHAPTER')); }]);
   f.phasePlans.set('修订检查点:review', [answer(reviewOutput('revise', '缺少关键限制，请修订全文。')), answer(reviewOutput())]);
-  assert.equal(await h.handle(f.message('revise', `把部署问题加入研究清单 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
-  const task = f.taskRows()[0]; assert.equal(task.status, 'completed', task.reason);
+  const task = await runLegacyTask(f, { key: 'revise', title: '修订检查点', goal: '核验并修订部署结论', urls: [sourceUrl] });
+  assert.equal(task.status, 'completed', task.reason);
   const versions = f.inspect(db => db.prepare('SELECT version,mode FROM research_workflow_versions WHERE task_id=? ORDER BY version').all(task.id));
   assert.deepEqual(versions.map(v => [v.version, v.mode]), [[1, 'replace'], [2, 'replace']]);
   assert.equal(await readFile(join(f.config.dataDir, 'research', task.id, 'sections', 's1', '1.md'), 'utf8'), 'OLD_CHAPTER_BEFORE_REVIEW');
@@ -518,21 +672,23 @@ test('审查revise开启replace修订周期，旧章节和审查记录保持可�
   assert.doesNotMatch(assembled, /OLD_CHAPTER_BEFORE_REVIEW/); assert.match(assembled, /REPLACEMENT_VERIFIED_CHAPTER/);
   assert.deepEqual(f.inspect(db => db.prepare('SELECT verdict,version FROM research_workflow_reviews WHERE task_id=? ORDER BY cycle').all(task.id)).map(r => [r.verdict, r.version]),
     [['revise', 1], ['pass', 2]]);
-  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['plan', 'collect', 'collect', 'write', 'review', 'write', 'review']);
+  assert.deepEqual(f.requests.filter(r => r.worker).map(r => r.worker.phase), ['collect', 'collect', 'write', 'review', 'write', 'review']);
 });
 
-test('计划格式错误与未知provider错误保留失败周期，不自动重试或转为完成', async t => {
+test('v2采集未知响应与写作契约错误保留失败周期，不自动重试或转为完成', async t => {
   const f = await fixture(t), h = await f.harness();
-  f.phasePlans.set('计划格式错误:plan', [answer('{"sections":')]);
   f.phasePlans.set('未知请求:collect', [{ httpError: true }]);
-  for (const [key, title, expectedCalls] of [['bad-plan', '计划格式错误', 1], ['unknown', '未知请求', 2]]) {
+  f.phasePlans.set('无效正文:collect', [answer('已取得一条候选资料。')]);
+  f.workerPlans.set('无效正文', [answer('{"status":"written"}')]);
+  for (const [key, title, expectedCalls] of [['unknown', '未知请求', 1], ['invalid', '无效正文', 2]]) {
     f.plans.set(key, [call('create_research', { key, title, goal: '研究原文资料', urls: [sourceUrl] }), answer('已加入。')]);
     const before = f.requests.filter(r => r.worker).length;
     assert.equal(await h.handle(f.message(key, `加入研究清单 ${sourceUrl}`)), 'sent'); await h.waitForResearch();
     const task = f.taskRows().find(task => task.title === title); assert.equal(task.status, 'failed', task.reason);
     assert.equal(task.attempt, 1); assert.equal(task.latest_version, null);
     assert.equal(f.requests.filter(r => r.worker).length - before, expectedCalls);
-    if (title === '未知请求') assert.deepEqual(f.requests.filter(r => r.worker?.task.title === title).map(r => r.worker.phase), ['plan', 'collect']);
+    assert.deepEqual(f.requests.filter(r => r.worker?.task.title === title).map(r => r.worker.phase),
+      title === '未知请求' ? ['collect'] : ['collect', 'write']);
     const cycles = f.inspect(db => db.prepare('SELECT cycle,status FROM research_workflow_cycles WHERE task_id=? UNION ALL SELECT cycle,status FROM research_collection_cycles WHERE task_id=? ORDER BY cycle').all(task.id, task.id));
     assert.ok(cycles.length); assert.ok(['failed', 'unknown'].includes(cycles.at(-1).status));
     const count = f.requests.length; await h.waitForResearch(); assert.equal(f.requests.length, count);

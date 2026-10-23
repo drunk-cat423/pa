@@ -124,7 +124,8 @@ export class ResearchWorkflowStore {
         sectionId(input.sectionId); version(input.expectedVersion);
         const section = workflow.sections.find(item => item.id === input.sectionId);
         if (!section || section.version !== input.expectedVersion) throw new MemoryError('研究章节版本已改变。');
-        if (input.phase === 'review' ? section.status !== 'written' : !['pending','draft','needs_revision','blocked'].includes(section.status))
+        if (workflow.plan?.version === 2 && input.phase === 'review') throw new MemoryError('轻量调研不执行章节审查。');
+        if (input.phase === 'review' ? section.status !== 'written' : !['pending','draft','needs_revision','blocked',...(workflow.plan?.version === 2 ? ['written'] : [])].includes(section.status))
           throw new MemoryError('研究章节状态不允许本阶段操作。');
       }
       const at = now(), cycle = workflow.nextCycle;
@@ -152,8 +153,9 @@ export class ResearchWorkflowStore {
   }
 
   savePlan(id: string, attempt: number, cycle: number, input: ResearchPlan): void {
-    if (!input || input.version !== 1 || !Array.isArray(input.sections) || input.sections.length < 1 || input.sections.length > 8) throw new MemoryError('研究计划须包含1至8个章节。');
-    const plan: ResearchPlan = { version:1,sections:input.sections.map((item,index) => {
+    if (!input || ![1,2].includes(input.version) || !Array.isArray(input.sections) || input.sections.length < 1 || input.sections.length > 8
+      || (input.version === 2 && input.sections.length !== 1)) throw new MemoryError('研究计划须包含1至8个章节；轻量任务只能有一份答复。');
+    const plan: ResearchPlan = { version:input.version,sections:input.sections.map((item,index) => {
       if (!item || item.id !== `s${index+1}`) throw new MemoryError('研究章节编号须从s1连续排列。');
       return { id:item.id,title:bounded(item.title,'章节标题',160),objective:bounded(item.objective,'章节目标',3000),acceptance:bounded(item.acceptance,'章节验收要求',3000) };
     }) };
@@ -185,7 +187,7 @@ export class ResearchWorkflowStore {
     this.transaction(() => {
       this.cycle(id,attempt,cycle,'write',input.sectionId,input.expectedVersion);
       const workflow = this.load(id), current = workflow.sections.find(item => item.id === input.sectionId);
-      if (!current || current.version !== input.expectedVersion || !['pending','draft','needs_revision','blocked'].includes(current.status)) throw new MemoryError('研究章节版本或状态已改变。');
+      if (!current || current.version !== input.expectedVersion || !['pending','draft','needs_revision','blocked',...(workflow.plan?.version === 2 ? ['written'] : [])].includes(current.status)) throw new MemoryError('研究章节版本或状态已改变。');
       if (input.mode === 'append' && !['pending','draft'].includes(current.status)) throw new MemoryError('仅待写或续写章节允许追加正文。');
       const markdown = input.mode === 'append' && current.markdown ? `${current.markdown}\n\n${fragment}`.trimEnd() : fragment;
       const bytes = Buffer.byteLength(markdown);
@@ -254,6 +256,11 @@ export class ResearchWorkflowStore {
 
   assertComplete(id: string): void {
     const workflow = this.load(id);
+    if (workflow.plan?.version === 2) {
+      if (workflow.sections.length !== 1 || workflow.sections.some(section => section.status !== 'written'
+        || !section.markdown.trim() || !section.sources.length || section.gaps.length)) throw new MemoryError('轻量调研正文、来源或核心问题尚未完成，不能完成归档。');
+      return;
+    }
     if (!workflow.plan || workflow.sections.some(section => section.status !== 'approved' || !section.markdown.trim())) throw new MemoryError('研究计划尚有未通过审查的章节，不能完成归档。');
   }
 

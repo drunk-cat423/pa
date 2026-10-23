@@ -192,7 +192,7 @@ export class ResearchStore {
       usage:JSON.parse(String(row.usage_json)),evidence };
   }
 
-  /** Local operator interface only; task records and artifacts remain readable by their owner. */
+  /** Shared archival entry; records and artifacts remain readable by their owner. */
   archive(conversationId: string, sourceMessageId: string, input: { ids:string[]; reason:string }): { archivedIds:string[] } {
     if (!Array.isArray(input.ids) || input.ids.length === 0) throw new MemoryError('请明确指定要归档的研究编号。');
     const ids = [...new Set(input.ids)], reason = text(input.reason,'研究归档原因',2000);

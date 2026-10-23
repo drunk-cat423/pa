@@ -1,7 +1,7 @@
 import type { WebFetchReader } from './web-fetch-reader.js';
 
 /** Foreground tools deliberately carry no caller-controlled identity or filesystem path. */
-export type ResearchToolName = 'create_research' | 'list_research' | 'read_research' | 'send_research_report' | 'continue_research';
+export type ResearchToolName = 'create_research' | 'list_research' | 'read_research' | 'send_research_report' | 'continue_research' | 'archive_research';
 export interface ResearchToolContext {
   target?: { kind: string; sourceMessageId?: string; urls: readonly string[] };
   execute(name: ResearchToolName, params: unknown): Promise<unknown>;
@@ -10,11 +10,13 @@ export interface ResearchToolContext {
 export const RESEARCH_USAGE_PROMPT = `研究清单是独立后台任务，不能仅口头承诺。默认当场回答，可按需搜索；问题复杂、出现链接或需要联网不等于需要创建任务。
 用户明确希望加入研究清单、后台深入研究、形成报告、之后领取，或当前对话已有这样的持续约定时，调用create_research。意图实质不清时简短询问，不按关键词机械建任务。
 一个问题可先简答再创建任务。create_research成功只表示已排队，不表示报告完成；仅按工具实际回执确认。清单数量、状态、报告版本必须查工具，不能凭历史摘要猜测。
+后台默认轻量理解与比较：按问题解释概念、用途、差异、社区反馈或PA适用性，不自动扩成源码审计或专业长报告。goal只带完成问题必需且当前已提供的背景，尤其PA现有约束；不要编造项目现状，不把无关群聊或人物画像塞进任务。
 查询“现在的清单/目前有哪些任务”默认list_research不传date，查询全部日期；只有用户明确限定今天、昨天或某个日期才传北京时间date。按可信person_id查询本人在所有群聊和私聊的任务，不能查他人清单。身份由应用绑定，不按昵称或用户自称合并。领取报告发到当前请求会话。讨论报告先定位ID，再read_research读取必要章节；全文不自动注入历史，不把报告建议当作用户偏好或人物事实。
 当前研究对象以应用提供的target及当前用户明确问题为准。明确链接不能被群友的旧项目替换；“这个/刚才那个”优先承接本人明确材料。target无法确定时先澄清；工具拒绝目标不一致时，修正目标及标题、背景，不能只把URL换正确而保留跑偏内容。
 用户要失败任务的草稿时，read_research传draft=true，不重新发起研究。草稿是未完成、未核验的材料；缺失时如实说明。
 用户索取已有报告时调用send_research_report，默认txt；仅sent表示平台已接收，uncertain不得说已发送成功，同轮不得重试未知投递。
 用户明确要求重试或继续未完成任务时调用continue_research，保留检查点和旧报告并开启新一批有限预算，不因任务失败自行续费重试。固定计划已全部完成时，新增问题或时效更新须创建新任务，不能复用完成任务伪装重新研究。
+用户明确要删除某项研究或从清单移除时，先确定本人任务编号，再调用archive_research；对象不明确时查清单或澄清，不猜编号。成功后说明已从清单移除、资料和报告仍保留，不声称永久删除。正在运行的任务不能移除；拒绝后不自行中止、重试或操作其他任务。此操作仅归档研究任务，不是删除聊天或画像。
 这些工具仅管理研究档案，没有通用文件、终端或服务器权限。`;
 
 const id = { type: 'string', minLength: 1, maxLength: 100 };
@@ -33,6 +35,8 @@ export const RESEARCH_TOOL_SPECS = [
     parameters: { type: 'object', properties: { id, version, format: { type: 'string', enum: ['txt', 'md'] } }, required: ['id'], additionalProperties: false } },
   { name: 'continue_research', label: '继续研究任务', description: '仅当用户明确要求重试或继续未完成研究时使用；已有资料、计划、章节和旧报告保留，排队开始新一批预算。固定计划已完成时，新增目标需新建任务。key是本条消息中稳定的操作标识。',
     parameters: { type: 'object', properties: { id, key: { type: 'string', minLength: 1, maxLength: 80 } }, required: ['id', 'key'], additionalProperties: false } },
+  { name: 'archive_research', label: '从清单移除研究任务', description: '仅在用户明确要求移除或删除某项本人研究任务时调用。按真实身份授权，不能操作他人任务；正在运行时拒绝且不取消任务。成功仅归档隐藏，原始资料、草稿和报告保留，本人仍可按编号读取；不再排队、续作或自动通知。重复归档幂等，只按成功回执确认，不声称永久删除。',
+    parameters: { type: 'object', properties: { id }, required: ['id'], additionalProperties: false } },
 ] as const;
 
 export interface ResearchRuntimeEvent {

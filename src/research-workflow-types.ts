@@ -1,6 +1,7 @@
 export type ResearchPhase = 'plan' | 'collect' | 'write' | 'review';
 export interface ResearchPlanSection { id: string; title: string; objective: string; acceptance: string }
-export interface ResearchPlan { version: 1; sections: ResearchPlanSection[] }
+/** v1 preserves existing chapter/review jobs; v2 is one lightweight answer. */
+export interface ResearchPlan { version: 1 | 2; sections: ResearchPlanSection[] }
 export type ResearchSectionStatus = 'pending' | 'draft' | 'written' | 'approved' | 'needs_revision' | 'blocked';
 export interface ResearchSection extends ResearchPlanSection {
   version: number; status: ResearchSectionStatus; markdown: string; summary: string; sources: string[]; gaps: string[];

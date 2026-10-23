@@ -43,6 +43,34 @@ function fixture(t) {
   };
 }
 
+test('轻量固定单答复无需审查，核心缺口阻止完成，显式续作保留旧正文与版本', t => {
+  const f=fixture(t), id=f.task.id; f.claim();
+  const cycle=f.workflow.begin(id,1,{phase:'plan',input:{origin:'program',protocol:2}});
+  assert.throws(()=>f.workflow.savePlan(id,1,cycle,{version:2,sections:[...plan.sections,{...plan.sections[0],id:'s2'}]}),/只能有一份/);
+  f.workflow.savePlan(id,1,cycle,{...plan,version:2});
+  let writing=f.workflow.begin(id,1,{phase:'write',sectionId:'s1',expectedVersion:0,input:{purpose:'answer'}});
+  f.workflow.saveSection(id,1,writing,{sectionId:'s1',expectedVersion:0,mode:'replace',status:'written',
+    markdown:'部分解释，社区反馈尚不清楚。',summary:'已有部分解释',sources:['https://example.com/source'],gaps:['缺少社区反馈']});
+  assert.throws(()=>f.workflow.begin(id,1,{phase:'review',sectionId:'s1',expectedVersion:1,input:{}}),/轻量调研不执行/);
+  assert.throws(()=>f.store.research.finish(id,1,{status:'completed',markdown:'不该完成',abstract:'缺口尚存'}),/核心问题尚未完成/);
+  const partial=assembleResearchReport(f.task,f.workflow.load(id),'partial','缺少社区依据');
+  assert.doesNotMatch(partial.markdown,/通过审查|待审查/);
+  f.store.research.finish(id,1,partial);
+  const path=join(f.directory,'research',id,'sections','s1','1.md'), original=readFileSync(path,'utf8');
+  f.reopen(); assert.equal(f.workflow.load(id).plan.version,2);
+  const source=f.message(); f.store.research.retry(f.conversation.id,source.id,{id,key:'more-evidence'}); f.claim();
+  writing=f.workflow.begin(id,2,{phase:'write',sectionId:'s1',expectedVersion:1,input:{purpose:'resolve-gap'}});
+  f.workflow.saveSection(id,2,writing,{sectionId:'s1',expectedVersion:1,mode:'replace',status:'written',
+    markdown:'概念解释和已核实的社区个例。',summary:'完整解释',sources:['https://example.com/source'],gaps:[]});
+  const complete=assembleResearchReport(f.task,f.workflow.load(id),'completed');
+  assert.doesNotMatch(complete.markdown,/通过审查|待审查/);
+  assert.equal(f.store.research.finish(id,2,complete).status,'completed');
+  assert.equal(readFileSync(path,'utf8'),original);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM research_workflow_reviews WHERE task_id=?').get(id).n,0);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM research_workflow_versions WHERE task_id=?').get(id).n,2);
+  assert.equal(f.db.prepare('SELECT count(*) n FROM research_reports WHERE task_id=?').get(id).n,2);
+});
+
 test('独立收集固定输入并原子完成，跨表周期编号及并发检查，章节保持不变', t => {
   const f=fixture(t), id=f.task.id;
   assert.deepEqual(f.workflow.load(id),{sections:[],nextCycle:1,collected:false});

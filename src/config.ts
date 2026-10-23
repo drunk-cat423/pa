@@ -78,7 +78,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
   const researchFlag = env.PA_RESEARCH_ENABLED?.trim() || 'true';
   if (!['true', 'false'].includes(researchFlag)) throw new Error('PA_RESEARCH_ENABLED 必须为 true 或 false。');
   const research = { enabled: researchFlag === 'true',
-    maxModelCalls: positiveInteger(env, 'PA_RESEARCH_MAX_MODEL_CALLS', 12),
+    maxModelCalls: positiveInteger(env, 'PA_RESEARCH_MAX_MODEL_CALLS', 16),
     maxToolCalls: positiveInteger(env, 'PA_RESEARCH_MAX_TOOL_CALLS', 24),
     maxSearchCalls: positiveInteger(env, 'PA_RESEARCH_MAX_SEARCH_CALLS', 6) };
   if (research.maxModelCalls < 2 || research.maxModelCalls > 50 || research.maxToolCalls > 100

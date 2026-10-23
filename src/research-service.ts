@@ -9,7 +9,7 @@ import { normalizeWebFetchUrl } from './web-fetch.js';
 import { WebFetchReader } from './web-fetch-reader.js';
 import type { ResearchToolContext, ResearchToolName, ResearchRuntimeEvent } from './research-tools.js';
 import type { CreateResearchInput, ResearchListParams, ResearchReadParams, ResearchTask } from './research-types.js';
-import { assembleResearchReport, hasFetchedSource, isResearchSourceMaterial, parseResearchPlan, parseResearchReview, parseResearchSection, researchSources, researchStagePrompt } from './research-workflow.js';
+import { assembleResearchReport, hasFetchedSource, isResearchSourceMaterial, lightweightResearchPlan, parseResearchPlan, parseResearchReview, parseResearchSection, researchSources, researchStagePrompt } from './research-workflow.js';
 import type { ResearchPhase, ResearchSection } from './research-workflow-types.js';
 
 export type ResearchSender = (message: Pick<OutboundMessage, 'text' | 'file'>) => Promise<DeliveryResult>;
@@ -71,6 +71,11 @@ export class ResearchService {
       }
       case 'list_research': return store.list(conversationId, sourceMessageId, params as ResearchListParams);
       case 'read_research': return store.read(conversationId, sourceMessageId, params as ResearchReadParams);
+      case 'archive_research': {
+        const { id } = params as { id: string };
+        const result = store.archive(conversationId, sourceMessageId, { ids: [id], reason: '用户通过聊天要求从研究清单移除任务。' });
+        return { ...result, archived: true, materialsRetained: true, reportsRetained: true };
+      }
       case 'continue_research': {
         const task = store.retry(conversationId, sourceMessageId, params as { id: string; key: string });
         this.wake();
@@ -137,20 +142,34 @@ export class ResearchService {
     }) : undefined;
     let finished: ResearchTask;
     try {
+      // New tasks need no paid chapter-planning call. The persisted protocol is
+      // fixed once; existing v1 plans and their reviews are never rewritten.
+      if (!persist(() => store.workflow.load(task.id)).plan) {
+        const cycle = persist(() => store.workflow.begin(task.id, task.attempt, { phase: 'plan',
+          input: { origin: 'program', protocol: 2, goal: task.goal, originalRequest: task.originalText } }));
+        activeCycle = cycle;
+        persist(() => store.workflow.savePlan(task.id, task.attempt, cycle, lightweightResearchPlan()));
+        activeCycle = undefined;
+      }
       while (current.modelCalls < budget.maxModelCalls) {
         if (this.closed) throw new RequestError('研究服务正在关闭。', 'cancelled');
         const workflow = persist(() => store.workflow.load(task.id));
+        const lightweight = workflow.plan?.version === 2;
         if (workflow.plan && workflow.sections.every(section => section.status === 'approved')) break;
         // Review a newly written chapter before spending on the next one. Blocked chapters
         // are revisited only by a new, explicitly requested attempt, never in a busy loop.
         const section = workflow.collected ? workflow.sections.find(item => item.status === 'written')
           ?? workflow.sections.find(item => item.status !== 'approved' && !blockedThisAttempt.has(item.id)) : undefined;
         if (workflow.plan && workflow.collected && !section) break;
-        const phase: ResearchPhase = !workflow.plan ? 'plan' : !workflow.collected ? 'collect' : section!.status === 'written' ? 'review' : 'write';
+        const phase: ResearchPhase = !workflow.plan ? 'plan' : !workflow.collected ? 'collect' : !lightweight && section!.status === 'written' ? 'review' : 'write';
+        // Do not spend the last available call gathering material with no room
+        // left to answer. A saved checkpoint remains available for continuation.
+        if (lightweight && phase === 'collect' && budget.maxModelCalls - current.modelCalls < 2) break;
         const saved = persist(() => store.get(task.id)!);
         const material = saved.evidence.map((evidence, index) => ({ id: `e${index + 1}`, ...evidence }))
-          .filter(evidence => ['web_fetch', 'web_search'].includes(evidence.tool));
-        const previousMaterial = boundedText(JSON.stringify(material.slice(-24).map(item => ({ ...item,
+          .filter(evidence => ['web_fetch', 'web_search', ...(lightweight ? ['read_research_material'] : [])].includes(evidence.tool)
+            && (!lightweight || evidence.result !== undefined || evidence.error !== undefined));
+        const previousMaterial = lightweight ? lightweightMaterials(material) : boundedText(JSON.stringify(material.slice(-24).map(item => ({ ...item,
           result: item.result === undefined ? undefined : boundedText(JSON.stringify(item.result), phase === 'write' ? 24_000 : 4500) }))), phase === 'write' ? 120_000 : 45_000);
         const reviewCoverage = new Map<string, { total: number; ranges: [number, number][] }>();
         const reviewSources = new Set<string>();
@@ -169,8 +188,10 @@ export class ResearchService {
         const input = { task: { id: task.id, title: task.title, goal: task.goal, originalRequest: task.originalText,
           urls: task.urls, requiresOriginal: task.requiresOriginal }, phase, researchedAt: new Date().toISOString(),
           previousMaterial: phase === 'review' ? undefined : previousMaterial,
+          ...(lightweight ? { collectionNote: boundedText(String(saved.evidence.findLast(item => item.tool === 'collection_note')?.result ?? ''), 8000) } : {}),
           ...(phase === 'review' ? { reviewMaterial } : {}),
-          materialIndex: material.map(item => ({ id: item.id, tool: item.tool, input: item.input, error: item.error })).slice(-64),
+          materialIndex: material.slice(lightweight ? -24 : -64).map(item => ({ id: item.id, tool: item.tool,
+            input: lightweight ? boundedText(JSON.stringify(item.input), 1000) : item.input, error: item.error })),
           plan: workflow.plan, progress: workflow.sections.map(({ id, title, status, summary }) => ({ id, title, status, summary })),
           ...(section ? { section: phase === 'review' ? section : sectionProjection(section),
             writeMode: section.status === 'draft' ? 'append' : 'replace' } : {}),
@@ -193,12 +214,13 @@ export class ResearchService {
         const remaining = budget.maxModelCalls - current.modelCalls;
         // Collection stops after successful tool execution at its own boundary.
         // Writing starts a clean, tool-free session and never inherits that loop.
-        const modelCalls = phase === 'collect' ? Math.min(8, Math.max(1, remaining - workflow.sections.filter(item => item.status !== 'approved').length * 2))
+        const modelCalls = phase === 'collect' ? lightweight ? Math.min(6, remaining - 1)
+          : Math.min(8, Math.max(1, remaining - workflow.sections.filter(item => item.status !== 'approved').length * 2))
           : phase === 'review' ? Math.min(4, remaining) : 1;
         try {
           this.runtime = await openConversation({ ...this.config, loop: { maxModelCalls: modelCalls, maxToolCalls: budget.maxToolCalls } },
             `research:${task.id}:${task.attempt}:cycle:${cycle}`, { enableSearch: true, research: {
-              phase, systemPrompt: researchStagePrompt(phase), maxToolCalls: phase === 'write' || phase === 'plan' ? 0 : budget.maxToolCalls - current.toolCalls,
+              phase, systemPrompt: researchStagePrompt(phase, lightweight), maxToolCalls: phase === 'write' || phase === 'plan' ? 0 : budget.maxToolCalls - current.toolCalls,
               maxSearchCalls: budget.maxSearchCalls - current.searchCalls, record,
               ...(fetchReader ? { fetchReader } : {}),
               readMaterial: params => {
@@ -226,6 +248,9 @@ export class ResearchService {
             const proposal = parseResearchSection(output, stopReason, section!, store.get(task.id)!.evidence);
             persist(() => store.workflow.saveSection(task.id, task.attempt, cycle, proposal));
             if (proposal.status === 'blocked') blockedThisAttempt.add(section!.id);
+            // One answer, not a review/rewrite loop. Only an actual incomplete
+            // draft can continue automatically within the remaining budget.
+            if (lightweight && proposal.status !== 'draft') { activeCycle = undefined; break; }
           } else {
             const review = parseResearchReview(output, stopReason, section!);
             const evidence = store.get(task.id)!.evidence;
@@ -250,15 +275,21 @@ export class ResearchService {
       }
       if (this.closed) throw new RequestError('研究服务正在关闭。', 'cancelled');
       const workflow = persist(() => store.workflow.load(task.id));
+      const lightweight = workflow.plan?.version === 2;
       const allEvidence = store.get(task.id)!.evidence;
       const pages = fetchedPages(allEvidence);
       const hasSearchEvidence = allEvidence.some(e => e.tool === 'web_search' && e.result && typeof e.result === 'object'
         && (('summary' in e.result && typeof e.result.summary === 'string' && e.result.summary.trim())
           || ('sources' in e.result && Array.isArray(e.result.sources) && e.result.sources.length > 0)));
       const originalMissing = task.requiresOriginal && (!task.urls.length || task.urls.some(url => !fullyRead(pages, normalizeWebFetchUrl(url))));
-      const done = Boolean(workflow.plan) && workflow.sections.every(section => section.status === 'approved');
+      const done = Boolean(workflow.plan) && workflow.sections.every(section => lightweight
+        ? section.status === 'written' && section.gaps.length === 0 && section.sources.length > 0
+        : section.status === 'approved');
       const reason = originalMissing ? '指定原始资料尚未完整读取；章节、材料和检查点已保存，需补充资料或明确要求继续。'
         : !pages.length && !hasSearchEvidence ? '尚未取得可用的联网资料；已保留研究进度，需补充资料或明确要求继续。'
+        : lightweight ? (current.modelCalls >= budget.maxModelCalls || budget.maxModelCalls - current.modelCalls < 2
+          ? '本批预算不足以继续完成答复；材料和正文已保存，需明确要求继续。'
+          : '答复尚有核心问题缺少依据或有效来源；已有内容已保存，需补充资料或明确要求继续。')
         : current.modelCalls >= budget.maxModelCalls ? '本批模型调用预算用完，尚有章节未完成或未通过审查；已保存检查点，需明确要求继续。'
         : '尚有章节因证据不足未通过审查；已保存检查点，需补充资料或明确要求继续。';
       const hasText = workflow.sections.some(section => section.markdown.trim());
@@ -297,6 +328,22 @@ export class ResearchService {
 function sectionProjection(section: ResearchSection): ResearchSection & { markdownIsTail: boolean } {
   const tail = section.status === 'draft' && [...section.markdown].length > 8000;
   return { ...section, markdown: tail ? [...section.markdown].slice(-8000).join('') : section.markdown, markdownIsTail: tail };
+}
+
+/** Small, explicitly partial projections; originals and read cursors stay in evidence. */
+function lightweightMaterials(material: (ResearchTask['evidence'][number] & { id: string })[]) {
+  const entries: { id: string; tool: string; sources: string[]; excerpt: string; truncated: boolean }[] = [];
+  let bytes = 0;
+  for (const item of material.slice(-16).reverse()) {
+    const original = JSON.stringify(item);
+    const excerpt = boundedText(original, 6000);
+    const entry = { id: item.id, tool: item.tool, sources: [...researchSources([item])].slice(0, 5), excerpt, truncated: excerpt !== original };
+    const size = Buffer.byteLength(JSON.stringify(entry));
+    if (bytes + size > 40_000) continue;
+    bytes += size; entries.unshift(entry);
+  }
+  return { entries, omittedRecords: material.length - entries.length,
+    notice: '这里只是有界材料片段，截断或省略不表示相关内容已被核验。需要补读时在采集阶段按材料编号读取。' };
 }
 
 interface Coverage { offset: number; end: number; totalChars: number; contentHash: string }

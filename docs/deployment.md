@@ -57,7 +57,7 @@ systemctl disable --now mysql.service
 
 研究功能首次部署将 schema23 升级到24，停机快照标记 `before-schema-24` 检查点。报告目录位于 `PA_DATA_DIR/research`，由现有整个数据目录备份一并保留。先在新发布目录完成构建及研究端到端检查；停止服务并完成快照后，以pa用户打开新版本ConversationStore迁移，核对原文和外键，再切换并启动。不能把旧schema23代码直接指向升级后的数据库。
 
-`PA_RESEARCH_ENABLED` 默认true，独立后台预算默认12次主模型、24次工具、其中6次搜索，单任务串行运行。复用当前模型和已启用的搜索/网页读取配置，无需新凭证。群聊与私聊只在原渠道白名单内接入；跨场景研究清单复用 `policy.json` 的可信人物绑定。启动就绪不等于真实研究质量或QQ文件客户端已验收，实际使用说明见 [research.md](research.md)。
+`PA_RESEARCH_ENABLED` 默认true，独立后台预算默认16次主模型、24次工具、其中6次搜索，轻量采集最多6轮，单任务串行运行。复用当前模型和已启用的搜索/网页读取配置，无需新凭证。群聊与私聊只在原渠道白名单内接入；跨场景研究清单复用 `policy.json` 的可信人物绑定。启动就绪不等于真实研究质量或QQ文件客户端已验收，实际使用说明见 [research.md](research.md)。
 
 ### 分阶段研究与 schema25
 
@@ -70,6 +70,8 @@ systemctl disable --now mysql.service
 schema26研究清单归档升级同样先停服务并创建 `before-schema-26` 完整快照，再增量迁移和核对旧表/文件哈希。新增归档表不删除原档案；定点收费测试必须先停止正常研究领取与整理，仅对明确授权的编号/批次调用runOnce，保留调用诊断，失败不重试。恢复常驻前核对任务状态与通知回执，避免重复运行或意外投递。
 
 schema27仅增加独立资料采集周期表；部署前快照标记 `before-schema-27`，核对全部旧表/文件未改。真实新流程验证需使用已授权的单项预算；明确从头重做时归档旧试验、新建同目标任务，不把旧材料或已失败的工具历史带入纯写作会话。
+
+轻量调研及聊天归档升级仍为schema27，无须触发清理迁移。研究材料保留工具的 `pa-research-retention.service`/`.timer` 仅以preview模式安装，每日04:45检查；不得改成run/apply。部署只切换代码、同步明确授权的预算并正常重启，不重试历史失败任务，保留私有配置/人物绑定。详见[研究清理说明](research-retention.md)。
 
 统一使用 `/usr/local/sbin/pa-storage`，实现和 systemd 模板在 `scripts/deployment/`。完整快照只写入 `/var/backups/pa/snapshots/`；不再在 `/root/pa-*` 下另建数据副本。每份快照保存整个数据目录的 `data.tar.gz`、对应代码的 `source.tar.gz`（不含 node_modules）、私有配置和服务单元。完成校验后才写入带 SHA-256 的 `manifest.json` 并原子发布目录；`.partial-*` 和未知格式目录不参与自动删除。
 

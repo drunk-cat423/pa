@@ -1,0 +1,14 @@
+[Unit]
+Description=PA research retention preview (no deletion)
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+TimeoutStartSec=10min
+Nice=10
+IOSchedulingClass=idle
+# Shares the backup/release lock. Default is preview; never silently enable apply.
+ExecStart=/usr/bin/flock -n /run/lock/pa-storage.lock /opt/node-v24.15.0/bin/node /opt/pa/current/scripts/deployment/research-retention.mjs preview /var/lib/pa
+StandardOutput=journal
+StandardError=journal

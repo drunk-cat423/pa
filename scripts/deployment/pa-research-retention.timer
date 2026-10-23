@@ -1,0 +1,10 @@
+[Unit]
+Description=Preview PA research retention daily
+
+[Timer]
+OnCalendar=*-*-* 04:45:00
+Persistent=true
+Unit=pa-research-retention.service
+
+[Install]
+WantedBy=timers.target
