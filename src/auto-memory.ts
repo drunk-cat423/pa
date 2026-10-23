@@ -5,7 +5,7 @@ import { ObsoletePersonalMemoryError, assertCurrentMemoryProtocol, mergeProfileF
 import type { AutoMemoryJob, AutoMemoryTaskInput, AutoMemoryPipeline, ValidatedExtract, PersonProfile, ProfileFact } from './auto-memory-types.js';
 import { createMemoryProvider, MemoryInputTooLargeError, type MemoryProvider } from './memory-provider.js';
 import { selfProfileBudget, validateSelfProfileProposal } from './self-profile-store.js';
-import { isRejectedMemoryResponse, memoryFailure, memoryFailurePhase, MemoryProposalRejectedError, MemoryProviderError } from './memory-diagnostics.js';
+import { isRejectedMemoryResponse, memoryFailure, memoryFailurePhase, MemoryProposalRejectedError, MemoryProviderError, MemoryStatePersistenceError } from './memory-diagnostics.js';
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
 import { assertProfileCapacity, PersonProfileCapacityError, profileCapacity } from './profile-limits.js';
 import { assertProfileEvidenceStrength, assertLiveProfileProtocol, assertProfileProtocol, PersonProfileProtocolError, validateProfilePendingResults } from './profile-pending.js';
@@ -338,6 +338,7 @@ export class BackgroundMemory {
     if (this.closed || this.diagnosticFailed || !this.config.memory?.enabled) return;
     if (this.scope && (reason !== undefined || excludeMessageId !== undefined)) throw new Error('回填执行不能预约新的整理或压缩任务。');
     if (!this.scope) {
+      this.store.reserveRecoveryJobs(this.conversationId);
       if (reason === 'capacity') this.store.reserveCompressionBatch(this.conversationId, excludeMessageId);
       this.store.reserveMaterialsIfDue(this.conversationId);
     }
@@ -356,7 +357,8 @@ export class BackgroundMemory {
             // A different process may hold the database-wide materials lease.
             // Let the normal timer retry rather than spinning microtasks while
             // no local job is claimable (and starving cancellation/timers).
-            if (pipeline !== 'materials' && status.queued && !status.failed && !status.running) queueMicrotask(() => this.start());
+            if (pipeline !== 'materials' && status.queued && !status.failed && !status.running
+              &&!(this.config.memory!.maxCalls>0&&this.budget.calls>=this.config.memory!.maxCalls)) queueMicrotask(() => this.start());
           }
         });
       this.work.set(pipeline, work);
@@ -422,6 +424,7 @@ export class BackgroundMemory {
         }
       } finally { this.controllers.delete(waiting); }
       try {
+      if(setting.maxCalls>0&&this.budget.calls>=setting.maxCalls) return;
       const job = this.store.claimNext(this.conversationId, { owner: this.owner, leaseMs: setting.timeoutMs + 10000, pipeline,
         ...(this.scope ? { jobIds: this.scope.jobIds } : {}) });
       if (!job) return;
@@ -591,15 +594,16 @@ export class BackgroundMemory {
               phase, { failure: memoryFailure(error, phase) });
           }
         } catch (diagnosticError) { failure = diagnosticError; }
-        if (failure instanceof DiagnosticPersistenceError) this.diagnosticFailed = true;
-        this.lastError = this.diagnosticFailed ? '后台整理失败；[diagnostic_persistence] 诊断持久化失败，当前工作器已停止。'
+        if (failure instanceof DiagnosticPersistenceError || failure instanceof MemoryStatePersistenceError) this.diagnosticFailed = true;
+        this.lastError = failure instanceof MemoryStatePersistenceError ? `后台整理失败；${memoryFailure(failure,phase)}`
+          : this.diagnosticFailed ? '后台整理失败；[diagnostic_persistence] 诊断持久化失败，当前工作器已停止。'
           : `后台整理失败；${memoryFailure(error, phase)}`;
         this.pipelineErrors.set(pipeline, this.lastError);
         const conflict = error instanceof Error && /版本冲突|输入版本/.test(error.message);
         if (!committed) {
           // A compact task's protocol and completion receipts stay tied to its
           // original snapshot. A conflict requires an explicit replacement task.
-          if (conflict && !compactTask) this.store.clearProgress(job.id, lease);
+          if (conflict && !compactTask && pipeline==='legacy') this.store.clearProgress(job.id, lease);
           if (error instanceof ProfileRefinementExhaustedError && !this.diagnosticFailed && pipeline === 'materials') {
             this.store.deferCapacityFailure(job.id, lease, this.lastError);
             this.diagnostics?.event(context, 'profile_capacity', 'deferred', { reason: 'refinement_exhausted' }, callId);
@@ -612,7 +616,8 @@ export class BackgroundMemory {
           }
           this.store.fail(job.id, lease, this.lastError);
         }
-        // A failed/aborted request may have been billed or completed upstream. Only explicit retry may call again.
+        // Old attempts stay failed; automatic recovery is a separately scheduled, bounded new task.
+        if(!this.scope&&!this.diagnosticFailed&&pipeline!=='legacy') continue;
         return;
       }
       } finally { release?.(); }
@@ -710,6 +715,12 @@ export class BackgroundMemory {
     }
     if (input.extractionProtocol === 2 && item.mode === 'messages') delete chunk.selfProfile;
     if (input.pipeline === 'materials') delete chunk.previousSummary;
+    if(chunk.recoveryReviewMessages&&item.mode==='messages') chunk.recoveryReviewMessages=[];
+    if(chunk.recoveryReviewMessages&&item.mode==='profiles') {
+      const confirmationIds=new Set((input.recoveryProfileFactSources??[]).filter(source=>people.has(source.personId)).flatMap(source=>source.messageIds));
+      chunk.recoveryReviewMessages=chunk.recoveryReviewMessages
+        .filter(message=>(message.personId&&people.has(message.personId))||sourceIds.has(message.id)||confirmationIds.has(message.id));
+    }
     if (chunk.mode === 'profiles' && chunk.profiles.length === 1) chunk.profileOutputTarget = profileOutputTarget(chunk, this.config);
     return chunk;
   }
@@ -752,20 +763,26 @@ export class BackgroundMemory {
     const existing = progressWasLoaded ? loadedProgress : this.store.loadProgress(job.id, job.leaseToken!);
     if (existing !== undefined && existing !== null) {
       assertCurrentMemoryProtocol(existing);
-      if (!record(existing) || existing.version !== (input.extractionProtocol === 2 ? 3 : 2)) throw new PersonProfileProtocolError();
+      if(!record(existing)||!Number.isSafeInteger(existing.version)) throw new MemoryStatePersistenceError('后台整理检查点结构损坏。');
+      if (existing.version !== (input.extractionProtocol === 2 ? 3 : 2)) throw new PersonProfileProtocolError();
       if (existing.profileBaselineProtocol !== input.profileBaselineProtocol) throw new PersonProfileProtocolError();
       if(existing.profileAttributionProtocol!==input.profileAttributionProtocol||existing.selfProfileProtocol!==input.selfProfileProtocol) throw new PersonProfileProtocolError();
       if (!Array.isArray(existing.remaining) || !record(existing.extract)
-        || !Array.isArray(existing.profiles)) throw new Error('后台整理检查点损坏。');
+        || !Array.isArray(existing.profiles)) throw new MemoryStatePersistenceError('后台整理检查点损坏。');
+      const savedExtract=existing.extract;
+      if(!['topics','fragments','profiles','ignoredMessageIds'].every(key=>Array.isArray(savedExtract[key]))
+        ||[...existing.profiles,...savedExtract.profiles as unknown[]].some(profile=>!record(profile)||!Array.isArray(profile.facts)
+          ||profile.facts.some(fact=>!record(fact)||!Array.isArray(fact.messageIds))
+          ||(profile.pending!==undefined&&!Array.isArray(profile.pending)))) throw new MemoryStatePersistenceError('后台整理检查点产物结构损坏。');
       if (existing.separateMaterialSteps !== undefined && (existing.separateMaterialSteps !== true
-        || input.pipeline !== 'materials' || input.extractionProtocol !== 2)) throw new Error('后台整理检查点损坏。');
+        || input.pipeline !== 'materials' || input.extractionProtocol !== 2)) throw new MemoryStatePersistenceError('后台整理检查点损坏。');
       if (existing.capacityRecovery !== undefined) {
         const recovery = existing.capacityRecovery;
         if (input.pipeline !== 'materials' || input.profileAttributionProtocol !== 1 || !record(recovery)
           || recovery.version !== 1 || typeof recovery.workKey !== 'string' || !record(recovery.result)
           || !Array.isArray(recovery.attemptedPersonIds) || new Set(recovery.attemptedPersonIds).size !== recovery.attemptedPersonIds.length
           || recovery.attemptedPersonIds.some(id => typeof id !== 'string' || !input.profiles.some(profile => profile.personId === id))) {
-          throw new Error('画像容量提炼检查点损坏。');
+          throw new MemoryStatePersistenceError('画像容量提炼检查点损坏。');
         }
       }
       const available = new Set(input.messages.map(message => message.id));
@@ -775,10 +792,10 @@ export class BackgroundMemory {
       if (existing.remaining.some(item => !record(item) || ![undefined, 'messages', 'profiles', ...(input.extractionProtocol === 2 ? ['self'] : [])].includes(item.mode as WorkItem['mode'])
         || !Array.isArray(item.messageIds) || new Set(item.messageIds).size !== item.messageIds.length || item.messageIds.some(id => !available.has(id))
         || !Array.isArray(item.personIds) || new Set(item.personIds).size !== item.personIds.length || item.personIds.some(id => !people.has(id))
-        || (item.pendingIds !== undefined && (!Array.isArray(item.pendingIds) || item.pendingIds.some(id => !pendingIds.has(id)))))) throw new Error('后台检查点来源不匹配。');
+        || (item.pendingIds !== undefined && (!Array.isArray(item.pendingIds) || item.pendingIds.some(id => !pendingIds.has(id)))))) throw new MemoryStatePersistenceError('后台检查点来源不匹配。');
       this.store.assertProfileEvidenceCurrent(input, existing.extract as unknown as ValidatedExtract);
       this.store.assertProfileEvidenceCurrent(input, { profiles: existing.profiles as PersonProfile[] });
-      if (input.extractionProtocol === 2 && !Array.isArray(existing.extract.processedRanges)) throw new Error('后台整理检查点缺少步骤完成回执。');
+      if (input.extractionProtocol === 2 && !Array.isArray(existing.extract.processedRanges)) throw new MemoryStatePersistenceError('后台整理检查点缺少步骤完成回执。');
       return existing as unknown as Progress;
     }
     const messageIds = input.messages.map(message => message.id);

@@ -68,6 +68,10 @@ export interface SummaryCorrections {
     subjectActorIds: string[]; excludedActorIds: string[]; correctedMessages: AutoMemoryMessage[] }[];
 }
 export interface AutoMemoryTaskInput {
+  /** Read-only later evidence for chronological recovery; never grants write attribution. */
+  recoveryReviewMessages?: AutoMemoryMessage[];
+  /** Frozen supplementary confirmations; facts stay unchanged for revision/CAS validation. */
+  recoveryProfileFactSources?: {personId:string;fact:ProfileFact;messageIds:string[]}[];
   /** Program-confirmed correction lineage captured with the immutable compression input. */
   summaryCorrections?: SummaryCorrections;
   /** Absent on preserved combined jobs. New tasks write only their own pipeline's results. */

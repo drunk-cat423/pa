@@ -1,4 +1,10 @@
 /** Only application-authored descriptions may enter persisted diagnostics. */
+export class MemoryStatePersistenceError extends Error {
+  constructor(message='后台整理持久状态损坏。',options?:ErrorOptions) {
+    super(message,options);this.name='MemoryStatePersistenceError';
+  }
+}
+
 export class MemoryProviderError extends Error {
   constructor(readonly code: 'model_length' | 'model_request' | 'model_empty' | 'model_json' | 'model_contract',
     message: string, readonly httpStatus?: number) {
@@ -34,7 +40,9 @@ export function memoryFailure(error: unknown, phase: string): string {
   const message = error instanceof Error ? error.message : '';
   let code = 'unexpected';
   let detail = '未分类异常；调用结果可能未知，需人工检查后重试。';
-  if (error instanceof MemoryProviderError) {
+  if (error instanceof MemoryStatePersistenceError) {
+    code='state_persistence';detail='后台整理持久状态损坏；已停止，保留现场供操作者检查。';
+  } else if (error instanceof MemoryProviderError) {
     code = error.code;
     const descriptions = { model_length: '模型输出截断。', model_request: '模型请求未完成，调用结果可能未知。',
       model_empty: '模型未返回正文。', model_json: '模型正文不是有效JSON。', model_contract: '模型返回结构不符合约定。' };

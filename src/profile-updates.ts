@@ -56,6 +56,24 @@ export function validateProfileUpdates(profile: PersonProfile, baseline: PersonP
     const subject = resolveProfileSubject(evidence, source, input.profileSubjects ?? []);
     if (subject.personId !== profile.personId || (subject.sourceType === 'third_party' && !item.subject)) invalid();
   }
+  if(input.recoveryReviewMessages!==undefined) {
+    const chronologySources=new Map([...(input.recoveryReviewMessages??[]),...sources.values()].map(message=>[message.id,message]));
+    const evidenceOrder=(ids:readonly string[]):[number,number]=>ids.reduce<[number,number]>((latest,id)=>{
+      const source=chronologySources.get(id);const next:[number,number]=source?[Date.parse(source.createdAt),source.ingestSeq]:[-Infinity,-Infinity];
+      return next[0]>latest[0]||(next[0]===latest[0]&&next[1]>latest[1])?next:latest;
+    },[-Infinity,-Infinity]);
+    const atLeast=(a:[number,number],b:[number,number])=>a[0]>b[0]||(a[0]===b[0]&&a[1]>=b[1]);
+    baseline.facts.forEach((fact,index)=>{
+      if(profile.facts.some(next=>same(next,fact))) return;
+      const confirmations=(input.recoveryProfileFactSources??[]).filter(source=>source.personId===profile.personId&&same(source.fact,fact))
+        .flatMap(source=>source.messageIds);
+      // Old recovered text may add unrelated facts, but may not erase/rewrite a later baseline.
+      if(!updates.some(update=>update.baselineFactIndexes?.includes(index)
+        &&atLeast(evidenceOrder(update.evidence.map(item=>item.messageId)),evidenceOrder([...fact.messageIds,...confirmations])))) {
+        throw new Error('恢复任务不能用较早来源删除或改写较新的画像事实；缺少同等或更新的明确替代依据。');
+      }
+    });
+  }
 }
 
 export function normalizeProfileUpdates(profile: PersonProfile, normalizedFacts: ProfileFact[]): ProfileFactUpdate[] | undefined {

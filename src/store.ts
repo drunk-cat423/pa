@@ -71,7 +71,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 28;
+const SCHEMA_VERSION = 29;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -504,6 +504,20 @@ export class ConversationStore {
           message_id TEXT UNIQUE REFERENCES messages(id), external_message_id TEXT, reference_index TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );`);
+      if (version < 29) this.db.exec(`
+        CREATE TABLE auto_memory_recoveries (
+          failed_job_id TEXT PRIMARY KEY REFERENCES auto_memory_jobs(id),
+          root_job_id TEXT NOT NULL REFERENCES auto_memory_jobs(id), attempt INTEGER NOT NULL,
+          due_at INTEGER NOT NULL, replacement_job_id TEXT UNIQUE REFERENCES auto_memory_jobs(id),
+          created_at TEXT NOT NULL, manual_reason TEXT, manual_at TEXT);
+        CREATE TABLE auto_memory_material_job_messages_v29 (
+          job_id TEXT NOT NULL REFERENCES auto_memory_jobs(id), message_id TEXT NOT NULL REFERENCES messages(id),
+          ordinal INTEGER NOT NULL, PRIMARY KEY(job_id,message_id));
+        INSERT INTO auto_memory_material_job_messages_v29 SELECT * FROM auto_memory_material_job_messages;
+        DROP TABLE auto_memory_material_job_messages;
+        ALTER TABLE auto_memory_material_job_messages_v29 RENAME TO auto_memory_material_job_messages;
+        CREATE INDEX material_message_membership ON auto_memory_material_job_messages(message_id);
+      `);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');

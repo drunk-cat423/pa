@@ -54,10 +54,11 @@ test('worker commit failure keeps SDK response and associates the final phase wi
   const f = await fixture(t);
   f.store.autoMemory.commit = () => { throw new Error('PRIVATE_COMMIT_ERROR'); };
   const worker = f.worker(); worker.start('capacity');
-  await assert.rejects(worker.wait(undefined, 3000, 'compression'), /失败/);
+  await worker.wait(undefined, 3000, 'compression');
   const [job] = f.store.autoMemory.listJobs();
   assert.equal(job.pipeline, 'compression');
   assert.equal(job.status, 'failed'); assert.ok(f.requests.length >= 1);
+  assert.ok(f.store.autoMemory.recoveryInfo(job.id), 'failed work leaves FIFO but retains a durable recovery record');
   const call = f.log.calls({ jobId: job.id }).find(item => item.phase === 'commit');
   assert.ok(call);
   assert.equal(call.status, 'failed'); assert.equal(call.phase, 'commit');

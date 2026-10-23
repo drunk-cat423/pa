@@ -156,7 +156,7 @@ export class SelfProfileStore {
   }
 
   /** The enclosing auto-memory commit transaction also owns all other memory writes. */
-  commit(snapshot: SelfProfileSnapshot, proposal: SelfProfileProposal, batchMessages: readonly AutoMemoryMessage[], maxBytes = 20000, jobId?: string): void {
+  commit(snapshot: SelfProfileSnapshot, proposal: SelfProfileProposal, batchMessages: readonly AutoMemoryMessage[], maxBytes = 20000, jobId?: string, recovery=false): void {
     this.transaction(() => {
       if (snapshot.protocol !== 2 || snapshot.sourceMessageIds !== undefined || proposal.protocol !== 2) {
         throw new Error('自我档案协议版本已失效，旧冻结输入不能提交现场更新。');
@@ -194,6 +194,17 @@ export class SelfProfileStore {
         throw new Error('自我档案输入版本已变化，待整理画像容量不足，请重读后重试。');
       }
       const changed = proposal.content !== current.content;
+      if(recovery&&changed&&snapshot.content&&!proposal.content.includes(snapshot.content)) {
+        const latest=this.db.prepare(`SELECT m.created_at,m.ingest_seq FROM self_profile_update_sources s JOIN messages m ON m.id=s.message_id
+          ORDER BY m.created_at DESC,m.ingest_seq DESC LIMIT 1`).get();
+        const ids=[...updates.map(update=>update.messageId),...pendingSources.map(pending=>pending.sourceMessageId)];
+        const newest=ids.map(id=>this.db.prepare('SELECT created_at,ingest_seq FROM messages WHERE id=?').get(id)!)
+          .sort((a,b)=>Date.parse(String(b.created_at))-Date.parse(String(a.created_at))||Number(b.ingest_seq)-Number(a.ingest_seq))[0];
+        if(latest&&(!newest||Date.parse(String(newest.created_at))<Date.parse(String(latest.created_at))
+          ||(newest.created_at===latest.created_at&&Number(newest.ingest_seq)<Number(latest.ingest_seq)))) {
+          throw new Error('恢复任务不能用较早来源整体替换较新的AI画像；当前正文须保留。');
+        }
+      }
       const revision = snapshot.baseVersion + (changed ? 1 : 0);
       if (changed) this.db.prepare('INSERT INTO self_profile_revisions VALUES (?,?,?,?)')
         .run(revision, proposal.content, '[]', timestamp());

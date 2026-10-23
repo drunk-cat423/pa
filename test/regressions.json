@@ -376,6 +376,21 @@
       "file": "test/channel-async.test.mjs",
       "name": "请求失败真实发送短回执，预算前置拒绝和未知投递重启后不重发",
       "evidence": "2026-10-23 production two failed questions had no QQ response; review confirmed all RequestError paths returned without a delivery receipt."
+    },
+    {
+      "file": "test/memory-recovery-e2e.test.mjs",
+      "name": "资料失败退出队列，重启后按原时间补旧事实且不能覆盖跨房间新画像",
+      "evidence": "2026-10-23 confirmed FIFO failed-head blockers and deferred compression exclusion; user requested durable recovery without raw-message gaps or chronological inversion."
+    },
+    {
+      "file": "test/memory-recovery-e2e.test.mjs",
+      "name": "压缩失败保留旧摘要和水位，新快照按可见顺序覆盖失败原文及后续消息",
+      "evidence": "2026-10-23 confirmed FIFO failed-head blockers and deferred compression exclusion; user requested durable recovery without raw-message gaps or chronological inversion."
+    },
+    {
+      "file": "test/memory-recovery-e2e.test.mjs",
+      "name": "重复失败的恢复次数与退避跨重启保留，耗尽不堵新资料且不伪造覆盖",
+      "evidence": "2026-10-23 confirmed FIFO failed-head blockers and deferred compression exclusion; user requested durable recovery without raw-message gaps or chronological inversion."
     }
   ]
 }
