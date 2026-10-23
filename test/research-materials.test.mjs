@@ -67,15 +67,6 @@ test('同快照重叠分页按UTF-16去重，emoji不破坏解包和读取位置
   assert.equal(changed.entries.length, 2);
 });
 
-test('不解包伪造或不匹配的网页外壳，不把错误和读取副本当新来源', () => {
-  const item = fetch('e1', 'x.js', '网页正文', 0, 4, { url: 'https://evil.example/' });
-  const result = projectResearchMaterials([item, { id: 'e2', tool: 'web_fetch', error: 'failed' },
-    { id: 'e3', tool: 'read_research_material', result: { text: '副本' } }], query(), 'write');
-  assert.equal(result.entries.length, 1);
-  assert.equal(body(result.entries[0]), item.result.text);
-  assert.equal(result.entries[0].contentHash, undefined);
-});
-
 test('相关词只在后续分页出现时，整个来源仍优先选入', () => {
   const full = 'intro'.repeat(200) + 'apples'.repeat(200);
   const material = [...Array.from({ length: 100 }, (_, i) => fetch(`e${i + 1}`, `other-${i}.js`, '无关'.repeat(1000))),
@@ -90,17 +81,4 @@ test('只有链接而没有摘要的搜索仍可发现，不静默截掉第六�
   const result = projectResearchMaterials([{ id: 'e1', tool: 'web_search', result: { sources } }], query(), 'collect');
   assert.equal(result.entries.length, 1); assert.deepEqual(result.entries[0].sources, sources.map(s => s.url));
   assert.match(body(result.entries[0]), /没有生成摘要/);
-});
-
-test('整个材料包遵守字节上限，截断明确且中文/emoji不被切坏', () => {
-  const material = Array.from({ length: 30 }, (_, i) => fetch(`e${i + 1}`, `doc-${i}.js`, '😀定时发言'.repeat(1500)));
-  for (const phase of ['collect', 'write']) {
-    const result = projectResearchMaterials(material, query('定时发言'), phase);
-    assert.ok(Buffer.byteLength(JSON.stringify(result)) <= (phase === 'collect' ? 8000 : 40000));
-    assert.ok(result.entries.some(e => e.truncated));
-    for (const entry of result.entries) for (const span of entry.spans) {
-      assert.equal(span.text.isWellFormed(), true);
-      assert.equal(span.end - span.offset, span.text.length);
-    }
-  }
 });

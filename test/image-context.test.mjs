@@ -130,22 +130,3 @@ test('QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、
     assert.equal(finalDb.prepare(`SELECT count(*) n FROM messages WHERE external_event_id IN ('preparing-at-close','queued-at-close')`).get().n,0);
   }finally{finalDb.close();}
 });
-
-test('关闭等待中的图片admission会取消下载，关闭完成后不入库、不回复、不调用模型',async t=>{
-  const dir=await mkdtemp(join(tmpdir(),'pa-image-close-'));
-  let started;
-  const downloading=new Promise(resolve=>{started=resolve;});
-  const originalFetch=globalThis.fetch;
-  let sent=0;
-  globalThis.fetch=async(_url,options)=>{started();return new Promise((_resolve,reject)=>{
-    options.signal.addEventListener('abort',()=>reject(new Error('aborted')),{once:true});
-  });};
-  const config={cwd:dir,dataDir:join(dir,'data'),provider:'deepseek',model:'deepseek-flash',apiKey:'fixture',baseUrl:'http://127.0.0.1:1',contextWindow:1_000_000,maxOutputTokens:1024,timeoutMs:5000};
-  const route={channel:'qq',accountId:'bot',roomId:'room',roomType:'group'};
-  const h=new ChannelHarness(config,[route],{send:async()=>{sent++;return {status:'sent',externalMessageId:'unused'};}},0);
-  t.after(async()=>{await h.close();globalThis.fetch=originalFetch;await rm(dir,{recursive:true,force:true});});
-  const pending=h.handle({route,eventId:'image',senderId:'sender',text:'看看图',mentioned:true,sentAt:new Date().toISOString(),imageSources:[{url:'https://multimedia.nt.qq.com.cn/image'}]});
-  await downloading;await h.close();assert.equal(await pending,'ignored');assert.equal(sent,0);
-  const db=new DatabaseSync(join(config.dataDir,'pa.sqlite'));
-  try{assert.equal(db.prepare('SELECT count(*) n FROM messages').get().n,0);assert.equal(db.prepare('SELECT count(*) n FROM agent_runs').get().n,0);}finally{db.close();}
-});

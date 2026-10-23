@@ -160,29 +160,6 @@ test('chunk progress and input snapshot survive retry and reclaim; clearing rere
   }finally{f.close();}
 });
 
-test('shared room records remain separate from stable personal profiles',()=>{
-  const f=fixture();try {
-    const self=f.inbound('self'),actor=f.store.findActor(f.conversation.id,'alice');
-    const memory=f.store.rememberMemory(f.conversation.id,{content:'group agreement',sourceMessageId:self.existingMessageId}).memory;
-    const owner=f.inbound('owner correction','owner');
-    f.store.correctMemory(f.conversation.id,memory.id,{content:'corrected group agreement',sourceMessageId:owner.existingMessageId},1);
-    assert.equal(f.store.queryMemories(f.conversation.id)[0].content,'corrected group agreement');
-    assert.deepEqual(f.store.autoMemory.profileForActors(actor)[0].facts,[]);
-    assert.deepEqual(f.store.autoMemory.profileForActors(actor)[0].pending,[]);
-  }finally{f.close();}
-});
-
-test('private compression excludes pending and uncertain assistant replies',()=>{
-  const f=fixture('private');try {
-    const input=f.inbound();const run=f.store.beginRun(f.conversation.id,'hello','p','m',[],input);
-    const delivery=f.store.completeRun(run.id,'draft',undefined,undefined);
-    assert.deepEqual(f.store.autoMemory.conversationContext(f.conversation.id).messages.map(m=>m.text),['hello']);
-    assert.deepEqual(f.store.autoMemory.reserveCompressionBatch(f.conversation.id).messageIds,[input.existingMessageId]);
-    f.store.ackDelivery(delivery.deliveryId,'uncertain');
-    assert.deepEqual(f.store.autoMemory.conversationContext(f.conversation.id).messages.map(m=>m.text),['hello']);
-  }finally{f.close();}
-});
-
 test('unbound actors are isolated and configured multiple people share only explicit bindings',()=>{
   const f=fixture();try {
     const alice=f.inbound('我喜欢tea','alice');const bob=f.inbound('我喜欢sports','bob');const a=f.store.findActor(f.conversation.id,'alice');const b=f.store.findActor(f.conversation.id,'bob');

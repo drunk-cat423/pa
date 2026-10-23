@@ -1,0 +1,336 @@
+{
+  "policy": "Retain exact recorded failing tests or tests for independently confirmed incidents. Local failure logs are private and not committed.",
+  "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
+  "tests": [
+    {
+      "file": "test/answer-documents.test.mjs",
+      "name": "schema17只读保留旧页面正文与引用索引，不混入规范回答历史",
+      "evidence": ".local/identity-attribution-regression.log:9"
+    },
+    {
+      "file": "test/answer-documents.test.mjs",
+      "name": "schema16 migration keeps canonical history and creates an intact backup",
+      "evidence": ".local/identity-attribution-regression.log:10"
+    },
+    {
+      "file": "test/auto-memory-retrieval.test.mjs",
+      "name": "a captured third-party target is organized even when only its recorder spoke in this batch",
+      "evidence": ".local/memory-refactor-narrow.log:5"
+    },
+    {
+      "file": "test/auto-memory-retrieval.test.mjs",
+      "name": "deduplicated facts recalled through a Topic reveal only evidence from that Topic room",
+      "evidence": ".local/memory-refactor-narrow.log:9"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "capacity short batch and queued snapshot survive failures and process restart",
+      "evidence": ".local/memory-refactor-regression-initial.log:33"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "deferral preserves failed evidence and frozen input, releases later batches in order and retains the raw gap",
+      "evidence": "User-confirmed failed first consolidation batch blocked 12 later batches; explicit deferral repair"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "v12 migration backs up the consistent original database before adding deferrals",
+      "evidence": ".local/memory-split-regression.log:36"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "expired worker is failed without automatic recall; explicit retry fences the old lease",
+      "evidence": ".local/memory-refactor-regression-initial.log:37"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "chunk progress and input snapshot survive retry and reclaim; clearing rereads facts",
+      "evidence": ".local/profile-subject-integration-20261021.log:38"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "unbound actors are isolated and configured multiple people share only explicit bindings",
+      "evidence": ".local/profile-subject-integration-20261021.log:42"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "profile pending corrections captured after a batch stay pending for the next batch",
+      "evidence": ".local/memory-refactor-regression-initial.log:43"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "confirmed binding carries independent automatic profile and fences in-flight old identity results",
+      "evidence": ".local/memory-refactor-regression-initial.log:46"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "atomic Topic, person evidence, profile and room-scoped keyword search",
+      "evidence": ".local/memory-refactor-regression-initial.log:47"
+    },
+    {
+      "file": "test/auto-memory-store.test.mjs",
+      "name": "v5 incremental migration preserves original IDs, tombstones, primary identity and snapshots legacy watermark",
+      "evidence": ".local/profile-subject-integration-20261021.log:51"
+    },
+    {
+      "file": "test/auto-memory.test.mjs",
+      "name": "私聊完成50轮且容量较低时不按轮数自动压缩",
+      "evidence": ".local/memory-split-regression-bounded.log:57"
+    },
+    {
+      "file": "test/auto-memory.test.mjs",
+      "name": "最终上下文达到85%才整理；摘要与检查点后消息跨新轮和重启继续",
+      "evidence": ".local/memory-refactor-main-narrow.log:29"
+    },
+    {
+      "file": "test/auto-memory.test.mjs",
+      "name": "仅发送者及真实@对象画像，绑定人物私聊自述可在群使用",
+      "evidence": ".local/memory-loop-tests.txt:42"
+    },
+    {
+      "file": "test/auto-memory.test.mjs",
+      "name": "群容量压缩标记新协议、创建群摘要且数据库保留原文",
+      "evidence": ".local/memory-refactor-main-narrow.log:35"
+    },
+    {
+      "file": "test/auto-memory.test.mjs",
+      "name": "长批次拆分检查点在失败重试后续接，不重复已成功的子批次",
+      "evidence": ".local/memory-loop-tests.txt:49"
+    },
+    {
+      "file": "test/auto-memory.test.mjs",
+      "name": "关闭中断的后台批次保留失败，只有显式重试后才继续整理",
+      "evidence": ".local/memory-refactor-main-narrow.log:39"
+    },
+    {
+      "file": "test/auto-memory.test.mjs",
+      "name": "后台提供完整旧画像并整体替换收敛结果，不再补回未返回的旧事实",
+      "evidence": ".local/memory-refactor-main-narrow.log:40"
+    },
+    {
+      "file": "test/auto-memory.test.mjs",
+      "name": "等待截止时间独立于后台工作结束，超时后后台可以继续",
+      "evidence": ".local/memory-refactor-regression-initial.log:73"
+    },
+    {
+      "file": "test/calibrated-compression.test.mjs",
+      "name": "渠道按实测校准跨任务复用，字节超窗口不误压缩，接近实际85%后触发同一整理流程",
+      "evidence": ".local/memory-refactor-main-narrow2.log:44"
+    },
+    {
+      "file": "test/channel-async.test.mjs",
+      "name": "同群长回答分段与其它回答按队列顺序完成",
+      "evidence": ".local/memory-split-regression-bounded.log:78"
+    },
+    {
+      "file": "test/channel-task-store.test.mjs",
+      "name": "真实v9迁移先备份，保留原文、已确认分段和旧canonical运行",
+      "evidence": ".local/memory-loop-tests.txt:88"
+    },
+    {
+      "file": "test/channel-web-tools.test.mjs",
+      "name": "搜索及后续网页核验不附网址，单独读取网页仍保留来源，实际工具参数与投递落库",
+      "evidence": ".local/memory-split-regression-bounded.log:114"
+    },
+    {
+      "file": "test/cli-interaction.test.mjs",
+      "name": "实际 CLI 多轮输入、管理指令、退出及重启恢复",
+      "evidence": ".local/memory-loop-tests.txt:90"
+    },
+    {
+      "file": "test/delivery-parts.test.mjs",
+      "name": "last receipt and parent completion are atomic; cross-conversation child references fail",
+      "evidence": ".local/identity-attribution-regression.log:155"
+    },
+    {
+      "file": "test/delivery-parts.test.mjs",
+      "name": "v7 migration creates a consistent backup and preserves legacy replies and unrelated records",
+      "evidence": ".local/identity-attribution-regression.log:157"
+    },
+    {
+      "file": "test/image-context.test.mjs",
+      "name": "QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、重启与容量摘要，按房间重新读取",
+      "evidence": ".local/memory-split-regression-final.log:191"
+    },
+    {
+      "file": "test/legacy-count-retirement.test.mjs",
+      "name": "retiring the failed + queued + deferred count backlog preserves evidence and hands every original to rolling",
+      "evidence": ".local/memory-refactor-regression-initial.log:194"
+    },
+    {
+      "file": "test/legacy-count-retirement.test.mjs",
+      "name": "schema15 upgrade backs up original evidence and never retires or reserves work automatically",
+      "evidence": ".local/profile-subject-integration-20261021.log:223"
+    },
+    {
+      "file": "test/material-proposal-recovery.test.mjs",
+      "name": "materials wire_subject rejection preserves evidence and releases the next batch without covering its gap",
+      "evidence": ".local/server-audit-20261022/排查结果.md:50; saved group proposal referenced a person absent from the input baseline, blocking later batches"
+    },
+    {
+      "file": "test/material-proposal-recovery.test.mjs",
+      "name": "materials attribution rejection preserves evidence and releases the next batch without covering its gap",
+      "evidence": ".local/server-audit-20261022/排查结果.md:51; asking about a tool was misattributed as personal usage, blocking later batches"
+    },
+    {
+      "file": "test/memory-context.test.mjs",
+      "name": "真实请求追加受限完整记忆、固定system不变、SQL usage只记录实际引用",
+      "evidence": ".local/memory-loop-tests.txt:135"
+    },
+    {
+      "file": "test/memory-diagnostics.test.mjs",
+      "name": "worker commit failure keeps SDK response and associates the final phase with the call",
+      "evidence": ".local/memory-refactor-regression-initial.log:245"
+    },
+    {
+      "file": "test/memory-diagnostics.test.mjs",
+      "name": "paused background and injected fake providers preserve scheduling while only real SDK calls create call records",
+      "evidence": ".local/memory-refactor-regression-initial.log:246"
+    },
+    {
+      "file": "test/memory-diagnostics.test.mjs",
+      "name": "diagnostic persistence failure before commit halts the worker without another call",
+      "evidence": ".local/memory-refactor-regression-initial.log:248"
+    },
+    {
+      "file": "test/memory-diagnostics.test.mjs",
+      "name": "diagnostic persistence failure after commit halts the worker without another call",
+      "evidence": ".local/logging-targeted.txt:8"
+    },
+    {
+      "file": "test/memory-store.test.mjs",
+      "name": "真实V1布局迁移到V6，保留消息、运行与投递并可写入记忆",
+      "evidence": ".local/memory-loop-tests.txt:151"
+    },
+    {
+      "file": "test/memory-store.test.mjs",
+      "name": "真实V3增量迁移保留所有业务列、rowid及审计，旧群记忆不自动共享，DDL失败回滚",
+      "evidence": ".local/memory-loop-tests.txt:152"
+    },
+    {
+      "file": "test/memory-store.test.mjs",
+      "name": "真实V2迁移保留记忆版本、来源、使用审计与pending重置标记，失败整笔回滚",
+      "evidence": ".local/memory-loop-tests.txt:153"
+    },
+    {
+      "file": "test/memory-store.test.mjs",
+      "name": "真实V4增量迁移保留rowid/正文/修订/来源/使用与reset水位，V5 DDL冲突整笔回滚",
+      "evidence": ".local/memory-loop-tests.txt:172"
+    },
+    {
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "v13 migration backup preserves archived legacy pending rows and current database advances to v23",
+      "evidence": "91791ad explicitly renamed v14 to v23; old exact name failed at .local/memory-refactor-regression-final.log:310"
+    },
+    {
+      "file": "test/profile-history-storage.test.mjs",
+      "name": "v8 migration backs up and preserves archived legacy field metadata, identities, queued snapshot and FTS backfill",
+      "evidence": ".local/memory-loop-tests.txt:190"
+    },
+    {
+      "file": "test/research-archive.test.mjs",
+      "name": "归档其他三项后清单只保留目标，报告草稿历史和文件不变，幂等且停止执行与通知",
+      "evidence": ".local/research-revision-regression-20261023.log:130"
+    },
+    {
+      "file": "test/research-context.test.mjs",
+      "name": "本地HTTP采集循环：轻量投影启用，完整思考与原始Pi记录保留",
+      "evidence": "b888659; saved six collect requests prefix changed at byte 2069; .local/research-followup-20261023/cache-analysis.json"
+    },
+    {
+      "file": "test/research-e2e.test.mjs",
+      "name": "研究故障端到端：原文失败仅尝试两次、显式续作保留证据，未知发送和崩溃运行不自动重放",
+      "evidence": "1584876; actual regression failed when error index omitted network code"
+    },
+    {
+      "file": "test/research-e2e.test.mjs",
+      "name": "最后一个采集工具失败且无笔记时，写作仅带必要失败说明并保留blocked",
+      "evidence": "b888659; stage cleanup removed last-batch fetch failure from write input; sourceFailures repair"
+    },
+    {
+      "file": "test/research-e2e.test.mjs",
+      "name": "章节报告不继承聊天输出上限，程序组装长正文；伪调用保留失败草稿且不重试",
+      "evidence": "50242f9; user-reported real research report truncation and DSML pseudo-tool result"
+    },
+    {
+      "file": "test/research-e2e.test.mjs",
+      "name": "明确检查链接必须真实读取，不能只凭URL文字回答能看到",
+      "evidence": ".local/server-audit-20261022/排查结果.md:24; bot claimed repository readable without web_fetch/web_search"
+    },
+    {
+      "file": "test/research-materials.test.mjs",
+      "name": "省略告警保留但不挤爆合法的30条缺口和单条字节上限",
+      "evidence": "1584876; 30 valid gaps plus omission warning rejected by saveSection limit"
+    },
+    {
+      "file": "test/research-materials.test.mjs",
+      "name": "新增要求直接涉及的早期文件不被最近材料挤掉，短文件完整展示",
+      "evidence": "1584876; saved DeepSeek-Bot request dropped e29/e32; local first material test failed"
+    },
+    {
+      "file": "test/research-materials.test.mjs",
+      "name": "没有新增要求时原始目标仍参与排序、保护和省略告警",
+      "evidence": "1584876; reviewer reproduced goal ignored by newline truthiness and e101 omitted"
+    },
+    {
+      "file": "test/research-materials.test.mjs",
+      "name": "同快照重叠分页按UTF-16去重，emoji不破坏解包和读取位置",
+      "evidence": "1584876; reviewer reproduced abc😀def envelope failing UTF-16 range validation"
+    },
+    {
+      "file": "test/research-materials.test.mjs",
+      "name": "相关词只在后续分页出现时，整个来源仍优先选入",
+      "evidence": "1584876; reviewer reproduced second-page apples omitted after 100 unrelated sources"
+    },
+    {
+      "file": "test/research-materials.test.mjs",
+      "name": "只有链接而没有摘要的搜索仍可发现，不静默截掉第六个来源",
+      "evidence": "1584876; reviewer reproduced valid sources-only response projected to zero entries"
+    },
+    {
+      "file": "test/research-target.test.mjs",
+      "name": "明确承接继承最近同actor链接，群友新链接不会覆盖",
+      "evidence": ".local/server-audit-20261022/排查结果.md:18; follow-up repository question incorrectly became another member's old research topic"
+    },
+    {
+      "file": "test/research-thinking-runtime.test.mjs",
+      "name": "collect最后一次请求保持auto并执行整批真实抓取与材料工具，只发送一次请求",
+      "evidence": "52a95f7; real research run failed at forced no-tools last collect request"
+    },
+    {
+      "file": "test/rolling-memory-store.test.mjs",
+      "name": "v14 migration backs up original jobs and preserves old done group Topic history without a summary",
+      "evidence": ".local/memory-refactor-narrow.log:47"
+    },
+    {
+      "file": "test/runtime-search-boundaries.test.mjs",
+      "name": "搜索结果使最终请求超过窗口时发送前硬检查仍拦截",
+      "evidence": ".local/profile-subject-integration-20261021.log:460"
+    },
+    {
+      "file": "test/runtime-search.test.mjs",
+      "name": "harness真实Pi自主工具循环、查询实参、普通聊天不自动调用、CLI禁工具、重启不重放搜索",
+      "evidence": ".local/logging-regression.txt:282"
+    },
+    {
+      "file": "test/runtime-token-calibration.test.mjs",
+      "name": "successful prepare usage is learned before answer payload is sent in the same tool loop",
+      "evidence": ".local/identity-attribution-regression.log:380"
+    },
+    {
+      "file": "test/self-profile-store.test.mjs",
+      "name": "v6 migration backs up original data and preserves frozen job input while isolating its old lease",
+      "evidence": "9e42f99 explicitly renamed old v6 test; old exact name failed at .local/memory-loop-tests.txt:256"
+    },
+    {
+      "file": "test/store.test.mjs",
+      "name": "schema启用WAL与外键，会话和消息重开后持久化并隔离",
+      "evidence": ".local/memory-loop-tests.txt:259"
+    },
+    {
+      "file": "test/store.test.mjs",
+      "name": "上下文SQL在LIMIT之前过滤管理、失败运行与其他成员AI交互，重置水位持久生效",
+      "evidence": ".local/simplification-tests.txt:289"
+    }
+  ]
+}

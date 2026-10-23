@@ -42,26 +42,27 @@ npm run check
 npm test
 ```
 
-测试使用临时目录、SQLite 和本地 HTTP，不调用外部模型、不消费生产凭据。当前套件按2026-10-21确认的规则精简：只保留本机开发记录中至少失败过一次的现存用例，包括有明确改名记录的延续用例。按具体用例筛选，不因文件中某一项失败就保留整个文件；仅有文件导入失败的记录，也不视为其中全部用例都失败过。已经移除的旧功能测试不恢复。
+测试使用临时目录、SQLite 和本地 HTTP，不调用外部模型、不消费生产凭据。2026-10-23再次按用户要求清理：只保留有同名实际失败记录、明确改名的失败延续记录，或能对应已确认故障复现的现存用例。保留依据逐项列在 [test/regressions.json](../test/regressions.json)，私有故障日志不提交。按具体用例及参数化变体筛选，不因文件中某一项失败就保留整个文件；仅有文件导入失败不算其中全部用例失败。已经移除的旧功能测试不恢复。
 
-研究功能以 `research-e2e.test.mjs` 可观察端到端流程覆盖创建到文件发送，以及网络失败/显式继续/重启与未知投递恢复。2026-10-22按线上故障补充目标绑定、长报告/截断、伪调用与明确链接读取回归；`material-proposal-recovery.test.mjs` 检查被拒绝模型提案的原子搁置及不可降级边界。新增故障优先复用现有流程，避免镜像实现的测试。模型、网页与QQ接口使用本地模拟，真实意图判断和客户端展示仍需独立联调。研究的设计、预算和边界见 [research.md](research.md)。
+研究保留错误码丢失、长报告截断、未读取链接却声称可读、目标串话题、末轮工具关闭、材料漏选与分页、前缀缓存失配等已复现问题的回归；`material-proposal-recovery.test.mjs`只保留实际出现过的未知画像对象和错误人物归属两个分支。无故障依据的功能验收与预防性组合已删除，附属无用helper、import和代理测试证书一起清理。模型、网页与QQ接口仍使用本地模拟，真实模型质量和客户端展示需独立联调。研究的设计、预算和边界见 [research.md](research.md)。
 
 失败记录可能来自实现、测试样例或旧断言，不等于每次都发现了产品缺陷。未找到失败记录的用例及不再使用的辅助代码已移除，当前套件不代表所有功能和边界都有覆盖。保留的回归按以下范围查找：
 
 | 范围 | 主要测试文件 | 防止的故障 |
 |---|---|---|
-| 对话和工具循环 | `companion-loop`、`channel-harness`、`cli-interaction` | 准备与回答衔接、单轮失败后的继续对话、终端交互 |
-| 上下文与用量校准 | `group-context`、`memory-context`、`context-tokens`、`runtime-token-calibration`、`calibrated-compression` | 已记录的历史注入、容量压缩和实测用量问题 |
+| 对话和工具循环 | `channel-async`、`cli-interaction` | 已记录的分段排队和终端交互失败 |
+| 上下文与用量校准 | `memory-context`、`runtime-token-calibration`、`calibrated-compression` | 已记录的历史注入、容量压缩和实测用量问题 |
 | 画像与后台整理 | `auto-memory*`、`self-profile*`、`memory-diagnostics` | 已记录的画像注入、整理恢复及诊断保存问题 |
-| 存储与消息投递 | `store`、`memory-store`、`channel-task-store`、`channel-async`、`delivery-parts`、`qq-channel` | 旧数据库升级、分段投递与引用处理 |
-| 搜索、网页和图片 | `runtime-search*`、`channel-web-tools`、`web-fetch-proxy`、`image-context`、`markdown-chunks` | 搜索工具衔接、代理连接关闭、图片传递与代码围栏分段 |
-| 运维与旧任务处理 | `pa-storage`、`legacy-count-retirement` | 备份清理计划、保留版本保护及旧计数任务退役 |
+| 存储与消息投递 | `store`、`memory-store`、`channel-task-store`、`delivery-parts` | 旧数据库升级及投递状态 |
+| 搜索、网页和图片 | `runtime-search*`、`channel-web-tools`、`image-context` | 搜索工具衔接及图片传递 |
+| 后台研究 | `research-context`、`research-materials`、`research-e2e`、`research-target`、`research-thinking-runtime`、`research-archive` | 已复现的材料、缓存、循环、目标和归档问题 |
+| 旧任务处理 | `legacy-count-retirement` | 失败队列退役与原始资料保留 |
 
 表中的名称均对应 `test/<名称>.test.mjs`。只检查相关模块时，先构建，再指定文件，例如：
 
 ```powershell
 npm run build
-node --test test/group-context.test.mjs test/context-tokens.test.mjs
+node --test test/research-materials.test.mjs test/research-context.test.mjs
 ```
 
 后续优先为实际故障补充回归用例，说明触发条件和错误结果；同一入口、同一输入和同一结果不重复覆盖。迁移测试也按失败记录筛选，不整组保留。

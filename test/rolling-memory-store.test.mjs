@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
-import { BackgroundMemory } from '../dist/auto-memory.js';
+
 import { downgradeSchema14 } from './fixtures/legacy-schema.mjs';
 import { emptyExtraction } from './fixtures/memory-output.mjs';
 
@@ -44,29 +44,4 @@ test('v14 migration backs up original jobs and preserves old done group Topic hi
   assert.deepEqual(f.reserve().messageIds,[source.existingMessageId]);commit(f,'whole room history');
   assert.equal(f.context().messages.length,0);assert.equal(f.store.autoMemory.searchTopics(f.room.id,{text:'Topic'}).topics.length,1);
   assert.equal(input.contextProtocol,undefined);
-});
-
-test('v14 frozen failed jobs are isolated and keep their input and progress unchanged',async t=>{
-  const f=fixture(t);f.inbound('legacy input');
-  f.store.autoMemory.reserveBatch(f.room.id,'count',1);const job=f.claim();
-  const input=f.store.autoMemory.taskInput(job);
-  f.store.autoMemory.saveProgress(job.id,job.leaseToken,{version:2,
-    remaining:[{messageIds:input.messages.map(m=>m.id),personIds:input.profiles.map(p=>p.personId)}],
-    profiles:input.profiles,extract:{topics:[],fragments:[],profiles:[],ignoredMessageIds:[]}});
-  f.store.autoMemory.fail(job.id,job.leaseToken,'unknown result');
-  const frozen=f.inspect(db=>db.prepare('SELECT input_json,progress_json,error FROM auto_memory_jobs WHERE id=?').get(job.id));
-  f.store.close();f.inspect(db=>{downgradeSchema14(db);db.exec('PRAGMA user_version=14;');});f.restart();
-  let calls=0;
-  const worker=new BackgroundMemory({contextWindow:8192,memory:{enabled:true,maxCalls:2,timeoutMs:1000}},
-    f.store.autoMemory,f.room.id,{extract:async captured=>{
-      calls++;assert.equal(captured.contextProtocol,undefined);
-      const result=output(captured);delete result.continuationSummary;return result;
-    }});
-  t.after(()=>worker.close());
-  worker.start();await worker.wait();assert.equal(calls,0);
-  assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json,error FROM auto_memory_jobs WHERE id=?').get(job.id)),frozen);
-  assert.equal(f.store.autoMemory.status(f.room.id).isolated,1);
-  assert.throws(()=>worker.retry(job.id),/隔离/);
-  assert.equal(f.inspect(db=>db.prepare('SELECT input_json FROM auto_memory_jobs WHERE id=?').get(job.id)).input_json,frozen.input_json);
-  assert.deepEqual(f.context().messages.map(m=>m.text),['legacy input']);
 });

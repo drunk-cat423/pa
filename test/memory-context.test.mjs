@@ -62,21 +62,6 @@ function recalledItems(message) {
   return JSON.parse(content.slice(content.lastIndexOf('\n') + 1));
 }
 
-test('显式记忆到期后清旧Pi投影，既有记忆块和派生对话不继续载入', async t => {
-  const f = await fixture(t);
-  const conversation = await f.conversation('EXPIRY');
-  const memory = conversation.remember({ content: 'EXPIRING_PLAN_SECRET', expiresAt: new Date(Date.now() + 60_000).toISOString() }).memory;
-  await conversation.prompt('EXPIRY_FIRST_TURN');
-  assert.ok(JSON.stringify(f.requests.at(-1)).includes('EXPIRING_PLAN_SECRET'));
-  // Simulate reaching the recorded deadline without a real-time wait or API cost.
-  const db = f.database();
-  db.prepare('UPDATE memories SET expires_at=? WHERE id=?').run('2000-01-01T00:00:00.000Z', memory.id);
-  await conversation.prompt('EXPIRY_NEW_TURN');
-  const body = JSON.stringify(f.requests.at(-1));
-  assert.ok(!body.includes('EXPIRING_PLAN_SECRET') && !body.includes('EXPIRY_FIRST_TURN'));
-  assert.equal(db.prepare('SELECT content FROM memories WHERE id=?').get(memory.id).content, 'EXPIRING_PLAN_SECRET');
-});
-
 test('真实请求追加受限完整记忆、固定system不变、SQL usage只记录实际引用', async t => {
   const f = await fixture(t);
   const conversation = await f.conversation('recall');
@@ -102,35 +87,4 @@ test('真实请求追加受限完整记忆、固定system不变、SQL usage只�
   await conversation.close();
   const reopened = await f.conversation('recall');
   assert.equal(reopened.history().length, 4, 'custom memory must not break Pi/SQL integrity');
-});
-
-test('JSON转义计入8000字符预算，不截断单条，长chat原文仍可请求', async t => {
-  const f = await fixture(t);
-  const conversation = await f.conversation('budget');
-  for (let index = 0; index < 8; index++) conversation.remember({ content: `完整-${index}-${'"\\'.repeat(850)}` });
-  const original = new Map(conversation.queryMemories().map(memory => [memory.id, memory.content]));
-  const input = '长'.repeat(1200);
-  await conversation.prompt(input);
-  const recalled = memoryMessages(f.requests[0])[0];
-  assert.ok(recalled.content.length <= 8000);
-  const items = recalledItems(recalled);
-  assert.ok(items.length > 0 && items.length < 8);
-  assert.ok(items.every(item => item.content === original.get(item.id)));
-  assert.equal(requestText(asText(f.requests[0].messages.at(-1).content)), input);
-  assert.equal(conversation.history()[0].text, input);
-});
-
-test('当前问题子串命中时只召回命中记忆，外部会话与未命中记忆不进入请求', async t => {
-  const f = await fixture(t);
-  const other = await f.memory('other');
-  other.remember({ content: '主题外部secret' });
-  await other.close();
-  const conversation = await f.conversation('keyword');
-  const relevant = conversation.remember({ content: '主题是蓝色' });
-  conversation.remember({ content: '无关secret' });
-  const result = await conversation.prompt('主题');
-  const items = recalledItems(memoryMessages(f.requests[0])[0]);
-  assert.deepEqual(items.map(item => item.id), [relevant.memory.id]);
-  assert.doesNotMatch(JSON.stringify(f.requests[0]), /secret/);
-  assert.equal(f.database().prepare('SELECT COUNT(*) AS n FROM memory_uses WHERE run_id = ?').get(result.runId).n, 1);
 });

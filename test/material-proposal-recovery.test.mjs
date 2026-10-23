@@ -8,7 +8,7 @@ import test from 'node:test';
 import { BackgroundMemory } from '../dist/auto-memory.js';
 import { ConversationStore } from '../dist/store.js';
 import { MemoryProviderError } from '../dist/memory-diagnostics.js';
-import { DiagnosticPersistenceError } from '../dist/diagnostics.js';
+
 import { parseMemoryResponse } from '../dist/memory-provider.js';
 import { prepareMemoryWireExtraction } from '../dist/memory-wire.js';
 
@@ -62,7 +62,7 @@ function valid(input) {
     : { topics: [{ summary: '本批讨论了工具与备份。', messageIds: [] }], fragments: [], profiles: [], ignoredMessageIds: [] };
 }
 
-for (const kind of ['wire_subject', 'attribution', 'structure', 'model_json', 'model_empty', 'model_length']) {
+for (const kind of ["wire_subject","attribution"]) {
   test(`materials ${kind} rejection preserves evidence and releases the next batch without covering its gap`, async t => {
     const f = fixture(t, kind === 'attribution' ? 'private' : 'group');
     const history = f.history(), calls = [];
@@ -108,100 +108,3 @@ for (const kind of ['wire_subject', 'attribution', 'structure', 'model_json', 'm
     assert.equal(f.store.autoMemory.status(f.conversation.id, 'compression').completed, 0);
   });
 }
-
-for (const kind of ['version', 'live_binding', 'model_request', 'diagnostics', 'checkpoint', 'commit', 'budget', 'input_protocol',
-  'saved_progress', 'final_validation', 'cancelled']) {
-  test(`materials ${kind} failure remains blocking and never automatically defers`, async t => {
-    const f = fixture(t), calls = [];
-    if (kind === 'input_protocol') {
-      const original = f.store.autoMemory.taskInput.bind(f.store.autoMemory);
-      f.store.autoMemory.taskInput = job => ({ ...original(job), selfProfileProtocol: 1 });
-    }
-    if (kind === 'saved_progress') {
-      const claimed = f.store.autoMemory.claimNext(f.conversation.id, { owner: 'fixture', leaseMs: 60000, pipeline: 'materials' });
-      f.store.autoMemory.saveProgress(claimed.id, claimed.leaseToken, { version: 0 });
-      f.store.autoMemory.fail(claimed.id, claimed.leaseToken, 'fixture saved protocol failure');
-      f.store.autoMemory.retry(claimed.id);
-    }
-    if (kind === 'final_validation') {
-      const save = f.store.autoMemory.saveProgress.bind(f.store.autoMemory);
-      f.store.autoMemory.saveProgress = (id, lease, progress) => {
-        if (!progress.remaining.length) progress.extract.topics[0].summary = '';
-        save(id, lease, progress);
-      };
-    }
-    const worker = f.start(async (input, signal) => {
-      calls.push([input.job.id, input.mode]);
-      if (kind === 'checkpoint' && input.mode === 'messages') f.inspect(db => db.exec(
-        "CREATE TRIGGER reject_progress BEFORE UPDATE OF progress_json ON auto_memory_jobs BEGIN SELECT RAISE(ABORT,'fixture persistence failure'); END"));
-      if (input.mode !== 'profiles') return valid(input);
-      if (kind === 'model_request') throw new MemoryProviderError('model_request', 'upstream result unknown');
-      if (kind === 'diagnostics') throw new DiagnosticPersistenceError();
-      if (kind === 'cancelled') {
-        await new Promise(resolve => setTimeout(resolve, 30));
-        assert.equal(signal.aborted, true);
-        throw new MemoryProviderError('model_json', 'response rejected after cancellation');
-      }
-      if (kind === 'commit') f.inspect(db => db.exec(
-        "CREATE TRIGGER reject_commit BEFORE UPDATE OF status ON auto_memory_jobs WHEN NEW.status='done' BEGIN SELECT RAISE(ABORT,'fixture commit failure'); END"));
-      if (kind === 'live_binding') f.store.autoMemory.assertProfileEvidenceCurrent = () => { throw new Error('人物绑定版本冲突。'); };
-      const proposal = valid(input);
-      if (kind === 'version') proposal.profiles[0].baseVersion++;
-      return proposal;
-    }, kind === 'budget' ? { maxCalls: 1 } : kind === 'cancelled' ? { timeoutMs: 10 } : {});
-    await assert.rejects(worker.wait());
-    const jobs = f.store.autoMemory.listJobs();
-    assert.equal(jobs.find(job => job.id === f.first.id).status, 'failed');
-    assert.equal(jobs.find(job => job.id === f.first.id).deferred, undefined);
-    assert.equal(jobs.find(job => job.id === f.second.id).status, 'queued');
-    assert.equal(calls.some(([id]) => id === f.second.id), false);
-    assert.equal(f.inspect(db => db.prepare('SELECT COUNT(*) AS count FROM auto_memory_job_deferrals').get().count), 0);
-  });
-}
-
-for (const kind of ['deferral_transaction', 'expired_lease']) {
-  test(`materials ${kind} cannot release FIFO or partially mark the failed proposal`, async t => {
-    const f = fixture(t), calls = [];
-    let frozen;
-    const worker = f.start(async input => {
-      calls.push(input.job.id);
-      if (input.mode !== 'profiles') return valid(input);
-      frozen = f.frozen();
-      f.inspect(db => db.exec(kind === 'deferral_transaction'
-        ? "CREATE TRIGGER reject_deferral BEFORE INSERT ON auto_memory_job_deferrals BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END"
-        : 'UPDATE auto_memory_jobs SET lease_until=0 WHERE status=\'running\''));
-      return { profiles: 'invalid' };
-    });
-    await assert.rejects(worker.wait());
-    assert.deepEqual(f.frozen(), frozen);
-    const jobs = f.store.autoMemory.listJobs();
-    assert.equal(jobs.find(job => job.id === f.first.id).status, 'running');
-    assert.equal(jobs.find(job => job.id === f.first.id).deferred, undefined);
-    assert.equal(jobs.find(job => job.id === f.second.id).status, 'queued');
-    assert.equal(calls.includes(f.second.id), false);
-    assert.equal(f.inspect(db => db.prepare('SELECT COUNT(*) AS count FROM auto_memory_job_deferrals').get().count), 0);
-  });
-}
-
-test('unknown capacity-refinement request preserves the consumed opportunity and still blocks FIFO', async t => {
-  const f = fixture(t), calls = [];
-  const worker = f.start(async input => {
-    calls.push([input.job.id, input.mode, Boolean(input.profileRefinement)]);
-    if (input.profileRefinement) throw new MemoryProviderError('model_request', 'refinement result unknown');
-    const proposal = valid(input);
-    if (input.mode === 'profiles') {
-      proposal.profiles[0].facts = [{ content: '阅读'.repeat(61), sourceType: 'self', messageIds: [f.source] }];
-      proposal.profiles[0].updates = [{ factIndex: 0, baselineFactIndexes: [], evidence: [{ messageId: f.source,
-        factQuote: '我喜欢阅读。', subjectKind: 'self', subjectQuote: '我' }] }];
-    }
-    return proposal;
-  });
-  await assert.rejects(worker.wait());
-  const jobs = f.store.autoMemory.listJobs();
-  assert.equal(jobs.find(job => job.id === f.first.id).status, 'failed');
-  assert.equal(jobs.find(job => job.id === f.first.id).deferred, undefined);
-  assert.match(jobs.find(job => job.id === f.first.id).error, /model_request/);
-  assert.equal(jobs.find(job => job.id === f.second.id).status, 'queued');
-  assert.equal(calls.filter(([, , refinement]) => refinement).length, 1);
-  assert.equal(JSON.parse(f.frozen().progress_json).capacityRecovery.attemptedPersonIds.length, 1);
-});

@@ -88,16 +88,3 @@ test('deduplicated facts recalled through a Topic reveal only evidence from that
   assert.equal(here.length,1);assert.equal(there.length,1);
   assert.deepEqual(here[0].facts[0].messageIds,[sourceOne]);assert.deepEqual(there[0].facts[0].messageIds,[sourceTwo]);
 });
-
-test('failed extraction records safe phase diagnostics, preserves its batch, and never retries implicitly', async t => {
-  const f=fixture(t); for(let i=0;i<100;i++)f.inbound(`真人消息${i}`);
-  let calls=0;
-  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:20,timeoutMs:200}},
-    f.store.autoMemory,f.conversation.id,{extract:async()=>{calls++;throw new Error('Bearer sk-secret 原始用户机密内容');}});
-  t.after(()=>worker.close()); worker.start('capacity'); await assert.rejects(worker.wait(undefined,2000),/失败/);
-  assert.equal(calls,1);assert.equal(f.store.autoMemory.status(f.conversation.id).failed,1);assert.equal(f.store.autoMemory.status(f.conversation.id).queued,0);
-  worker.start(); await assert.rejects(worker.wait(undefined,2000),/失败/);assert.equal(calls,1);
-  const error=f.store.autoMemory.listJobs().find(job=>job.status==='failed').error;
-  assert.match(error,/\[unexpected\].*phase=extract/);assert.doesNotMatch(error,/sk-secret|机密/);
-  assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM auto_memory_context_job_messages').get().n),100);
-});
