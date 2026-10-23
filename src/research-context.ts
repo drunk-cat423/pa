@@ -15,7 +15,7 @@ function encodedResult(text: unknown): Record<string, unknown> | undefined {
 
 /** Only a reference to already persisted, readable material may replace a body. */
 export function researchContextReference(tool: string, input: unknown, result: unknown,
-  materialId: string): ResearchContextReference | undefined {
+  materialId: string, materialReadProtocol?: 'body-v1'): ResearchContextReference | undefined {
   if (!/^e[1-9][0-9]*$/u.test(materialId) || !['web_fetch', 'web_search', 'read_research_material'].includes(tool)) return undefined;
   const value = object(result);
   if (!value || value.error !== undefined || value.originalRead === false) return undefined;
@@ -32,7 +32,9 @@ export function researchContextReference(tool: string, input: unknown, result: u
   return { tool, text: JSON.stringify({ ...metadata, projection: 'saved_research_material', id: materialId, tool, input,
     ...(decoded && value.coverage ? { coverage: value.coverage } : {}),
     ...(excerpt ? { excerpt } : {}), bodyOmitted: true,
-    notice: '较旧工具正文已从本次上下文省略，原材料完整保存。摘录不代表全文；需要原文时调用read_research_material按此id从offset=0读取，后续只用该工具返回的nextOffset，不使用网页coverage偏移。网页续读仍使用原url/nextCursor。' }) };
+    notice: materialReadProtocol === 'body-v1'
+      ? '较旧工具正文已省略，原材料保存。摘录不代表全文；核对已读正文时用read_research_material传此id、正文offset（从头为0）和reread:true；补读新内容省略offset或用nextUnreadOffset。正文游标为Unicode码点，不能用网页coverage偏移；网页续读仍用原url/nextCursor。'
+      : '较旧工具正文已从本次上下文省略，原材料完整保存。摘录不代表全文；需要原文时调用read_research_material按此id从offset=0读取，后续只用该工具返回的nextOffset，不使用网页coverage偏移。网页续读仍使用原url/nextCursor。' }) };
 }
 
 /** A wire-only projection: neither the transcript nor persisted results change. */

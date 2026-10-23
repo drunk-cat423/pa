@@ -1,4 +1,5 @@
 import type { WebFetchReader } from './web-fetch-reader.js';
+import type { MaterialReadParams } from './research-material-reader.js';
 
 /** Foreground tools deliberately carry no caller-controlled identity or filesystem path. */
 export type ResearchToolName = 'create_research' | 'list_research' | 'read_research' | 'send_research_report' | 'continue_research' | 'archive_research';
@@ -56,7 +57,8 @@ export interface ResearchRuntimeOptions {
   /** Lightweight collection only; projects older persisted tool bodies on the wire. */
   compactResearchContext?: boolean;
   resolveMaterialReference?(tool: string, input: unknown, result: unknown): { id: string } | undefined;
-  readMaterial?(params: { id: string; offset?: number }): unknown | Promise<unknown>;
+  materialReadProtocol?: 'body-v1';
+  readMaterial?(params: MaterialReadParams, maxResultBytes: number): unknown | Promise<unknown>;
   /** Owned by the task attempt; its document cache and cursors outlive one cycle. */
   fetchReader?: WebFetchReader;
   maxToolCalls?: number;

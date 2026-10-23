@@ -3,6 +3,21 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/research-materials.test.mjs",
+      "name": "材料正文分页不再切JSON外壳，按实际返回范围续读且不被工具字节上限截断",
+      "evidence": "2026-10-23 real research attempt 3: read_research_material paged serialized evidence instead of clean body; .local/research-followup3-20261023/offline-fixture.json"
+    },
+    {
+      "file": "test/research-materials.test.mjs",
+      "name": "重复材料读取返回准确已读范围，跳读保留缺口且可显式重读被省略正文",
+      "evidence": "2026-10-23 real research attempt 3: 18 reads included 4 identical repeated reads; .local/research-followup3-20261023/stable-cache-comparison.json"
+    },
+    {
+      "file": "test/research-context.test.mjs",
+      "name": "真实工具循环使用正文协议：重复回执、显式重读和预算接线",
+      "evidence": "Local HTTP replay of the attempt-3 repeated-read incident validates the corrected tool contract and recovery of compacted body without a paid model call"
+    },
+    {
       "file": "test/answer-documents.test.mjs",
       "name": "schema17只读保留旧页面正文与引用索引，不混入规范回答历史",
       "evidence": ".local/identity-attribution-regression.log:9"

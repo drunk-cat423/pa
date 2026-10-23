@@ -11,6 +11,7 @@ import type { ResearchToolContext, ResearchToolName, ResearchRuntimeEvent } from
 import type { ContinueResearchInput, CreateResearchInput, ResearchListParams, ResearchReadParams, ResearchTask } from './research-types.js';
 import { toPlainText } from './plain-text.js';
 import { projectResearchMaterials, withMaterialOmissionGap } from './research-materials.js';
+import { ResearchMaterialReader } from './research-material-reader.js';
 import { assembleResearchReport, hasFetchedSource, isResearchSourceMaterial, lightweightResearchPlan, parseResearchPlan, parseResearchReview, parseResearchSection, researchSources, researchStagePrompt } from './research-workflow.js';
 import type { ResearchPhase, ResearchSection } from './research-workflow-types.js';
 
@@ -194,7 +195,11 @@ export class ResearchService {
           return { id: item.id, text, totalChars: points.length, hasMore: end < points.length,
             ...(end < points.length ? { nextOffset: end } : {}) };
         });
-        const input = { task: { id: task.id, title: task.title, goal: task.goal, originalRequest: task.originalText,
+        const bodyReader = lightweight && phase === 'collect' ? new ResearchMaterialReader(id => {
+          const evidence = store.get(task.id)!.evidence[Number(id.slice(1))-1];
+          return evidence ? {...evidence,id} : undefined;
+        }) : undefined;
+        const input = { ...(bodyReader ? {materialReadProtocol:'body-v1'} : {}), task: { id: task.id, title: task.title, goal: task.goal, originalRequest: task.originalText,
           followups: task.followups,
           urls: task.urls, requiresOriginal: task.requiresOriginal }, phase, researchedAt: new Date().toISOString(),
           ...(['collect','write'].includes(phase) ? {remainingGaps:workflow.sections.flatMap(item=>item.gaps),previousMaterial}:{}),
@@ -240,6 +245,7 @@ export class ResearchService {
             `research:${task.id}:${task.attempt}:cycle:${cycle}`, { enableSearch: true, research: {
               phase, systemPrompt: researchStagePrompt(phase, lightweight), maxToolCalls: phase === 'write' || phase === 'plan' ? 0 : budget.maxToolCalls - current.toolCalls,
               maxSearchCalls: budget.maxSearchCalls - current.searchCalls, record,
+              ...(bodyReader ? {materialReadProtocol:'body-v1' as const}:{}),
               ...(lightweight ? {compactResearchContext:true,resolveMaterialReference:(tool:string,toolInput:unknown,result:unknown)=>{
                 const evidence=store.get(task.id)!.evidence;
                 if(tool==='read_research_material' && result && typeof result==='object' && 'id' in result && typeof result.id==='string' && /^e[1-9][0-9]*$/.test(result.id)) {
@@ -250,7 +256,8 @@ export class ResearchService {
                 return index>=0?{id:`e${index+1}`}:undefined;
               }}:{}),
               ...(fetchReader ? { fetchReader } : {}),
-              readMaterial: params => {
+              readMaterial: (params,maxResultBytes) => {
+                if (bodyReader) return bodyReader.read(params,maxResultBytes);
                 if (!/^e[1-9][0-9]*$/u.test(params.id)) throw new MemoryError('材料编号无效。');
                 const evidence = store.get(task.id)!.evidence[Number(params.id.slice(1)) - 1];
                 if (!evidence || !['web_fetch', 'web_search'].includes(evidence.tool)) throw new MemoryError('该材料不属于当前任务的联网资料。');
