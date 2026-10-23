@@ -128,7 +128,13 @@ function buildPlan(db, root, identity, now) {
       };
       for (const report of reportRows) {
         if (!Number.isSafeInteger(report.version) || report.version < 1) throw new Error('invalid report version');
-        for (const ext of ['md','txt']) addFile(`research/${task.id}/${report.version}.${ext}`, report.content_hash);
+        for (const ext of ['md','txt']) {
+          const path = `research/${task.id}/${report.version}.${ext}`;
+          // Committed newer report metadata retires older report bodies. The
+          // version/hash rows remain the audit even when replacement removed files.
+          if (report.version < task.latest_version && !inspect(join(root,path),true)) continue;
+          addFile(path, report.content_hash);
+        }
       }
       const sections = rows.research_workflow_sections;
       const plan = rows.research_workflow_plans.length ? JSON.parse(rows.research_workflow_plans[0].plan_json) : undefined;

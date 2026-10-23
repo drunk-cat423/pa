@@ -8,7 +8,8 @@ import { MemoryError } from './memory-types.js';
 import { normalizeWebFetchUrl } from './web-fetch.js';
 import { WebFetchReader } from './web-fetch-reader.js';
 import type { ResearchToolContext, ResearchToolName, ResearchRuntimeEvent } from './research-tools.js';
-import type { CreateResearchInput, ResearchListParams, ResearchReadParams, ResearchTask } from './research-types.js';
+import type { ContinueResearchInput, CreateResearchInput, ResearchListParams, ResearchReadParams, ResearchTask } from './research-types.js';
+import { toPlainText } from './plain-text.js';
 import { assembleResearchReport, hasFetchedSource, isResearchSourceMaterial, lightweightResearchPlan, parseResearchPlan, parseResearchReview, parseResearchSection, researchSources, researchStagePrompt } from './research-workflow.js';
 import type { ResearchPhase, ResearchSection } from './research-workflow-types.js';
 
@@ -18,6 +19,10 @@ const boundedText = (text: string, bytes: number) => Buffer.byteLength(text, 'ut
   : Buffer.from(text, 'utf8').subarray(0, bytes).toString('utf8').replace(/\ufffd$/u, '') + '\n[此材料片段已截断]';
 const publicTask = (task: ResearchTask) => ({ id: task.id, title: task.title, status: task.status, attempt: task.attempt,
   reportVersion: task.reportVersion, createdAt: task.createdAt });
+const shortPlain = (value: string, limit: number) => {
+  const points = [...toPlainText(value).replace(/\s+/gu,' ').trim()];
+  return points.length <= limit ? points.join('') : points.slice(0,limit-1).join('') + '…';
+};
 
 /** One worker per harness. Research state and paid-call markers outlive the Pi loop. */
 export class ResearchService {
@@ -77,7 +82,7 @@ export class ResearchService {
         return { ...result, archived: true, materialsRetained: true, reportsRetained: true };
       }
       case 'continue_research': {
-        const task = store.retry(conversationId, sourceMessageId, params as { id: string; key: string });
+        const task = store.retry(conversationId, sourceMessageId, params as ContinueResearchInput);
         this.wake();
         return { ...publicTask(task), saved: true };
       }
@@ -186,7 +191,9 @@ export class ResearchService {
             ...(end < points.length ? { nextOffset: end } : {}) };
         });
         const input = { task: { id: task.id, title: task.title, goal: task.goal, originalRequest: task.originalText,
+          followups: task.followups,
           urls: task.urls, requiresOriginal: task.requiresOriginal }, phase, researchedAt: new Date().toISOString(),
+          remainingGaps: workflow.sections.flatMap(item=>item.gaps),
           previousMaterial: phase === 'review' ? undefined : previousMaterial,
           ...(lightweight ? { collectionNote: boundedText(String(saved.evidence.findLast(item => item.tool === 'collection_note')?.result ?? ''), 8000) } : {}),
           ...(phase === 'review' ? { reviewMaterial } : {}),
@@ -312,13 +319,33 @@ export class ResearchService {
   }
 
   private async notify(task: ResearchTask): Promise<void> {
+    if (this.store!.research.notificationObsolete(task.id,task.attempt)) return;
+    try { await this.notifyCurrent(task); }
+    catch (error) {
+      // Expiry or an explicit continuation can race the notification snapshot.
+      // Only these known obsolete states may suppress a notification failure.
+      if (error instanceof MemoryError && this.store!.research.notificationObsolete(task.id,task.attempt)) return;
+      throw error;
+    }
+  }
+
+  private async notifyCurrent(task: ResearchTask): Promise<void> {
     const state = { completed: '已完成', partial: '已有阶段性报告', blocked: '暂时受阻', failed: '执行失败', interrupted: '执行中断', running: '执行中', queued: '排队中' }[task.status];
-    const text = `研究 ${task.id}「${task.title}」${state}。${task.status === 'completed' || task.status === 'partial'
-      ? `报告 v${task.reportVersion} 已保存，需要时可以让我发送文件。` : task.reason ?? '可查询清单或明确要求继续。'}`;
+    let text = `研究 ${task.id}「${shortPlain(task.title,60)}」${state}。`;
+    if (task.status === 'completed' || task.status === 'partial') {
+      // Summarize the persisted report, not a new independent research/chat call.
+      const report = this.store!.research.report(task.id,task.reportVersion!);
+      text += `\n报告 v${report.version} 摘要：${shortPlain(report.abstract,240)}`;
+      if (task.status === 'partial') {
+        const gaps = this.store!.research.workflow.load(task.id).sections.flatMap(section=>section.gaps).join('；');
+        text += `\n待补充：${shortPlain(gaps || task.reason || '关键问题仍待核实。',90)}`;
+      }
+      text += '\n完整报告已保存，需要时可发送文件。';
+    } else text += shortPlain(task.reason ?? '可查询清单或明确要求继续。',260);
     const receipt = this.store!.research.reserveNotification(task.id, task.attempt, text);
     if (!receipt.shouldSend) return;
     let result: DeliveryResult;
-    try { result = await this.send({ route: task.route, deliveryMode: 'active', text, plainText: true }); }
+    try { result = await this.send({ route: receipt.route, deliveryMode: 'active', text, plainText: true }); }
     catch { result = { status: 'uncertain' }; }
     this.store!.research.finishDelivery(receipt.deliveryId, result.status,
       result.status === 'sent' ? result.externalMessageId : undefined, result.status === 'sent' ? result.referenceIndex : undefined);

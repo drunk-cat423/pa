@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import https from 'node:https';
@@ -12,6 +13,7 @@ import { ChannelHarness } from '../dist/channel-harness.js';
 import { QQChannel } from '../dist/qq-channel.js';
 import { ConversationStore } from '../dist/store.js';
 import { ResearchService } from '../dist/research-service.js';
+import { applyResearchCleanup, previewResearchCleanup } from '../scripts/deployment/research-retention.mjs';
 import { currentMessage, isPreparationRequest, preparationDelta } from './fixtures/turn-preparation.mjs';
 
 const sourceUrl = 'https://example.com/research-source';
@@ -448,6 +450,84 @@ test('轻量正文保留核心缺口为partial，成功写作后不触发章节�
   assert.equal(f.inspect(db => db.prepare("SELECT count(*) n FROM research_workflow_cycles WHERE task_id=? AND phase='review'").get(task.id).n), 0);
 });
 
+test('partial 续作把新增要求带入采集与写作，并按新版摘要通知', async t => {
+  const f = await fixture(t), h = await f.harness();
+  const requirements = '补充核验官方成本数据，并说明价格适用条件。';
+  f.plans.set('revision-create', [call('create_research', { key: 'revision-create', title: '成本核验', goal: '比较部署方案并标注未知项', urls: [sourceUrl] })]);
+  f.phasePlans.set('成本核验:collect', [call('web_fetch', { url: sourceUrl }), answer('首轮材料已取得。')]);
+  f.workerPlans.set('成本核验', [answer(sectionOutput('written', '已比较部署方案。', { gaps: ['缺少官方成本数据。'] }))]);
+  assert.equal(await h.handle(f.message('revision-create', `研究部署方案 ${sourceUrl}`)), 'sent');
+  await h.waitForResearch();
+  let task = f.taskRows()[0];
+  assert.equal(task.status, 'partial');
+  assert.equal(task.latest_version, 1);
+
+  f.plans.set('revision-continue', [call('continue_research', { id: task.id, key: 'add-official-costs', requirements })]);
+  f.phasePlans.set('成本核验:collect', [body => {
+    const worker = JSON.parse(userText(body));
+    assert.equal(worker.phase, 'collect');
+    assert.ok(worker.task.followups.some(item => item.requirements === requirements));
+    return call('web_fetch', { url: sourceUrl });
+  }, answer('已取得官方成本和适用范围材料。')]);
+  f.workerPlans.set('成本核验', [body => {
+    assert.match(JSON.stringify(body.messages), new RegExp(requirements));
+    assert.match(JSON.stringify(body.messages), /官方成本|适用条件/);
+    return answer(sectionOutput('written', '官方成本数据已经核验，适用条件已说明。', {
+      summary: '官方成本数据已经核验，价格适用条件已确认。', gaps: [] }));
+  }]);
+  assert.equal(await h.handle({ ...f.message('revision-continue', `请继续 ${task.id}。新增要求：${requirements}`, 'alice-private'), route: f.privateRoute }), 'sent');
+  await h.waitForResearch();
+  task = f.taskRows()[0];
+  assert.equal(task.status, 'completed', task.reason);
+  assert.equal(task.attempt, 2);
+  assert.equal(task.latest_version, 2);
+  const followup = f.inspect(db => db.prepare("SELECT evidence_json FROM research_evidence WHERE task_id=? AND attempt=2 AND ordinal=1").get(task.id));
+  assert.equal(JSON.parse(followup.evidence_json).input.requirements, requirements);
+  const notification = f.qqRequests.filter(request => request.url.endsWith('/messages') && request.body?.msg_type === 0).at(-1);
+  assert.ok(notification);
+  assert.ok(notification.url.endsWith('/v2/users/alice-dm/messages'), '续作通知应发到本次私聊请求来源');
+  const notificationText = notification.body.content;
+  assert.equal(typeof notificationText, 'string');
+  assert.match(notificationText, /官方成本数据已经核验/);
+  assert.doesNotMatch(notificationText, /已比较部署方案|缺少官方成本数据/);
+  assert.ok([...notificationText].length <= 500);
+  const chatMessages = f.inspect(db => db.prepare("SELECT text FROM messages WHERE role='assistant' ORDER BY created_at").all());
+  assert.ok(chatMessages.some(message => message.text.includes('官方成本数据已经核验')));
+  assert.ok(chatMessages.every(message => !message.text.includes('已比较部署方案')));
+});
+
+test('过期已完成任务无待通知时服务启动正常继续处理队列', async t => {
+  const f = await fixture(t);
+  const store = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'));
+  let task;
+  try {
+    const conversation = store.ensureConversation('expired-without-notice', join(f.config.cwd, 'expired.jsonl'), f.route);
+    store.recordInbound(conversation.id, '研究原始请求', { eventId: 'expired-without-notice', senderId: 'alice',
+      sentAt: new Date().toISOString(), modelInputText: '研究原始请求' });
+    const source = store.externalMessage(conversation.id, 'expired-without-notice');
+    task = store.research.create(conversation.id, source.id, { key: 'expired-notice', title: '到期且未通知', goal: '保留到期清理验证' });
+    store.research.claim(task.id, f.config.research);
+    store.research.finish(task.id, 1, { status: 'completed', markdown: '# 已完成报告', abstract: '已保存摘要', keywords: [] });
+    db.prepare('UPDATE research_tasks SET updated_at=? WHERE id=?').run('2026-09-01T00:00:00.000Z', task.id);
+    db.prepare('UPDATE research_attempts SET updated_at=? WHERE task_id=? AND attempt=1').run('2026-09-01T00:00:00.000Z', task.id);
+    assert.ok(store.research.pendingNotifications().some(row => row.id === task.id));
+    const now = new Date('2026-10-23T00:00:00.000Z');
+    const cleanup = previewResearchCleanup(f.config.dataDir, { now });
+    assert.ok(cleanup.candidates.some(row => row.taskId === task.id));
+    applyResearchCleanup(f.config.dataDir, cleanup, { now });
+    assert.equal(store.research.pendingNotifications().some(row => row.id === task.id), false);
+  } finally { db.close(); store.close(); }
+
+  const service = new ResearchService(f.config, [f.route], async () => ({ status: 'rejected' }), () => {});
+  service.start();
+  await service.wait();
+  assert.equal(service.info().failed, false);
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.qqRequests.filter(request => request.url.endsWith('/messages')).length, 0);
+  await service.close();
+});
+
 test('轻量采集六次上限保留未读原文缺口，模型written不能绕过完整原文要求', async t => {
   const f = await fixture(t); f.config.fetch.maxTextChars = 128;
   f.pageText('START ' + '0123456789'.repeat(100) + 'UNREAD_END');
@@ -650,7 +730,10 @@ test('旧版version1章节计划沿用跨预算与审查流程；显式继续复
   const resumed = f.requests.filter(r => r.worker).slice(checkpointCount);
   assert.deepEqual(resumed.map(r => [r.worker.phase, r.worker.section?.id]), [['collect', undefined], ['write', 's2'], ['review', 's2']]);
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_collection_cycles WHERE task_id=?').get(task.id).n), 2);
-  assert.equal(await readFile(join(f.config.dataDir, 'research', task.id, '1.md'), 'utf8'), firstReport);
+  assert.equal(existsSync(join(f.config.dataDir, 'research', task.id, '1.md')), false);
+  const replaced = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  try { assert.throws(() => replaced.research.report(task.id, 1), /已被 v2 替换/); }
+  finally { replaced.close(); }
   const completed = await readFile(join(f.config.dataDir, 'research', task.id, '2.md'), 'utf8');
   assert.match(completed, /APPROVED_CHAPTER_ONE/); assert.match(completed, /SECOND_CHAPTER_AFTER_EXPLICIT_RESUME/);
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM research_workflow_plans WHERE task_id=?').get(task.id).n), 1);

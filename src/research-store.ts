@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { memoryWords } from './memory-text.js';
@@ -8,7 +8,7 @@ import { researchTargetContext, validateResearchTarget, type ResearchTargetConte
 import { ResearchWorkflowStore } from './research-workflow-store.js';
 import type { ResearchBudget, ResearchDelivery, ResearchDeliveryStatus, ResearchEvidence, ResearchFinishInput,
   ResearchList, ResearchListParams, ResearchProgress, ResearchReadParams, ResearchReadResult, ResearchReport,
-  ResearchStatus, ResearchTask, CreateResearchInput } from './research-types.js';
+  ResearchStatus, ResearchTask, CreateResearchInput, ContinueResearchInput } from './research-types.js';
 export type * from './research-types.js';
 
 export function migrateResearch(db: DatabaseSync): void {
@@ -189,7 +189,11 @@ export class ResearchStore {
       ...(row.latest_version == null ? {} : {reportVersion:Number(row.latest_version)}),
       ...(row.reason == null ? {} : {reason:String(row.reason)}),
       ...(row.budget_json == null ? {} : {budget:JSON.parse(String(row.budget_json)) as ResearchBudget}),
-      usage:JSON.parse(String(row.usage_json)),evidence };
+      usage:JSON.parse(String(row.usage_json)),evidence,
+      followups:this.db.prepare(`SELECT e.attempt,e.evidence_json,a.source_message_id FROM research_evidence e
+        JOIN research_attempts a ON a.task_id=e.task_id AND a.attempt=e.attempt
+        WHERE e.task_id=? AND e.ordinal=1 AND json_extract(e.evidence_json,'$.tool')='research_followup' ORDER BY e.attempt`).all(id)
+        .map(item=>({attempt:Number(item.attempt),requirements:String(JSON.parse(String(item.evidence_json)).input.requirements),sourceMessageId:String(item.source_message_id)})) };
   }
 
   /** Shared archival entry; records and artifacts remain readable by their owner. */
@@ -230,7 +234,14 @@ export class ResearchStore {
       WHERE t.status NOT IN ('queued','running') AND NOT EXISTS (SELECT 1 FROM research_task_archives ar WHERE ar.task_id=t.id) AND NOT EXISTS (
         SELECT 1 FROM research_deliveries d WHERE d.task_id=t.id AND d.attempt=t.attempt AND d.kind='notice')
       ORDER BY t.updated_at,t.id`).all();
-    return rows.filter(row => !conversationIds || conversationIds.includes(String(row.conversation_id))).map(row => this.get(String(row.id))!);
+    return rows.filter(row => (!conversationIds || conversationIds.includes(String(row.conversation_id))) && !this.contentExpired(String(row.id)))
+      .map(row => this.get(String(row.id))!);
+  }
+
+  notificationObsolete(id: string, attempt: number): boolean {
+    const task = this.get(id);
+    return !task || task.attempt !== attempt || task.status === 'queued' || task.status === 'running'
+      || this.archived(id) || this.contentExpired(id);
   }
 
   claim(id: string, budget: ResearchBudget, expectedAttempt?: number): ResearchTask | undefined {
@@ -296,7 +307,7 @@ export class ResearchStore {
       this.saveFile(id,version,'txt',Buffer.from(markdown,'utf8'));
       report = {version,abstract,keywords:normalizedKeywords,hash:digest(markdown),at:timestamp()};
     } else if (input.status === 'completed' || input.status === 'partial') throw new MemoryError('完成状态必须先保存报告正文。');
-    return this.transaction(() => {
+    const finished = this.transaction(() => {
       this.running(id,attempt);
       if (input.status === 'completed' && this.workflow.load(id).plan) this.workflow.assertComplete(id);
       const at = timestamp();
@@ -310,21 +321,40 @@ export class ResearchStore {
       this.updateIndex(id);
       return this.get(id)!;
     });
+    // Publish the new report before retiring any old file. Committed report rows
+    // and latest_version are the replacement audit and make crash recovery safe.
+    if (report) this.purgeSupersededReports(id);
+    return finished;
   }
 
-  retry(conversationId: string, sourceMessageId: string, input: { id:string; key:string }): ResearchTask {
+  retry(conversationId: string, sourceMessageId: string, input: ContinueResearchInput): ResearchTask {
     const key = text(input.key,'研究续作标识',80);
+    const requirements = input.requirements === undefined ? '' : text(input.requirements,'新增研究要求',4000);
     return this.transaction(() => {
       const task = this.authorized(conversationId,sourceMessageId,input.id);
       if (this.archived(task.id)) throw new MemoryError('该研究已归档，不能继续执行。');
       if (this.contentExpired(task.id)) throw new MemoryError('该研究资料已按30天保留规则清理；如需再次研究，请创建新任务。');
       const existing = this.db.prepare('SELECT attempt FROM research_attempts WHERE task_id=? AND source_message_id=? AND action_key=?').get(task.id,sourceMessageId,key);
-      if (existing) return task;
+      if (existing) {
+        const prior = this.db.prepare("SELECT evidence_json FROM research_evidence WHERE task_id=? AND attempt=? AND ordinal=1 AND json_extract(evidence_json,'$.tool')='research_followup'").get(task.id,Number(existing.attempt));
+        if ((prior ? JSON.parse(String(prior.evidence_json)).input.requirements : '') !== requirements) throw new MemoryError('同一续作标识已用于不同的新增要求。');
+        return task;
+      }
       if (task.status === 'queued' || task.status === 'running') throw new MemoryError('该研究正在排队或进行中，无需重复创建。');
-      if (task.status === 'completed' && this.workflow.load(task.id).plan) throw new MemoryError('该研究的固定计划已全部完成；新增目标或更新时效资料请创建新任务，旧报告保持不变。');
+      if (task.status === 'completed' && this.workflow.load(task.id).plan && !requirements) throw new MemoryError('该研究已完成；请说明需要进一步调研或更新的具体要求。');
+      if (requirements && [...task.followups.map(item=>item.requirements).join('\n') + requirements].length > 12000) throw new MemoryError('累计新增要求过长，请为新的研究范围创建任务。');
       const attempt = task.attempt+1, at = timestamp();
       this.db.prepare('INSERT INTO research_attempts(task_id,attempt,source_message_id,action_key,status,usage_json,created_at,updated_at) VALUES(?,?,?,?,\'queued\',?,?,?)')
         .run(task.id,attempt,sourceMessageId,key,JSON.stringify(zeroUsage()),at,at);
+      if (requirements) {
+        const evidence = JSON.stringify({tool:'research_followup',input:{requirements,sourceMessageId},result:{accepted:true}});
+        const bytes = Number(this.db.prepare('SELECT coalesce(sum(length(CAST(evidence_json AS BLOB))),0) AS bytes FROM research_evidence WHERE task_id=?').get(task.id)?.bytes ?? 0);
+        if (bytes+Buffer.byteLength(evidence) > 4_000_000) throw new MemoryError('研究资料存储已达单任务上限。');
+        this.db.prepare('INSERT INTO research_evidence VALUES(?,?,1,?,?)').run(task.id,attempt,evidence,at);
+        // A new requirement is a revision, not an append to a truncated draft.
+        this.db.prepare("UPDATE research_workflow_sections SET status='needs_revision',review_reason=?,updated_at=? WHERE task_id=? AND version>0")
+          .run('按已确认的新增要求修订，并保留仍适用的原有结论。',at,task.id);
+      }
       this.db.prepare("UPDATE research_tasks SET attempt=?,status='queued',reason=NULL,updated_at=? WHERE id=?").run(attempt,at,task.id);
       return this.get(task.id)!;
     });
@@ -344,6 +374,9 @@ export class ResearchStore {
         for (const id of conversationIds) this.db.prepare("UPDATE research_deliveries SET status='uncertain',updated_at=? WHERE status='sending' AND task_id IN(SELECT id FROM research_tasks WHERE conversation_id=?)").run(at,id);
       } else this.db.prepare("UPDATE research_deliveries SET status='uncertain',updated_at=? WHERE status='sending'").run(at);
     });
+    for (const row of this.db.prepare('SELECT id,conversation_id FROM research_tasks WHERE latest_version>1').all()) {
+      if (!conversationIds || conversationIds.includes(String(row.conversation_id))) this.purgeSupersededReports(String(row.id));
+    }
   }
 
   read(conversationId: string, sourceMessageId: string, params: ResearchReadParams): ResearchReadResult {
@@ -396,8 +429,9 @@ export class ResearchStore {
 
   private reportSnapshot(id: string, version: number): ResearchReport {
     validId(id); integer(version,'报告版本',1,1_000_000);
-    const row = this.db.prepare('SELECT r.*,t.title FROM research_reports r JOIN research_tasks t ON t.id=r.task_id WHERE r.task_id=? AND r.version=?').get(id,version);
+    const row = this.db.prepare('SELECT r.*,t.title,t.latest_version FROM research_reports r JOIN research_tasks t ON t.id=r.task_id WHERE r.task_id=? AND r.version=?').get(id,version);
     if (!row) throw new MemoryError('该版本的研究报告不存在。');
+    if (version < Number(row.latest_version)) throw new MemoryError(`该报告已被 v${row.latest_version} 替换，旧正文不再保留，请读取最新版本。`);
     if (this.contentExpired(id,`research/${id}/${version}.md`)) throw new MemoryError('该研究报告已按30天保留规则清理；任务记录及调用用量仍保留。');
     const data = this.readFile(id,version,'md');
     if (digest(data) !== row.content_hash) throw new Error('研究报告校验失败，保留文件供检查。');
@@ -422,10 +456,16 @@ export class ResearchStore {
   }
 
   reserveNotification(id: string, attempt: number, notificationText: string): ResearchDelivery {
+    return this.transaction(() => this.reserveNotificationSnapshot(id,attempt,notificationText));
+  }
+
+  private reserveNotificationSnapshot(id: string, attempt: number, notificationText: string): ResearchDelivery {
     const task = this.get(id);
-    if (!task || task.attempt !== attempt || task.status === 'queued' || task.status === 'running') throw new MemoryError('研究通知的任务状态无效。');
+    if (task && this.archived(id)) throw new MemoryError('该研究已归档，不再自动通知。');
+    if (!task || this.notificationObsolete(id,attempt)) throw new MemoryError('研究通知已失效、过期或任务状态改变。');
     const body = text(notificationText,'研究通知',2000);
-    const reservation = this.reserve(task,task.sourceMessageId,'notice',task.reportVersion ?? 0,'text',attempt,body);
+    const source = this.db.prepare('SELECT source_message_id FROM research_attempts WHERE task_id=? AND attempt=?').get(id,attempt)!;
+    const reservation = this.reserve(task,String(source.source_message_id),'notice',task.reportVersion ?? 0,'text',attempt,body);
     return {...reservation,...(reservation.shouldSend ? {text:body} : {})};
   }
 
@@ -454,10 +494,12 @@ export class ResearchStore {
     if (!['sent','uncertain','rejected'].includes(status)) throw new MemoryError('报告投递状态无效。');
     if (status === 'sent') text(externalMessageId,'平台消息编号',1000);
     if (referenceIndex !== undefined) text(referenceIndex,'平台引用编号',1000);
+    let taskId: string | undefined;
     this.transaction(() => {
       const row = this.db.prepare(`SELECT d.*,source.conversation_id,t.title FROM research_deliveries d
         JOIN research_tasks t ON t.id=d.task_id JOIN messages source ON source.id=d.source_message_id WHERE d.id=?`).get(deliveryId);
       if (!row || row.status !== 'sending') throw new MemoryError('报告投递已确认或不存在，拒绝覆盖。');
+      taskId = String(row.task_id);
       const at = timestamp(); let messageId: string | null = null;
       if (status === 'sent') {
         const body = row.kind === 'notice' ? String(row.text)
@@ -471,6 +513,37 @@ export class ResearchStore {
       }
       this.db.prepare("UPDATE research_deliveries SET status=?,external_message_id=?,reference_index=?,message_id=?,updated_at=? WHERE id=? AND status='sending'")
         .run(status,externalMessageId ?? null,referenceIndex ?? null,messageId,at,deliveryId);
+    });
+    if (taskId) this.purgeSupersededReports(taskId);
+  }
+
+  /** Retire only registered report files, never raw chat, evidence or chapter checkpoints. */
+  private purgeSupersededReports(id: string): void {
+    this.transaction(() => {
+      const task = this.db.prepare('SELECT latest_version FROM research_tasks WHERE id=?').get(id);
+      if (!task || Number(task.latest_version) < 2 || this.contentExpired(id)) return;
+      const latest = this.db.prepare('SELECT content_hash FROM research_reports WHERE task_id=? AND version=?').get(id,Number(task.latest_version));
+      if (!latest) throw new Error('最新报告元数据缺失，未清理旧报告。');
+      for (const format of ['md','txt'] as const) {
+        if (digest(this.readFile(id,Number(task.latest_version),format)) !== latest.content_hash) throw new Error('最新报告校验失败，未清理旧报告。');
+      }
+      const files: {path:string;hash:string}[] = [];
+      for (const row of this.db.prepare(`SELECT r.version,r.content_hash FROM research_reports r WHERE r.task_id=? AND r.version<?
+        AND NOT EXISTS(SELECT 1 FROM research_deliveries d WHERE d.task_id=r.task_id AND d.version=r.version AND d.status='sending')`).all(id,Number(task.latest_version))) {
+        for (const format of ['md','txt'] as const) {
+          const path = this.artifactPath(id,Number(row.version),format);
+          if (!existsSync(path)) continue;
+          const stat = lstatSync(path);
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || digest(this.readFile(id,Number(row.version),format)) !== row.content_hash)
+            throw new Error('旧报告文件不安全或哈希不符，保留待检查。');
+          files.push({path,hash:String(row.content_hash)});
+        }
+      }
+      for (const file of files) {
+        if (digest(readFileSync(file.path)) !== file.hash) throw new Error('旧报告在清理前变化，保留待检查。');
+        unlinkSync(file.path);
+        if (process.platform !== 'win32') { const fd = openSync(dirname(file.path),'r'); try { fsyncSync(fd); } finally { closeSync(fd); } }
+      }
     });
   }
 

@@ -8,6 +8,7 @@ export interface ResearchProgress extends ResearchUsage { evidence?: ResearchEvi
 export interface CreateResearchInput {
   key: string; title: string; goal: string; urls?: string[]; requiresOriginal?: boolean;
 }
+export interface ContinueResearchInput { id: string; key: string; requirements?: string }
 export interface ResearchTask {
   id: string; conversationId: string; sourceMessageId: string; actorId: string; personId: string;
   route: ChannelRoute; senderId: string; originalText: string;
@@ -15,6 +16,8 @@ export interface ResearchTask {
   status: ResearchStatus; attempt: number; createdAt: string; updatedAt: string;
   reportVersion?: number; reason?: string;
   budget?: ResearchBudget; usage: ResearchUsage; evidence: ResearchEvidence[];
+  /** Authorized follow-ups are task instructions, separate from fetched evidence. */
+  followups: { attempt: number; requirements: string; sourceMessageId: string }[];
 }
 export interface ResearchListParams { date?: string; query?: string; limit?: number; offset?: number }
 export interface ResearchList {
