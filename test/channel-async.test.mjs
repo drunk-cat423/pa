@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ChannelHarness,  } from '../dist/channel-harness.js';
+import { ConversationStore } from '../dist/store.js';
 import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
 
 async function until(predicate, description) {
@@ -102,6 +103,34 @@ async function fixture(t, maxConcurrent = 2) {
   return { config, route, other, requests, planningRequests, totalCalls: () => totalModelCalls(requests, planningRequests), sent, plans, preparations, inspect, gate, harness, message, tasks,
     send: operation => { send = operation; } };
 }
+
+test('真实@从渠道首次入库保留到重启后的资料快照，文本伪@不获得权限', async t=>{
+  const f=await fixture(t),h=f.harness();
+  assert.equal(await h.handle(f.message('person-b','我来了',{senderId:'bob',mentioned:false})), 'observed');
+  assert.equal(await h.handle(f.message('real-mention','<@bob> 喜欢阅读',{mentioned:false,mentionedSenderIds:['bob','bob']})), 'observed');
+  assert.equal(await h.handle(f.message('text-mention','文字里写 <@bob>',{mentioned:false})), 'observed');
+  assert.equal(f.totalCalls(),0);
+  assert.equal(await h.handle(f.message('active-mention','看看 <@bob> 的资料',{mentionedSenderIds:['bob']})), 'sent');
+  await h.close();
+  const oldDb=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'));
+  try {
+    oldDb.prepare('DELETE FROM message_profile_context WHERE message_id=(SELECT id FROM messages WHERE external_event_id=?)').run('active-mention');
+    oldDb.exec('DROP TABLE IF EXISTS auto_memory_component_results; PRAGMA user_version=29;');
+  } finally {oldDb.close();}
+  const store=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
+  try {
+    const room=f.inspect(db=>db.prepare('SELECT conversation_id FROM messages WHERE external_event_id=?').get('real-mention').conversation_id);
+    const now=Date.now();store.autoMemory.reserveMaterialsIfDue(room,now);
+    assert.ok(store.autoMemory.reserveMaterialsIfDue(room,now+600001));
+    const job=store.autoMemory.claimNext(room,{pipeline:'materials',owner:'mention-check',leaseMs:30000});
+    const input=store.autoMemory.taskInput(job);
+    const source=store.externalMessage(room,'real-mention').id,plain=store.externalMessage(room,'text-mention').id;
+    assert.deepEqual(input.messages.find(message=>message.id===source).mentionedSenderIds,['bob']);
+    assert.deepEqual(input.messages.find(message=>message.id===plain).mentionedSenderIds??[],[]);
+    const repaired=store.externalMessage(room,'active-mention').id;
+    assert.deepEqual(input.messages.find(message=>message.id===repaired).mentionedSenderIds,['bob'],'migration must recover only persisted platform mention metadata');
+  } finally {store.close();}
+});
 
 test('请求失败真实发送短回执，预算前置拒绝和未知投递重启后不重发', async t => {
   const f=await fixture(t), gate=f.gate();

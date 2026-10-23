@@ -391,6 +391,21 @@
       "file": "test/memory-recovery-e2e.test.mjs",
       "name": "重复失败的恢复次数与退避跨重启保留，耗尽不堵新资料且不伪造覆盖",
       "evidence": "2026-10-23 confirmed FIFO failed-head blockers and deferred compression exclusion; user requested durable recovery without raw-message gaps or chronological inversion."
+    },
+    {
+      "file": "test/channel-async.test.mjs",
+      "name": "真实@从渠道首次入库保留到重启后的资料快照，文本伪@不获得权限",
+      "evidence": "2026-10-23 live saved-response replay: readonly evidence references, summaryExtra and redundant empty profiles rejected whole batches; channel ingress omitted actual mentionedSenderIds. User authorized simpler single-person proposals and durable partial success."
+    },
+    {
+      "file": "test/material-components-e2e.test.mjs",
+      "name": "单人物简化提案接受自然表达，无关字段不拖垮Topic；失败画像跨重启只补自身",
+      "evidence": "2026-10-23 live saved-response replay: readonly evidence references, summaryExtra and redundant empty profiles rejected whole batches; channel ingress omitted actual mentionedSenderIds. User authorized simpler single-person proposals and durable partial success."
+    },
+    {
+      "file": "test/material-components-e2e.test.mjs",
+      "name": "画像请求未知失败保留其他组件，单目标来源和真实权限仍不能越界",
+      "evidence": "2026-10-23 live saved-response replay: readonly evidence references, summaryExtra and redundant empty profiles rejected whole batches; channel ingress omitted actual mentionedSenderIds. User authorized simpler single-person proposals and durable partial success."
     }
   ]
 }

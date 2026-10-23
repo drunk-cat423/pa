@@ -37,7 +37,7 @@ export function assertProfileEvidenceStrength(fact: ProfileFact, baseline: Perso
   const explicit = new Set([
     ...priorSelf,
     ...(baseline.pending ?? []).filter(item => item.sourceType === 'self').map(item => item.sourceMessageId),
-    ...input.messages.filter(message => message.role === 'user' && message.personId === baseline.personId
+    ...[...input.messages, ...(input.materialsProtocol === 3 ? input.recoveryReviewMessages ?? [] : [])].filter(message => message.role === 'user' && message.personId === baseline.personId
       && (!weaker.has(message.id) || priorSelf.has(message.id))).map(message => message.id),
   ]);
   if (!fact.messageIds.some(id => explicit.has(id))) throw new Error('人物画像改写不能把旧转述或推断提升为本人自述。');

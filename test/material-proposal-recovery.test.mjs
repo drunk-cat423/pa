@@ -71,16 +71,14 @@ for (const kind of ["wire_subject","attribution"]) {
       calls.push([input.job.id, input.mode]);
       if (input.job.id !== f.first.id || input.mode !== 'profiles') return valid(input);
       frozen = f.frozen();
-      assert.equal(JSON.parse(frozen.progress_json).extract.topics.length, 1);
-      assert.match(prepareMemoryWireExtraction(input, 1000000).systemPrompt, /profileSubjects仅用于识别对象/);
+      assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM memory_topics WHERE job_id=?').get(f.first.id).n),1);
+      assert.match(prepareMemoryWireExtraction(input, 1000000).systemPrompt, /唯一目标人物/);
       if (kind === 'wire_subject') return parseMemoryResponse({ stopReason: 'stop', content: [{ type: 'text', text:
-        JSON.stringify({ profiles: [{ personId: 'p999', baseVersion: 0, facts: [], updates: [], pendingResults: [] }] }) }] }, input);
+        JSON.stringify({ facts: [{ content: '无效来源', sources: ['m999999'] }] }) }] }, input);
       if (kind === 'structure') return { profiles: 'invalid' };
       if (kind.startsWith('model_')) throw new MemoryProviderError(kind, 'fixture response rejected');
       const proposal = valid(input), profile = proposal.profiles[0];
-      profile.facts = [{ content: '已经使用示例工具', sourceType: 'self', messageIds: [f.question] }];
-      profile.updates = [{ factIndex: 0, baselineFactIndexes: [], evidence: [{ messageId: f.question,
-        factQuote: '讲一下示例工具是什么，有何用途？', subjectKind: 'self', subjectQuote: '我' }] }];
+      profile.personId='outside-target';
       return proposal;
     });
     await worker.wait();
@@ -90,7 +88,8 @@ for (const kind of ["wire_subject","attribution"]) {
     assert.match(jobs.find(job => job.id === f.first.id).error, /model_proposal_rejected/);
     assert.equal(jobs.find(job => job.id === f.second.id).status, 'done');
     assert.equal(f.store.autoMemory.status(f.conversation.id, 'materials').checkpoint, 0);
-    assert.deepEqual(f.frozen(), frozen);
+    assert.equal(f.frozen().input_json, frozen.input_json);
+    assert.equal(JSON.parse(f.frozen().progress_json).remaining.length,0);
     // The later batch may append its own profile revision, but it cannot rewrite historical rows or failed pending.
     const after = f.history();
     assert.deepEqual(after.messages, history.messages);
@@ -100,7 +99,7 @@ for (const kind of ["wire_subject","attribution"]) {
     const deferral = f.inspect(db => db.prepare('SELECT * FROM auto_memory_job_deferrals WHERE job_id=?').get(f.first.id));
     const hash = text => createHash('sha256').update(text).digest('hex');
     assert.equal(deferral.input_hash, hash(frozen.input_json));
-    assert.equal(deferral.progress_hash, hash(frozen.progress_json));
+    assert.equal(deferral.progress_hash, hash(f.frozen().progress_json));
     assert.equal(calls.filter(([id, mode]) => id === f.first.id && mode === 'profiles').length, 1);
     assert.throws(() => f.store.autoMemory.retry(f.first.id), /搁置/);
     const lease = JSON.parse(frozen.input_json).job.leaseToken;

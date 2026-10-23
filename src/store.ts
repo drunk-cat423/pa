@@ -71,7 +71,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 29;
+const SCHEMA_VERSION = 30;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -519,6 +519,34 @@ export class ConversationStore {
         CREATE INDEX material_message_membership ON auto_memory_material_job_messages(message_id);
       `);
       if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('数据库迁移后的外键校验失败。');
+      if (version < 30) {
+        this.db.exec(`CREATE TABLE auto_memory_component_results (
+          job_id TEXT NOT NULL REFERENCES auto_memory_jobs(id), component TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('done','failed')), error TEXT, created_at TEXT NOT NULL, message_ids_json TEXT NOT NULL,
+          PRIMARY KEY(job_id,component));
+          CREATE TABLE IF NOT EXISTS message_profile_context_repairs (
+            version INTEGER PRIMARY KEY, restored INTEGER NOT NULL, unverifiable INTEGER NOT NULL, created_at TEXT NOT NULL);`);
+        let restored=0,unverifiable=0;
+        for(const row of this.db.prepare(`SELECT m.id,m.text,m.external_event_id,a.external_user_id,
+          r.channel,r.account,r.room_type,r.external_chat_id,t.input_json FROM messages m
+          JOIN conversations c ON c.id=m.conversation_id JOIN rooms r ON r.id=c.room_id
+          JOIN actors a ON a.id=m.actor_id AND a.room_id=c.room_id
+          LEFT JOIN channel_tasks t ON t.message_id=m.id AND t.conversation_id=m.conversation_id
+          LEFT JOIN message_profile_context x ON x.message_id=m.id
+          WHERE m.role='user' AND m.external_event_id IS NOT NULL AND x.message_id IS NULL`).all()) {
+          let input:Partial<InboundMessage>|undefined;
+          try {input=JSON.parse(String(row.input_json)) as Partial<InboundMessage>;} catch {unverifiable++;continue;}
+          if(!input||typeof input!=='object'||!input.route||input.eventId!==row.external_event_id
+            ||input.senderId!==row.external_user_id||input.text!==row.text
+            ||input.route.channel!==row.channel||input.route.accountId!==row.account
+            ||input.route.roomType!==row.room_type||input.route.roomId!==row.external_chat_id
+            ||!Array.isArray(input.mentionedSenderIds)||!input.mentionedSenderIds.length
+            ||input.mentionedSenderIds.some(id=>typeof id!=='string'||!id.trim())) {unverifiable++;continue;}
+          this.db.prepare('INSERT INTO message_profile_context VALUES (?,?)')
+            .run(String(row.id),JSON.stringify([...new Set(input.mentionedSenderIds)]));restored++;
+        }
+        this.db.prepare('INSERT OR IGNORE INTO message_profile_context_repairs VALUES (30,?,?,?)').run(restored,unverifiable,now());
+      }
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
     } catch (error) {

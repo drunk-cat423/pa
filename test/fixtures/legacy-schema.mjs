@@ -1,4 +1,5 @@
 export function downgradeSchema22(db) {
+  db.exec('DROP TABLE IF EXISTS auto_memory_component_results;');
   db.exec('DROP TABLE IF EXISTS auto_memory_recoveries;');
   db.exec('DROP TABLE IF EXISTS channel_task_failures;');
   if (db.prepare('PRAGMA table_info(conversation_context_state)').all().some(column => column.name === 'summary_correction_hash')) {

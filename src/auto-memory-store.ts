@@ -10,6 +10,7 @@ import { assertMemorySourceRange, assertProcessedRanges, COMPACT_TOPIC_LIMITS } 
 import { memoryScheduleDue, noteMemoryContent } from './memory-schedule.js';
 import { inferPersonProfileEvidence, resolveProfileSubject, type ProfileSubjectCandidate, type ProfileSubjectEvidence } from './profile-attribution.js';
 import { validateProfileUpdates } from './profile-updates.js';
+import { materialProfileSources } from './material-profile-wire.js';
 import { MemoryProposalRejectedError, MemoryStatePersistenceError } from './memory-diagnostics.js';
 
 const timestamp = () => new Date().toISOString();
@@ -62,6 +63,7 @@ export function assertCurrentMemoryProtocol(value: unknown): void {
   if (!value || typeof value !== 'object') return;
   if (Array.isArray(value)) { value.forEach(assertCurrentMemoryProtocol); return; }
   const object = value as Record<string, unknown>;
+  if (object.materialsProtocol !== undefined && object.materialsProtocol !== 3) throw new Error('未知资料组件协议。');
   if (object.extractionProtocol !== undefined && object.extractionProtocol !== 2) throw new Error('未知整理协议；固定输入与进度保持不变。');
   if (object.profileBaselineProtocol !== undefined && object.profileBaselineProtocol !== 1) throw new Error('未知画像基线协议；固定输入与进度保持不变。');
   if (object.profileAttributionProtocol !== undefined && object.profileAttributionProtocol !== 1) throw new Error('未知画像对象协议；固定输入与进度保持不变。');
@@ -915,12 +917,12 @@ export class AutoMemoryStore {
     if(canonical.pipeline==='materials') selfProfile.pending=materialPending.filter(item=>item.kind==='self').map(item=>({
       id:item.payload.id,content:item.payload.content,sourceMessageId:item.payload.sourceMessageId}));
     const input:AutoMemoryTaskInput={...(canonical.pipeline==='materials'?{pipeline:'materials' as const,extractionProtocol:2 as const,profileBaselineProtocol:1 as const,
-      profileAttributionProtocol:1 as const,selfProfileProtocol:2 as const,profileSubjects:this.profileSubjectCandidates(canonical.conversationId)}
+      materialsProtocol:3 as const,profileAttributionProtocol:1 as const,selfProfileProtocol:2 as const,profileSubjects:this.profileSubjectCandidates(canonical.conversationId)}
       :contextJob?{contextProtocol:1 as const,extractionProtocol:2 as const}:{}),profileProtocol:2,profileSources,profileFragments,
       ...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),
       job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile,
       ...(canonical.pipeline==='materials'||previousSummary==null?{}:{previousSummary:String(previousSummary)})};
-    if(canonical.pipeline==='materials'&&this.db.prepare('SELECT 1 FROM auto_memory_recoveries WHERE replacement_job_id=?').get(job.id)) {
+    if(canonical.pipeline==='materials') {
       input.recoveryProfileFactSources=profiles.flatMap(profile=>{
         const revision=this.db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=?')
           .get(profile.personId,profile.baseVersion);
@@ -930,10 +932,14 @@ export class AutoMemoryStore {
             WHERE s.person_id=? AND s.revision=? AND s.fact_index=? ORDER BY m.created_at DESC,m.ingest_seq DESC LIMIT 1`)
             .all(profile.personId,profile.baseVersion,originalFacts.findIndex(original=>sameFact(original,fact))).map(row=>String(row.id))}));
       });
+      const confirmations=this.messages(input.recoveryProfileFactSources.flatMap(fact=>fact.messageIds));
+      input.profileSources=[...new Map([...profileSources,...confirmations].map(message=>[message.id,message])).values()];
+    }
+    if(canonical.pipeline==='materials'&&this.db.prepare('SELECT 1 FROM auto_memory_recoveries WHERE replacement_job_id=?').get(job.id)) {
       const pendingSourceIds=[...profiles.flatMap(profile=>(profile.pending??[]).map(pending=>pending.sourceMessageId)),...selfProfile.pending.map(pending=>pending.sourceMessageId)];
       const earliest=[...messages,...this.messages(pendingSourceIds)].reduce((time,message)=>Math.min(time,Date.parse(message.createdAt)),Infinity);
       const baselineIds=new Set([...profiles.flatMap(profile=>profile.facts.flatMap(fact=>fact.messageIds)),
-        ...input.recoveryProfileFactSources.flatMap(fact=>fact.messageIds),
+        ...(input.recoveryProfileFactSources??[]).flatMap(fact=>fact.messageIds),
         ...this.db.prepare(`SELECT DISTINCT s.message_id FROM self_profile_update_sources s JOIN self_profile_updates u ON u.id=s.update_id
           WHERE u.revision=?`).all(selfProfile.baseVersion).map(row=>String(row.message_id))]);
       const people=new Set(profiles.map(profile=>profile.personId));
@@ -945,6 +951,11 @@ export class AutoMemoryStore {
       const review=this.messages([...new Set([...reviewIds.map(row=>String(row.id)),...baselineIds])]);
       input.recoveryReviewMessages=review.filter(message=>baselineIds.has(message.id)||Date.parse(message.createdAt)>=earliest)
         .sort((a,b)=>Date.parse(a.createdAt)-Date.parse(b.createdAt)||a.ingestSeq-b.ingestSeq);
+    }
+    if(input.materialsProtocol===3) {
+      const done=this.completedMaterialComponents(job.id);
+      input.completedComponents=done.map(row=>String(row.component));
+      input.completedMaterialMessageIds=[...new Set(done.flatMap(row=>parseFrozen<string[]>(row.message_ids_json)))];
     }
     this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
     return input;
@@ -1030,11 +1041,39 @@ export class AutoMemoryStore {
   private evidenceSequence(ids:readonly string[]):number {
     return ids.reduce((highest,id)=>Math.max(highest,Number(this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(id)?.ingest_seq??0)),0);
   }
-  commit(jobId:string,leaseToken:string,extract:ValidatedExtract,selfBudget?:number): void {
+  commit(jobId:string,leaseToken:string,extract:ValidatedExtract,selfBudget?:number,component?:{key:string;messageIds:string[]}): void {
     this.atomic(()=>{
-      const row=this.active(jobId,leaseToken); const job=this.job(row); const input=this.taskInput(job); assertCurrentMemoryProtocol(input); assertProfileProtocol(input); assertCurrentMemoryProtocol(extract); this.assertProfileEvidenceCurrent(input,extract); const owned=new Set(job.messageIds);
+      const row=this.active(jobId,leaseToken); const job=this.job(row); const capturedInput=this.taskInput(job);
+      if(component && (capturedInput.materialsProtocol!==3 || job.pipeline!=='materials')) throw new Error('组件提交协议无效。');
+      if(component && this.completedMaterialComponents(jobId).some(row=>row.component===component.key)) return;
+      if(component) {
+        if(!Array.isArray(component.messageIds)||new Set(component.messageIds).size!==component.messageIds.length) throw new Error('组件来源范围无效。');
+        if(component.key.startsWith('messages:')) {
+          if(component.key!=='messages:'+hash(JSON.stringify(component.messageIds))) throw new Error('组件来源标识无效。');
+          const done=new Set(this.completedMaterialComponents(jobId).flatMap(row=>parseFrozen<string[]>(row.message_ids_json)));
+          if(component.messageIds.some(id=>done.has(id))) throw new Error('已成功的消息组件不能重复提交。');
+        } else if(component.messageIds.length) throw new Error('画像组件不能提交消息覆盖。');
+      }
+      const input=component?{...capturedInput, profiles: component.key.startsWith('profile:')
+        ? capturedInput.profiles.filter(profile=>component.key==='profile:'+profile.personId):[]}:capturedInput;
+      if(component) {
+        const person=input.profiles[0];
+        const sourceIds=new Set(person ? [...person.facts.flatMap(fact=>fact.messageIds),...(person.pending??[]).map(item=>item.sourceMessageId),
+          ...(input.recoveryProfileFactSources??[]).filter(item=>item.personId===person.personId).flatMap(item=>item.messageIds)]
+          : component.key==='self' ? [...(input.selfProfile?.pending??[]).map(item=>item.sourceMessageId),
+            ...(extract.selfProfile?.updates??[]).map(item=>item.messageId)] : component.messageIds);
+        input.messages=input.messages.filter(message=>sourceIds.has(message.id)||person&&message.personId===person.personId);
+        input.profileSources=(input.profileSources??[]).filter(message=>sourceIds.has(message.id));
+        input.profileFragments=(input.profileFragments??[]).filter(fragment=>fragment.personId===person?.personId);
+        if(input.recoveryReviewMessages) input.recoveryReviewMessages=input.recoveryReviewMessages.filter(message=>sourceIds.has(message.id)||person&&message.personId===person.personId);
+      }
+      if(component && (component.key.startsWith('profile:') ? input.profiles.length!==1 || extract.profiles.length!==1
+        || extract.profiles[0]!.personId!==input.profiles[0]!.personId || extract.topics.length>0 || extract.selfProfile!==undefined
+        : component.key==='self' ? extract.profiles.length>0 || extract.topics.length>0 || extract.selfProfile===undefined
+        : !component.key.startsWith('messages:') || extract.profiles.length>0 || extract.selfProfile!==undefined)) throw new Error('组件提交目标无效。');
+      assertCurrentMemoryProtocol(input); assertProfileProtocol(input); assertCurrentMemoryProtocol(extract); this.assertProfileEvidenceCurrent(input,extract); const owned=new Set(job.messageIds);
       assertLiveProfileProtocol(input);
-      if([...(input.profileSources??[]),...input.messages].some(m=>m.actorId!==undefined&&this.personForActor(m.actorId)!==m.personId)) throw new Error('人物绑定版本冲突，请重读后重试。');
+      if([...(input.profileSources??[]),...input.messages,...(input.materialsProtocol===3?input.recoveryReviewMessages??[]:[])].some(m=>m.actorId!==undefined&&this.personForActor(m.actorId)!==m.personId)) throw new Error('人物绑定版本冲突，请重读后重试。');
       const first=this.nextPending(job.conversationId,job.pipeline);
       if(first?.id!==jobId) throw new Error('同房间整理必须按批次顺序提交。');
       if(!Array.isArray(extract.topics)||!Array.isArray(extract.fragments)||!Array.isArray(extract.profiles)) throw new Error('整理产物结构无效。');
@@ -1059,7 +1098,14 @@ export class AutoMemoryStore {
         if (extract.ignoredMessageIds.length || extract.fragments.length) throw new Error('新整理协议不接受逐条覆盖清单或人物事件片段。');
         if(job.pipeline==='materials'&&job.messageIds.length===0) {
           if(!Array.isArray(extract.processedRanges)||extract.processedRanges.length) throw new Error('空消息快照只能提交空完成回执。');
-        } else assertProcessedRanges(extract.processedRanges, job.messageIds.length);
+        } else if(!component) assertProcessedRanges(extract.processedRanges, job.messageIds.length);
+        else if(component.key.startsWith('messages:')) {
+          const positions=component.messageIds.map(id=>job.messageIds.indexOf(id));
+          if(!positions.length||positions.some(index=>index<0)||!Array.isArray(extract.processedRanges)
+            ||extract.processedRanges.length!==1||extract.processedRanges[0]!.startOrdinal!==positions[0]
+            ||extract.processedRanges[0]!.endOrdinal!==positions.at(-1)
+            ||positions.some((value,index)=>value!==positions[0]!+index)) throw new Error('组件来源范围无效。');
+        }
       } else {
         const covered=new Set([...extract.ignoredMessageIds,...extract.topics.flatMap(t=>t.messageIds),...extract.fragments.flatMap(f=>f.messageIds)]);
         if(input.messages.some(m=>m.role==='user'&&!covered.has(m.id))) throw new Error('整理结果未覆盖所有真人消息。');
@@ -1116,7 +1162,7 @@ export class AutoMemoryStore {
           const captured=baseline.pending??[];
           const priorIds = new Set([...(input.profileFragments ?? []).filter(fragment => fragment.personId === profile.personId).flatMap(fragment => fragment.messageIds),
             ...baseline.facts.flatMap(old => old.messageIds)]);
-          const allowed=new Map([...input.messages,...(input.profileSources??[]).filter(message=>captured.some(item=>item.sourceMessageId===message.id)||priorIds.has(message.id)),
+          const allowed=new Map([...input.messages,...(input.materialsProtocol===3?materialProfileSources(input,baseline).values():[]),...(input.profileSources??[]).filter(message=>captured.some(item=>item.sourceMessageId===message.id)||priorIds.has(message.id)),
             ...this.messages([...priorIds])].map(message=>[message.id,message]));
           if(!fact.messageIds.length||new Set(fact.messageIds).size!==fact.messageIds.length
             ||fact.messageIds.some(id=>!allowed.has(id)||allowed.get(id)!.role!=='user')
@@ -1133,8 +1179,28 @@ export class AutoMemoryStore {
         // Validate the deduplicated final result, not just each model chunk.
         assertProfileCapacity({...profile,facts:mergeProfileFacts(profile.facts)});
         this.writeProfile(profile,jobId);
+        if(input.materialsProtocol===3) {
+          // Pure baseline consolidation changes wording, but keeps the baseline's
+          // confirmed chronology. Locate sources in the full stored revision;
+          // the visible baseline may have filtered expired facts out of its array.
+          const previous=this.db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=?')
+            .get(profile.personId,profile.baseVersion);
+          const previousFacts=previous?parseFrozen<ProfileFact[]>(previous.facts_json):[];
+          const normalized=mergeProfileFacts(profile.facts);
+          for(const update of profile.updates??[]) if(update.evidence.length===0) {
+            const target=normalized.findIndex(fact=>sameFactContent(fact,profile.facts[update.factIndex]!));
+            for(const index of update.baselineFactIndexes??[]) {
+              const original=previousFacts.findIndex(fact=>sameFact(fact,baseline.facts[index]!));
+              if(original<0||target<0) throw new MemoryStatePersistenceError('画像基线来源关联与完整旧版本不一致。');
+              this.db.prepare(`INSERT OR IGNORE INTO person_profile_revision_sources(person_id,revision,fact_index,message_id)
+                SELECT person_id,?,?,message_id FROM person_profile_revision_sources
+                WHERE person_id=? AND revision=? AND fact_index=?`)
+                .run(profile.baseVersion+1,target,profile.personId,profile.baseVersion,original);
+            }
+          }
+        }
         for(const update of profile.updates??[]) for(const evidence of update.evidence) {
-          const source=[...input.messages,...(input.profileSources??[])].find(message=>message.id===evidence.messageId)!;
+          const source=[...input.messages,...(input.profileSources??[]),...(input.materialsProtocol===3?input.recoveryReviewMessages??[]:[])].find(message=>message.id===evidence.messageId)!;
           const target=mergeProfileFacts(profile.facts).findIndex(fact=>sameFactContent(fact,profile.facts[update.factIndex]!));
           this.db.prepare('INSERT OR IGNORE INTO person_profile_subject_updates VALUES (?,?,?,?,?,?,?)')
             .run(profile.personId,profile.baseVersion+1,target,evidence.messageId,source.personId!,JSON.stringify(evidence),timestamp());
@@ -1170,6 +1236,12 @@ export class AutoMemoryStore {
       }
       // Check again after all writes; the transaction rolls everything back if the lease expired.
       this.active(jobId,leaseToken);
+      if(component) {
+        this.db.prepare(`INSERT INTO auto_memory_component_results VALUES (?,?,?,?,?,?)
+          ON CONFLICT(job_id,component) DO UPDATE SET status='done',error=NULL,message_ids_json=excluded.message_ids_json`)
+          .run(jobId,component.key,'done',null,timestamp(),JSON.stringify(component.messageIds));
+        return;
+      }
       const contextJob=this.db.prepare('SELECT * FROM auto_memory_context_jobs WHERE job_id=?').get(jobId);
       if(contextJob) {
         const state=this.contextState(job.conversationId);
@@ -1202,6 +1274,46 @@ export class AutoMemoryStore {
         .run(completedSeq,extract.continuationSummary??null,extract.continuationSummary??null,jobId,job.conversationId);
       if(!contextJob&&extract.continuationSummary!==undefined) this.db.prepare(`UPDATE conversation_context_state SET summary=?
         WHERE conversation_id=? AND revision=0`).run(extract.continuationSummary,job.conversationId);
+    });
+  }
+  materialComponentDone(jobId:string,component:string): boolean {
+    return this.completedMaterialComponents(jobId).some(row=>row.component===component);
+  }
+  private completedMaterialComponents(jobId:string) {
+    const prior=this.db.prepare('SELECT root_job_id FROM auto_memory_recoveries WHERE replacement_job_id=?').get(jobId);
+    const root=prior?String(prior.root_job_id):jobId;
+    return this.db.prepare(`SELECT c.* FROM auto_memory_component_results c WHERE c.status='done'
+      AND (c.job_id=? OR c.job_id=? OR c.job_id IN (SELECT replacement_job_id FROM auto_memory_recoveries WHERE root_job_id=?))`)
+      .all(jobId,root,root);
+  }
+  recordMaterialComponentFailure(jobId:string,leaseToken:string,component:string,error:string): void {
+    this.atomic(()=>{
+      const job=this.active(jobId,leaseToken);
+      if(job.pipeline!=='materials') throw new Error('组件失败仅适用于资料任务。');
+      this.db.prepare(`INSERT INTO auto_memory_component_results VALUES (?,?,?,?,?,?)
+        ON CONFLICT(job_id,component) DO UPDATE SET error=excluded.error WHERE status='failed'`)
+        .run(jobId,component,'failed',error,timestamp(),'[]');
+    });
+  }
+  finishMaterialComponents(jobId:string,leaseToken:string): boolean {
+    return this.atomic(()=>{
+      const row=this.active(jobId,leaseToken), job=this.job(row), input=this.taskInput(job);
+      if(input.materialsProtocol!==3) throw new Error('组件完成协议无效。');
+      const done=this.completedMaterialComponents(jobId), keys=new Set(done.map(row=>String(row.component)));
+      const messageIds=new Set(done.flatMap(row=>parseFrozen<string[]>(row.message_ids_json)));
+      const failures=this.db.prepare("SELECT component,error FROM auto_memory_component_results WHERE job_id=? AND status='failed'").all(jobId)
+        .filter(row=>!keys.has(String(row.component)));
+      const complete=job.messageIds.every(id=>messageIds.has(id))&&input.profiles.every(profile=>keys.has('profile:'+profile.personId))
+        &&(!input.selfProfile?.pending.length||keys.has('self'))&&failures.length===0;
+      if(!complete) {
+        const error='资料组件未全部完成；成功组件已独立保存，失败来源与pending保留。'+failures.map(row=>` ${String(row.component)}: ${String(row.error)}`).join('');
+        this.db.prepare("UPDATE auto_memory_jobs SET status='failed',error=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?").run(error,jobId);
+        this.registerRecovery(jobId,Date.now());
+      } else {
+        this.db.prepare("UPDATE auto_memory_jobs SET status='done',completed_at=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?").run(timestamp(),jobId);
+        this.advanceMaterialCheckpoint(job.conversationId);
+      }
+      return complete;
     });
   }
   fail(jobId:string,leaseToken:string,error:string): void {

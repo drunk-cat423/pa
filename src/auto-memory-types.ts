@@ -68,6 +68,10 @@ export interface SummaryCorrections {
     subjectActorIds: string[]; excludedActorIds: string[]; correctedMessages: AutoMemoryMessage[] }[];
 }
 export interface AutoMemoryTaskInput {
+  /** Single-target proposals and independently durable material components. */
+  materialsProtocol?: 3;
+  completedComponents?: string[];
+  completedMaterialMessageIds?: string[];
   /** Read-only later evidence for chronological recovery; never grants write attribution. */
   recoveryReviewMessages?: AutoMemoryMessage[];
   /** Frozen supplementary confirmations; facts stay unchanged for revision/CAS validation. */
@@ -102,6 +106,7 @@ export interface AutoMemoryTaskInput {
 }
 export interface MemorySourceRange { startOrdinal: number; endOrdinal: number }
 export interface ValidatedExtract {
+  componentFailures?: { component: string; error: string }[];
   ignoredMessageIds: string[];
   topics: { summary: string; messageIds: string[]; sourceRange?: MemorySourceRange }[];
   fragments: { personId: string; content: string; sourceType: EvidenceType; messageIds: string[]; topicIndex?: number }[];

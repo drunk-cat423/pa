@@ -10,6 +10,7 @@ import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } fro
 import { assertProfileCapacity, PersonProfileCapacityError, profileCapacity } from './profile-limits.js';
 import { assertProfileEvidenceStrength, assertLiveProfileProtocol, assertProfileProtocol, PersonProfileProtocolError, validateProfilePendingResults } from './profile-pending.js';
 import { accumulateProfileUpdates, normalizeProfileUpdates, validateProfileUpdates } from './profile-updates.js';
+import { materialProfileSources } from './material-profile-wire.js';
 import { assertMemoryOutputFits, assertMemorySourceRange, assertProcessedRanges, COMPACT_TOPIC_LIMITS,
   memoryOutputBudget, memorySourceRange, MemoryOutputBudgetError, profileOutputTarget } from './memory-work.js';
 
@@ -135,7 +136,7 @@ function validateExtractProposal(value: unknown, input: AutoMemoryTaskInput, mer
     const captured = profileFact ? people.get(personId)?.pending ?? [] : [];
     const priorIds = new Set(profileFact ? [...(input.profileFragments ?? []).filter(fragment => fragment.personId === personId).flatMap(fragment => fragment.messageIds),
       ...(people.get(personId)?.facts ?? []).filter(old => input.profileProtocol === 2 || sameFactContent(old, v as unknown as ProfileFact)).flatMap(old => old.messageIds)] : []);
-    const allowed = new Map([...input.messages,...(input.profileSources ?? []).filter(message => captured.some(item => item.sourceMessageId === message.id)||priorIds.has(message.id))]
+    const allowed = new Map([...input.messages,...(input.materialsProtocol === 3 ? materialProfileSources(input, people.get(personId)!).values() : []),...(input.profileSources ?? []).filter(message => captured.some(item => item.sourceMessageId === message.id)||priorIds.has(message.id))]
       .map(message => [message.id,message]));
     if (!Array.isArray(v.messageIds) || !v.messageIds.length || new Set(v.messageIds).size !== v.messageIds.length
       || v.messageIds.some(id => typeof id !== 'string' || !allowed.has(id) || allowed.get(id)!.role !== 'user')) throw new Error('人物事实必须引用有效原始真人消息。');
@@ -255,6 +256,11 @@ class ProfileRefinementExhaustedError extends Error {
   }
 }
 
+function componentKey(item: WorkItem): string {
+  return item.mode==='profiles'?'profile:'+item.personIds[0]:item.mode==='self'?'self'
+    :'messages:'+createHash('sha256').update(JSON.stringify(item.messageIds)).digest('hex');
+}
+
 interface WorkItem {
   mode?: 'messages' | 'profiles' | 'self';
   messageIds: string[];
@@ -262,6 +268,7 @@ interface WorkItem {
   pendingIds?: string[];
 }
 interface Progress {
+  materialsProtocol?: 3;
   version: 2 | 3;
   profileBaselineProtocol?: 1;
   profileAttributionProtocol?: 1;
@@ -463,6 +470,9 @@ export class BackgroundMemory {
           if (this.closed) throw new Error('closed');
           this.store.renewLease(job.id, lease, setting.timeoutMs + 10000);
           const item = progress.remaining[0]!;
+          if(input.materialsProtocol===3 && this.store.materialComponentDone(job.id,componentKey(item))) {
+            progress.remaining.shift();this.store.saveProgress(job.id,lease,progress);continue;
+          }
           const chunk = this.workInput(input, progress, item);
           let result: ValidatedExtract;
           try {
@@ -501,8 +511,29 @@ export class BackgroundMemory {
             // Non-live/legacy tasks and the repaired result still have the same hard boundary.
             if (chunk.profileProtocol === 2) result.profiles.forEach(profile => assertProfileCapacity({ ...profile, baseVersion: profile.baseVersion + 1 }));
             this.diagnostics?.event(context, phase, 'completed', undefined, callId);
+            if(input.materialsProtocol===3) {
+              phase='commit';
+              this.store.commit(job.id,lease,result,input.selfProfileBudgetBytes,{key:componentKey(item),messageIds:item.mode==='messages'?item.messageIds:[]});
+            }
           }
           catch (error) {
+            if(input.materialsProtocol===3 && !(error instanceof DiagnosticPersistenceError || error instanceof MemoryStatePersistenceError
+              || error instanceof PersonProfileProtocolError || error instanceof ObsoletePersonalMemoryError)
+              && !this.closed && !(error instanceof Error && (/租约|预算|正在关闭/.test(error.message) || 'code' in error && String(error.code).includes('SQLITE')))) {
+              if((error instanceof MemoryInputTooLargeError || error instanceof MemoryOutputBudgetError) && !callId && item.mode==='messages') {
+                const replacements=this.splitWork(item,chunk);
+                if(replacements) { progress.remaining.splice(0,1,...replacements);this.store.saveProgress(job.id,lease,progress);continue; }
+              }
+              const failure=memoryFailure(error,phase);
+              this.store.recordMaterialComponentFailure(job.id,lease,componentKey(item),failure);
+              this.diagnostics?.event(context,phase,'failed',{failure,component:componentKey(item)},callId);
+              const callError=error instanceof ProfileRefinementExhaustedError||error instanceof MemoryProposalRejectedError?error.cause:error;
+              if(callId) this.diagnostics?.finishCall(callId,
+                callError instanceof MemoryProviderError&&callError.code==='model_request'?'unknown':'failed',phase,{failure});
+              delete progress.capacityRecovery;progress.remaining.shift();
+              this.store.saveProgress(job.id,lease,progress);
+              continue;
+            }
             if (progress.capacityRecovery && (error instanceof MemoryInputTooLargeError || error instanceof MemoryOutputBudgetError)) {
               throw new ProfileRefinementExhaustedError(error);
             }
@@ -517,6 +548,11 @@ export class BackgroundMemory {
             continue;
           }
           delete progress.capacityRecovery;
+          if(input.materialsProtocol===3) {
+            progress.remaining.shift();this.store.saveProgress(job.id,lease,progress);
+            if(callId) this.diagnostics?.finishCall(callId,'completed','commit');
+            continue;
+          }
           const offset = progress.extract.topics.length;
           progress.extract.topics.push(...result.topics);
           progress.extract.fragments.push(...result.fragments.map(fragment => ({ ...fragment,
@@ -569,6 +605,13 @@ export class BackgroundMemory {
           this.diagnostics?.event(context, phase, 'started', undefined, callId);
           this.store.saveProgress(job.id, lease, progress);
           this.diagnostics?.event(context, phase, 'completed', undefined, callId);
+        }
+        if(input.materialsProtocol===3) {
+          phase='commit';
+          const complete=this.store.finishMaterialComponents(job.id,lease);committed=true;
+          if(!complete) {this.lastError='资料部分组件失败；成功部分已保存，失败组件按持久退避恢复。';this.pipelineErrors.set(pipeline,this.lastError);}
+          else {this.pipelineErrors.delete(pipeline);this.lastError=[...this.pipelineErrors.values()].at(-1);}
+          continue;
         }
         phase = 'validate';
         this.diagnostics?.event(context, phase, 'started', { final: true }, callId);
@@ -681,6 +724,9 @@ export class BackgroundMemory {
     const fragments = item.mode === 'messages' ? [] : (input.profileFragments ?? []).filter(fragment => people.has(fragment.personId));
     const sourceIds = new Set([...profiles.flatMap(profile => [...profile.facts.flatMap(fact => fact.messageIds),
       ...(profile.pending ?? []).map(pending => pending.sourceMessageId)]), ...fragments.flatMap(fragment => fragment.messageIds)]);
+    if(input.materialsProtocol===3) for(const source of input.recoveryProfileFactSources??[]) {
+      if(people.has(source.personId)) source.messageIds.forEach(id=>sourceIds.add(id));
+    }
     const allSources = new Map([...(input.profileSources ?? []), ...input.messages].map(message => [message.id, message]));
     const chunk: AutoMemoryTaskInput = { ...input, ...(item.mode ? { mode: item.mode } : {}),
       messages: input.messages.filter(message => ids.has(message.id)), profiles,
@@ -742,6 +788,7 @@ export class BackgroundMemory {
       const middle = Math.floor(pendingIds.length / 2);
       return [pendingIds.slice(0, middle), pendingIds.slice(middle)].map(pendingIds => ({ ...item, pendingIds }));
     }
+    if(chunk.materialsProtocol===3 && item.mode==='profiles') return undefined;
     if (item.mode === 'profiles' && item.personIds.length > 1) {
       const middle = Math.floor(item.personIds.length / 2);
       return [item.personIds.slice(0, middle), item.personIds.slice(middle)].map(personIds => ({ ...item, personIds }));
@@ -765,6 +812,7 @@ export class BackgroundMemory {
       assertCurrentMemoryProtocol(existing);
       if(!record(existing)||!Number.isSafeInteger(existing.version)) throw new MemoryStatePersistenceError('后台整理检查点结构损坏。');
       if (existing.version !== (input.extractionProtocol === 2 ? 3 : 2)) throw new PersonProfileProtocolError();
+      if (existing.materialsProtocol !== input.materialsProtocol) throw new PersonProfileProtocolError();
       if (existing.profileBaselineProtocol !== input.profileBaselineProtocol) throw new PersonProfileProtocolError();
       if(existing.profileAttributionProtocol!==input.profileAttributionProtocol||existing.selfProfileProtocol!==input.selfProfileProtocol) throw new PersonProfileProtocolError();
       if (!Array.isArray(existing.remaining) || !record(existing.extract)
@@ -799,19 +847,27 @@ export class BackgroundMemory {
       return existing as unknown as Progress;
     }
     const messageIds = input.messages.map(message => message.id);
-    const separateMaterialSteps = this.scope?.separateMaterialSteps === true && input.pipeline === 'materials'
+    const separateMaterialSteps = (input.materialsProtocol===3 || this.scope?.separateMaterialSteps === true) && input.pipeline === 'materials'
       && input.extractionProtocol === 2;
+    const completedMessages=new Set(input.completedMaterialMessageIds??[]),completed=new Set(input.completedComponents??[]);
+    const messageGroups:string[][]=[];
+    let group:string[]=[];
+    for(const id of messageIds) {
+      if(completedMessages.has(id)) {if(group.length) messageGroups.push(group);group=[];}
+      else group.push(id);
+    }
+    if(group.length) messageGroups.push(group);
     const remaining: WorkItem[] = separateMaterialSteps
       ? [
-        ...(messageIds.length ? [{ messageIds, personIds: [], mode: 'messages' as const }] : []),
-        ...input.profiles.map(profile => ({ messageIds, personIds: [profile.personId], mode: 'profiles' as const })),
-        ...(input.selfProfile?.pending.length ? [{ messageIds, personIds: [], mode: 'self' as const }] : []),
+        ...messageGroups.map(messageIds=>({messageIds,personIds:[],mode:'messages' as const})),
+        ...input.profiles.filter(profile=>!completed.has('profile:'+profile.personId)).map(profile => ({ messageIds, personIds: [profile.personId], mode: 'profiles' as const })),
+        ...(input.selfProfile?.pending.length && !completed.has('self') ? [{ messageIds, personIds: [], mode: 'self' as const }] : []),
       ]
       : input.pipeline === 'materials' && input.messages.length === 0
         ? [...input.profiles.map(profile => ({ messageIds: [] as string[], personIds: [profile.personId], mode: 'profiles' as const })),
           ...(input.selfProfile?.pending.length ? [{ messageIds: [] as string[], personIds: [] as string[], mode: 'self' as const }] : [])]
         : [{ messageIds, personIds: input.profiles.map(profile => profile.personId) }];
-    return { version: input.extractionProtocol === 2 ? 3 : 2,
+    return { ...(input.materialsProtocol===3?{materialsProtocol:3 as const}:{}),version: input.extractionProtocol === 2 ? 3 : 2,
       ...(input.profileBaselineProtocol === 1 ? { profileBaselineProtocol: 1 as const } : {}),
       ...(input.profileAttributionProtocol?{profileAttributionProtocol:input.profileAttributionProtocol}:{}),
       ...(input.selfProfileProtocol?{selfProfileProtocol:input.selfProfileProtocol}:{}),

@@ -3,6 +3,7 @@ import { imageMetadata } from './image-context.js';
 import { MemoryProviderError } from './memory-diagnostics.js';
 import { personProfileCapacityPrompt, profileCapacity, profileStepPrompt } from './profile-limits.js';
 import { profileSourcesForModel } from './profile-pending.js';
+import { decodeMaterialProfile, prepareMaterialProfile } from './material-profile-wire.js';
 
 /** References are scoped to one frozen input, never to a process or conversation. */
 export function memoryWireReferences(input: AutoMemoryTaskInput) {
@@ -46,6 +47,7 @@ export function memoryWireReferences(input: AutoMemoryTaskInput) {
 
 export function prepareMemoryWireExtraction(input: AutoMemoryTaskInput, _contextWindow: number) {
   const refs = memoryWireReferences(input);
+  if (input.materialsProtocol === 3 && input.mode === 'profiles') return prepareMaterialProfile(input, refs.messages);
   const modelSources = profileSourcesForModel(input);
   const baseline = input.profileBaselineProtocol === 1;
   const outputBudget = input.outputBudget ?? { summaryCharacters: 2000, topicCount: 8, topicCharacters: 400, topicTotalCharacters: 2000 };
@@ -140,8 +142,9 @@ function invalid(): never { throw new MemoryProviderError('model_contract', '记
 function object(value: unknown, allowed: readonly string[], required: readonly string[] = allowed): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return invalid();
   const result = value as Record<string, unknown>;
-  if (Object.keys(result).some(key => !allowed.includes(key)) || required.some(key => !Object.hasOwn(result, key))) return invalid();
-  return result;
+  if (required.some(key => !Object.hasOwn(result, key))) return invalid();
+  // Unknown annotations carry no write semantics; decode only the declared fields.
+  return Object.fromEntries(Object.entries(result).filter(([key]) => allowed.includes(key)));
 }
 function list(value: unknown): unknown[] { if (!Array.isArray(value)) return invalid(); return value; }
 function string(value: unknown): string { if (typeof value !== 'string') return invalid(); return value; }
@@ -156,6 +159,7 @@ function references(value: unknown, map: Map<string, string>): string[] {
 
 /** Decode only ID-bearing schema fields. Free text is deliberately never rewritten. */
 export function decodeMemoryWireResponse(value: unknown, input: AutoMemoryTaskInput): unknown {
+  if (input.materialsProtocol === 3 && input.mode === 'profiles') return decodeMaterialProfile(value, input, memoryWireReferences(input).messages);
   if (input.pipeline === 'compression') {
     const result = object(value, ['continuationSummary']);
     return { ignoredMessageIds: [], topics: [], fragments: [], profiles: [], continuationSummary: string(result.continuationSummary) };

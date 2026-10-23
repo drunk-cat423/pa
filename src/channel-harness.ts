@@ -139,6 +139,7 @@ export class ChannelHarness {
         if (this.closed) return 'ignored';
         const source = conversation.ingest(message.text,{eventId:message.eventId,senderId:message.senderId,
           modelInputText:message.text,sentAt:message.sentAt,imageFailure:error.code,
+          ...(message.mentionedSenderIds?{mentionedSenderIds:message.mentionedSenderIds}:{}),
           ...(message.senderName?{senderName:message.senderName.slice(0,100)}:{})});
         if (!source) return 'duplicate';
         if (!this.closed && message.text.trim() && (message.route.roomType === 'private' || message.mentioned)) {
@@ -154,6 +155,7 @@ export class ChannelHarness {
     const memoryRequest = parseMemoryRequest(message.text);
     const source = conversation.ingest(message.text, {
       eventId: message.eventId, senderId: message.senderId, modelInputText: message.text, sentAt: message.sentAt,
+      ...(message.mentionedSenderIds ? { mentionedSenderIds: message.mentionedSenderIds } : {}),
       ...(message.senderName ? { senderName: message.senderName.slice(0, 100) } : {}),
       ...(memoryRequest || RESULT_COMMAND.test(message.text) ? { messageKind: 'memory' as const } : {}),
       ...(message.quote ? { quote: message.quote } : {}),

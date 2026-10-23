@@ -45,8 +45,9 @@ test('a captured third-party target is organized even when only its recorder spo
   const source=f.inbound('<@bob>喜欢绘画','owner',['bob']);
   f.store.autoMemory.addProfilePending(bob,source,'喜欢绘画','third_party',{allowThirdParty:true,mentionedSenderIds:['bob']});
   let captured;
-  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:2,timeoutMs:1000}},
+  const worker=new BackgroundMemory({contextWindow:100000,memory:{enabled:true,maxCalls:4,timeoutMs:1000}},
     f.store.autoMemory,f.conversation.id,{extract:async input=>{
+      if(input.mode!=='profiles'||!input.profiles.some(profile=>profile.personId===bob)) return emptyExtraction(input);
       captured=input;
       const person=input.profiles.find(profile=>profile.personId===bob),pending=person.pending[0];
       return {topics:[],fragments:[],ignoredMessageIds:[],

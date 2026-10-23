@@ -7,6 +7,7 @@ import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
 import { BackgroundMemory } from '../dist/auto-memory.js';
 import { emptyExtraction } from './fixtures/memory-output.mjs';
+import { parseMemoryResponse } from '../dist/memory-provider.js';
 
 function fixture(t) {
   const dir=mkdtempSync(join(tmpdir(),'pa-memory-recovery-')),path=join(dir,'pa.sqlite');
@@ -56,7 +57,7 @@ test('资料失败退出队列，重启后按原时间补旧事实且不能覆�
   assert.equal(f.store.autoMemory.reserveRecoveryJobs(f.a.id,due+1).length,1);
   let checked=false;
   await f.run(f.a,'materials',async input=>{
-    if(input.mode) return emptyExtraction(input);
+    if(input.mode!=='profiles') return emptyExtraction(input);
     const profile=input.profiles.find(item=>item.personId==='alice');
     assert.equal(input.messages.find(message=>message.id===old).createdAt,originalTime);
     assert.deepEqual(input.messages.map(message=>message.contextSeq),input.messages.map(message=>message.contextSeq).sort((a,b)=>a-b));
@@ -64,7 +65,7 @@ test('资料失败退出队列，重启后按原时间补旧事实且不能覆�
     const pendingResults=profile.pending.map(item=>({pendingId:item.id,status:'deferred'}));
     const stale={...emptyExtraction(input),profiles:[{...profile,facts:[fact('喜欢咖啡',old)],pendingResults,
       updates:[{factIndex:0,baselineFactIndexes:[0],evidence:[evidence(old,'我喜欢猫，也喜欢咖啡')]}]}]};
-    assert.throws(()=>f.store.autoMemory.commit(input.job.id,input.job.leaseToken,stale));
+    assert.throws(()=>f.store.autoMemory.commit(input.job.id,input.job.leaseToken,stale,undefined,{key:'profile:alice',messageIds:[]}),/较早来源|较新的/);
     assert.equal(f.store.autoMemory.profile('alice').facts[0].content,'现在不喝咖啡');
     checked=true;
     return {...emptyExtraction(input),profiles:[{...profile,facts:[...profile.facts,fact('喜欢猫',old)],pendingResults,
@@ -77,8 +78,17 @@ test('资料失败退出队列，重启后按原时间补旧事实且不能覆�
   assert.equal(f.inspect(db=>db.prepare('SELECT text FROM messages WHERE id=?').get(old).text),'我喜欢猫，也喜欢咖啡');
   f.inbound(f.a,'接下来继续聊');assert.ok(f.reserve(f.a));
   const following=f.claim(f.a,'materials');
-  assert.ok(f.store.autoMemory.taskInput(following).profiles.find(item=>item.personId==='alice').pending.some(item=>item.sourceMessageId===old),
+  const followingInput=f.store.autoMemory.taskInput(following),person=followingInput.profiles.find(item=>item.personId==='alice');
+  assert.ok(person.pending.some(item=>item.sourceMessageId===old),
     'a deferred pending from a successful recovery must remain schedulable');
+  const mergeInput={...followingInput,mode:'profiles',profiles:[person]};
+  const merged=parseMemoryResponse({stopReason:'stop',content:[{type:'text',text:JSON.stringify({facts:[
+    {content:'不再喝咖啡',replaces:['f0']},{keep:'f1'},
+  ]})}]},mergeInput);
+  f.store.autoMemory.commit(following.id,following.leaseToken,{...emptyExtraction(mergeInput),...merged},undefined,{key:'profile:alice',messageIds:[]});
+  const revision=f.store.autoMemory.profile('alice').baseVersion;
+  assert.ok(f.inspect(db=>db.prepare('SELECT 1 FROM person_profile_revision_sources WHERE person_id=? AND revision=? AND fact_index=0 AND message_id=?').get('alice',revision,newer)),
+    'compacting baseline facts must preserve their newer supplementary confirmation');
   assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
 });
 
@@ -141,7 +151,7 @@ test('重复失败的恢复次数与退避跨重启保留，耗尽不堵新资�
   await f.run(f.a,'materials',async input=>emptyExtraction(input));
   assert.equal(f.store.autoMemory.status(f.a.id,'materials').completed,1);
   assert.equal(f.store.autoMemory.materialSchedule(f.a.id).completedSeq,0);
-  assert.equal(calls,1);assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM messages').get().n),2);
+  assert.equal(calls,2);assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM messages').get().n),2);
   const authorized=f.store.autoMemory.recover(latest.id,'explicit offline recovery');
   const manual=f.claim(f.a,'materials');assert.equal(manual.id,authorized);
   f.store.autoMemory.fail(manual.id,manual.leaseToken,'fixture manual attempt also failed');

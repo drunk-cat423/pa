@@ -3,6 +3,10 @@ import { DatabaseSync } from 'node:sqlite';
 export function emptyExtraction(input, summary = '继续对话') {
   const compact = input.extractionProtocol === 2;
   const result = { topics: [], fragments: [], profiles: [], ignoredMessageIds: compact ? [] : input.messages.filter(m => m.role === 'user').map(m => m.id) };
+  if(input.materialsProtocol===3 && input.mode==='profiles') result.profiles=input.profiles.map(profile=>({
+    personId:profile.personId,baseVersion:profile.baseVersion,facts:profile.facts,updates:[],
+    pendingResults:(profile.pending??[]).map(item=>({pendingId:item.id,status:'deferred'})),
+  }));
   if (input.mode !== 'profiles' && input.mode !== 'self') {
     if (input.pipeline !== 'materials' && (input.roomType === 'private' || input.contextProtocol === 1)) result.continuationSummary = summary;
     if (compact && input.messages.length) {

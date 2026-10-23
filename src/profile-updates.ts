@@ -1,5 +1,6 @@
 import type { AutoMemoryTaskInput, PersonProfile, ProfileFact, ProfileFactUpdate } from './auto-memory-types.js';
 import { inferPersonProfileEvidence, resolveProfileSubject, type ProfileSubjectEvidence } from './profile-attribution.js';
+import { materialProfileSources } from './material-profile-wire.js';
 
 const same = (a: ProfileFact, b: ProfileFact) => a.content === b.content && a.sourceType === b.sourceType
   && (a.occurredAt ?? null) === (b.occurredAt ?? null) && (a.expiresAt ?? null) === (b.expiresAt ?? null)
@@ -13,8 +14,9 @@ export function validateProfileUpdates(profile: PersonProfile, baseline: PersonP
   if (input.profileAttributionProtocol !== 1) return;
   const updates = profile.updates ?? [];
   if (!Array.isArray(updates)) invalid();
-  const sources = new Map([...input.messages, ...(input.profileSources ?? [])].map(message => [message.id, message]));
-  const visible = new Set([...input.messages.map(message => message.id), ...(baseline.pending ?? []).map(item => item.sourceMessageId)]);
+  const sources = new Map([...input.messages, ...(input.profileSources ?? []), ...(input.materialsProtocol === 3 ? input.recoveryReviewMessages ?? [] : [])].map(message => [message.id, message]));
+  const visible = new Set([...input.messages.map(message => message.id), ...(baseline.pending ?? []).map(item => item.sourceMessageId),
+    ...(input.materialsProtocol === 3 ? materialProfileSources(input, baseline).keys() : [])]);
   const seen = new Set<number>();
   for (const update of updates) {
     if (!update || Object.keys(update).some(key => !['factIndex','baselineFactIndexes','evidence'].includes(key))
@@ -27,8 +29,9 @@ export function validateProfileUpdates(profile: PersonProfile, baseline: PersonP
     const allowed = new Set<string>();
     for (const index of update.baselineFactIndexes ?? []) {
       const previous = baseline.facts[index];
-      if (!Number.isSafeInteger(index) || index < 0 || !previous || previous.sourceType !== fact.sourceType) invalid();
-      previous.messageIds.forEach(id => allowed.add(id));
+      if (!Number.isSafeInteger(index) || index < 0 || !previous
+        || (previous.sourceType !== fact.sourceType && !(input.materialsProtocol === 3 && update.evidence.length))) invalid();
+      if (previous.sourceType === fact.sourceType) previous.messageIds.forEach(id => allowed.add(id));
     }
     const references = new Set<string>();
     for (const evidence of update.evidence) {
@@ -36,7 +39,10 @@ export function validateProfileUpdates(profile: PersonProfile, baseline: PersonP
       references.add(evidenceKey(evidence));
       const source = sources.get(evidence.messageId);
       if (!source || !visible.has(source.id) || input.excludedProfileSourceIds?.includes(source.id)) invalid();
-      const subject = resolveProfileSubject(evidence, source, input.profileSubjects ?? []);
+      const subject = input.materialsProtocol === 3 && source.personId === baseline.personId
+        && source.conversationId === input.job.conversationId && materialProfileSources(input, baseline).has(source.id)
+        ? { personId: baseline.personId, sourceType: 'self' as const }
+        : resolveProfileSubject(evidence, source, input.profileSubjects ?? []);
       if (subject.personId !== profile.personId || (fact.sourceType !== 'inference' && fact.sourceType !== subject.sourceType)) invalid();
       if (subject.sourceType === 'third_party' && !(baseline.pending ?? []).some(item => item.sourceMessageId === source.id
         && item.sourceType === 'third_party' && item.subject
@@ -53,23 +59,31 @@ export function validateProfileUpdates(profile: PersonProfile, baseline: PersonP
     const source = item && sources.get(item.sourceMessageId);
     if (!item || !source) invalid();
     const evidence = item.subject ?? inferPersonProfileEvidence(source, item.content, input.profileSubjects ?? [], profile.personId);
-    const subject = resolveProfileSubject(evidence, source, input.profileSubjects ?? []);
+    const subject = input.materialsProtocol === 3 && source.personId === baseline.personId
+      ? { personId: baseline.personId, sourceType: 'self' as const }
+      : resolveProfileSubject(evidence, source, input.profileSubjects ?? []);
     if (subject.personId !== profile.personId || (subject.sourceType === 'third_party' && !item.subject)) invalid();
   }
-  if(input.recoveryReviewMessages!==undefined) {
+  if(input.recoveryReviewMessages!==undefined || input.materialsProtocol===3) {
     const chronologySources=new Map([...(input.recoveryReviewMessages??[]),...sources.values()].map(message=>[message.id,message]));
     const evidenceOrder=(ids:readonly string[]):[number,number]=>ids.reduce<[number,number]>((latest,id)=>{
       const source=chronologySources.get(id);const next:[number,number]=source?[Date.parse(source.createdAt),source.ingestSeq]:[-Infinity,-Infinity];
       return next[0]>latest[0]||(next[0]===latest[0]&&next[1]>latest[1])?next:latest;
     },[-Infinity,-Infinity]);
     const atLeast=(a:[number,number],b:[number,number])=>a[0]>b[0]||(a[0]===b[0]&&a[1]>=b[1]);
+    const confirmationsFor=(fact:ProfileFact)=>(input.recoveryProfileFactSources??[])
+      .filter(source=>source.personId===profile.personId&&same(source.fact,fact)).flatMap(source=>source.messageIds);
     baseline.facts.forEach((fact,index)=>{
       if(profile.facts.some(next=>same(next,fact))) return;
-      const confirmations=(input.recoveryProfileFactSources??[]).filter(source=>source.personId===profile.personId&&same(source.fact,fact))
-        .flatMap(source=>source.messageIds);
+      const confirmations=confirmationsFor(fact);
       // Old recovered text may add unrelated facts, but may not erase/rewrite a later baseline.
       if(!updates.some(update=>update.baselineFactIndexes?.includes(index)
-        &&atLeast(evidenceOrder(update.evidence.map(item=>item.messageId)),evidenceOrder([...fact.messageIds,...confirmations])))) {
+        &&atLeast(evidenceOrder(update.evidence.length ? update.evidence.map(item=>item.messageId)
+          : input.materialsProtocol===3 ? (update.baselineFactIndexes??[]).flatMap(index=>{
+            const previous=baseline.facts[index]!;
+            return [...previous.messageIds,...confirmationsFor(previous)];
+          }) : []),
+          evidenceOrder([...fact.messageIds,...confirmations])))) {
         throw new Error('恢复任务不能用较早来源删除或改写较新的画像事实；缺少同等或更新的明确替代依据。');
       }
     });
