@@ -40,7 +40,11 @@ export class ResearchMaterialReader {
     const prior = this.seen.get(params.id);
     const ranges = prior?.digest === digest ? prior.ranges : [];
     const offset = params.offset ?? firstUnread(ranges,total);
-    if (!Number.isSafeInteger(offset) || offset < 0 || offset > total) throw new MemoryError('材料正文读取位置无效；请使用本工具返回的游标。');
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > total) throw new MemoryError(JSON.stringify({
+      code: 'invalid_material_offset', id: params.id, requestedOffset: offset, totalChars: total,
+      validOffset: { min: 0, max: total }, nextUnreadOffset: firstUnread(ranges,total), unit: 'unicode_code_points',
+      message: '材料正文读取位置无效；请使用nextUnreadOffset游标读取保存片段，不要使用网页coverage偏移。',
+    }));
     const covered = ranges.find(([start,end])=>start<=offset && end>offset);
     const duplicate = !params.reread && (offset === total || Boolean(covered));
     const pageEnd = Math.min(total,offset+2800,...(duplicate && covered ? [covered[1]] : []));

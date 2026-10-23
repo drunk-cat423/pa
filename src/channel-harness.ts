@@ -233,7 +233,11 @@ export class ChannelHarness {
       release();
       return this.deliver(conversation, message, control, 0, taskId);
     }
-    if (this.maxCalls > 0 && this.calls >= this.maxCalls) { conversation.finishTask(taskId, 'failed'); return 'budget_exhausted'; }
+    if (this.maxCalls > 0 && this.calls >= this.maxCalls) {
+      conversation.finishTask(taskId, 'failed'); release();
+      await this.failureNotice(conversation,message,taskId,'本次服务的对话额度已用完，暂时无法继续回答。',0);
+      return 'budget_exhausted';
+    }
     // Reserve before invoking Pi; errors also consume the attempt. No automatic retry.
     this.calls++;
     let reply;
@@ -262,13 +266,36 @@ export class ChannelHarness {
         }));
     } catch (error) {
       if (error instanceof DuplicateMessageError) { this.calls--; conversation.finishTask(taskId, 'interrupted'); return 'duplicate'; }
-      if (error instanceof RequestError) { conversation.finishTask(taskId, this.closed ? 'interrupted' : 'failed'); return 'failed'; }
+      if (error instanceof RequestError) {
+        conversation.finishTask(taskId, this.closed ? 'interrupted' : 'failed'); release();
+        const confirmed = error.confirmedActions.join('\n');
+        const receipt = Buffer.from(confirmed,'utf8').subarray(0,700).toString('utf8').replace(/\ufffd$/u,'');
+        if (!this.closed) await this.failureNotice(conversation,message,taskId,
+          receipt ? `${receipt}\n其余操作未能确认完成，不会自动重试；已保存事项可查询研究清单。`
+          : error.kind==='timeout' ? '这次请求超时，未能完成答复。原消息和已保存的操作会保留，不会自动重试。'
+            : '这次未能完成答复。原消息和已保存的操作会保留；你可以再发消息继续。',replyOffset);
+        return 'failed';
+      }
       // An API failure is recoverable on a new message; broken persistence is fatal.
       throw error;
     }
     conversation.finishTask(taskId, 'completed', reply.deliveryId);
     release();
     return this.deliver(conversation, message, reply, replyOffset, taskId);
+  }
+
+  private failureNotice(conversation: RecordedConversation, message: InboundMessage, taskId: string, text: string, offset: number): Promise<void> {
+    return this.output(message.route, async () => {
+      if (this.closed) return;
+      const mode=this.passiveAvailable(message,offset)?'passive':'active';
+      if (!conversation.reserveTaskFailure(taskId,text,mode,mode==='passive'?offset+1:undefined)) return;
+      let result: DeliveryResult;
+      try { result=await this.transport.send({route:message.route,deliveryMode:mode,text,plainText:true,
+        ...(mode==='passive'?{replyToMessageId:message.eventId,partIndex:offset}:{})}); }
+      catch { result={status:'uncertain'}; }
+      conversation.ackTaskFailure(taskId,result.status,result.status==='sent'?result.externalMessageId:undefined,
+        result.status==='sent'?result.referenceIndex:undefined);
+    });
   }
 
   private async deliver(conversation: RecordedConversation, message: InboundMessage,

@@ -346,6 +346,36 @@
       "file": "test/store.test.mjs",
       "name": "上下文SQL在LIMIT之前过滤管理、失败运行与其他成员AI交互，重置水位持久生效",
       "evidence": ".local/simplification-tests.txt:289"
+    },
+    {
+      "file": "test/tool-recovery-e2e.test.mjs",
+      "name": "真实Pi循环：准备schema和跨目标字段被拒后可修正，未保存承诺仅重写一次且不扩大预算",
+      "evidence": "2026-10-23 production: prepare rejected ai_self attribution, unbacked save claim, research e56 offset 14000 over 8000; independent review confirmed partial-success and rejected-call budget cases."
+    },
+    {
+      "file": "test/tool-recovery-e2e.test.mjs",
+      "name": "真实Pi研究循环：越界材料给出真实范围并可续读，末轮失败有记录，存储故障仍硬停止",
+      "evidence": "2026-10-23 production: prepare rejected ai_self attribution, unbacked save claim, research e56 offset 14000 over 8000; independent review confirmed partial-success and rejected-call budget cases."
+    },
+    {
+      "file": "test/tool-recovery-e2e.test.mjs",
+      "name": "真实Pi研究创建：同批成功任务保留，失败项修正后不重跑成功项，预算耗尽明示部分失败",
+      "evidence": "2026-10-23 production: prepare rejected ai_self attribution, unbacked save claim, research e56 offset 14000 over 8000; independent review confirmed partial-success and rejected-call budget cases."
+    },
+    {
+      "file": "test/memory-robustness-e2e.test.mjs",
+      "name": "two rooms sharing one person serialize material snapshots, preserve compression and cancel queued workers",
+      "evidence": "2026-10-23 independent review: cross-room person CAS could block materials FIFO; any old correction permanently hid subsequent summaries; reproduced with persisted SQLite workers."
+    },
+    {
+      "file": "test/memory-robustness-e2e.test.mjs",
+      "name": "compression incorporates correction lineage and only unmasks the exact captured version, retaining originals",
+      "evidence": "2026-10-23 independent review: cross-room person CAS could block materials FIFO; any old correction permanently hid subsequent summaries; reproduced with persisted SQLite workers."
+    },
+    {
+      "file": "test/channel-async.test.mjs",
+      "name": "请求失败真实发送短回执，预算前置拒绝和未知投递重启后不重发",
+      "evidence": "2026-10-23 production two failed questions had no QQ response; review confirmed all RequestError paths returned without a delivery receipt."
     }
   ]
 }

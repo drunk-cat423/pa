@@ -155,3 +155,5 @@ QQ正式发送采用上传取得 `file_info` 后发送媒体消息，支持TXT/M
 ## 验证
 
 `test/research-e2e.test.mjs` 使用本地模型SSE、真实Pi、SQLite/磁盘和模拟QQ协议，覆盖轻量默认路径、旧计划兼容、截断续写、预算、显式恢复、缓存续读和权限；`research-workflow-store.test.mjs` 验证两种计划的完成约束、固定输入/CAS、旧版保留、恢复与容量；`research-thinking-runtime.test.mjs` 验证思考payload、reasoning_content往返和阶段工具权限。模拟接口不代表真实模型研究质量、token节省或QQ客户端验收。
+
+材料读取参数越界返回invalid_material_offset及保存片段的totalChars、有效范围、nextUnreadOffset，单位为Unicode码点；与网页coverage的UTF-16位置不同。可纠正的工具参数/业务拒绝（含执行前schema错误）交回采集模型修正，不因任意isError结束整批。错误工具调用仍占预算，最终一次失败也保留证据错误记录交给后续写作，不能视为原文已读取；联网/收费状态未知及真正持久化失败不通过该机制自动重试。

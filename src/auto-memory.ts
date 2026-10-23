@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { resolve } from 'node:path';
 import type { PaConfig } from './config.js';
 import { ObsoletePersonalMemoryError, assertCurrentMemoryProtocol, mergeProfileFacts, sameFact, sameFactContent, type AutoMemoryStore } from './auto-memory-store.js';
 import type { AutoMemoryJob, AutoMemoryTaskInput, AutoMemoryPipeline, ValidatedExtract, PersonProfile, ProfileFact } from './auto-memory-types.js';
@@ -18,6 +19,34 @@ function sharedBudget(config: PaConfig): Budget {
   let budget = budgets.get(config);
   if (!budget) { budget = { calls: 0 }; budgets.set(config, budget); }
   return budget;
+}
+// Fair, cancellable materials gate: every task releases its place before claiming
+// another one. Compression uses a separate lane and never waits here.
+type MaterialWaiter = { enter: () => void; cancel: () => void };
+const materialQueues = new Map<string | PaConfig, MaterialWaiter[]>();
+function acquireMaterialTurn(key:string|PaConfig,signal:AbortSignal):Promise<(() => void)|undefined> {
+  if(signal.aborted) return Promise.resolve(undefined);
+  return new Promise(resolveTurn=>{
+    const queue=materialQueues.get(key)??[];
+    materialQueues.set(key,queue);
+    let entered=false,released=false;
+    const release=()=>{
+      if(released) return;
+      released=true;
+      signal.removeEventListener('abort',waiter.cancel);
+      const index=queue.indexOf(waiter);
+      if(index>=0) queue.splice(index,1);
+      if(queue.length) { if(index===0) queue[0]!.enter(); }
+      else materialQueues.delete(key);
+    };
+    const waiter:MaterialWaiter={enter:()=>{
+      if(entered||released) return;
+      entered=true;signal.removeEventListener('abort',waiter.cancel);resolveTurn(release);
+    },cancel:()=>{if(entered) return;release();resolveTurn(undefined);}};
+    queue.push(waiter);
+    signal.addEventListener('abort',waiter.cancel,{once:true});
+    if(queue.length===1) waiter.enter();
+  });
 }
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -324,7 +353,10 @@ export class BackgroundMemory {
           this.work.delete(pipeline);
           if (!this.closed && !this.diagnosticFailed && !this.scope) {
             const status = this.store.status(this.conversationId, pipeline);
-            if (status.queued && !status.failed && !status.running) queueMicrotask(() => this.start());
+            // A different process may hold the database-wide materials lease.
+            // Let the normal timer retry rather than spinning microtasks while
+            // no local job is claimable (and starving cancellation/timers).
+            if (pipeline !== 'materials' && status.queued && !status.failed && !status.running) queueMicrotask(() => this.start());
           }
         });
       this.work.set(pipeline, work);
@@ -377,7 +409,19 @@ export class BackgroundMemory {
 
   private async run(pipeline: AutoMemoryPipeline): Promise<void> {
     const setting = this.config.memory!;
-    while (!this.closed) {
+    while (!this.closed && !this.diagnosticFailed) {
+      const waiting = new AbortController();
+      this.controllers.add(waiting);
+      let release:(()=>void)|undefined;
+      try {
+        if (pipeline === 'materials') {
+          const file=this.store.materialLockKey()??this.config.dataDir;
+          const key=file?(process.platform==='win32'?resolve(file).toLowerCase():resolve(file)):this.config;
+          release=await acquireMaterialTurn(key,waiting.signal);
+          if(!release||this.closed||this.diagnosticFailed) { release?.(); return; }
+        }
+      } finally { this.controllers.delete(waiting); }
+      try {
       const job = this.store.claimNext(this.conversationId, { owner: this.owner, leaseMs: setting.timeoutMs + 10000, pipeline,
         ...(this.scope ? { jobIds: this.scope.jobIds } : {}) });
       if (!job) return;
@@ -571,6 +615,7 @@ export class BackgroundMemory {
         // A failed/aborted request may have been billed or completed upstream. Only explicit retry may call again.
         return;
       }
+      } finally { release?.(); }
     }
   }
 

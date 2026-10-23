@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { MemoryError, type PrimaryPerson } from './memory-types.js';
-import type { AutoMemoryJob, AutoMemoryMessage, AutoMemoryPipeline, AutoMemoryReason, AutoMemoryTaskInput, MaterialBackfillBatch, MaterialBackfillLimits, MaterialBackfillPlan, MaterialBackfillRun, PersonProfile, PersonProfilePending, ProfileFact, TopicRecord, ValidatedExtract } from './auto-memory-types.js';
+import type { AutoMemoryJob, AutoMemoryMessage, AutoMemoryPipeline, AutoMemoryReason, AutoMemoryTaskInput, MaterialBackfillBatch, MaterialBackfillLimits, MaterialBackfillPlan, MaterialBackfillRun, PersonProfile, PersonProfilePending, ProfileFact, SummaryCorrections, TopicRecord, ValidatedExtract } from './auto-memory-types.js';
 import { SelfProfileStore } from './self-profile-store.js';
 import { memoryWords } from './memory-text.js';
 import { assertProfileCapacity, profileCapacity } from './profile-limits.js';
@@ -714,6 +714,10 @@ export class AutoMemoryStore {
           .run('[interrupted] phase=recover; 先前调用结果未知，固定批次和检查点保留，需显式重试。', String(row.id));
         return undefined;
       }
+      // Materials share global person/self-profile baselines across rooms. Claim and
+      // snapshot atomically only while no other materials lease can still commit.
+      if (row.pipeline === 'materials' && this.db.prepare(`SELECT 1 FROM auto_memory_jobs
+        WHERE pipeline='materials' AND status='running' AND lease_until>? AND id<>? LIMIT 1`).get(current,String(row.id))) return undefined;
       this.db.prepare(`UPDATE auto_memory_jobs SET status='running',attempts=attempts+1,lease_token=?,lease_owner=?,lease_until=?,error=NULL WHERE id=?`)
         .run(randomUUID(),options.owner,current+options.leaseMs,String(row.id));
       const job=this.job(this.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(String(row.id))!);
@@ -735,11 +739,12 @@ export class AutoMemoryStore {
   }
   private messages(ids: readonly string[]): AutoMemoryMessage[] {
     return ids.map(id=>{
-      const r=this.db.prepare(`SELECT m.*,p.person_id,coalesce(r.status,CASE WHEN rd.status='sent' THEN 'completed' END) AS run_status,coalesce(d.status,rd.status) AS delivery_status,input.ingest_seq AS turn_input_seq,
-        context.seq AS context_seq,a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,coalesce(r.input_message_id,rd.source_message_id) AS input_message_id FROM messages m
+      const r=this.db.prepare(`SELECT m.*,p.person_id,coalesce(r.status,CASE WHEN cf.status='sent' THEN 'failed' WHEN rd.status='sent' THEN 'completed' END) AS run_status,coalesce(d.status,rd.status,cf.status) AS delivery_status,input.ingest_seq AS turn_input_seq,
+        context.seq AS context_seq,a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) AS input_message_id FROM messages m
         LEFT JOIN actor_person_bindings p ON p.actor_id=m.actor_id LEFT JOIN agent_runs r ON r.input_message_id=m.id OR r.response_message_id=m.id
         LEFT JOIN research_deliveries rd ON rd.message_id=m.id
-        LEFT JOIN messages input ON input.id=coalesce(r.input_message_id,rd.source_message_id) LEFT JOIN deliveries d ON d.message_id=m.id
+        LEFT JOIN channel_task_failures cf ON cf.message_id=m.id LEFT JOIN channel_tasks failed_task ON failed_task.id=cf.task_id
+        LEFT JOIN messages input ON input.id=coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) LEFT JOIN deliveries d ON d.message_id=m.id
         LEFT JOIN actors a ON a.id=m.actor_id LEFT JOIN actors inputa ON inputa.id=input.actor_id
         LEFT JOIN conversation_context_messages context ON context.message_id=m.id WHERE m.id=?`).get(id)!;
       const images=this.db.prepare('SELECT metadata_json FROM message_images WHERE message_id=? ORDER BY ordinal').all(id)
@@ -787,6 +792,31 @@ export class AutoMemoryStore {
       AND revision=(SELECT max(revision) FROM room_rule_revisions n WHERE n.conversation_id=v.conversation_id AND n.rule_key=v.rule_key)
       ORDER BY created_at,rule_key`).all(conversationId).map(r=>({key:String(r.rule_key),content:String(r.content)}));
   }
+  /** File identity shares the in-process fair gate even across distinct config/store objects. */
+  materialLockKey(): string | undefined {
+    const file=this.db.prepare("SELECT file FROM pragma_database_list WHERE name='main'").get()?.file;
+    return file ? String(file) : undefined;
+  }
+  /** Stable lineage through expired/revised notes; never equate wall time with coverage. */
+  summaryCorrections(conversationId:string,cutoffContextSeq:number): SummaryCorrections {
+    const rows=this.db.prepare(`SELECT v.memory_id,v.revision,v.content,v.source_message_id,
+      a.subject_actor_ids_json,a.excluded_actor_ids_json,a.corrected_message_ids_json
+      FROM memory_fact_attributions a JOIN memory_revisions v ON v.memory_id=a.memory_id AND v.revision=a.revision
+      JOIN memories m ON m.id=v.memory_id
+      JOIN conversation_context_messages c ON c.message_id=v.source_message_id AND c.conversation_id=m.conversation_id
+      WHERE m.conversation_id=? AND m.status='active' AND a.kind='correction' AND c.seq<=?
+      ORDER BY c.seq,v.memory_id,v.revision`).all(conversationId,cutoffContextSeq);
+    const corrections:SummaryCorrections['corrections']=rows.map(row=>({memoryId:String(row.memory_id),revision:Number(row.revision),
+      content:String(row.content),source:this.messages([String(row.source_message_id)])[0]!,
+      subjectActorIds:parse<string[]>(row.subject_actor_ids_json),excludedActorIds:parse<string[]>(row.excluded_actor_ids_json),
+      correctedMessages:this.messages(parse<string[]>(row.corrected_message_ids_json).filter(id=>Boolean(this.db.prepare(
+        'SELECT 1 FROM conversation_context_messages WHERE conversation_id=? AND message_id=? AND seq<=?').get(conversationId,id,cutoffContextSeq))))}));
+    // Hash only evidence, attribution and revision. Delivery status, timestamps and
+    // unrelated new messages must not invalidate a previously corrected summary.
+    const identity=(message:AutoMemoryMessage)=>({id:message.id,text:message.text,actorId:message.actorId,senderId:message.senderId,role:message.role});
+    return {hash:hash(JSON.stringify({conversationId,corrections:corrections.map(item=>({...item,
+      source:identity(item.source),correctedMessages:item.correctedMessages.map(identity)}))})),corrections};
+  }
   taskInput(job:AutoMemoryJob): AutoMemoryTaskInput {
     if(!job.leaseToken) throw new Error('整理任务尚未领取。');
     const row=this.active(job.id,job.leaseToken);
@@ -797,6 +827,7 @@ export class AutoMemoryStore {
     if(canonical.pipeline==='compression') {
       const input:AutoMemoryTaskInput={pipeline:'compression',contextProtocol:1,extractionProtocol:2,profileProtocol:2,
         job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles:[],
+        summaryCorrections:this.summaryCorrections(canonical.conversationId,Number(contextJob!.end_cursor)),
         ...(previousSummary==null?{}:{previousSummary:String(previousSummary)})};
       this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
       return input;
@@ -1083,8 +1114,8 @@ export class AutoMemoryStore {
           .all(job.conversationId,Number(contextJob.end_cursor)).find(row=>deferred.has(String(row.message_id)));
         const completed=gap?Number(this.db.prepare('SELECT COALESCE(MAX(seq),0) AS seq FROM conversation_context_messages WHERE conversation_id=? AND seq<?')
           .get(job.conversationId,Number(gap.seq))!.seq):Number(contextJob.end_cursor);
-        this.db.prepare('UPDATE conversation_context_state SET cursor=?,completed_seq=?,revision=revision+1,summary=? WHERE conversation_id=?')
-          .run(Number(contextJob.end_cursor),completed,extract.continuationSummary!,job.conversationId);
+        this.db.prepare('UPDATE conversation_context_state SET cursor=?,completed_seq=?,revision=revision+1,summary=?,summary_correction_hash=? WHERE conversation_id=?')
+          .run(Number(contextJob.end_cursor),completed,extract.continuationSummary!,input.summaryCorrections?.hash??null,job.conversationId);
       }
       this.db.prepare("UPDATE auto_memory_jobs SET status='done',completed_at=?,lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?").run(timestamp(),jobId);
       if(job.pipeline==='materials') {

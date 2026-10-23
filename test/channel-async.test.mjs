@@ -75,7 +75,8 @@ async function fixture(t, maxConcurrent = 2) {
     const h = new ChannelHarness(config, [route, other], { send: async message => {
       const persisted = inspect(db => db.prepare(`SELECT status,delivery_mode,reply_slot FROM delivery_parts
         WHERE status='sending' AND text=? UNION ALL
-        SELECT status,delivery_mode,reply_slot FROM run_progress WHERE status='sending' AND text=?`).all(message.text, message.text));
+        SELECT status,delivery_mode,reply_slot FROM run_progress WHERE status='sending' AND text=? UNION ALL
+        SELECT status,delivery_mode,reply_slot FROM channel_task_failures WHERE status='sending' AND text=?`).all(message.text, message.text, message.text));
       sent.push({ ...message, persisted });
       return send(message, sent.length);
     } }, maxCalls);
@@ -101,6 +102,35 @@ async function fixture(t, maxConcurrent = 2) {
   return { config, route, other, requests, planningRequests, totalCalls: () => totalModelCalls(requests, planningRequests), sent, plans, preparations, inspect, gate, harness, message, tasks,
     send: operation => { send = operation; } };
 }
+
+test('请求失败真实发送短回执，预算前置拒绝和未知投递重启后不重发', async t => {
+  const f=await fixture(t), gate=f.gate();
+  f.config.timeoutMs=300;
+  const h=f.harness(1);
+  f.plans.set('timeout',[{gate,answer:'不应送达的迟到回答'}]);
+  assert.equal(await h.handle(f.message('timeout','这个请求会超时')), 'failed');
+  gate.release();
+  assert.equal(f.sent.length,1);
+  assert.match(f.sent[0].text,/这次请求超时/);
+  assert.equal(f.sent[0].persisted[0].status,'sending');
+  assert.equal(f.tasks()[0].status,'failed');
+  const first=f.inspect(db=>db.prepare(`SELECT cf.status,cf.message_id,m.text FROM channel_task_failures cf
+    JOIN messages m ON m.id=cf.message_id WHERE cf.status='sent'`).get());
+  assert.match(first.text,/超时/);
+  assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM conversation_context_messages WHERE message_id=?').get(first.message_id).n),1);
+  f.send(async()=>{throw new Error('unknown delivery');});
+  const blocked=f.message('budget','下一条提问');
+  const calls=f.totalCalls();
+  assert.equal(await h.handle(blocked),'budget_exhausted');
+  assert.equal(f.totalCalls(),calls);
+  assert.equal(f.sent.length,2);
+  assert.equal(f.inspect(db=>db.prepare("SELECT count(*) n FROM channel_task_failures WHERE status='uncertain' AND message_id IS NULL").get().n),1);
+  assert.equal(f.tasks()[1].runInput,null);
+  await h.close();
+  const reopened=f.harness(1); await reopened.start();
+  assert.equal(await reopened.handle(blocked),'duplicate');
+  assert.equal(f.sent.length,2); assert.equal(f.totalCalls(),calls);
+});
 
 test('同群长回答分段与其它回答按队列顺序完成', async t => {
   const f = await fixture(t), output = f.gate(), h = f.harness();

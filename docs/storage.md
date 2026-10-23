@@ -2,6 +2,12 @@
 
 SQLite pa.sqlite 保存权威原文、消息来源、运行和投递记录，以及记忆派生数据；Pi session.jsonl 保存模型上下文与审计条目。压缩仅改变活跃模型投影，原文保持完整。两者使用 run ID / Pi entry ID 对应，不能混合恢复不同时点的文件。
 
+## schema v28：失败回执与纠正覆盖
+
+增加channel_task_failures，独立记录失败问答的程序短回执，关联原task和房间、预约投递方式/回复槽、平台消息ID及引用索引。原任务与模型run保持failed；只有sent才原子追加assistant短消息和滚动可见序列。重启将sending标为uncertain，不重发未知投递，前置失败尚未创建模型run时也能保留可见回执。真实持久化错误不触发额外发送。
+
+conversation_context_state.summary_correction_hash记录成功压缩实际捕获的纠正链指纹；冻结输入同时保留纠正关系、必要原文和归属。旧summary及旧冻结任务无指纹，不冒充覆盖新纠正；指纹匹配当前可见纠正链后，曾因纠正隐藏的摘要恢复。原始聊天与旧修订不变。
+
 ## schema v24：研究清单与报告
 
 新增研究台账 `research_tasks`、执行批次 `research_attempts`、追加资料 `research_evidence`、不可变报告版本 `research_reports`、标题/摘要/关键词的中文 FTS5/BM25 索引 `research_report_fts` 和独立投递回执 `research_deliveries`。升级沿用旧库的一致性备份和事务迁移。任务保存创建时的 person、actor 和原房间供审计，不接受模型指定所有者；清单与报告权限按来源actor的当前可信person绑定核验，跨群和私聊统一为本人研究清单，不开放他人访问。按北京时间的创建日期统计，数据库分页查询给出跨会话准确总数，不从聊天摘要推算。研究文件投递路由和已发送回执所属会话由领取请求的source_message_id确定，不沿用报告创建房间。

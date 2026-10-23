@@ -42,6 +42,8 @@ export interface RecordedConversation {
   enqueueTask(sourceMessageId: string, input: import('./channel-types.js').InboundMessage): { id: string; status: ChannelTaskStatus };
   claimTask(id: string): boolean;
   finishTask(id: string, status: 'completed' | 'failed' | 'interrupted', deliveryId?: string): void;
+  reserveTaskFailure(taskId: string, text: string, mode: 'passive'|'active', replySlot?: number): boolean;
+  ackTaskFailure(taskId: string, status: 'sent'|'uncertain'|'rejected', externalId?: string, referenceIndex?: string): void;
   tasks(status?: ChannelTaskStatus): ChannelTaskRecord[];
   taskResult(senderId: string, taskId?: string): ReturnType<ConversationStore['latestTaskResult']>;
   abort(): Promise<void>;
@@ -271,6 +273,8 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
       },
       claimTask(id) { usable(); return persist(() => openedStore.claimChannelTask(id)); },
       finishTask(id, status, deliveryId) { usable(); persist(() => openedStore.finishChannelTask(id, status, deliveryId)); },
+      reserveTaskFailure(id,text,mode,slot) { usable(); return persist(() => openedStore.reserveTaskFailure(conversation.id,id,text,mode,slot)); },
+      ackTaskFailure(id,status,externalId,referenceIndex) { usable(); persist(() => openedStore.ackTaskFailure(conversation.id,id,status,externalId,referenceIndex)); },
       tasks: status => { usable(); return persist(() => openedStore.listChannelTasks(conversation.id, status)); },
       taskResult: (senderId, taskId) => { usable(); return persist(() => openedStore.latestTaskResult(conversation.id, senderId, taskId)); },
       abort: async () => {
@@ -564,7 +568,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
               throw new PersistenceError(`Pi 运行状态无法确认，请关闭并检查会话数据：${message}`,
                 { cause: new Error(message) });
             }
-            throw new RequestError(message, kind);
+            throw new RequestError(message, kind, undefined, error instanceof RequestError ? error.confirmedActions : []);
           }
           const turn = matchingTurn(runtime.recordedTurns(), run.id, modelInput);
           if (!turn?.user || !turn.assistant || !['stop', 'length'].includes(turn.assistant.stopReason)

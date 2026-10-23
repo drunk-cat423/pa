@@ -62,7 +62,14 @@ export interface AutoMemoryJob {
   startSeq: number; endSeq: number; messageIds: string[]; attempts: number;
   leaseToken?: string; leaseOwner?: string; leaseUntil?: number; error?: string;
 }
+export interface SummaryCorrections {
+  hash: string;
+  corrections: { memoryId: string; revision: number; content: string; source: AutoMemoryMessage;
+    subjectActorIds: string[]; excludedActorIds: string[]; correctedMessages: AutoMemoryMessage[] }[];
+}
 export interface AutoMemoryTaskInput {
+  /** Program-confirmed correction lineage captured with the immutable compression input. */
+  summaryCorrections?: SummaryCorrections;
   /** Absent on preserved combined jobs. New tasks write only their own pipeline's results. */
   pipeline?: Exclude<AutoMemoryPipeline, 'legacy'>;
   /** Absent on preserved frozen inputs; version 2 uses program-owned coverage. */

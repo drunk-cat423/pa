@@ -36,7 +36,7 @@ test('schema17只读保留旧页面正文与引用索引，不混入规范回答
   assert.deepEqual(f.store.autoMemory.conversationContext(f.a.id).messages.map(m=>m.text),['问题',f.canonical]);
   f.restart();
   assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId});
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),27);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),28);
 });
 
 test('schema16 migration keeps canonical history and creates an intact backup',t=>{
@@ -45,7 +45,7 @@ test('schema16 migration keeps canonical history and creates an intact backup',t
   f.inspect(db=>{downgradeSchema16(db);db.exec('PRAGMA user_version=16');});
   f.restart();
   assert.ok(readdirSync(f.dir).some(name=>name.includes('.v16.')&&name.endsWith('.bak')));
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),27);
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),28);
   assert.deepEqual(f.store.quotedMessage(f.a.id,'legacy'),{role:'assistant',text:f.canonical,sourceMessageId:f.result.messageId});
   assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
 });

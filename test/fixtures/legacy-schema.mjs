@@ -1,4 +1,8 @@
 export function downgradeSchema22(db) {
+  db.exec('DROP TABLE IF EXISTS channel_task_failures;');
+  if (db.prepare('PRAGMA table_info(conversation_context_state)').all().some(column => column.name === 'summary_correction_hash')) {
+    db.exec('ALTER TABLE conversation_context_state DROP COLUMN summary_correction_hash;');
+  }
   db.exec(`DROP TABLE IF EXISTS research_collection_cycles;
     DROP TABLE IF EXISTS research_task_archives;
     DROP TABLE IF EXISTS research_workflow_reviews;
