@@ -176,6 +176,7 @@ export class ResearchService {
           .filter(evidence => ['web_fetch', 'web_search', ...(lightweight ? ['read_research_material'] : [])].includes(evidence.tool)
             && (!lightweight || evidence.result !== undefined || evidence.error !== undefined));
         const materialQuery = {goal:task.goal,followups:task.followups,gaps:workflow.sections.flatMap(item=>item.gaps)};
+        const failedMaterials = material.filter(item=>item.error).slice(-8);
         const lightweightProjection = lightweight && phase !== 'review' ? projectResearchMaterials(material,materialQuery,phase==='collect'?'collect':'write') : undefined;
         const previousMaterial = lightweightProjection ?? boundedText(JSON.stringify(material.slice(-24).map(item => ({ ...item,
           result: item.result === undefined ? undefined : boundedText(JSON.stringify(item.result), phase === 'write' ? 24_000 : 4500) }))), phase === 'write' ? 120_000 : 45_000);
@@ -196,22 +197,26 @@ export class ResearchService {
         const input = { task: { id: task.id, title: task.title, goal: task.goal, originalRequest: task.originalText,
           followups: task.followups,
           urls: task.urls, requiresOriginal: task.requiresOriginal }, phase, researchedAt: new Date().toISOString(),
-          remainingGaps: workflow.sections.flatMap(item=>item.gaps),
-          previousMaterial: phase === 'review' ? undefined : previousMaterial,
-          ...(lightweight ? { collectionNote: boundedText(String(saved.evidence.findLast(item => item.tool === 'collection_note')?.result ?? ''), 8000) } : {}),
+          ...(['collect','write'].includes(phase) ? {remainingGaps:workflow.sections.flatMap(item=>item.gaps),previousMaterial}:{}),
+          ...(lightweight && phase === 'write' ? { collectionNote: boundedText(String(saved.evidence.findLast(item => item.tool === 'collection_note')?.result ?? ''), 8000) } : {}),
           ...(phase === 'review' ? { reviewMaterial } : {}),
           // Projection entries already carry exact evidence IDs and source URLs.
           // Only errors need a separate small index in the lightweight flow.
-          materialIndex: (lightweight ? material.filter(item=>item.error).slice(-8) : material.slice(-64)).map(item => ({ id: item.id, tool: item.tool,
+          ...(phase === 'collect' ? {materialIndex: (lightweight ? failedMaterials : material.slice(-64)).map(item => ({ id: item.id, tool: item.tool,
             input: lightweight ? boundedText(JSON.stringify(item.input), 1000) : item.input, error: item.error,
-            ...(lightweight && item.error && item.result!==undefined ? {failure:boundedText(JSON.stringify(item.result),1000)}:{}) })),
-          plan: workflow.plan, progress: workflow.sections.map(({ id, title, status, summary }) => ({ id, title, status, summary })),
-          ...(section ? { section: phase === 'review' ? section : sectionProjection(section),
-            writeMode: section.status === 'draft' ? 'append' : 'replace' } : {}),
-          budget: { modelCalls: budget.maxModelCalls - current.modelCalls, toolCalls: budget.maxToolCalls - current.toolCalls,
-            searchCalls: budget.maxSearchCalls - current.searchCalls,
-            suggestedSections: Math.max(1, Math.min(3, Math.floor((budget.maxModelCalls - 3) / 2))) },
-          ...(!workflow.plan && task.reportVersion ? { previousReport: boundedText(store.report(task.id, task.reportVersion).markdown, 12_000) } : {}) };
+            ...(lightweight && item.error && item.result!==undefined ? {failure:boundedText(JSON.stringify(item.result),1000)}:{}) }))}:{}),
+          ...(phase === 'write' && failedMaterials.length ? {sourceFailures:failedMaterials.map(item=>({tool:item.tool,
+            request:boundedText(JSON.stringify(item.input),1000),error:boundedText(item.error!,500),
+            ...(item.result && typeof item.result==='object' && 'code' in item.result && typeof item.result.code==='string'
+              ? {code:boundedText(item.result.code,100)}:{})}))}:{}),
+          ...(!lightweight && phase === 'collect' ? {plan:workflow.plan}:{}),
+          ...(!lightweight && phase !== 'plan' ? {progress:workflow.sections.filter(item=>item.id!==section?.id)
+            .map(({id,title,status,summary})=>({id,title,status,summary}))}:{}),
+          ...(section && (phase === 'write' || phase === 'review') ? {
+            ...(!lightweight ? {section:phase==='review'?section:sectionProjection(section)}
+              : section.version>0 ? {section:lightweightSectionProjection(section)}:{}),
+            ...(phase === 'write' ? {writeMode:section.status==='draft'?'append':'replace'}:{}) }:{}),
+          ...(phase === 'plan' && task.reportVersion ? { previousReport: boundedText(store.report(task.id, task.reportVersion).markdown, 12_000) } : {}) };
         const cycle = persist(() => store.workflow.begin(task.id, task.attempt, { phase, input,
           ...(section ? { sectionId: section.id, expectedVersion: section.version } : {}) }));
         activeCycle = cycle;
@@ -371,6 +376,11 @@ export class ResearchService {
 function sectionProjection(section: ResearchSection): ResearchSection & { markdownIsTail: boolean } {
   const tail = section.status === 'draft' && [...section.markdown].length > 8000;
   return { ...section, markdown: tail ? [...section.markdown].slice(-8000).join('') : section.markdown, markdownIsTail: tail };
+}
+
+function lightweightSectionProjection(section: ResearchSection) {
+  const {markdown,markdownIsTail,sources} = sectionProjection(section);
+  return {markdown,markdownIsTail,sources};
 }
 
 interface Coverage { offset: number; end: number; totalChars: number; contentHash: string }

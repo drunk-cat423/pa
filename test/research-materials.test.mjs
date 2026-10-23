@@ -60,7 +60,9 @@ test('同快照重叠分页按UTF-16去重，emoji不破坏解包和读取位置
   assert.equal(entry.offsetUnit, 'utf16'); assert.equal(entry.truncated, false);
   assert.equal(entry.fetchedAt, '2026-10-23'); assert.equal(entry.dateEvidence[0].date, '2026-10-22');
   for (const span of entry.spans) assert.equal(full.slice(span.offset, span.end), span.text);
-  assert.match(result.notice, /offset=0/); assert.match(result.notice, /nextOffset/);
+  assert.match(result.notice, /没有工具/); assert.doesNotMatch(result.notice,/read_research_material/);
+  const collecting = projectResearchMaterials(items, query('target.js'), 'collect');
+  assert.match(collecting.notice, /offset=0/); assert.match(collecting.notice, /nextOffset/);
   const changed = projectResearchMaterials([...items, fetch('e4', 'target.js', '新版本')], query(), 'write');
   assert.equal(changed.entries.length, 2);
 });

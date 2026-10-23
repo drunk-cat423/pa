@@ -53,16 +53,25 @@ async function fixture(t) {
         const plan = message ? plans.get(message.eventId) : phasePlans.get(`${worker.task.title}:${worker.phase}`)
           ?? (worker.phase === 'write' ? workerPlans.get(worker.task.title) : undefined);
         if (!message) {
+          assert.equal(worker.budget, undefined);
+          assert.doesNotMatch(userText(body), /"suggestedSections"/);
           assert.deepEqual(body.thinking, { type: 'enabled' }); assert.equal(body.reasoning_effort, 'high');
           assert.equal(body.max_tokens, undefined); assert.equal(body.max_completion_tokens, undefined);
           assert.ok(['none', 'auto'].includes(body.tool_choice));
           if (worker.phase === 'plan' || worker.phase === 'write') {
             assert.equal(body.tool_choice, 'none'); assert.deepEqual(body.tools ?? [], []);
             assert.ok(body.messages.every(message => message.role !== 'tool' && !message.tool_calls));
+            assert.equal(worker.materialIndex, undefined);
+            assert.equal(worker.plan, undefined);
           } else if (worker.phase === 'collect') {
             assert.equal(worker.section, undefined);
+            assert.equal(worker.writeMode, undefined);
+            assert.equal(worker.collectionNote, undefined);
+            const instructions = body.messages.filter(m=>['system','developer'].includes(m.role));
+            assert.doesNotMatch(JSON.stringify(instructions), /写作元数据summary|150至220/);
           } else if (worker.phase === 'review') {
             assert.ok((body.tools ?? []).every(tool => tool.function.name === 'read_research_material'));
+            for (const key of ['collectionNote','writeMode','previousMaterial','materialIndex','remainingGaps','plan']) assert.equal(worker[key], undefined);
           }
         }
         if (!plan && worker?.phase === 'plan') step = answer(planOutput());
@@ -416,6 +425,26 @@ test('聊天归档仅限本人且拒绝运行中任务，跨场景幂等移除�
   assert.equal(f.requests.filter(r => r.worker).length, workerCount);
 });
 
+test('最后一个采集工具失败且无笔记时，写作仅带必要失败说明并保留blocked', async t => {
+  const f = await fixture(t); f.config.research.maxToolCalls=1;
+  const h = await f.harness(); f.pageFails(true);
+  f.plans.set('last-failure',[call('create_research',{key:'last-failure',title:'最后抓取失败',goal:'读取指定原文',urls:[sourceUrl],requiresOriginal:true})]);
+  f.phasePlans.set('最后抓取失败:collect',[call('web_fetch',{url:sourceUrl})]);
+  f.workerPlans.set('最后抓取失败',[body=>{
+    const input=JSON.parse(userText(body));
+    assert.equal(input.collectionNote,''); assert.equal(input.materialIndex,undefined);
+    assert.equal(input.sourceFailures.length,1);
+    assert.equal(input.sourceFailures[0].code,'network');
+    assert.match(input.sourceFailures[0].request,/research-source/);
+    assert.ok(input.sourceFailures[0].error);
+    return answer(sectionOutput('blocked'));
+  }]);
+  assert.equal(await h.handle(f.message('last-failure',`研究指定原文 ${sourceUrl}`)),'sent');
+  await h.waitForResearch();
+  assert.equal(f.taskRows()[0].status,'blocked');
+  assert.deepEqual(f.requests.filter(r=>r.worker).map(r=>r.worker.phase),['collect','write']);
+});
+
 test('轻量采集最多用到写作预留前，最后一个模型调用用于正文', async t => {
   const f = await fixture(t); f.config.research.maxModelCalls = 2;
   const h = await f.harness();
@@ -467,9 +496,17 @@ test('partial 续作把新增要求带入采集与写作，并按新版摘要通
     const worker = JSON.parse(userText(body));
     assert.equal(worker.phase, 'collect');
     assert.ok(worker.task.followups.some(item => item.requirements === requirements));
+    assert.deepEqual(worker.remainingGaps,['缺少官方成本数据。']);
+    assert.equal(worker.plan,undefined); assert.equal(worker.progress,undefined);
     return call('web_fetch', { url: sourceUrl });
   }, answer('已取得官方成本和适用范围材料。')]);
   f.workerPlans.set('成本核验', [body => {
+    const worker = JSON.parse(userText(body));
+    assert.equal(worker.writeMode,'replace');
+    assert.match(worker.section.markdown,/已比较部署方案/);
+    assert.deepEqual(Object.keys(worker.section).sort(),['markdown','markdownIsTail','sources']);
+    assert.match(worker.collectionNote,/已取得官方成本/);
+    assert.equal(worker.progress,undefined);
     assert.match(JSON.stringify(body.messages), new RegExp(requirements));
     assert.match(JSON.stringify(body.messages), /官方成本|适用条件/);
     return answer(sectionOutput('written', '官方成本数据已经核验，适用条件已说明。', {

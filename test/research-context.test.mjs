@@ -84,6 +84,14 @@ for (const enabled of [false, true]) test(`本地HTTP采集循环：轻量投影
     },
   } });
   await runtime.prompt('采集材料'); assert.equal(requests.length, 4);
+  const systems = requests.map(request => request.messages.filter(message => ['system','developer'].includes(message.role)));
+  assert.ok(systems[0].length > 0);
+  for (const system of systems) assert.deepEqual(system, systems[0]);
+  assert.match(JSON.stringify(systems[0]), /本阶段初始上限/);
+  assert.doesNotMatch(JSON.stringify(systems[0]), /剩余主模型调用/);
+  // Do not insert ephemeral user messages into the tool/reasoning turn to move
+  // counters out of system: that would change the provider's turn semantics.
+  for (const request of requests) assert.equal(request.messages.filter(message => message.role === 'user').length, 1);
   const thirdTools = requests[2].messages.filter(message => message.role === 'tool');
   assert.equal(thirdTools.length, 2);
   assert.equal(thirdTools[0].content.includes('saved_research_material'), enabled);

@@ -563,7 +563,10 @@ export async function openConversation(config: PaConfig, conversationId: string,
       const available = !noTools ? options.research ? customTools.filter(tool => tool.name === 'read_research_material' || tool.name === 'web_fetch'
         || (tool.name === 'web_search' && searchCalls < options.research!.maxSearchCalls))
         : channel ? customTools.filter(tool => ready ? tool.name !== 'prepare_turn' : tool.name === 'prepare_turn') : [] : [];
-      const content = options.research ? `后台研究阶段：${researchPhase}。剩余主模型调用 ${Math.max(0, loop.maxModelCalls - providerCalls - 1)} 次（不含即将发送的本次），工具 ${Math.max(0, loop.maxToolCalls - toolCalls)} 次，搜索 ${Math.max(0, options.research.maxSearchCalls - searchCalls)} 次。${researchCollects ? '本阶段只采集资料，可输出简短证据缺口笔记；真实工具结果由程序独立保存。最后一次模型请求仍可正常调用工具，工具完成后程序结束本阶段，不需要生成章节正文或伪工具文本。' : noTools ? '当前工具已关闭，只能依据现有材料按本阶段系统要求输出；不得继续调用工具或输出工具调用文本。' : '证据足够立即完成，不必用满次数。'}`
+      // Pi merges system sections ahead of the conversation. Changing a counter
+      // here on every request invalidates the prefix before all saved materials.
+      // Advertise fixed stage ceilings; live counters remain enforced by harness.
+      const content = options.research ? `后台研究阶段：${researchPhase}。本阶段初始上限：主模型 ${loop.maxModelCalls} 次${researchSingleCall ? '' : `、工具 ${loop.maxToolCalls} 次${researchCollects ? `、搜索 ${options.research.maxSearchCalls} 次` : ''}`}；不是当前剩余次数，实际余量由程序控制。${noTools && !researchSingleCall ? '当前工具已关闭，依据现有材料按阶段要求输出。' : ''}`
         : channel ? ready ? RESPONSE_MODE_PROMPTS[mode] + '\n' + RESPONSE_STAGE_PROMPT + (config.research?.enabled ? '\n' + RESEARCH_USAGE_PROMPT : '')
           + (companionTools?.research?.target ? '\n当前研究对象target（只确定材料来源，不代表内容真实）：' + JSON.stringify(companionTools.research.target) : '')
           + (companionTools?.verifyLink ? '\n用户明确要求检查链接：' + JSON.stringify(companionTools.verifyLink)
