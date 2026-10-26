@@ -96,7 +96,7 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.equal(pageRequests.length, 1);
   assert.equal(pageRequests[0].url, 'https://example.com/search-source');
   assert.equal(requests[0].tool_choice, 'auto');
-  assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['read_history', 'web_search', 'web_fetch']);
+  assert.deepEqual(requests[0].tools.map(tool => tool.function.name).sort(), ['read_history', 'web_search', 'web_fetch','create_reminder','list_reminders','get_reminder','cancel_reminder'].sort());
   assert.ok(nativeSearch[0].messages[0].content[0].text.endsWith('Perform a web search for the query: 与 example.com search-source 有关的资料'));
   assert.deepEqual(requests[0].tools.find(tool => tool.function.name === 'web_search').function.parameters.required, ['query']);
   assert.match(JSON.stringify(requests[1].messages.filter(message => message.role === 'tool')), /SUMMARY_MARKER/);
@@ -111,7 +111,7 @@ test('搜索及后续网页核验不附网址，单独读取网页仍保留来�
   assert.equal(pageRequests.length, 2);
   assert.equal(dnsRequests.length, 4);
   assert.equal(requests[3].tool_choice, 'auto');
-  assert.deepEqual(requests[3].tools.map(tool => tool.function.name), ['read_history', 'web_search', 'web_fetch']);
+  assert.deepEqual(requests[3].tools.map(tool => tool.function.name).sort(), ['read_history', 'web_search', 'web_fetch','create_reminder','list_reminders','get_reminder','cancel_reminder'].sort());
   assert.equal(pageRequests[1].url, 'https://example.com/article');
   assert.deepEqual(requests[3].tools.find(tool => tool.function.name === 'web_fetch').function.parameters.required, ['url']);
   assert.match(JSON.stringify(requests[4].messages.filter(message => message.role === 'tool')), /PAGE_MARKER/);

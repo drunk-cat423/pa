@@ -9,10 +9,10 @@ export interface ResearchToolContext {
 }
 
 export const RESEARCH_USAGE_PROMPT = `研究清单是独立后台任务，不能仅口头承诺。默认当场回答，可按需搜索；问题复杂、出现链接或需要联网不等于需要创建任务。
-用户明确希望加入研究清单、后台深入研究、形成报告、之后领取，或当前对话已有这样的持续约定时，调用create_research。意图实质不清时简短询问，不按关键词机械建任务。
+只有用户明确委托PA后台实际研究并产出结果（如加入研究清单、后台研究形成报告），或本人明确续接这样的约定时，调用create_research。“提醒我调研X”是提醒本人去做，不能启动研究；普通待办不能塞进研究清单。未来定时启动研究目前不支持，不能擅自立即执行。意图实质不清时简短询问，不按“任务/时间/调研”等关键词机械建任务。
 用户明确加入研究清单后，前台只执行入队并简短确认，不先独立搜索、抓取链接或给出研究结论；后台形成报告后，讨论时基于实际报告回答。create_research/continue_research成功后由程序按实际回执确认，不继续解释或调用研究之外的工具；多个研究事项应在同批逐项入队，不声称未执行事项已完成。清单数量、状态、报告版本必须查工具，不能凭历史摘要猜测。
 后台默认轻量理解与比较：按问题解释概念、用途、差异、社区反馈或PA适用性，不自动扩成源码审计或专业长报告。goal只带完成问题必需且当前已提供的背景，尤其PA现有约束；不要编造项目现状，不把无关群聊或人物画像塞进任务。
-查询“现在的清单/目前有哪些任务”默认list_research不传date，查询全部日期；只有用户明确限定今天、昨天或某个日期才传北京时间date。按可信person_id查询本人在所有群聊和私聊的任务，不能查他人清单。身份由应用绑定，不按昵称或用户自称合并。领取报告发到当前请求会话。讨论报告先定位ID，再read_research读取必要章节；全文不自动注入历史，不把报告建议当作用户偏好或人物事实。
+研究上下文中查询“现在的清单/目前有哪些任务”用list_research不传date，查询全部日期；若上下文不能确定用户在问研究还是提醒，先澄清类别，不把研究清单当作全部事项。只有用户明确限定今天、昨天或某个日期才传北京时间date。按可信person_id查询本人在所有群聊和私聊的任务，不能查他人清单。身份由应用绑定，不按昵称或用户自称合并。领取报告发到当前请求会话。讨论报告先定位ID，再read_research读取必要章节；全文不自动注入历史，不把报告建议当作用户偏好或人物事实。
 当前研究对象以应用提供的target及当前用户明确问题为准。明确链接不能被群友的旧项目替换；“这个/刚才那个”优先承接本人明确材料。target无法确定时先澄清；工具拒绝目标不一致时，修正目标及标题、背景，不能只把URL换正确而保留跑偏内容。
 用户要失败任务的草稿时，read_research传draft=true，不重新发起研究。草稿是未完成、未核验的材料；缺失时如实说明。
 用户索取已有报告时调用send_research_report，默认txt；仅sent表示平台已接收，uncertain不得说已发送成功，同轮不得重试未知投递。
@@ -23,7 +23,7 @@ export const RESEARCH_USAGE_PROMPT = `研究清单是独立后台任务，不能
 const id = { type: 'string', minLength: 1, maxLength: 100 };
 const version = { type: 'integer', minimum: 1 };
 export const RESEARCH_TOOL_SPECS = [
-  { name: 'create_research', label: '创建后台研究', description: '用户明确希望收录并后台研究形成报告时创建任务，不用于普通即时提问。只按成功回执确认加入；key是本条消息内稳定的事项标识，同一个事项重用相同key。需要严格总结指定原文时requiresOriginal=true，拿不到原文不能用别的资料冒充。goal须包含用户目标及完成所需的必要背景，后台不读取整段群聊。',
+  { name: 'create_research', label: '创建后台研究', description: '用户明确委托PA后台研究并形成结果时创建，立即排队。不要用于“提醒我研究X”、普通待办或定时启动研究，普通问题默认当场回答；有歧义先澄清。只按成功回执确认；key是本条消息内稳定事项标识。需严格总结指定原文时requiresOriginal=true；goal只带用户目标及必要背景，后台不读取整段群聊。',
     parameters: { type: 'object', properties: { key: { type: 'string', minLength: 1, maxLength: 80 }, title: { type: 'string', minLength: 1, maxLength: 200 },
       goal: { type: 'string', minLength: 1, maxLength: 4000 }, urls: { type: 'array', maxItems: 8, items: { type: 'string', maxLength: 2000 } },
       requiresOriginal: { type: 'boolean' } }, required: ['key', 'title', 'goal'], additionalProperties: false } },

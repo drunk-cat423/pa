@@ -15,6 +15,7 @@ const scopeFiles = {
     'channel-admission-atomic.test.mjs',
     'channel-web-tools.test.mjs',
     'research-e2e.test.mjs',
+    'reminder-runtime.test.mjs',
     'session-integrity.test.mjs',
   ],
   memory: [
@@ -54,6 +55,7 @@ const scopeFiles = {
     'channel-task-store.test.mjs',
     'delivery-parts.test.mjs',
     'research-e2e.test.mjs',
+    'reminder-service.test.mjs',
   ],
   research: [
     'research-archive.test.mjs',
@@ -90,6 +92,8 @@ const scopeFiles = {
     'self-profile-store.test.mjs',
     'session-integrity.test.mjs',
     'store.test.mjs',
+    'work-ledger-migration.test.mjs',
+    'work-ledger-store.test.mjs',
   ],
 };
 const scopes = ['all', ...Object.keys(scopeFiles)];

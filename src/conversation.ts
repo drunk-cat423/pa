@@ -19,6 +19,7 @@ import { imageMetadata, type ImageProjection, type ImageContent } from './image-
 import { ImageAssets } from './image-assets.js';
 import { DiagnosticLog } from './diagnostics.js';
 import type { ResearchToolContext } from './research-tools.js';
+import type {ReminderToolContext} from './reminder-tools.js';
 import type { ResearchSender } from './research-service.js';
 import { researchUrls } from './research-target.js';
 import type { AnswerGroundingContext, GroundingSource } from './answer-grounding.js';
@@ -118,6 +119,7 @@ function memoryContext(memories: MemoryRecord[], channel = false): { content?: s
 
 export async function openRecordedConversation(config: PaConfig, conversationKey: string, route?: ChannelRoute,
   options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy;
+    reminderContext?: (conversationId:string,sourceMessageId:string,sourceText:string)=>ReminderToolContext;
     onIntegrityFailure?: (error: Error) => void;
     researchContext?: (conversationId: string, sourceMessageId: string, send?: ResearchSender) => ResearchToolContext } = {}): Promise<RecordedConversation> {
   // Acquire the Pi conversation lock before inspecting or mutating its business records.
@@ -558,6 +560,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
                   ...messagePeople({role:'user',personId:currentPersonId}),
                   ...(inputExternal?.existingMessageId ? {messageId:inputExternal.existingMessageId}:{}),
                   ...(inputExternal?.senderName ? { senderName: inputExternal.senderName } : {}),
+                  ...(inputExternal?.sentAt ? {sentAt:inputExternal.sentAt}:{}),
                   ...(inputExternal ? { eventId: inputExternal.eventId } : {}), text,
                   ...(currentImages.length ? { images: currentImages.map(imageMetadata) } : {}), ...projectedQuoteContext } });
             const currentContent: ImageContent[] = [];
@@ -622,6 +625,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
                 ...(config.fetch?.enabled && /能(?:不能|否)?.{0,12}(?:看|读)|(?:读|看|打开|访问)(?:一下|下|这个|链接|网页|仓库)|(?:总结|分析).{0,12}(?:网页|链接|仓库)/u.test(text)
                   && researchUrls(text).length === 1 ? { verifyLink: researchUrls(text)[0] } : {}),
                 ...(options.researchContext ? { research: options.researchContext(conversation.id, run.inputMessageId, sendResearch) } : {}),
+                ...(options.reminderContext ? {reminders:options.reminderContext(conversation.id,run.inputMessageId,text)} : {}),
                 prepareTurn: (plan: import('./turn-plan.js').TurnPlan) => persist(()=>openedStore.prepareTurn(
                   conversation.id,run.inputMessageId,plan,policy,inputExternal.mentionedSenderIds,
                   selfProfileBudget(runtime.estimate('').contextWindow)),text),

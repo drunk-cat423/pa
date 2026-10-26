@@ -297,7 +297,12 @@ export class QQChannel {
     if (deliveryMode === 'passive' && !referenceId(message.replyToMessageId)) return { status: 'rejected' };
     const partIndex = message.partIndex ?? 0;
     if (!Number.isSafeInteger(partIndex) || partIndex < 0 || (deliveryMode === 'passive' && partIndex >= 5)) return { status: 'rejected' };
-    const content = message.markdown || message.plainText ? message.text : toPlainText(message.text);
+    if(message.mentionSenderId!==undefined && (message.route.roomType!=='group'
+      || !/^[a-zA-Z0-9_-]{1,128}$/.test(message.mentionSenderId)))return {status:'rejected'};
+    const bodyText = message.markdown || message.plainText ? message.text : toPlainText(message.text);
+    // QQ official text-chain @ tag. Keep the original group's identity domain.
+    const content = message.mentionSenderId===undefined?bodyText
+      : `<qqbot-at-user id="${message.mentionSenderId}" /> ${bodyText.replace(/<(?=\/?(?:qqbot-|@))/gi,'〈')}`;
     // Only the harness can supply these in-memory report exports. Do not accept
     // paths/URLs or let a filename escape into a local/remote lookup operation.
     const file = message.file;

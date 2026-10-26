@@ -596,6 +596,111 @@
       "file": "test/research-retention-schema.test.mjs",
       "name": "exact session-integrity ledger triggers are compatible; same-name altered SQL is refused",
       "evidence": "Confirmed schema compatibility incident extended to frozen-plan recovery and exact structural dependency validation; offline temp SQLite apply in .local/long-task-20261026/full-final.log."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "提醒按真实人物授权，同人物跨场景查询但不迁移通知路由，幂等并拒绝冲突",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "身份重绑不把相同原始来源和幂等键转移给新人物",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "到期查询命中部分索引，双连接领取不重复且提交检查 lease/version/授权",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "版本取消阻止迟到 worker；撤销来源绑定后不执行；重启未知通知不重发",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+    },
+    {
+      "file": "test/work-ledger-migration.test.mjs",
+      "name": "schema33升级保留schema31原文与schema32已有提醒，备份及清理契约兼容",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+    },
+    {
+      "file": "test/reminder-service.test.mjs",
+      "name": "真实harness落库后确认，重开服务由1秒循环补提醒，群目标正确且不再请求模型",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-service.test.mjs",
+      "name": "等待房间输出期间取消或撤销权限不发送；未知投递重开后不重发",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-service.test.mjs",
+      "name": "实际工具列表在鉴权范围内分页，第100项后仍可查询取消，不把其他人任务混入",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-service.test.mjs",
+      "name": "QQ主动群提醒仅序列化受控发起人@，正文标签不能扩大收件人，私聊不携带@",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "提醒成功使用prepare和create两次本地SSE请求，程序确认并持久保留工具记录",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "提醒拒绝不确认成功，已保存画像也不能授权无回执的未来提醒承诺",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "模糊时间按正常回答澄清，没有额外提醒规划请求或工具执行",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "提醒成功后阻止同批后续工具并确认未执行项",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "提醒已保存后取消本轮请求，RequestError保留实际成功确认",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "取消只采用真实成功回执，sending等未知状态留给正常回答解释",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "CLI、后台研究、无提醒context与未启用渠道工具的运行时不展示提醒工具",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "无回执提醒承诺的窄校验保留否定、引用和澄清",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "送达事务失败保留 sending 和正文；成功仅留短期无正文回执并拒绝同来源重排",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "发送前复核真实绑定，失败和未知正文不清理；本地租约恢复及回执清理有界",
+      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "时间schema拒绝自然语言和无时区参数，模型可在原预算内修正且只执行有效调用",
+      "evidence": "2026-10-26 reminder/research boundary acceptance; runtime reproduced a clarification question wrongly blocked as an unsaved reminder promise. .local/reminder-boundary-20261026/targeted.log; fixed-response protocol test, not live model classification."
+    },
+    {
+      "file": "test/reminder-runtime.test.mjs",
+      "name": "提醒与研究同时可用时按实际工具调用分流，普通待办和定时研究澄清无副作用",
+      "evidence": "2026-10-26 reminder/research boundary acceptance; runtime reproduced a clarification question wrongly blocked as an unsaved reminder promise. .local/reminder-boundary-20261026/targeted.log; fixed-response protocol test, not live model classification."
     }
   ],
   "modelEvaluations": [

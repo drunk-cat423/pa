@@ -23,6 +23,7 @@ import { WebFetchReader } from './web-fetch-reader.js';
 import { WebFetchError, normalizeWebFetchUrl } from './web-fetch.js';
 import { RESEARCH_TOOL_SPECS, RESEARCH_USAGE_PROMPT, RESEARCH_WORKER_PROMPT, RESEARCH_STAGE_PROMPT,
   type ResearchToolContext, type ResearchToolName, type ResearchRuntimeOptions, type ResearchRuntimeEvent } from './research-tools.js';
+import { REMINDER_TOOL_SPECS, REMINDER_USAGE_PROMPT, type ReminderToolContext, type ReminderToolName } from './reminder-tools.js';
 import { outputLengthGuidance } from './output-length.js';
 import { compactResearchContext, researchContextReference, type ResearchContextReference } from './research-context.js';
 import { RESEARCH_MATERIAL_PREFIX, type MaterialReadParams } from './research-material-reader.js';
@@ -31,7 +32,7 @@ import { ContextTokenEstimator, contextCalibrationKey, normalizedInputTokens, up
   validContextCalibration, type ContextCalibration } from './context-tokens.js';
 import { imageMetadata, imageTokenPayload, imageRequestFits, projectImagePayload, IMAGE_TOKENS, MAX_REQUEST_IMAGES, type ImageProjection, type MessageImage } from './image-context.js';
 import { PREPARE_TURN_PROMPT, PREPARE_TURN_DESCRIPTION, RESPONSE_STAGE_PROMPT, CLI_STAGE_PROMPT, RESPONSE_MODE_PROMPTS, TURN_PLAN_SCHEMA,
-  validateTurnPlan, hasUnbackedSaveClaim, type TurnPlan, type TurnReceipt, type ReplyMode } from './turn-plan.js';
+  validateTurnPlan, hasUnbackedSaveClaim, hasUnbackedReminderClaim, type TurnPlan, type TurnReceipt, type ReplyMode } from './turn-plan.js';
 import { ANSWER_GROUNDING_PROMPT, ATTRIBUTION_REVIEW_PROMPT, bindAnswerGrounding, parseAttributionReview,
   UNVERIFIED_CURRENT_NOTICE, UNCERTAIN_ATTRIBUTION_NOTICE, type AnswerGroundingContext, type AnswerGroundingReceipt } from './answer-grounding.js';
 
@@ -64,6 +65,7 @@ export interface CompanionToolContext {
   readImage?(imageId: string): MessageImage | Promise<MessageImage>;
   onProgress?(text: string): Promise<void>;
   research?: ResearchToolContext;
+  reminders?: ReminderToolContext;
 }
 
 export interface ContextEstimate {
@@ -205,6 +207,9 @@ export async function openConversation(config: PaConfig, conversationId: string,
     let researchUnconfirmed = false;
     let researchAcknowledgementEnded = false;
     let researchPartialFailure = false;
+    let reminderAcknowledgements: string[] = [];
+    let reminderAcknowledgementEnded = false;
+    const skippedAfterReminder = new Set<string>();
     const unresolvedResearchOperations = new Set<string>();
     const skippedAfterResearch = new Set<string>();
     let collectionBudgetEnded = false;
@@ -213,6 +218,8 @@ export async function openConversation(config: PaConfig, conversationId: string,
     let preparationError: string | undefined;
     let replyMode: ReplyMode = 'standard';
     let preparationReceipt: TurnReceipt | undefined;
+    const hasUnconfirmedSaveClaim = (answer: string) => (!reminderAcknowledgements.length && hasUnbackedReminderClaim(answer))
+      || (!preparationReceipt?.saved.length && !researchSaved && !reminderAcknowledgements.length && hasUnbackedSaveClaim(answer));
     let saveClaimCorrection = false;
     let saveClaimFallback = false;
     let answerGrounding: AnswerGroundingReceipt | undefined;
@@ -453,6 +460,32 @@ export async function openConversation(config: PaConfig, conversationId: string,
         }
       },
     });
+    if (options.enableSearch && !options.research) for (const spec of REMINDER_TOOL_SPECS) customTools.push({
+      name: spec.name, label: spec.label, description: spec.description,
+      parameters: spec.parameters as ToolDefinition['parameters'], executionMode: 'sequential',
+      async execute(_id, params, signal) {
+        startTool(signal, _id);
+        if (!companionTools?.reminders) throw new MemoryError('本会话未开放一次性提醒。');
+        try {
+          const receipt = await cancellable(() => companionTools!.reminders!.execute(spec.name as ReminderToolName, params), signal);
+          if (receipt && typeof receipt === 'object') {
+            const value = receipt as Record<string, unknown>;
+            if (!value.error && typeof value.confirmation === 'string' && value.confirmation.trim()
+              && typeof value.id === 'string' && value.id.trim()
+              && ((spec.name === 'create_reminder' && value.saved === true
+                && typeof value.remindAt === 'string' && value.remindAt.trim() && typeof value.goal === 'string' && value.goal.trim())
+                || (spec.name === 'cancel_reminder' && value.cancelled === true))) {
+              reminderAcknowledgements.push(value.confirmation.trim());
+            }
+          }
+          return result(receipt, '以下是提醒工具实际回执；只能据成功回执确认安排或取消，状态不明不得声称成功：\n');
+        } catch (error) {
+          if (error instanceof MemoryError) return rejectArguments(_id, error);
+          if (error instanceof RequestError) throw error;
+          return failPersistence(error);
+        }
+      },
+    });
     if (config.provider !== 'deepseek' || config.model !== 'deepseek-flash') customTools.splice(customTools.findIndex(tool => tool.name === 'read_image'),1);
     if (options.research) customTools.splice(0);
     if (options.research?.readMaterial && (researchCollects || researchPhase === 'review')) customTools.push({
@@ -637,21 +670,23 @@ export async function openConversation(config: PaConfig, conversationId: string,
       }
       const available = !noTools ? options.research ? customTools.filter(tool => tool.name === 'read_research_material' || tool.name === 'web_fetch'
         || (tool.name === 'web_search' && searchCalls < options.research!.maxSearchCalls))
-        : channel ? customTools.filter(tool => ready ? tool.name !== 'prepare_turn' : tool.name === 'prepare_turn') : [] : [];
+        : channel ? customTools.filter(tool => (ready ? tool.name !== 'prepare_turn' : tool.name === 'prepare_turn')
+          && (!REMINDER_TOOL_SPECS.some(spec => spec.name === tool.name) || !companionTools || Boolean(companionTools.reminders))) : [] : [];
       // Pi merges system sections ahead of the conversation. Changing a counter
       // here on every request invalidates the prefix before all saved materials.
       // Advertise fixed stage ceilings; live counters remain enforced by harness.
       const content = options.research ? `后台研究阶段：${researchPhase}。本阶段初始上限：主模型 ${loop.maxModelCalls} 次${researchSingleCall ? '' : `、工具 ${loop.maxToolCalls} 次${researchCollects ? `、搜索 ${options.research.maxSearchCalls} 次` : ''}`}；不是当前剩余次数，实际余量由程序控制。${noTools && !researchSingleCall ? '当前工具已关闭，依据现有材料按阶段要求输出。' : ''}`
         : channel ? ready ? RESPONSE_MODE_PROMPTS[mode] + '\n' + RESPONSE_STAGE_PROMPT + (config.research?.enabled ? '\n' + RESEARCH_USAGE_PROMPT : '')
+          + (options.enableSearch ? '\n' + REMINDER_USAGE_PROMPT : '')
           + (companionTools?.research?.target ? '\n当前研究对象target（只确定材料来源，不代表内容真实）：' + JSON.stringify(companionTools.research.target) : '')
           + (companionTools?.verifyLink ? '\n用户明确要求检查链接：' + JSON.stringify(companionTools.verifyLink)
             + '。若本轮仅明确将链接加入后台研究清单，直接入队并等待报告，不当场抓取；否则必须实际调用web_fetch后依据返回结果回答能否读取，不能把看到URL文字说成读到了内容。' : '')
-        : PREPARE_TURN_PROMPT + (hasGrounding?'\n'+ANSWER_GROUNDING_PROMPT:'') + (config.research?.enabled
+        : PREPARE_TURN_PROMPT + (hasGrounding?'\n'+ANSWER_GROUNDING_PROMPT:'') + (options.enableSearch ? '\n' + REMINDER_USAGE_PROMPT : '') + (config.research?.enabled
           ? '\n用户明确要求加入研究清单或继续后台研究时，intent=research；本轮仅准备入队和简短确认，不先展开研究结论。' : '') : CLI_STAGE_PROMPT;
       // Tool availability and phase instructions have one projection for estimation and sending.
       // Pi renders free-form content before its structured prompt sections.
       // Append the phase as a section so the stable companion prefix stays first.
-      return [...messages, { role: 'system', content: '', sections: { pa_phase: content + (saveClaimCorrection ? '\n应用校验：刚才草稿含无持久化回执的保存承诺，尚未发送。请重新回答原问题，保留有用内容，取消无依据的记住/记下/保存承诺；本轮不得再调用工具或保存资料。' : '') }, timestamp: Date.now(),
+      return [...messages, { role: 'system', content: '', sections: { pa_phase: content + (saveClaimCorrection ? '\n应用校验：刚才草稿含无持久化回执的保存或提醒承诺，尚未发送。请重新回答原问题，保留有用内容，取消无依据的记住/记下/保存/安排提醒承诺；本轮不得再调用工具或保存资料。' : '') }, timestamp: Date.now(),
         toolsAdded: available.map(tool => ({ name: tool.name, description: tool.description, parameters:
           tool.name==='prepare_turn' && hasGrounding
             ? {...TURN_PLAN_SCHEMA,required:[...TURN_PLAN_SCHEMA.required,'grounding']} : tool.parameters })),
@@ -705,12 +740,12 @@ export async function openConversation(config: PaConfig, conversationId: string,
       // Pi validates the schema before execute. Such rejections also consume
       // tool budget, and their toolResult must reach the next bounded request.
       for (const item of turn.toolResults) if (!enteredTools.has(item.toolCallId)
-        && !skippedAfterResearch.has(item.toolCallId) && toolCalls < loop.maxToolCalls) {
+        && !skippedAfterResearch.has(item.toolCallId) && !skippedAfterReminder.has(item.toolCallId) && toolCalls < loop.maxToolCalls) {
         toolCalls++;
         recordResearch({ kind: 'tool_start' });
       }
-      if (!attributionReviewActive && companionTools?.prepareTurn && prepared && !preparationReceipt?.saved.length && !researchSaved
-        && turn.message.stopReason === 'stop' && hasUnbackedSaveClaim(turn.message.content
+      if (!attributionReviewActive && companionTools?.prepareTurn && prepared
+        && turn.message.stopReason === 'stop' && hasUnconfirmedSaveClaim(turn.message.content
           .filter(part => part.type === 'text').map(part => part.text).join(''))) {
         checkRun(signal);
         if (!saveClaimCorrection && providerCalls < loop.maxModelCalls) {
@@ -718,6 +753,11 @@ export async function openConversation(config: PaConfig, conversationId: string,
           return { action: 'continue' };
         }
         saveClaimFallback = true;
+        return { action: 'end' };
+      }
+      if (reminderAcknowledgements.length) {
+        checkRun(signal);
+        reminderAcknowledgementEnded = true;
         return { action: 'end' };
       }
       if (researchAcknowledgements.length) {
@@ -774,6 +814,10 @@ export async function openConversation(config: PaConfig, conversationId: string,
     agentSession.agent.toolExecution = 'sequential';
     agentSession.agent.beforeToolCall = async (context, signal) => {
       checkRun(signal);
+      if (reminderAcknowledgements.length) {
+        skippedAfterReminder.add(context.toolCall.id);
+        return { block: true, terminate: true, reason: '提醒操作已保存，本轮只按实际回执确认；其他操作未执行。' };
+      }
       if (researchAcknowledgements.length && !['create_research', 'continue_research'].includes(context.toolCall.name)) {
         skippedAfterResearch.add(context.toolCall.id);
         return { block: true, terminate: true, reason: '研究操作已保存，本轮只确认研究状态；其他操作未执行。' };
@@ -977,6 +1021,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           researchUnconfirmed = false;
           researchAcknowledgementEnded = false; skippedAfterResearch.clear();
           researchPartialFailure = false;
+          reminderAcknowledgements = []; reminderAcknowledgementEnded = false; skippedAfterReminder.clear();
           unresolvedResearchOperations.clear();
           collectionBudgetEnded = false; collectionToolFailed = false; linkReadAttempted = false;
           requestTimedOut = false;
@@ -1018,7 +1063,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
             }
             if (companionTools?.prepareTurn && (!prepared || preparationError)) throw new RequestError(preparationError ?? '本轮没有完成结构化准备，未放行回答。','error');
             if (collectionToolFailed) throw new RequestError('采集工具执行失败，已保存工具结果，未继续追加模型请求。', 'error');
-            if (assistant.stopReason === 'toolUse' && !collectionBudgetEnded && !researchAcknowledgementEnded && !groundingFallback && !attributionReviewActive) throw new RequestError('本轮没有形成完整回答，未继续追加模型请求。', 'error');
+            if (assistant.stopReason === 'toolUse' && !collectionBudgetEnded && !researchAcknowledgementEnded && !reminderAcknowledgementEnded && !groundingFallback && !attributionReviewActive) throw new RequestError('本轮没有形成完整回答，未继续追加模型请求。', 'error');
             const assistantText = assistant.content.filter((part) => part.type === 'text').map((part) => part.text).join('');
             // Collection notes are small; full evidence is retained by record().
             let answer = assistantText;
@@ -1035,9 +1080,13 @@ export async function openConversation(config: PaConfig, conversationId: string,
               answer='已搜索相关资料，但来源日期与现况尚未独立核验；以下仅依据本次检索结果。\n\n'+answer;
               groundedReplacement=true;
             }
-            if (researchAcknowledgementEnded || saveClaimFallback || groundedReplacement) {
-              if(researchAcknowledgementEnded||saveClaimFallback)
-              answer = saveClaimFallback ? '这次没有保存任何新资料。刚才的回复包含无法确认的保存承诺，未发送；请重新提出需要回答的问题或明确要记住的内容。'
+            if (researchAcknowledgementEnded || reminderAcknowledgementEnded || saveClaimFallback || groundedReplacement) {
+              if (reminderAcknowledgementEnded) answer = reminderAcknowledgements.join('\n')
+                + (skippedAfterReminder.size ? '\n本轮其他操作未执行。' : '');
+              else if(researchAcknowledgementEnded||saveClaimFallback)
+              answer = saveClaimFallback ? ((preparationReceipt as TurnReceipt | undefined)?.saved.length || researchSaved
+                ? '本轮已保存的资料仍保留，但没有确认安排提醒。刚才的回复包含无法确认的提醒承诺，未发送；请明确需要提醒的时间和事项。'
+                : '这次没有保存任何新资料，也没有确认安排提醒。刚才的回复包含无法确认的保存或提醒承诺，未发送；请重新提出需要回答的问题或明确要保存、提醒的内容。')
                 : researchAcknowledgements.join('\n') + (researchPartialFailure ? '\n本轮还有研究操作失败或状态未确认，未视为全部成功；上列已保存任务仍保留。' : '')
                   + (skippedAfterResearch.size ? '\n本轮其他操作未执行。' : '');
               // Keep the provider's toolUse message as execution history. Persist a
@@ -1059,11 +1108,10 @@ export async function openConversation(config: PaConfig, conversationId: string,
               }
             }
             options.research?.onFinalResponse?.({ stopReason: assistant.stopReason });
-            if (companionTools?.verifyLink && !linkReadAttempted && !researchAcknowledgementEnded && !groundingFallback) {
+            if (companionTools?.verifyLink && !linkReadAttempted && !researchAcknowledgementEnded && !reminderAcknowledgementEnded && !groundingFallback) {
               throw new RequestError('本轮尚未实际读取指定链接，不能确认网页内容可访问；未自动重试。', 'error');
             }
-            const receipt = preparationReceipt as TurnReceipt | undefined;
-            if (receipt && !receipt.saved.length && !researchSaved && hasUnbackedSaveClaim(answer)) {
+            if (preparationReceipt && hasUnconfirmedSaveClaim(answer)) {
               throw new RequestError('回复声称保存，但没有对应落库回执，已阻止发送。','error');
             }
             recordDiagnostic(() => diagnostics.event(diagnosticContext, 'answer', 'turn.completed',
@@ -1082,7 +1130,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
             });
             // Billing/audit persistence failures remain fatal even if cancellation raced them.
             if (fatal) throw fatal;
-            const confirmed = [...new Set(researchAcknowledgements)];
+            const confirmed = [...new Set([...researchAcknowledgements, ...reminderAcknowledgements])];
             if (requestTimedOut) throw new RequestError('单个模型请求超时。', 'timeout', { cause: error }, confirmed);
             if (cancelRequested) throw new RequestError('本轮请求已取消。', 'cancelled', { cause: error }, confirmed);
             if (error instanceof RequestError && confirmed.length) throw new RequestError(error.message,error.kind,{cause:error},confirmed);

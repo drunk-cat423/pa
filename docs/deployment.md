@@ -59,6 +59,12 @@ systemctl disable --now mysql.service
 
 首次启动需要对所有旧任务JSONL建立真实核对checkpoint，可能比后续启动慢；确认QQ READY之外，还须检查`isolatedRooms`和`integrity`，不能把房间隔离误当完整上线。发生隔离保留原文件和账本、停止该房间后台，按[startup-and-scheduling.md](startup-and-scheduling.md)核查；不得直接将dirty/corrupt改成verified。回退旧schema30必须恢复同一完整快照。
 
+### schema33一次性提醒
+
+先完成类型检查、提醒工具/到期发送/台账/迁移定向回归，以及已有渠道生命周期的相关用例；沿用现有模型、QQ白名单和预算，不新增凭据。服务器准备新发布并构建后，在统一storage锁内停PA，创建`before-schema-33`完整检查点，再以pa用户打开新ConversationStore迁移。核对所有旧业务表内容及原研究清理契约保持不变，新增work-ledger契约应为2；不回填历史提醒、不重排失败研究，也不创建收费验证任务。
+
+切换后检查实际进程与状态文件PID一致、QQ就绪、提醒服务started且未failed、房间无隔离及完整性正常。提醒到期检查随harness运行，不需要额外systemd服务或定时器；只发送用户已明确安排的事项，到期不调用模型。研究清理与Mihomo等已有服务保持当前配置，按原规则轮换备份和发布。实际模型时间理解与QQ群@仍需真实客户端验收；回退旧schema31须使用同一停机快照恢复数据。
+
 ### 研究功能与 schema24
 
 研究功能首次部署将 schema23 升级到24，停机快照标记 `before-schema-24` 检查点。报告目录位于 `PA_DATA_DIR/research`，由现有整个数据目录备份一并保留。先在新发布目录完成构建及研究端到端检查；停止服务并完成快照后，以pa用户打开新版本ConversationStore迁移，核对原文和外键，再切换并启动。不能把旧schema23代码直接指向升级后的数据库。

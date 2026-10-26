@@ -15,6 +15,7 @@ import { splitMarkdown } from './markdown-chunks.js';
 import { ImageAssets, ImageAssetError } from './image-assets.js';
 import { ResearchService } from './research-service.js';
 import { SessionIntegrityError } from './session-integrity.js';
+import {ReminderService} from './reminder-service.js';
 
 export interface ChannelTransport {
   send(message: OutboundMessage): Promise<DeliveryResult>;
@@ -53,6 +54,7 @@ export class ChannelHarness {
   private readonly admissions = new Map<string, Promise<unknown>>();
   private readonly admissionAbort = new AbortController();
   private readonly research?: ResearchService;
+  private readonly reminders: ReminderService;
 
   constructor(private readonly config: PaConfig, private readonly routes: ChannelRoute[],
     private readonly transport: ChannelTransport, private readonly maxCalls: number, policy: HarnessPolicy = NO_OWNER_POLICY,
@@ -65,6 +67,12 @@ export class ChannelHarness {
     this.allowed = new Set(routes.map(channelConversationKey));
     this.policy = validateHarnessPolicy(policy);
     this.imageAssets = new ImageAssets(config);
+    this.reminders=new ReminderService(config,
+      ()=>this.routes.filter(route=>{
+        const key=channelConversationKey(route),room=this.conversations.get(key);
+        return !this.closed&&!this.fatal&&!this.isolatedRooms.has(key)&&room?.integrityStatus().status==='healthy';
+      }), (route,operation)=>this.output(route,operation),message=>this.transport.send(message),
+      error=>{this.fatal=error;this.onTaskError?.();});
     if (config.research?.enabled) this.research = new ResearchService(config, routes,
       message => this.output(message.route, () => this.closed ? Promise.resolve({ status: 'rejected' as const }) : this.transport.send(message)),
       () => { this.fatal = new Error('研究任务持久化失败。'); this.onTaskError?.(); });
@@ -76,6 +84,7 @@ export class ChannelHarness {
     isolatedRooms: [...this.isolatedRooms].map(([conversation,error]) => ({conversation,error})),
     integrity: [...this.conversations].map(([conversation,c]) => ({conversation,...c.integrityStatus()})),
     ...(this.research ? { research: this.research.info() } : {}),
+    reminders:this.reminders.info(),
     memory: [...this.conversations].map(([key, conversation]) => ({ conversation: key, ...conversation.memoryStatus() })) }; }
 
   async waitForMemory(): Promise<void> {
@@ -99,6 +108,7 @@ export class ChannelHarness {
       }));
       this.pump();
       if (!this.closed) this.research?.start();
+      if (!this.closed) this.reminders.start();
     }
   }
 
@@ -111,6 +121,7 @@ export class ChannelHarness {
             if(error instanceof SessionIntegrityError) this.isolate(key,error);
             else {this.fatal=error;this.onTaskError?.();}
           },
+          reminderContext:(conversationId,sourceId,text)=>this.reminders.context(conversationId,sourceId,text),
           ...(this.research ? { researchContext: (conversationId, sourceId, send) => this.research!.context(conversationId, sourceId, send) } : {}) });
       this.opening.set(key, pending);
       pending.then(conversation => {
@@ -331,7 +342,7 @@ export class ChannelHarness {
         const confirmed = error.confirmedActions.join('\n');
         const receipt = Buffer.from(confirmed,'utf8').subarray(0,700).toString('utf8').replace(/\ufffd$/u,'');
         if (!this.closed) await this.failureNotice(conversation,message,taskId,
-          receipt ? `${receipt}\n其余操作未能确认完成，不会自动重试；已保存事项可查询研究清单。`
+          receipt ? `${receipt}\n其余操作未能确认完成，不会自动重试。`
           : error.kind==='timeout' ? '这次请求超时，未能完成答复。原消息和已保存的操作会保留，不会自动重试。'
             : '这次未能完成答复。原消息和已保存的操作会保留；你可以再发消息继续。',replyOffset);
         return 'failed';
@@ -401,6 +412,7 @@ export class ChannelHarness {
     this.closed = true;
     this.admissionAbort.abort();
     const researchClosing = this.research?.abort();
+    const reminderClosing=this.reminders.close();
     for (const [id,waiting] of this.waiters) if(this.busyRooms.get(waiting.key)!==id) {
       waiting.resolve('ignored'); this.waiters.delete(id);
     }
@@ -412,6 +424,7 @@ export class ChannelHarness {
     await Promise.allSettled(this.jobs);
     await researchClosing;
     await this.research?.close();
+    await reminderClosing;
     await Promise.allSettled(this.outputs.values());
     // An open operation already in progress may have completed after the first close pass.
     await Promise.all([...this.conversations.values()].map(conversation => conversation.close()));

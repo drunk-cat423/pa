@@ -11,9 +11,10 @@
 | src/config.ts | 聊天与后台调用预算，不读取其他应用凭据 |
 | src/runtime.ts | 受限 Pi 会话、独立 ModelRuntime 工厂、最终输入容量估算、公开 API 重建投影 |
 | src/context-tokens.ts | 成功SDK输入用量校准、字段与正文细分指纹、旧样本核验升级、缓存统计校验及新增内容保守估算 |
-| src/store.ts | schema v31、原文/run/投递、独立失败回执、长回答文档与页面引用、显式记忆、迁移备份、去重和上下文水位 |
+| src/store.ts | schema v33、原文/run/投递、独立失败回执、长回答文档与页面引用、显式记忆、迁移备份、去重和上下文水位 |
 | src/context-people.ts / src/answer-grounding.ts | 稳定人物展示标签、真人经历来源与有界归属核验，标签不用于鉴权 |
 | src/session-integrity.ts / src/session-integrity-store.ts | Pi完整性账本、dirty会话核对、损坏隔离与启动巡检 |
+| src/reminder-tools.ts / src/reminder-service.ts / src/work-ledger-store.ts | 本人一次性提醒工具、持久到期台账、原会话主动通知、取消与未知投递隔离 |
 | src/research-tools.ts / src/research-service.ts | 模型研究工具、独立后台Pi循环、次数预算、受阻/恢复和正式报告投递 |
 | src/research-store.ts / src/research-types.ts | 研究台账、北京时间统计、报告FTS、不可变版本文件、批次证据与投递幂等 |
 | src/research-workflow.ts / src/research-workflow-store.ts / src/research-workflow-types.ts | 分阶段提示与协议、程序组装、schema25固定输入/章节版本/审查检查点、跨批恢复与完成门槛 |
