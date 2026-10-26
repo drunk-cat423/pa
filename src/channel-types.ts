@@ -55,6 +55,8 @@ export interface OutboundMessage {
   partIndex?: number;
   plainText?: boolean;
   markdown?: boolean;
+  /** Original room's actual sender ID, supplied by harness, never model text. */
+  mentionSenderId?: string;
   /** Harness-authorized report bytes, never a model-supplied path or remote URL. */
   file?: { name: string; data: Buffer };
 }

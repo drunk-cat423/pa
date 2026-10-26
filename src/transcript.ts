@@ -1,9 +1,10 @@
 import { lstat, readFile } from 'node:fs/promises';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import { RESEARCH_TOOL_SPECS } from './research-tools.js';
+import { REMINDER_TOOL_SPECS } from './reminder-tools.js';
 
 const recordedTools = new Set(['web_search', 'web_fetch', 'update_profile', 'read_history', 'read_image',
-  'answer_in_depth', 'prepare_turn', ...RESEARCH_TOOL_SPECS.map(tool => tool.name)]);
+  'answer_in_depth', 'prepare_turn', ...RESEARCH_TOOL_SPECS.map(tool => tool.name), ...REMINDER_TOOL_SPECS.map(tool => tool.name)]);
 
 export class TranscriptIntegrityError extends Error {
   constructor(message: string,options?: ErrorOptions) {super(message,options);this.name='TranscriptIntegrityError';}

@@ -1,4 +1,5 @@
 export function downgradeSchema31(db) {
+  db.exec('DROP TABLE IF EXISTS work_delivery_receipts;');
   db.exec(`DROP TABLE IF EXISTS work_notifications; DROP TABLE IF EXISTS work_events;
     DROP TABLE IF EXISTS work_attempts; DROP TABLE IF EXISTS work_authorizations; DROP TABLE IF EXISTS work_items;`);
   db.prepare("DELETE FROM maintenance_contracts WHERE domain='work-ledger'").run();

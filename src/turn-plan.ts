@@ -143,7 +143,18 @@ export const RESPONSE_MODE_PROMPTS: Record<ReplyMode, string> = {
 };
 
 /** A narrow final safeguard, not a classifier of arbitrary natural language intent. */
+export function hasUnbackedReminderClaim(answer: string): boolean {
+  const visible = answer.replace(/```[\s\S]*?```|`[^`]*`|“[^”]*”|‘[^’]*’|"[^"\n]*"|'[^'\n]*'/g, '');
+  return (visible.match(/[^。！!？?\n]+[。！!？?]?/gu) ?? []).some(part => {
+    // A question offering a choice is not a promise to perform that choice.
+    if (/[？?]$/u.test(part.trim()) && /^(?:你|您)(?:希望|想|要|需要)/u.test(part.trim())) return false;
+    if (/不|没|未|无法|不能|并非|如果|假如/.test(part)) return false;
+    return /(?:我(?:已经|已)?(?:帮你|为你)?(?:安排|设置)(?:好了?|了)提醒|(?:已经|已|成功)(?:帮你|为你)?(?:安排|设置|创建)(?:好了?|了)?(?:一次性)?提醒|提醒(?:已经|已)(?:安排|设置|创建)|(?:我)?(?:会|将|届时|到时).{0,40}提醒(?:你|您))/u.test(part);
+  });
+}
+
 export function hasUnbackedSaveClaim(answer: string): boolean {
+  if (hasUnbackedReminderClaim(answer)) return true;
   const visible = answer.replace(/```[\s\S]*?```|`[^`]*`|“[^”]*”|‘[^’]*’|"[^"\n]*"|'[^'\n]*'/g, '');
   return visible.split(/[。！!？?\n]/).some(part => {
     const sentence = part.trim().replace(/^(?:(?:好的?|行|收到|明白了?)[，,、：:\s]*)+/u, '');

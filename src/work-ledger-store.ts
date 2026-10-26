@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { MemoryError } from './memory-types.js';
 import type { ChannelRoute } from './channel-types.js';
@@ -7,6 +7,8 @@ import type { NotificationOutcome, ReminderInput, ReminderLease, WorkItem, WorkN
 type Tx = <T>(operation: () => T) => T;
 const MAX_GOAL = 2000;
 const LEASE_MS = 60_000;
+export const REMINDER_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const MAINTENANCE_BATCH = 100;
 const iso = (ms: number) => new Date(ms).toISOString();
 const routeKey = (route: ChannelRoute) => JSON.stringify([route.channel,route.accountId,route.roomType,route.roomId]);
 
@@ -48,6 +50,24 @@ export function migrateWorkLedger(db: DatabaseSync): void {
   db.prepare(`INSERT INTO maintenance_contracts(domain,version) VALUES('work-ledger',1)`).run();
 }
 
+export function migrateReminderDelivery(db: DatabaseSync): void {
+  const contract = db.prepare(`SELECT version FROM maintenance_contracts WHERE domain='work-ledger'`).get();
+  if (contract?.version !== 1) throw new MemoryError('提醒投递迁移需要 work-ledger 契约版本 1。');
+  db.exec(`
+    CREATE TABLE work_delivery_receipts (
+      work_id TEXT PRIMARY KEY, origin_message_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+      owner_person_id TEXT NOT NULL, input_hash TEXT NOT NULL, notification_id TEXT NOT NULL UNIQUE,
+      result TEXT NOT NULL CHECK(result='sent'), external_message_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+      UNIQUE(origin_message_id,idempotency_key)
+    );
+    CREATE INDEX work_delivery_receipts_expiry ON work_delivery_receipts(expires_at,work_id);
+    CREATE INDEX work_notifications_sending_expiry ON work_notifications(lease_until,id) WHERE status='sending';
+    CREATE INDEX work_attempts_running_expiry ON work_attempts(lease_until,work_id,attempt) WHERE status='running';
+    UPDATE maintenance_contracts SET version=2 WHERE domain='work-ledger' AND version=1;
+  `);
+}
+
 export class WorkLedgerStore {
   constructor(private readonly db: DatabaseSync, private readonly transaction: Tx) {}
 
@@ -59,6 +79,12 @@ export class WorkLedgerStore {
       const remindAt = Date.parse(input.remindAt);
       if (!Number.isSafeInteger(remindAt) || !Number.isFinite(new Date(remindAt).getTime()) || remindAt < 0) throw new MemoryError('提醒时间无效。');
       const key = input.key.trim();
+      const receipt = this.db.prepare(`SELECT owner_person_id,input_hash FROM work_delivery_receipts WHERE origin_message_id=? AND idempotency_key=?`).get(sourceMessageId,key);
+      if (receipt) {
+        if (receipt.owner_person_id !== source.personId || receipt.input_hash !== this.inputHash(source.personId,input.goal.trim(),remindAt,input.timezone,JSON.stringify(source.route)))
+          throw new MemoryError('相同幂等键已用于不同提醒内容。');
+        throw new MemoryError('该提醒已提醒，不能重复安排。');
+      }
       const existing = this.db.prepare(`SELECT * FROM work_items WHERE origin_message_id=? AND idempotency_key=?`)
         .get(sourceMessageId, key);
       if (existing) {
@@ -77,15 +103,18 @@ export class WorkLedgerStore {
     });
   }
 
-  listReminders(conversationId: string, sourceMessageId: string): WorkItem[] {
+  listReminders(conversationId: string, sourceMessageId: string, page: {offset?:number;limit?:number} = {}): WorkItem[] {
     const source = this.source(conversationId, sourceMessageId);
+    const offset=page.offset??0,limit=page.limit??100;
+    if(!Number.isSafeInteger(offset)||offset<0||offset>1_000_000||!Number.isSafeInteger(limit)||limit<1||limit>101)
+      throw new MemoryError('提醒列表范围无效。');
     const route=source.route;
     const rows=route.roomType==='private'
-      ? this.db.prepare(`SELECT * FROM work_items WHERE owner_person_id=? AND kind='reminder' AND json_extract(source_route_json,'$.roomType')='private' ORDER BY created_at DESC,id LIMIT 100`).all(source.personId)
+      ? this.db.prepare(`SELECT * FROM work_items WHERE owner_person_id=? AND kind='reminder' AND json_extract(source_route_json,'$.roomType')='private' ORDER BY created_at DESC,id LIMIT ? OFFSET ?`).all(source.personId,limit,offset)
       : this.db.prepare(`SELECT * FROM work_items WHERE owner_person_id=? AND kind='reminder'
           AND json_extract(source_route_json,'$.channel')=? AND json_extract(source_route_json,'$.accountId')=?
           AND json_extract(source_route_json,'$.roomType')=? AND json_extract(source_route_json,'$.roomId')=?
-          ORDER BY created_at DESC,id LIMIT 100`).all(source.personId,route.channel,route.accountId,route.roomType,route.roomId);
+          ORDER BY created_at DESC,id LIMIT ? OFFSET ?`).all(source.personId,route.channel,route.accountId,route.roomType,route.roomId,limit,offset);
     return rows.map(row => this.mapWork(row));
   }
 
@@ -134,8 +163,8 @@ export class WorkLedgerStore {
         let source: ReturnType<WorkLedgerStore['source']> | null = null;
         try { source = this.source(String(row.source_conversation_id), String(row.origin_message_id)); }
         catch (error) { if (!(error instanceof MemoryError)) throw error; }
-        if (!source || !auth || auth.revoked_at != null || auth.owner_person_id !== source.personId || auth.source_actor_id !== source.actorId
-          || auth.source_route_json !== routeJson || !allowedRoutes.some(route => routeKey(route) === routeKey(source.route))) {
+        if (!source || !auth || auth.revoked_at != null || row.owner_person_id !== source.personId || auth.owner_person_id !== source.personId || auth.source_actor_id !== source.actorId
+          || auth.source_route_json !== routeJson || routeKey(source.route) !== routeKey(JSON.parse(routeJson) as ChannelRoute) || !allowedRoutes.some(route => routeKey(route) === routeKey(source.route))) {
           const time = Date.now();
           this.db.prepare(`UPDATE work_items SET status='waiting_user',version=version+1,updated_at=? WHERE id=? AND status='scheduled'`).run(time,String(row.id));
           this.event(String(row.id),'authorization_changed',time,'提醒来源身份或路由授权已变化',String(row.origin_message_id));
@@ -177,8 +206,9 @@ export class WorkLedgerStore {
       let source: ReturnType<WorkLedgerStore['source']> | null = null;
       try { source=this.source(String(work.source_conversation_id),String(work.origin_message_id)); }
       catch(error) { if(!(error instanceof MemoryError)) throw error; }
-      if(!source||!auth||auth.revoked_at!=null||auth.owner_person_id!==source.personId||auth.source_actor_id!==source.actorId
-        ||auth.source_route_json!==routeJson||!allowedRoutes.some(route=>routeKey(route)===routeKey(JSON.parse(routeJson) as ChannelRoute))) {
+      if(!source||!auth||auth.revoked_at!=null||work.owner_person_id!==source.personId||auth.owner_person_id!==source.personId||auth.source_actor_id!==source.actorId
+        ||auth.source_route_json!==routeJson||work.source_route_json!==routeJson||routeKey(source.route)!==routeKey(JSON.parse(routeJson) as ChannelRoute)
+        ||!allowedRoutes.some(route=>routeKey(route)===routeKey(JSON.parse(routeJson) as ChannelRoute))) {
         this.db.prepare(`UPDATE work_notifications SET status='rejected',updated_at=? WHERE id=? AND status='queued'`).run(at,id);
         this.event(String(row.work_id),'authorization_changed',at,'通知发送前身份或路由授权已变化',String(work.origin_message_id));
         return this.getNotification(id);
@@ -194,22 +224,47 @@ export class WorkLedgerStore {
       .map(row => this.getNotification(String(row.id)));
   }
 
-  ackNotification(id: string, outcome: NotificationOutcome, now: string | number): WorkNotification {
+  ackNotification(id: string, outcome: NotificationOutcome, now: string | number, externalMessageId?: string): WorkNotification {
     return this.transaction(() => {
       if (!['sent','rejected','uncertain'].includes(outcome)) throw new MemoryError('通知回执状态无效。');
-      const at=this.toMs(now), row=this.db.prepare('SELECT status FROM work_notifications WHERE id=?').get(id);
+      if (outcome==='sent' && (typeof externalMessageId!=='string'||!externalMessageId.trim()||externalMessageId.length>512)) throw new MemoryError('成功送达必须提供真实外部消息编号。');
+      const at=this.toMs(now), row=this.db.prepare('SELECT status,work_id FROM work_notifications WHERE id=?').get(id);
       if (!row) throw new MemoryError('通知不存在。');
       if (row.status !== 'sending') throw new MemoryError('通知尚未预约发送。');
+      if (outcome==='sent') {
+        const notification={...this.getNotification(id),status:'sent' as const};
+        const work=this.db.prepare('SELECT * FROM work_items WHERE id=?').get(String(row.work_id));
+        if (!work) throw new MemoryError('提醒不存在。');
+        this.db.prepare(`INSERT INTO work_delivery_receipts VALUES(?,?,?,?,?,?,'sent',?,?,?)`).run(
+          String(work.id),String(work.origin_message_id),String(work.idempotency_key),String(work.owner_person_id),
+          this.inputHash(String(work.owner_person_id),String(work.goal),Number(work.remind_at),String(work.timezone),String(work.source_route_json)),
+          id,externalMessageId!,at,at+REMINDER_RECEIPT_RETENTION_MS);
+        this.db.prepare('DELETE FROM work_notifications WHERE work_id=?').run(String(work.id));
+        this.db.prepare('DELETE FROM work_attempts WHERE work_id=?').run(String(work.id));
+        this.db.prepare('DELETE FROM work_events WHERE work_id=?').run(String(work.id));
+        this.db.prepare('DELETE FROM work_authorizations WHERE work_id=?').run(String(work.id));
+        this.db.prepare('DELETE FROM work_items WHERE id=?').run(String(work.id));
+        return notification;
+      }
       this.db.prepare('UPDATE work_notifications SET status=?,updated_at=? WHERE id=? AND status=\'sending\'').run(outcome,at,id);
       return this.getNotification(id);
     });
   }
 
+  purgeExpiredReceipts(now: string | number): number {
+    return this.transaction(() => Number(this.db.prepare(`DELETE FROM work_delivery_receipts WHERE work_id IN
+      (SELECT work_id FROM work_delivery_receipts WHERE expires_at<=? ORDER BY expires_at,work_id LIMIT ?)`)
+      .run(this.toMs(now),MAINTENANCE_BATCH).changes));
+  }
+
   recoverAfterRestart(now: string | number): void {
     this.transaction(() => {
       const at=this.toMs(now);
-      this.db.prepare(`UPDATE work_notifications SET status='uncertain',updated_at=? WHERE status='sending' AND lease_until<=?`).run(at,at);
-      const attempts=this.db.prepare(`SELECT a.*,w.status AS work_status FROM work_attempts a JOIN work_items w ON w.id=a.work_id WHERE a.status='running' AND a.lease_until<=?`).all(at);
+      this.db.prepare(`UPDATE work_notifications SET status='uncertain',updated_at=? WHERE id IN
+        (SELECT id FROM work_notifications WHERE status='sending' AND lease_until<=? ORDER BY lease_until,id LIMIT ?)`).run(at,at,MAINTENANCE_BATCH);
+      const attempts=this.db.prepare(`SELECT a.*,w.status AS work_status FROM work_attempts a JOIN work_items w ON w.id=a.work_id
+        WHERE a.status='running' AND a.lease_until<=? AND w.kind='reminder' AND w.status IN ('running','cancel_requested')
+        ORDER BY a.lease_until,a.work_id,a.attempt LIMIT ?`).all(at,MAINTENANCE_BATCH);
       for(const a of attempts){
         const next=a.work_status==='cancel_requested'?'cancelled':'scheduled';
         this.db.prepare(`UPDATE work_attempts SET status='interrupted',finished_at=? WHERE work_id=? AND attempt=?`).run(at,String(a.work_id),Number(a.attempt));
@@ -244,7 +299,8 @@ export class WorkLedgerStore {
     const auth=this.db.prepare('SELECT * FROM work_authorizations WHERE work_id=?').get(lease.workId);
     const routeJson=String(row.source_route_json);
     if(source.personId!==lease.ownerPersonId||source.personId!==row.owner_person_id||!auth||auth.revoked_at!=null||source.actorId!==auth.source_actor_id
-      ||auth.owner_person_id!==source.personId||auth.source_route_json!==routeJson||!allowedRoutes.some(route=>routeKey(route)===routeKey(source.route))) throw new MemoryError('提醒授权已变化。');
+      ||auth.owner_person_id!==source.personId||auth.source_route_json!==routeJson||routeKey(source.route)!==routeKey(JSON.parse(routeJson) as ChannelRoute)
+      ||!allowedRoutes.some(route=>routeKey(route)===routeKey(source.route))) throw new MemoryError('提醒授权已变化。');
     return row;
   }
   private toMs(value:string|number):number { const ms=typeof value==='number'?value:Date.parse(value); if(!Number.isSafeInteger(ms)||!Number.isFinite(new Date(ms).getTime())||ms<0) throw new MemoryError('时间参数无效。'); return ms; }
@@ -262,6 +318,19 @@ export class WorkLedgerStore {
     return queryRoute.roomType==='private'&&workRoute.roomType==='private' || routeKey(queryRoute)===routeKey(workRoute);
   }
   private getWork(id:string):WorkItem { const row=this.db.prepare('SELECT * FROM work_items WHERE id=?').get(id); if(!row) throw new MemoryError('提醒不存在。'); return this.mapWork(row); }
-  private getNotification(id:string):WorkNotification { const r=this.db.prepare('SELECT * FROM work_notifications WHERE id=?').get(id); if(!r) throw new MemoryError('通知不存在。'); return {id:String(r.id),workId:String(r.work_id),eventSeq:Number(r.event_seq),route:JSON.parse(String(r.route_json)) as ChannelRoute,text:String(r.text),status:r.status as WorkNotification['status']}; }
-  private mapWork(r:Record<string,unknown>):WorkItem { return {id:String(r.id),ownerPersonId:String(r.owner_person_id),kind:'reminder',goal:String(r.goal),originMessageId:String(r.origin_message_id),sourceConversationId:String(r.source_conversation_id),sourceRoute:JSON.parse(String(r.source_route_json)) as ChannelRoute,status:r.status as WorkItem['status'],version:Number(r.version),remindAt:iso(Number(r.remind_at)),timezone:'Asia/Shanghai',createdAt:iso(Number(r.created_at)),updatedAt:iso(Number(r.updated_at))}; }
+  private inputHash(owner:string,goal:string,remindAt:number,timezone:string,routeJson:string):string {
+    return createHash('sha256').update(JSON.stringify([owner,goal,remindAt,timezone,routeKey(JSON.parse(routeJson) as ChannelRoute)])).digest('hex');
+  }
+  private getNotification(id:string):WorkNotification {
+    const r=this.db.prepare(`SELECT n.*,w.remind_at,a.external_user_id AS sender_id FROM work_notifications n
+      JOIN work_items w ON w.id=n.work_id JOIN messages m ON m.id=w.origin_message_id JOIN actors a ON a.id=m.actor_id WHERE n.id=?`).get(id);
+    if(!r) throw new MemoryError('通知不存在。');
+    return {id:String(r.id),workId:String(r.work_id),eventSeq:Number(r.event_seq),route:JSON.parse(String(r.route_json)) as ChannelRoute,text:String(r.text),
+      senderId:String(r.sender_id),remindAt:iso(Number(r.remind_at)),status:r.status as WorkNotification['status']};
+  }
+  private mapWork(r:Record<string,unknown>):WorkItem {
+    const notification=this.db.prepare('SELECT status FROM work_notifications WHERE work_id=? ORDER BY event_seq DESC LIMIT 1').get(String(r.id));
+    return {id:String(r.id),ownerPersonId:String(r.owner_person_id),kind:'reminder',goal:String(r.goal),originMessageId:String(r.origin_message_id),sourceConversationId:String(r.source_conversation_id),sourceRoute:JSON.parse(String(r.source_route_json)) as ChannelRoute,status:r.status as WorkItem['status'],version:Number(r.version),remindAt:iso(Number(r.remind_at)),timezone:'Asia/Shanghai',createdAt:iso(Number(r.created_at)),updatedAt:iso(Number(r.updated_at)),
+      ...(notification?{notificationStatus:notification.status as WorkNotification['status']}:{})};
+  }
 }

@@ -69,6 +69,6 @@ test('v8 migration backs up and preserves archived legacy field metadata, identi
     assert.equal(f.store.autoMemory.claimNext(f.room.id,{owner:'retry',leaseMs:60000,pipeline:'legacy'}),undefined);
     assert.deepEqual(f.inspect(db=>db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(job.id)),frozenBeforeMigration);
     const current=f.inbound('查询历史');assert.equal(f.store.readHistory(f.room.id,current.existingMessageId,{query:'火锅'}).messages[0].id,old.existingMessageId);
-    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),32);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
+    assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),33);assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
   }finally{f.close();}
 });

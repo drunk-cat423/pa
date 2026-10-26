@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { SessionIntegrityStore, migrateSessionIntegrity } from './session-integrity-store.js';
-import { WorkLedgerStore, migrateWorkLedger } from './work-ledger-store.js';
+import { WorkLedgerStore, migrateWorkLedger, migrateReminderDelivery } from './work-ledger-store.js';
 import { isDeepStrictEqual } from 'node:util';
 import { MemoryError } from './memory-types.js';
 import type { MemoryChange, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, PrimaryPerson,
@@ -74,7 +74,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 32;
+const SCHEMA_VERSION = 33;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -565,6 +565,7 @@ export class ConversationStore {
         migrateSessionIntegrity(this.db);
       }
       if(version<32) migrateWorkLedger(this.db);
+      if(version<33) migrateReminderDelivery(this.db);
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
     } catch (error) {

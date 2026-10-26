@@ -75,7 +75,7 @@ test('真实V1布局迁移到V6，保留消息、运行与投递并可写入记�
     assert.deepEqual(store.contextState('conv'), { required: false, generation: 0 });
     store.ackDelivery('delivery', 'sent');
     inspect(databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version,32);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version,33);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     });
     store.close();
@@ -204,7 +204,7 @@ test('真实V3增量迁移保留所有业务列、rowid及审计，旧群记忆�
     assert.equal(store.queryMemories('conv')[0].revision, 2);
     assert.deepEqual(store.contextState('conv'), { required: true, generation: 4 });
     inspect(databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version,32);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version,33);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       assert.ok(db.prepare('SELECT message_kind FROM messages').all().every(row => row.message_kind === 'chat'));
       assert.ok(db.prepare('SELECT scope_type FROM memories').all().every(row => row.scope_type === 'legacy'));
@@ -242,7 +242,7 @@ test('真实V2迁移保留记忆版本、来源、使用审计与pending重置�
     assert.deepEqual(store.queryMemories(channel.id), []);
     assert.throws(() => store.correctMemory(channel.id, 'memory', { content: '越界' }), MemoryError);
     inspect(databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version,32);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version,33);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       const deliveries = db.prepare('SELECT room_id FROM deliveries WHERE id = ?').get('delivery');
       assert.equal(deliveries.room_id, 'room');
@@ -313,7 +313,7 @@ test('真实V4增量迁移保留rowid/正文/修订/来源/使用与reset水位�
     });
     reopened = new ConversationStore(f.databasePath);
     inspect(f.databasePath, db => {
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version,32);
+      assert.equal(db.prepare('PRAGMA user_version').get().user_version,33);
       for (const [table, rows] of Object.entries(before)) {
         const columns = Object.keys(rows[0]).join(', ');
         assert.deepEqual(db.prepare(`SELECT ${columns} FROM ${table}`).all().map(row => ({ ...row })), rows);
