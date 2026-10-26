@@ -1,6 +1,6 @@
 # 开发说明
 
-当前实现遵循 [记忆 v1 确认方案](design/companion_memory_v1.md)，2026-10-16后续消融取消个人事件记忆和全部向量运行能力，旧数据保留；运行配置与命令见 [memory.md](memory.md)。后台模型默认关闭，离线验证完成后仍须分别确认真实模型预算及 QQ 事件。
+首次接手、按任务找模块、范围检查及交接见 [开发入口](repo-harness.md)。当前有效约定见根目录 [AGENTS.md](../AGENTS.md)，各主题文档说明实现边界；旧设计只作背景，不覆盖后续已确认的变更。运行模型、QQ 与后台任务需按实际配置及本次授权执行，离线检查不需要生产凭据。
 
 本轮恢复边界与已确认问题见 [健壮性审查](robustness-review.md)。工具拒绝允许在原预算内修正，不能与持久化损坏、权限绕过或未知收费调用混为一类。
 
@@ -11,13 +11,15 @@
 | src/config.ts | 聊天与后台调用预算，不读取其他应用凭据 |
 | src/runtime.ts | 受限 Pi 会话、独立 ModelRuntime 工厂、最终输入容量估算、公开 API 重建投影 |
 | src/context-tokens.ts | 成功SDK输入用量校准、字段与正文细分指纹、旧样本核验升级、缓存统计校验及新增内容保守估算 |
-| src/store.ts | schema v30、原文/run/投递、独立失败回执、长回答文档与页面引用、显式记忆、迁移备份、去重和上下文水位 |
+| src/store.ts | schema v31、原文/run/投递、独立失败回执、长回答文档与页面引用、显式记忆、迁移备份、去重和上下文水位 |
+| src/context-people.ts / src/answer-grounding.ts | 稳定人物展示标签、真人经历来源与有界归属核验，标签不用于鉴权 |
+| src/session-integrity.ts / src/session-integrity-store.ts | Pi完整性账本、dirty会话核对、损坏隔离与启动巡检 |
 | src/research-tools.ts / src/research-service.ts | 模型研究工具、独立后台Pi循环、次数预算、受阻/恢复和正式报告投递 |
 | src/research-store.ts / src/research-types.ts | 研究台账、北京时间统计、报告FTS、不可变版本文件、批次证据与投递幂等 |
 | src/research-workflow.ts / src/research-workflow-store.ts / src/research-workflow-types.ts | 分阶段提示与协议、程序组装、schema25固定输入/章节版本/审查检查点、跨批恢复与完成门槛 |
 | src/auto-memory-store.ts | 通用person绑定、可见消息序列、滚动摘要及容量快照、任务租约、子批次检查点、Topic/画像/关键词检索 |
 | src/self-profile-store.ts | 全局AI画像修订、带来源待整理建议、原子归档和并发版本检查 |
-| src/auto-memory.ts | 与聊天独立的后台调度、严格输出校验、显式失败重试、容量等待及 Topic 关键词检索 |
+| src/auto-memory.ts | 资料与压缩独立调度、组件失败隔离、有界退避恢复、容量等待及 Topic 关键词检索 |
 | src/memory-provider.ts | 独立 Pi 画像/Topic 提取请求 |
 | src/profile-limits.ts / src/profile-pending.ts | 人物完整画像容量、处理回执及来源强度校验 |
 | src/diagnostics.ts / src/logs.ts / src/logs-cli.ts | 独立诊断索引、请求响应证据、任务查询及无模型的离线解析校验 |
@@ -41,9 +43,13 @@ QQ 回答使用原生 Markdown；长回答按 UTF-8 字节限制自动切段并�
 ## 检查
 
 ```powershell
-npm run check
-npm test
+node scripts/repo-check.mjs --list
+node scripts/repo-check.mjs memory
+# 涉及多个范围时合并选择；综合改动用 all。
+node scripts/repo-check.mjs chat delivery
 ```
+
+脚本先编译与类型检查，再以并发2运行已有离线回归；分组与执行文件通过 `--list` 查询。原npm入口保留，不修改依赖清单或CI。
 
 测试使用临时目录、SQLite 和本地 HTTP，不调用外部模型、不消费生产凭据。2026-10-23再次按用户要求清理：只保留有同名实际失败记录、明确改名的失败延续记录，或能对应已确认故障复现的现存用例。保留依据逐项列在 [test/regressions.json](../test/regressions.json)，私有故障日志不提交。按具体用例及参数化变体筛选，不因文件中某一项失败就保留整个文件；仅有文件导入失败不算其中全部用例失败。已经移除的旧功能测试不恢复。
 
@@ -65,7 +71,7 @@ npm test
 
 ```powershell
 npm run build
-node --test test/research-materials.test.mjs test/research-context.test.mjs
+node --test --test-concurrency=2 test/research-materials.test.mjs test/research-context.test.mjs
 ```
 
 后续优先为实际故障补充回归用例，说明触发条件和错误结果；同一入口、同一输入和同一结果不重复覆盖。迁移测试也按失败记录筛选，不整组保留。
@@ -76,12 +82,12 @@ Mock只验证程序契约。真实模型的人物归属、提取质量、关键�
 
 ## 当前完成与后续边界
 
-自动记忆 v1 及2026-10-16的统一对话准备已完成本地实现，参考 [存储规则](storage.md) 与 [循环协议](design/companion-tool-loop.md)。v11升级先备份再增加群规则、准备回执、pending用途与Topic全文索引，原文、冻结批次和旧记忆保留。服务器历史失败首因未能从旧通用错误恢复；离线重放只证明已修复的覆盖契约问题，不代表生产批次已经成功重跑。
+当前包含统一对话准备、两条记忆流水线、单人物增量提案与独立组件恢复，以及schema31完整性账本和渠道调度，参考 [记忆](memory.md)、[存储](storage.md)、[循环协议](design/companion-tool-loop.md) 与 [启动和调度](startup-and-scheduling.md)。迁移保持原文、旧版本、冻结任务和审计；旧冻结协议与新任务分开处理。生产积压属于运行状态，应按诊断和任务库核对，不将某次维护的批次数写成当前系统事实。
 
 src/turn-plan.ts集中管理intent/mode/updates协议及三种回答提示；channel harness传可信policy启用prepare_turn，画像作为软参考不反复复述。一般渠道对话含准备和回答两次模型请求，网络/历史续轮计入相同上限。真实模型的意图、自然表达与语义检索质量尚需按授权联调，当前不宣称已经改善线上聊天质量。
 
 后台每次启动的调用上限由操作者明确设置。轻量自我画像已接入：所有成员的明确建议先保存并注入，再随记忆批次归档；没有独立关系模式、好感度或人格审批流程。Telegram、长回答合并转发和主动插话未在本次实现中。独立群情报摘要、人物 FTS/向量和删除功能已按用户决定排除；群聊/私聊的会话压缩摘要用于承接连续对话。
 
-[v0.2 基线](design/pi_evolving_companion_technical_design_v0.2.md) 与 [Shiori 参考](shiori-memory-reference.md) 保留设计来源；发生冲突时以 [记忆 v1](design/companion_memory_v1.md) 和用户最新决定为准。
+[v0.2 基线](design/pi_evolving_companion_technical_design_v0.2.md)、[记忆 v1 设计](design/companion_memory_v1.md) 与 [Shiori 参考](shiori-memory-reference.md) 保留设计来源；当前规则见根目录AGENTS和主题文档，用户最新决定优先。不要按旧设计重新引入已取消的向量或个人事件记忆功能。
 
 图片链路由 `image-assets.ts` 下载/验证/去重/保存原图并上传Files，`message_images`负责房间与消息关联；`image-context.ts`只依据harness可信metadata投影真正的DeepSeek user file blocks，同一投影用于估算和发送，不改Pi内部或伪造Base64图片文本。`image-context.test.mjs`用QQ真实字段fixture、CDN下载stub和本地HTTP模型验证准备/回答、完整图片历史、重启、后台冻结压缩、摘要切换、原图工具、跨群权限与关闭中的admission取消。后台画像专用任务不额外注入图片。
