@@ -596,6 +596,31 @@
       "file": "test/research-retention-schema.test.mjs",
       "name": "exact session-integrity ledger triggers are compatible; same-name altered SQL is refused",
       "evidence": "Confirmed schema compatibility incident extended to frozen-plan recovery and exact structural dependency validation; offline temp SQLite apply in .local/long-task-20261026/full-final.log."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "提醒按真实人物授权，同人物跨场景查询但不迁移通知路由，幂等并拒绝冲突",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "身份重绑不把相同原始来源和幂等键转移给新人物",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "到期查询命中部分索引，双连接领取不重复且提交检查 lease/version/授权",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+    },
+    {
+      "file": "test/work-ledger-store.test.mjs",
+      "name": "版本取消阻止迟到 worker；撤销来源绑定后不执行；重启未知通知不重发",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+    },
+    {
+      "file": "test/work-ledger-migration.test.mjs",
+      "name": "schema32台账迁移保留schema31原表、备份及研究清理契约，不生成历史工作",
+      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
     }
   ],
   "modelEvaluations": [

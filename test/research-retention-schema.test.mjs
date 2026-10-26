@@ -33,7 +33,7 @@ function tableSnapshot(db, excluded = new Set()) {
 
 test('current schema preview/apply protects unfinished research, ordinary chat and profiles; stale plans fail closed', t => {
   const f = fixture(t), {db,store,directory} = f;
-  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version),31);
+  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version),32);
   const route = { channel:'qq', accountId:'fixture', roomType:'group', roomId:'room' };
   const conversation = store.ensureConversation('room', join(directory,'ordinary-chat.jsonl'), route);
   writeFileSync(join(directory,'ordinary-chat.jsonl'),'ordinary session stays\n');

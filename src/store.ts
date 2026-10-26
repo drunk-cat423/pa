@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { SessionIntegrityStore, migrateSessionIntegrity } from './session-integrity-store.js';
+import { WorkLedgerStore, migrateWorkLedger } from './work-ledger-store.js';
 import { isDeepStrictEqual } from 'node:util';
 import { MemoryError } from './memory-types.js';
 import type { MemoryChange, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, PrimaryPerson,
@@ -73,7 +74,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 31;
+const SCHEMA_VERSION = 32;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -193,6 +194,7 @@ export class ConversationStore {
   readonly autoMemory: AutoMemoryStore;
   readonly research: ResearchStore;
   readonly sessionIntegrity: SessionIntegrityStore;
+  readonly workLedger: WorkLedgerStore;
   private readonly db: DatabaseSync;
   private closed = false;
   private transactionDepth = 0;
@@ -208,6 +210,7 @@ export class ConversationStore {
       this.autoMemory = new AutoMemoryStore(this.db, operation => this.memoryTransaction(operation));
       this.research = new ResearchStore(this.db, operation => this.memoryTransaction(operation), dirname(this.databasePath));
       this.sessionIntegrity = new SessionIntegrityStore(this.db);
+      this.workLedger = new WorkLedgerStore(this.db,operation=>this.memoryTransaction(operation));
     } catch (error) {
       this.db.close();
       this.closed = true;
@@ -561,6 +564,7 @@ export class ConversationStore {
             AND EXISTS(SELECT 1 FROM agent_runs WHERE input_message_id=channel_tasks.message_id);`);
         migrateSessionIntegrity(this.db);
       }
+      if(version<32) migrateWorkLedger(this.db);
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
     } catch (error) {
