@@ -1,7 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { isMemoryOwner, validateHarnessPolicy, type HarnessPolicy } from './harness-policy.js';
 import { MemoryError } from './memory-types.js';
-import type { SelfProfileSnapshot } from './self-profile-store.js';
+import { copySelfProfileSources, type SelfProfileSnapshot } from './self-profile-store.js';
 
 export interface SelfProfileTermMove {
   pendingId: string;
@@ -59,6 +60,12 @@ export function reclassifySelfProfileTerms(db: DatabaseSync, snapshot: SelfProfi
   // Even an unchanged archived body gets a revision: its active pending projection changed.
   db.prepare('INSERT INTO self_profile_revisions VALUES (?,?,?,?)')
     .run(revision, snapshot.content, '[]', createdAt);
+  // Changing the active-pending projection must not hide the unchanged body's
+  // sources from recovery, which reads associations for the current revision.
+  const updateId=randomUUID();
+  db.prepare('INSERT INTO self_profile_updates VALUES (?,?,?,?,?,?)')
+    .run(updateId,revision,null,'proposal',snapshot.content,createdAt);
+  copySelfProfileSources(db,snapshot.baseVersion,updateId);
   for (const move of pending) {
     const old = db.prepare(`SELECT revision,content FROM room_rule_revisions
       WHERE conversation_id=? AND rule_key=? ORDER BY revision DESC LIMIT 1`).get(move.conversationId, move.key);

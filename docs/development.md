@@ -23,6 +23,7 @@
 | src/auto-memory.ts | 资料与压缩独立调度、组件失败隔离、有界退避恢复、容量等待及 Topic 关键词检索 |
 | src/memory-provider.ts | 独立 Pi 画像/Topic 提取请求 |
 | src/profile-limits.ts / src/profile-pending.ts | 人物完整画像容量、处理回执及来源强度校验 |
+| src/profile-policy.ts | 即时保存与后台整理共用的画像纳入标准、AI长期关注课题边界 |
 | src/diagnostics.ts / src/logs.ts / src/logs-cli.ts | 独立诊断索引、请求响应证据、任务查询及无模型的离线解析校验 |
 | src/conversation.ts | 原文与Pi关联恢复、群聊/私聊完整滚动上下文、当前发送者/@对象画像预算、85%容量触发 |
 | src/channel-harness.ts | 先入库、按房间排队、参与判断、聊天预算、投递和启动后台恢复 |

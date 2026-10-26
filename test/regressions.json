@@ -3,6 +3,41 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/self-profile-store.test.mjs",
+      "name": "本地审阅AI画像执行CAS并保留历史来源与待整理建议",
+      "evidence": "2026-10-26 production AI profile mixed a sender's topical preference into global identity; operator review must preserve old sources and pending while normalizing the current view"
+    },
+    {
+      "file": "test/self-profile-store.test.mjs",
+      "name": "本地AI画像审阅拒绝在途与等待自动恢复的资料任务及超容量正文",
+      "evidence": "Review of the 2026-10-26 profile cleanup found queued/recoverable materials could reread old sources after cleanup; the local review is blocked until those attempts settle"
+    },
+    {
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "即时画像接受归纳正文和当前确认，保留来源绑定而不复制原话证据",
+      "evidence": "2026-10-26 private-chat incident: normalized prepare_turn rejected by literal excerpt gate; current confirmation could not save or archive the agreed preference"
+    },
+    {
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "第三方归纳仍须管理员与真实对象定位，仅保存对象token兼容旧协议",
+      "evidence": "Companion regression for the 2026-10-26 normalized-profile incident; preserve real mention, identity and owner boundaries while removing the excerpt requirement"
+    },
+    {
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "本地审阅去除已确认任务问句污染，旧画像与原文保留且拒绝旧版本和在途资料任务",
+      "evidence": "2026-10-26 production profile review found task instructions, temporary events and AI focus incorrectly retained as personal traits"
+    },
+    {
+      "file": "test/self-profile-store.test.mjs",
+      "name": "AI画像可归纳当前真人确认，归档不要求重复原话或AI关键词",
+      "evidence": "2026-10-26 life-first-cause private-chat incident: normalized AI-self update rejected before an exact-quote retry"
+    },
+    {
+      "file": "test/context-people.test.mjs",
+      "name": "Pi续问与旧Bot话题同时出现时，真实请求保留最近对象并明确检索仅作辅助",
+      "evidence": "2026-10-26 private Pi Durable follow-up drifted to a retrieved DeepSeek-Bot topic despite the immediate Pi link remaining visible; checks actual request and unchanged call count, not model semantics"
+    },
+    {
       "file": "test/research-materials.test.mjs",
       "name": "材料正文分页不再切JSON外壳，按实际返回范围续读且不被工具字节上限截断",
       "evidence": "2026-10-23 real research attempt 3: read_research_material paged serialized evidence instead of clean body; .local/research-followup3-20261023/offline-fixture.json"

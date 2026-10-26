@@ -1000,14 +1000,17 @@ export class AutoMemoryStore {
       const message=this.messages([sourceMessageId])[0]!;
       if(options.mentionedSenderIds) message.mentionedSenderIds=[...options.mentionedSenderIds];
       const candidates=this.profileSubjectCandidates(String(source.conversation_id));
-      let evidence:ProfileSubjectEvidence;
+      let evidence:ProfileSubjectEvidence|undefined;
       try {
-        if(!message.text.includes(content)) throw new MemoryError('保存内容必须来自原始真人消息。');
-        evidence=options.subject?{...options.subject,messageId:sourceMessageId,
-          factQuote:content.includes(options.subject.subjectQuote)?content:message.text}
-          :inferPersonProfileEvidence(message,content,candidates,personId);
-        const subject=resolveProfileSubject(evidence,message,candidates);
-        if(subject.personId!==personId||(sourceType==='self'&&subject.sourceType!=='self')) throw new MemoryError('画像对象与实际描述人物不一致。');
+        if(options.subject||!samePerson) {
+          const located=options.subject?{...options.subject,messageId:sourceMessageId,factQuote:options.subject.subjectQuote}
+            :inferPersonProfileEvidence(message,message.text,candidates,personId);
+          const subject=resolveProfileSubject(located,message,candidates);
+          if(subject.personId!==personId||(sourceType==='self'&&subject.sourceType!=='self')) throw new MemoryError('画像对象与实际描述人物不一致。');
+          // Keep only the target token for authorized third-party updates. The
+          // original message remains the source; pending content may be a summary.
+          if(!samePerson) evidence={...located,factQuote:located.subjectQuote};
+        }
       } catch(error) {throw new MemoryError(error instanceof Error?error.message:'画像对象无法确认。');}
       const profile=this.profile(personId);
       if((profile.pending??[]).some(item=>item.sourceMessageId===sourceMessageId&&item.content===content&&item.sourceType===sourceType)) return;
@@ -1015,7 +1018,57 @@ export class AutoMemoryStore {
       if(pending.length>=100||pending.reduce((bytes,item)=>bytes+Buffer.byteLength(item.content),0)+Buffer.byteLength(content)>12000
         ||Buffer.byteLength(JSON.stringify({personId,baseVersion:profile.baseVersion,pending:[...pending,{id:randomUUID(),content,sourceMessageId,sourceType}]}))>20000) throw new MemoryError('待整理人物画像容量已满，请等待归档或缩短内容。');
       this.db.prepare('INSERT INTO person_profile_pending(id,person_id,content,source_message_id,source_type,created_at,purpose,subject_json) VALUES (?,?,?,?,?,?,?,?)')
-        .run(randomUUID(),personId,content,sourceMessageId,sourceType,timestamp(),'profile',JSON.stringify(evidence));
+        .run(randomUUID(),personId,content,sourceMessageId,sourceType,timestamp(),'profile',evidence?JSON.stringify(evidence):null);
+    });
+  }
+  /** Local operator review only; never exposed as a conversation tool. */
+  reviewProfile(personId:string,expectedVersion:number,retainedFactIndexes:readonly number[],
+    rewrites:readonly {factIndex:number;content:string}[]=[]): {
+    beforeVersion:number;afterVersion:number;beforeCount:number;afterCount:number;
+  } {
+    return this.atomic(()=>{
+      if(!Number.isSafeInteger(expectedVersion)||expectedVersion<0||!Array.isArray(retainedFactIndexes)
+        ||retainedFactIndexes.some(index=>!Number.isSafeInteger(index)||index<0)
+        ||new Set(retainedFactIndexes).size!==retainedFactIndexes.length) throw new Error('画像审阅版本或保留索引无效。');
+      const person=this.db.prepare('SELECT revision FROM persons WHERE id=?').get(personId);
+      if(!person) throw new Error('人物不存在。');
+      const beforeVersion=Number(person.revision);
+      if(beforeVersion!==expectedVersion) throw new Error('人物画像版本冲突，请重读后重试。');
+      const row=this.db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=?').get(personId,beforeVersion);
+      if(!row) throw new Error('完整人物画像基线不存在。');
+      const before=parse<ProfileFact[]>(row.facts_json);
+      if(retainedFactIndexes.some(index=>index>=before.length)) throw new Error('画像审阅保留索引超出完整基线。');
+      if(!Array.isArray(rewrites)||rewrites.some(item=>!item||Object.keys(item).some(key=>!['factIndex','content'].includes(key))
+        ||!retainedFactIndexes.includes(item.factIndex)||typeof item.content!=='string'||!item.content.trim()
+        ||[...item.content].length>120)||new Set(rewrites.map(item=>item.factIndex)).size!==rewrites.length) {
+        throw new Error('画像审阅归纳条目无效，只能改写已保留的原事实。');
+      }
+      if(this.db.prepare("SELECT 1 FROM auto_memory_jobs WHERE pipeline='materials' AND status IN ('queued','running') LIMIT 1").get()) {
+        throw new Error('存在待处理或运行中的资料任务，不能审阅画像。');
+      }
+      const pendingRecovery=this.db.prepare(`SELECT 1 FROM auto_memory_jobs j LEFT JOIN auto_memory_recoveries r ON r.failed_job_id=j.id
+        WHERE j.pipeline='materials' AND j.status='failed'
+        AND instr(COALESCE(j.error,''),'[state_persistence]')=0 AND instr(COALESCE(j.error,''),'[diagnostic_persistence]')=0
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements t WHERE t.job_id=j.id)
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_legacy_isolations t WHERE t.job_id=j.id)
+        AND (r.failed_job_id IS NULL OR (r.replacement_job_id IS NULL AND r.attempt<3)) LIMIT 1`).get();
+      if(pendingRecovery) throw new Error('存在等待自动恢复的资料任务，不能审阅画像。');
+      const retained=new Set(retainedFactIndexes);
+      const replacements=new Map(rewrites.map(item=>[item.factIndex,item.content]));
+      const facts=mergeProfileFacts(before.flatMap((fact,index)=>retained.has(index)
+        ?[{...fact,content:replacements.get(index)??fact.content}]:[]));
+      this.writeProfile({personId,baseVersion:beforeVersion,facts},null);
+      // Rewording changes the content key, but not the original provenance or
+      // chronology. Keep supplementary confirmations as well as primary IDs.
+      before.forEach((fact,index)=>{
+        if(!retained.has(index)) return;
+        const next=facts.findIndex(item=>sameFactContent(item,{...fact,content:replacements.get(index)??fact.content}));
+        this.db.prepare(`INSERT OR IGNORE INTO person_profile_revision_sources(person_id,revision,fact_index,message_id)
+          SELECT person_id,?,?,message_id FROM person_profile_revision_sources
+          WHERE person_id=? AND revision=? AND fact_index=?`)
+          .run(beforeVersion+1,next,personId,beforeVersion,index);
+      });
+      return {beforeVersion,afterVersion:beforeVersion+1,beforeCount:before.length,afterCount:facts.length};
     });
   }
   private writeProfile(profile:PersonProfile,jobId:string|null,legacyMigration=false): void {
@@ -1208,7 +1261,8 @@ export class AutoMemoryStore {
           const source=[...input.messages,...(input.profileSources??[]),...(input.materialsProtocol===3?input.recoveryReviewMessages??[]:[])].find(message=>message.id===evidence.messageId)!;
           const target=mergeProfileFacts(profile.facts).findIndex(fact=>sameFactContent(fact,profile.facts[update.factIndex]!));
           this.db.prepare('INSERT OR IGNORE INTO person_profile_subject_updates VALUES (?,?,?,?,?,?,?)')
-            .run(profile.personId,profile.baseVersion+1,target,evidence.messageId,source.personId!,JSON.stringify(evidence),timestamp());
+            .run(profile.personId,profile.baseVersion+1,target,evidence.messageId,source.personId!,
+              JSON.stringify({messageId:evidence.messageId,subjectKind:evidence.subjectKind}),timestamp());
         }
         for(const result of pendingResults) {
           const captured=baseline.pending!.find(item=>item.id===result.pendingId)!;
@@ -1223,7 +1277,8 @@ export class AutoMemoryStore {
           if(result.status==='merged'&&captured.subject) {
             const speaker=[...input.messages,...(input.profileSources??[])].find(message=>message.id===captured.sourceMessageId)!;
             this.db.prepare('INSERT OR IGNORE INTO person_profile_subject_updates VALUES (?,?,?,?,?,?,?)')
-              .run(profile.personId,profile.baseVersion+1,normalizedIndex!,captured.sourceMessageId,speaker.personId!,JSON.stringify(captured.subject),timestamp());
+              .run(profile.personId,profile.baseVersion+1,normalizedIndex!,captured.sourceMessageId,speaker.personId!,
+                JSON.stringify({messageId:captured.sourceMessageId,subjectKind:captured.subject.subjectKind}),timestamp());
           }
           if(result.status!=='deferred') {
             // Internal acknowledged-queue cleanup only. Original messages, revisions and the receipt remain.

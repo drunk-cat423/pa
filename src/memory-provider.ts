@@ -9,6 +9,7 @@ import { personProfileCapacityPrompt, profileCapacity, profileStepPrompt } from 
 import { imageMetadata, imageRequestFits, projectImagePayload, type ImageProjection } from './image-context.js';
 import { ImageAssets } from './image-assets.js';
 import { decodeMemoryWireResponse, memoryWireReferences, prepareMemoryWireExtraction } from './memory-wire.js';
+import { PERSON_PROFILE_POLICY, SELF_PROFILE_POLICY } from './profile-policy.js';
 
 export interface MemoryProvider {
   extract(input: AutoMemoryTaskInput, signal: AbortSignal, options?: { onCall?: (callId: string) => void }): Promise<unknown>;
@@ -80,7 +81,10 @@ export function prepareMemoryExtraction(input: AutoMemoryTaskInput, contextWindo
     + (input.mode === 'messages' ? '\n本次mode=messages：profiles必须为空，只整理消息Topic、覆盖与续聊摘要；private的fragments必须为空，临时事项用Topic或续聊摘要表达。不要处理人物pending。' : '')
     + (input.selfProfile && input.mode !== 'profiles' ? SELF_EXTRACTION_PROMPT
       + `\n自我画像完整JSON的UTF-8大小不超过${input.selfProfileBudgetBytes ?? 20000}字节；未处理pending保持原样，禁止为了归档而把术语或群规则并入画像。` : '');
-  return { systemPrompt: systemPrompt + profileStepPrompt(input), userContent };
+  return { systemPrompt: systemPrompt
+    + (input.mode !== 'messages' && input.mode !== 'self' ? '\n' + PERSON_PROFILE_POLICY : '')
+    + (input.selfProfile && input.mode !== 'profiles' && input.mode !== 'messages' ? '\n' + SELF_PROFILE_POLICY : '')
+    + profileStepPrompt(input), userContent };
 }
 
 /** Parse a saved SDK-normalized response without credentials, a runtime, or a network call. */

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { AutoMemoryMessage } from './auto-memory-types.js';
 import { MemoryError } from './memory-types.js';
-import { assertAiProfileEvidence, inferAiProfileEvidence, type ProfileSubjectEvidence } from './profile-attribution.js';
+import { assertAiProfileEvidence, type ProfileSubjectEvidence } from './profile-attribution.js';
 
 export interface SelfProfileSnapshot {
   protocol?: 2;
@@ -23,12 +23,19 @@ export interface SelfProfileProposal {
 }
 
 const timestamp = () => new Date().toISOString();
-function assertPendingSource(source: Pick<AutoMemoryMessage, 'id' | 'role' | 'text'>, content: string): void {
-  if (!source.text.includes(content)) throw new Error('自我建议必须连续摘录原始真人消息。');
-  assertAiProfileEvidence(inferAiProfileEvidence(source.id, content), source);
-}
 export const selfProfileBytes = (snapshot: SelfProfileSnapshot): number => Buffer.byteLength(JSON.stringify(snapshot), 'utf8');
 export const selfProfileBudget = (contextWindow: number): number => Math.min(20000, Math.floor(contextWindow * 0.15));
+
+/** Projection-only revisions inherit the archived body's source IDs, not quotes. */
+export function copySelfProfileSources(db: DatabaseSync, fromVersion: number, updateId: string): void {
+  const sources=db.prepare(`SELECT DISTINCT s.message_id,s.pending_id FROM self_profile_update_sources s
+    JOIN self_profile_updates u ON u.id=s.update_id
+    WHERE u.revision=(SELECT MAX(u2.revision) FROM self_profile_updates u2
+      JOIN self_profile_update_sources s2 ON s2.update_id=u2.id WHERE u2.revision<=?)
+    ORDER BY s.message_id,s.pending_id`).all(fromVersion);
+  for(const row of sources) db.prepare('INSERT INTO self_profile_update_sources(update_id,message_id,pending_id) VALUES (?,?,?)')
+    .run(updateId,String(row.message_id),row.pending_id==null?null:String(row.pending_id));
+}
 
 function resultingSnapshot(snapshot: SelfProfileSnapshot, proposal: SelfProfileProposal): SelfProfileSnapshot {
   const changed = proposal.content !== snapshot.content;
@@ -116,6 +123,53 @@ export function migrateSelfProfileUpdates(db: DatabaseSync): void {
 export class SelfProfileStore {
   constructor(private readonly db: DatabaseSync, private readonly transaction: <T>(operation: () => T) => T) {}
 
+  /** Local operator maintenance of the current AI profile; this is not a conversation update. */
+  review(expectedVersion: number, expectedContent: string, content: string): {
+    beforeVersion: number; afterVersion: number; beforeBytes: number; afterBytes: number;
+  } {
+    return this.transaction(() => {
+      if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0 || typeof expectedContent !== 'string'
+        || typeof content !== 'string' || [...content].length > 4000 || !content.trim()) {
+        throw new Error('自我画像审阅版本或正文无效。');
+      }
+      const current = this.db.prepare('SELECT revision,content FROM self_profile_revisions ORDER BY revision DESC LIMIT 1').get();
+      if (!current) throw new Error('完整自我画像基线不存在。');
+      const beforeVersion = Number(current.revision);
+      if (beforeVersion !== expectedVersion) throw new Error('自我画像版本冲突，请重读后重试。');
+      if (String(current.content) !== expectedContent) throw new Error('自我画像输入正文已变化，请重读后重试。');
+
+      if (this.db.prepare("SELECT 1 FROM auto_memory_jobs WHERE pipeline='materials' AND status IN ('queued','running') LIMIT 1").get()) {
+        throw new Error('存在待处理或运行中的资料任务，不能审阅自我画像。');
+      }
+      const pendingRecovery = this.db.prepare(`SELECT 1 FROM auto_memory_jobs j LEFT JOIN auto_memory_recoveries r ON r.failed_job_id=j.id
+        WHERE j.pipeline='materials' AND j.status='failed'
+        AND instr(COALESCE(j.error,''),'[state_persistence]')=0 AND instr(COALESCE(j.error,''),'[diagnostic_persistence]')=0
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_job_retirements t WHERE t.job_id=j.id)
+        AND NOT EXISTS(SELECT 1 FROM auto_memory_legacy_isolations t WHERE t.job_id=j.id)
+        AND (r.failed_job_id IS NULL OR (r.replacement_job_id IS NULL AND r.attempt<3)) LIMIT 1`).get();
+      if (pendingRecovery) throw new Error('存在等待自动恢复的资料任务，不能审阅自我画像。');
+
+      const snapshot = this.snapshot();
+      const beforeBytes = selfProfileBytes(snapshot);
+      if (content === expectedContent) return { beforeVersion, afterVersion: beforeVersion, beforeBytes, afterBytes: beforeBytes };
+      const afterSnapshot = { ...snapshot, baseVersion: beforeVersion + 1, content };
+      const afterBytes = selfProfileBytes(afterSnapshot);
+      if (afterBytes > 20000) throw new Error('自我画像超过完整画像容量上限，请缩短正文。');
+
+      const revision = beforeVersion + 1;
+      this.db.prepare('INSERT INTO self_profile_revisions VALUES (?,?,?,?)').run(revision, content, '[]', timestamp());
+      const updateId = randomUUID();
+      // Reuse the existing proposal record format for this locally authorized review.
+      this.db.prepare('INSERT INTO self_profile_updates VALUES (?,?,?,?,?,?)')
+        .run(updateId, revision, null, 'proposal', content, timestamp());
+
+      // Carry forward the latest available source associations. A revision can
+      // legitimately have no sources, so fall back to its nearest sourced ancestor.
+      copySelfProfileSources(this.db,beforeVersion,updateId);
+      return { beforeVersion, afterVersion: revision, beforeBytes, afterBytes };
+    });
+  }
+
   snapshot(): SelfProfileSnapshot {
     return this.transaction(() => {
       const current = this.db.prepare('SELECT * FROM self_profile_revisions ORDER BY revision DESC LIMIT 1').get()!;
@@ -131,14 +185,15 @@ export class SelfProfileStore {
     return row ? { id: String(row.id), role: 'user', text: String(row.text) } : undefined;
   }
 
-  addPending(sourceMessageId: string, content: string, maxBytes = 20000): void {
+  addPending(sourceMessageId: string, content: string, maxBytes = 20000,
+    subject?: Omit<ProfileSubjectEvidence,'messageId'|'factQuote'>): void {
     if (typeof sourceMessageId !== 'string' || !sourceMessageId || typeof content !== 'string'
       || !content.trim() || [...content].length > 500) throw new MemoryError('自我建议不能为空，且不能超过 500 个 Unicode 字符。');
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 20000) throw new MemoryError('自我画像容量上限无效。');
     this.transaction(() => {
       const source = this.humanSource(sourceMessageId);
       if (!source) throw new MemoryError('自我建议必须来自原始真人消息。');
-      try { assertPendingSource(source, content); }
+      try { if(subject) assertAiProfileEvidence({...subject,messageId:sourceMessageId,factQuote:subject.subjectQuote},source); }
       catch (error) { throw new MemoryError(error instanceof Error ? error.message : '自我建议来源未明确指向本AI。'); }
       if (this.db.prepare('SELECT id FROM self_profile_pending WHERE source_message_id=? AND content=?').get(sourceMessageId,content)) return;
       const bytes = Number(this.db.prepare(`SELECT COALESCE(SUM(length(CAST(content AS BLOB))),0) AS bytes FROM self_profile_pending p
@@ -188,7 +243,6 @@ export class SelfProfileStore {
       for (const pending of pendingSources) {
         const source = this.humanSource(pending.sourceMessageId);
         if (!source) throw new Error('自我档案必须引用原始真人来源。');
-        assertPendingSource(source, pending.content);
       }
       if (selfProfileBytes(resultingSnapshot(this.snapshot(), proposal)) > maxBytes) {
         throw new Error('自我档案输入版本已变化，待整理画像容量不足，请重读后重试。');
@@ -212,8 +266,10 @@ export class SelfProfileStore {
         const updateId = randomUUID();
         this.db.prepare('INSERT INTO self_profile_updates VALUES (?,?,?,?,?,?)')
           .run(updateId, revision, jobId ?? null, 'proposal', proposal.content, timestamp());
-        for (const evidence of updates) this.db.prepare(`INSERT INTO self_profile_update_sources(update_id,message_id,evidence_json) VALUES (?,?,?)`)
-          .run(updateId, evidence.messageId, JSON.stringify(evidence));
+        // The validated source ID is sufficient after commit; do not duplicate
+        // the original chat as a second evidence document.
+        for (const evidence of updates) this.db.prepare(`INSERT INTO self_profile_update_sources(update_id,message_id) VALUES (?,?)`)
+          .run(updateId, evidence.messageId);
         for (const pending of pendingSources) this.db.prepare(`INSERT INTO self_profile_update_sources(update_id,message_id,pending_id) VALUES (?,?,?)`)
           .run(updateId, pending.sourceMessageId, pending.id);
       }

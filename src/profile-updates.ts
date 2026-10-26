@@ -58,10 +58,14 @@ export function validateProfileUpdates(profile: PersonProfile, baseline: PersonP
     const item = baseline.pending?.find(pending => pending.id === result.pendingId);
     const source = item && sources.get(item.sourceMessageId);
     if (!item || !source) invalid();
-    const evidence = item.subject ?? inferPersonProfileEvidence(source, item.content, input.profileSubjects ?? [], profile.personId);
-    const subject = input.materialsProtocol === 3 && source.personId === baseline.personId
+    const ownPending = input.materialsProtocol === 3 && item.sourceType === 'self' && source.personId === baseline.personId;
+    // New pending contains a normalized fact, not an excerpt. Its real source/target
+    // was bound by prepare_turn; do not try to find that wording in the original.
+    const evidence = ownPending ? undefined
+      : item.subject ?? inferPersonProfileEvidence(source, item.content, input.profileSubjects ?? [], profile.personId);
+    const subject = ownPending
       ? { personId: baseline.personId, sourceType: 'self' as const }
-      : resolveProfileSubject(evidence, source, input.profileSubjects ?? []);
+      : resolveProfileSubject(evidence!, source, input.profileSubjects ?? []);
     if (subject.personId !== profile.personId || (subject.sourceType === 'third_party' && !item.subject)) invalid();
   }
   if(input.recoveryReviewMessages!==undefined || input.materialsProtocol===3) {

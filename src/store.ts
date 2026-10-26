@@ -1013,6 +1013,26 @@ export class ConversationStore {
       this.autoMemory.selfProfile.snapshot(), moves, policy, expectedVersion));
   }
 
+  /** Explicit local operator maintenance; never registered as a chat tool. */
+  reviewProfiles(plan: {
+    people: readonly {personId:string;expectedVersion:number;retainedFactIndexes:readonly number[];
+      rewrites?:readonly {factIndex:number;content:string}[]}[];
+    self: {expectedVersion:number;expectedContent:string;content:string};
+    termMoves: readonly SelfProfileTermMove[];
+  }, policy: HarnessPolicy) {
+    return this.memoryTransaction(()=>{
+      if(!Array.isArray(plan.people)||new Set(plan.people.map(item=>item.personId)).size!==plan.people.length) {
+        throw new MemoryError('画像审阅人物不能重复。');
+      }
+      const people=plan.people.map(item=>({personId:item.personId,...this.autoMemory.reviewProfile(
+        item.personId,item.expectedVersion,item.retainedFactIndexes,item.rewrites)}));
+      const self=this.autoMemory.selfProfile.review(plan.self.expectedVersion,plan.self.expectedContent,plan.self.content);
+      const terms=plan.termMoves.length?this.reclassifySelfProfileTerms(plan.termMoves,policy,self.afterVersion)
+        :{revision:self.afterVersion,moved:0};
+      return {people,self,terms};
+    });
+  }
+
   prepareTurn(conversationId: string, sourceMessageId: string, proposed: TurnPlan, policy: HarnessPolicy,
     mentionedSenderIds: readonly string[] = [], selfBudget?: number): TurnReceipt {
     const plan = validateTurnPlan(proposed);
@@ -1034,7 +1054,9 @@ export class ConversationStore {
       const current = this.identityCard(conversationId,String(source.external_user_id),policy);
       const receipt: TurnReceipt = {prepared:true,mode:plan.mode,saved:[]};
       for (const update of plan.updates) {
-        if (!String(source.text).includes(update.content)) throw new MemoryError('保存内容必须连续摘录当前消息原文。');
+        if (['room_rule','room_memory'].includes(update.target) && !String(source.text).includes(update.content)) {
+          throw new MemoryError('群规则和群记忆必须连续摘录当前消息原文。');
+        }
         if (['mentioned_person','room_rule','room_memory'].includes(update.target) && !current.isMaintainer) {
           throw new MemoryError('你没有管理其他人物或群规则、群记忆的权限；本批内容均未保存。');
         }
@@ -1044,13 +1066,15 @@ export class ConversationStore {
           if (!subject) {
             throw new MemoryError('请在当前消息明确 @ 要记录的已知群成员。');
           }
-          this.autoMemory.addProfilePending(this.autoMemory.ensureActorPerson(subject),sourceMessageId,update.content,
-            update.target==='mentioned_person'?'third_party':'self',
+          const targetPerson = this.autoMemory.ensureActorPerson(subject);
+          const sourcePerson = this.autoMemory.ensureActorPerson(String(source.actor_id));
+          this.autoMemory.addProfilePending(targetPerson,sourceMessageId,update.content,
+            targetPerson===sourcePerson?'self':'third_party',
             {allowThirdParty:update.target==='mentioned_person',...(update.subject?{subject:update.subject}:{}),mentionedSenderIds});
           receipt.saved.push({target:update.target,status:'saved_pending'});
         } else if (update.target === 'ai_self') {
           if(update.subject&&update.subject.subjectKind!=='ai') throw new MemoryError('AI画像更新对象不一致。');
-          this.autoMemory.selfProfile.addPending(sourceMessageId,update.content,selfBudget);
+          this.autoMemory.selfProfile.addPending(sourceMessageId,update.content,selfBudget,update.subject);
           receipt.saved.push({target:update.target,status:'saved_pending'});
         } else if (update.target === 'room_rule') {
           const key=update.key!.normalize('NFKC').trim().toLocaleLowerCase('zh');

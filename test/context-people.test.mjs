@@ -11,6 +11,7 @@ import { personLabel, messagePeople } from '../dist/context-people.js';
 import { prepareMemoryWireExtraction } from '../dist/memory-wire.js';
 import { conversationContext, currentTurnInput } from './fixtures/conversation-context.mjs';
 import { companionReply } from './fixtures/companion-tools.mjs';
+import { emptyExtraction } from './fixtures/memory-output.mjs';
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'pa-context-people-'));
@@ -189,6 +190,39 @@ test('adding people, changing sender, restart, and another room preserve the exi
     assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE text LIKE '%第一条：A的原始记录%' AND role='user'").get().n, 1);
     assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE text LIKE '%第二条：B的新内容%' AND role='user'").get().n, 1);
   } finally { db.close(); }
+});
+
+test('Pi续问与旧Bot话题同时出现时，真实请求保留最近对象并明确检索仅作辅助', async t => {
+  const f = await fixture(t);
+  f.config.memory = { enabled: true, maxCalls: 1, timeoutMs: 1000 };
+  f.route.roomType = 'private';
+  const harness = f.open();
+  assert.equal(await harness.handle(f.message('old-topic', 'DeepSeek-Bot身份隔离的旧讨论', 'a')), 'sent');
+  // Use the real material commit and FTS index; do not manufacture a profile or
+  // replace the Pi session bound by the normal channel entry point.
+  const store = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  try {
+    const room = { id: f.conversationId(f.route) };
+    const now = Date.now();
+    store.autoMemory.reserveMaterialsIfDue(room.id, now);
+    assert.ok(store.autoMemory.reserveMaterialsIfDue(room.id, now + 600001));
+    const job = store.autoMemory.claimNext(room.id, { owner: 'topic-reference', leaseMs: 60000, pipeline: 'materials' });
+    const input = store.autoMemory.taskInput(job);
+    const output = emptyExtraction(input);
+    store.autoMemory.commit(job.id, job.leaseToken, { ...output,
+      topics: [{ summary: 'DeepSeek-Bot身份隔离：初号机按群友区分身份', messageIds: [], sourceRange: output.processedRanges[0] }] });
+  } finally { store.close(); }
+  assert.equal(await harness.handle(f.message('pi-link', 'https://earendil.com/posts/pi-durable/ 这个呢', 'a')), 'sent');
+  const prefix = conversationContext(f.requests.at(-1)).historyRaw;
+  assert.equal(await harness.handle(f.message('pi-followup', '仔细讲讲身份隔离的部分吧', 'a')), 'sent');
+  const request = f.requests.at(-1), serialized = JSON.stringify(request.messages);
+  assert.ok(conversationContext(request).historyRaw.startsWith(prefix));
+  assert.ok(conversationContext(request).historyRaw.includes('pi-durable'));
+  assert.ok(serialized.includes('DeepSeek-Bot身份隔离：初号机按群友区分身份'), 'automatic retrieval remains available');
+  assert.ok(serialized.includes('检索Topic是历史讨论的辅助参考'));
+  assert.ok(serialized.includes('当前问题与紧邻问答决定本轮对象'));
+  assert.equal(currentTurnInput(request).currentMessage.text, '仔细讲讲身份隔离的部分吧');
+  assert.equal(f.requests.length, 6, 'reference handling adds no classifier call to the three normal turns');
 });
 
 test('background memory projections keep stable person labels across local reference remapping and unknown legacy identity', () => {

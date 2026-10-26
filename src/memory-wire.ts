@@ -5,6 +5,7 @@ import { personProfileCapacityPrompt, profileCapacity, profileStepPrompt } from 
 import { profileSourcesForModel } from './profile-pending.js';
 import { decodeMaterialProfile, prepareMaterialProfile } from './material-profile-wire.js';
 import { messagePeople, personLabel, PERSON_LABEL_GUIDANCE } from './context-people.js';
+import { PERSON_PROFILE_POLICY, SELF_PROFILE_POLICY } from './profile-policy.js';
 
 /** References are scoped to one frozen input, never to a process or conversation. */
 export function memoryWireReferences(input: AutoMemoryTaskInput) {
@@ -136,7 +137,10 @@ ${input.mode === 'profiles' ? '本次mode=profiles：只返回{"profiles":[...]}
 ${input.selfProfile && input.mode !== 'profiles' && input.mode !== 'messages' ? input.selfProfile.protocol===2
   ? `AI画像协议2：selfProfile必须输出{"baseVersion":number,"content":string,"pendingIds":string[],"updates":[{"messageId":string,"factQuote":string,"subjectKind":"ai","subjectQuote":string}]}，不要sourceMessageIds或protocol字段。content为完整全局名称、定位、表达风格和倾向，最多4000个Unicode字符，尽量收敛到2000字符以内。不增加针对某人的相处模式、用户资料、群规则、真实经历或已完成行动。旧正文作为基线，无新建议保持稳定；没有待归档pending或可验证的新建议时不要改正文。pendingIds仅实际合并的捕获pending，所有允许接入用户的建议均可处理，不要求owner审批；来源由程序写独立更新记录，不加入当前画像。updates仅本次从真人messages提取的明确设定建议，factQuote连续引用原文，subjectQuote明确指向本Bot；不能给另一个Bot更新，也不能用引语、普通评价或AI自述制造设定。没有新消息建议则updates=[]，pending原文无需重复列出updates。来源不累计、不按条数限量；当前正文和剩余pending完整JSON最多${input.selfProfileBudgetBytes??20000}字节。照抄baseVersion，提交由程序核验真实来源、pending归属及版本。`
   : `selfProfile是AI自身的全局画像，不是用户画像，必须输出{"baseVersion":number,"content":string,"sourceMessageIds":string[],"pendingIds":string[]}。照抄baseVersion；content是完整最终自我描述，最多4000个Unicode字符；在不丢失有效设定的前提下尽量收敛到2000字符以内，只含名称解释、定位、表达风格、兴趣倾向，不增加与某个人的相处模式、用户资料、群摘要、真实身体经历或未执行的行动。无依据保持空；已有内容保持稳定，无新内容时保留原画像及来源，pendingIds为[]。pending是所有参与者已明确保存的建议，不要求管理者身份；按输入先后合并同义项，用较新明确纠正处理冲突，无冲突旧内容保留。普通闲聊评价只作有限风格证据，玩笑、引语、临时扮演及AI自述不能作为已确定人格事实。sourceMessageIds只引用本批真人、旧AI画像已有来源或本次AI pending来源，最多500个，非空画像必须有来源；pendingIds只列实际处理的s引用，并保留各自sourceMessageId。未处理pending保留；不能为归档把群规则或术语并入画像。完整JSON UTF-8最多${input.selfProfileBudgetBytes ?? 20000}字节。程序独立验证版本与来源。` : ''}`;
-  return { systemPrompt: systemPrompt + profileStepPrompt(input) + (input.profileAttributionProtocol === 1 && input.mode !== 'messages' && input.mode !== 'self'
+  return { systemPrompt: systemPrompt
+    + (input.mode !== 'messages' && input.mode !== 'self' ? '\n' + PERSON_PROFILE_POLICY : '')
+    + (input.selfProfile && input.mode !== 'profiles' && input.mode !== 'messages' ? '\n' + SELF_PROFILE_POLICY : '')
+    + profileStepPrompt(input) + (input.profileAttributionProtocol === 1 && input.mode !== 'messages' && input.mode !== 'self'
     ? '\n人物输出最终核对：只有本步骤profiles中列出基线的人物可以写入；profileSubjects仅用于识别对象，不能据此新增profiles人物。每项必须有updates和pendingResults，空时也显式输出[]，不能省略。新fact必须有可核验的对象依据；普通问句、随口确认和一次讨论不构成稳定本人画像。询问某工具是什么或有何用途，不能推断本人已经使用、偏好或计划使用该工具。' : ''), userContent };
 }
 
