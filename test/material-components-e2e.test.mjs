@@ -38,9 +38,9 @@ test('单人物简化提案接受自然表达，无关字段不拖垮Topic；失
     if(input.mode==='messages')return {topics:[{summary:'讨论偏好和交流方式',summaryExtra:'无关说明'}],profiles:[]};
     assert.equal(input.mode,'profiles');assert.equal(input.profiles.length,1);
     assert.doesNotMatch(wire.systemPrompt,/factIndex:|baselineFactIndexes:/);
-    if(input.profiles[0].personId==='bob')return {facts:[{content:'喜欢咖啡',sources:['m999999']}]};
+    if(input.profiles[0].personId==='bob')return {changes:[{content:'喜欢咖啡',sources:['m999999']}]};
     const source=payload.pending.find(pending=>pending.content==='我觉得回答简短一点比较好');
-    return {facts:[{content:'喜欢简短回答',sources:[source.id],explanation:'额外注释'}],discardPending:[],summaryExtra:'不影响保存'};
+    return {changes:[{content:'喜欢简短回答',sources:[source.id],explanation:'额外注释'}],discardPending:[],summaryExtra:'不影响保存'};
   });
   assert.ok(calls.includes('messages'));assert.ok(calls.includes('alice'));assert.ok(calls.includes('bob'));
   assert.equal(f.store.autoMemory.profile('alice').facts[0].content,'喜欢简短回答');
@@ -56,7 +56,7 @@ test('单人物简化提案接受自然表达，无关字段不拖垮Topic；失
     repeated.push(input.mode==='profiles'?input.profiles[0].personId:input.mode);
     assert.equal(input.mode,'profiles');assert.equal(input.profiles[0].personId,'bob');
     const source=payload.sources.find(source=>source.text==='我喜欢咖啡');
-    return {facts:[{content:'喜欢咖啡',sources:[source.id]}]};
+    return {changes:[{content:'喜欢咖啡',sources:[source.id]}]};
   });
   assert.deepEqual(repeated,['bob']);assert.equal(f.store.autoMemory.profile('alice').baseVersion,version);
   assert.equal(f.store.autoMemory.profile('bob').facts[0].content,'喜欢咖啡');
@@ -73,7 +73,7 @@ test('画像请求未知失败保留其他组件，单目标来源和真实权�
     const person=input.profiles[0].personId;
     if(person==='alice')throw new Error('fixture upstream response unknown');
     assert.ok(payload.sources.every(source=>!source.text.includes('喜欢阅读')),'other members are not writable sources for this target');
-    return {personId:'alice',facts:[{content:'喜欢登山',sources:[payload.sources.find(source=>source.text==='我喜欢登山').id]}]};
+    return {personId:'alice',changes:[{content:'喜欢登山',sources:[payload.sources.find(source=>source.text==='我喜欢登山').id]}]};
   });
   assert.equal(f.store.autoMemory.profile('bob').facts[0].content,'喜欢登山');
   assert.deepEqual(f.store.autoMemory.profile('alice').facts,[]);

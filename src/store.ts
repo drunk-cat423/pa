@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { SessionIntegrityStore, migrateSessionIntegrity } from './session-integrity-store.js';
 import { isDeepStrictEqual } from 'node:util';
 import { MemoryError } from './memory-types.js';
 import type { MemoryChange, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, PrimaryPerson,
@@ -16,6 +17,7 @@ import { reclassifySelfProfileTerms, type SelfProfileTermMove } from './self-pro
 import { imageMetadata, type MessageImage } from './image-context.js';
 import { migrateResearch, migrateResearchArchives, ResearchStore } from './research-store.js';
 import { migrateResearchCollection, migrateResearchWorkflow } from './research-workflow-store.js';
+import { messagePeople } from './context-people.js';
 
 export interface ConversationRecord {
   id: string;
@@ -71,7 +73,7 @@ export class DuplicateMessageError extends Error {
   constructor() { super('当前会话已保存该渠道消息，拒绝重复运行。'); this.name = 'DuplicateMessageError'; }
 }
 
-const SCHEMA_VERSION = 30;
+const SCHEMA_VERSION = 31;
 const OWNER_ID = 'local-owner';
 const historyTokens = memoryWords;
 
@@ -79,7 +81,8 @@ export interface HistoryOptions {
   query?: string; scope?: 'sender' | 'room'; senderId?: string; before?: string; after?: string; limit?: number;
 }
 export interface HistoryMessage {
-  id: string; senderId?: string; senderName?: string; replyToSenderId?: string;
+  id: string; senderId?: string; senderName?: string; personId?: string; replyToSenderId?: string; replyToMessageId?: string;
+  speakerLabel?: string; replyToLabel?: string;
   role: 'user' | 'assistant'; text: string; sentAt?: string;
   correctedBy?: string[];
 }
@@ -189,6 +192,7 @@ export class ConversationStore {
   readonly databasePath: string;
   readonly autoMemory: AutoMemoryStore;
   readonly research: ResearchStore;
+  readonly sessionIntegrity: SessionIntegrityStore;
   private readonly db: DatabaseSync;
   private closed = false;
   private transactionDepth = 0;
@@ -203,6 +207,7 @@ export class ConversationStore {
       this.initialize();
       this.autoMemory = new AutoMemoryStore(this.db, operation => this.memoryTransaction(operation));
       this.research = new ResearchStore(this.db, operation => this.memoryTransaction(operation), dirname(this.databasePath));
+      this.sessionIntegrity = new SessionIntegrityStore(this.db);
     } catch (error) {
       this.db.close();
       this.closed = true;
@@ -546,6 +551,15 @@ export class ConversationStore {
             .run(String(row.id),JSON.stringify([...new Set(input.mentionedSenderIds)]));restored++;
         }
         this.db.prepare('INSERT OR IGNORE INTO message_profile_context_repairs VALUES (30,?,?,?)').run(restored,unverifiable,now());
+      }
+      if (version < 31) {
+        this.db.exec(`CREATE TABLE maintenance_contracts(domain TEXT PRIMARY KEY, version INTEGER NOT NULL);
+          INSERT INTO maintenance_contracts VALUES ('research-retention',1);
+          CREATE INDEX channel_tasks_ready ON channel_tasks(conversation_id,status,created_at);
+          CREATE INDEX channel_unfinished_runs ON agent_runs(conversation_id,started_at) WHERE status='running';
+          UPDATE channel_tasks SET status='running' WHERE status='queued'
+            AND EXISTS(SELECT 1 FROM agent_runs WHERE input_message_id=channel_tasks.message_id);`);
+        migrateSessionIntegrity(this.db);
       }
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
@@ -1084,13 +1098,15 @@ export class ConversationStore {
       const tokens = historyTokens(options.query ?? '');
       const match = [...new Set(tokens)].map(token => '"' + token.replaceAll('"','""') + '"').join(' OR ');
       const filtered = `SELECT m.id,m.role,m.text,m.ingest_seq,m.sent_at,m.created_at,m.sender_name,m.image_failure,
-        a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) AS input_message_id,r.response_message_id
+        a.external_user_id AS sender_id,p.person_id,inputa.external_user_id AS reply_sender_id,inputp.person_id AS reply_person_id,coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) AS input_message_id,r.response_message_id
         ${match ? ',bm25(message_history_fts) AS score' : ''}
         FROM messages m LEFT JOIN actors a ON a.id=m.actor_id
+        LEFT JOIN actor_person_bindings p ON p.actor_id=m.actor_id
         LEFT JOIN agent_runs r ON r.input_message_id=m.id OR r.response_message_id=m.id
         LEFT JOIN research_deliveries rd ON rd.message_id=m.id
         LEFT JOIN channel_task_failures cf ON cf.message_id=m.id LEFT JOIN channel_tasks failed_task ON failed_task.id=cf.task_id
         LEFT JOIN messages input ON input.id=coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) LEFT JOIN actors inputa ON inputa.id=input.actor_id
+        LEFT JOIN actor_person_bindings inputp ON inputp.actor_id=input.actor_id
         LEFT JOIN deliveries d ON d.message_id=m.id
         ${match ? 'JOIN message_history_fts ON message_history_fts.message_id=m.id' : ''}
         WHERE m.conversation_id=? AND m.ingest_seq<?
@@ -1124,7 +1140,11 @@ export class ConversationStore {
         ...(correctedMessages[String(row.id)] ? {correctedBy:correctedMessages[String(row.id)]} : {}),
         ...(row.sender_id == null ? {} : { senderId: String(row.sender_id) }),
         ...(row.sender_name == null ? {} : { senderName: String(row.sender_name) }),
+        ...(row.person_id == null ? {} : { personId: String(row.person_id) }),
+        ...messagePeople({role:String(row.role),personId:row.person_id==null?undefined:String(row.person_id),
+          replyToPersonId:row.reply_person_id==null?undefined:String(row.reply_person_id)}),
         ...(row.role !== 'assistant' || row.reply_sender_id == null ? {} : { replyToSenderId: String(row.reply_sender_id) }),
+        ...(row.role !== 'assistant' || row.input_message_id == null ? {} : { replyToMessageId: String(row.input_message_id) }),
         sentAt: String(row.sent_at ?? row.created_at),
         ...(row.image_failure==null?{}:{imageFailure:String(row.image_failure)}),
         ...(this.messageImages(conversationId,String(row.id)).length ? { images: this.messageImages(conversationId,String(row.id)).map(imageMetadata) } : {}),
@@ -1169,7 +1189,8 @@ export class ConversationStore {
     return row ? { id: String(row.id), actorId: String(row.actor_id), senderId: String(row.external_user_id), text: String(row.text) } : undefined;
   }
 
-  quotedMessage(conversationId: string, externalId: string, referenceIndex = false): { role: 'user' | 'assistant'; senderId?: string; text: string; images?: MessageImage[]; sourceMessageId?: string } | undefined {
+  quotedMessage(conversationId: string, externalId: string, referenceIndex = false): { role: 'user' | 'assistant'; senderId?: string; personId?: string;
+    replyToPersonId?: string; text: string; images?: MessageImage[]; sourceMessageId?: string } | undefined {
     if (typeof externalId !== 'string' || !externalId || externalId.length > 512
       || externalId.trim() !== externalId || /[\u0000-\u001f\u007f]/.test(externalId)) return undefined;
     // Both inbound event IDs and confirmed outgoing IDs are scoped to this exact conversation.
@@ -1195,9 +1216,20 @@ export class ConversationStore {
       LIMIT 2`).all(referenceIndex ? 1 : 0, conversationId, externalId, externalId, conversationId, externalId, conversationId, externalId, conversationId, externalId, conversationId, externalId);
     if (rows.length !== 1) return undefined;
     const row = rows[0]!;
+    // Only enrich the already authorized source; platform-provided display names never resolve identity.
+    const people = this.db.prepare(`SELECT p.person_id,inputp.person_id AS reply_person_id FROM messages m
+      LEFT JOIN actor_person_bindings p ON p.actor_id=m.actor_id
+      LEFT JOIN agent_runs r ON r.response_message_id=m.id
+      LEFT JOIN research_deliveries rd ON rd.message_id=m.id
+      LEFT JOIN channel_task_failures cf ON cf.message_id=m.id LEFT JOIN channel_tasks t ON t.id=cf.task_id
+      LEFT JOIN messages input ON input.id=coalesce(r.input_message_id,rd.source_message_id,t.message_id)
+      LEFT JOIN actor_person_bindings inputp ON inputp.actor_id=input.actor_id
+      WHERE m.id=? AND m.conversation_id=?`).get(String(row.sourceMessageId),conversationId);
     const images = this.messageImages(conversationId,String(row.id));
     return { role: row.role as 'user' | 'assistant', text: String(row.text), sourceMessageId:String(row.sourceMessageId),
       ...(images.length ? { images } : {}),
+      ...(row.role !== 'user' || people?.person_id == null ? {} : {personId:String(people.person_id)}),
+      ...(row.role !== 'assistant' || people?.reply_person_id == null ? {} : {replyToPersonId:String(people.reply_person_id)}),
       ...(row.senderId == null ? {} : { senderId: String(row.senderId) }) };
   }
 
@@ -1276,6 +1308,32 @@ export class ConversationStore {
     });
   }
 
+  /** Commit the raw event and its response intent together; duplicates never schedule another run. */
+  admitChannelMessage(conversationId: string, input: InboundMessage, messageKind: 'chat' | 'memory' = 'chat'): {
+    source: { id: string; actorId: string; senderId: string; text: string };
+    task?: { id: string; status: ChannelTaskStatus };
+  } | undefined {
+    return this.memoryTransaction(() => {
+      const room = this.db.prepare(`SELECT r.channel,r.account,r.room_type,r.external_chat_id FROM conversations c
+        JOIN rooms r ON r.id=c.room_id WHERE c.id=?`).get(conversationId);
+      if (!room || room.channel !== input.route.channel || room.account !== input.route.accountId
+        || room.room_type !== input.route.roomType || room.external_chat_id !== input.route.roomId) {
+        throw new Error('接入消息路由与当前会话不一致。');
+      }
+      if (this.hasExternalMessage(conversationId,input.eventId)) return undefined;
+      this.insertInbound(conversationId,randomUUID(),input.text,now(),{
+        eventId:input.eventId,senderId:input.senderId,modelInputText:input.text,sentAt:input.sentAt,messageKind,
+        ...(input.senderName === undefined ? {} : {senderName:input.senderName.slice(0,100)}),
+        ...(input.mentionedSenderIds ? {mentionedSenderIds:input.mentionedSenderIds} : {}),
+        ...(input.quote ? {quote:input.quote} : {}),...(input.images?.length ? {images:input.images} : {}),
+      });
+      const source = this.externalMessage(conversationId,input.eventId)!;
+      const responds = Boolean(input.text.trim()) && (input.route.roomType === 'private' || input.mentioned);
+      const task = responds ? this.enqueueChannelTask(conversationId,source.id,input) : undefined;
+      return {source,...(task ? {task} : {})};
+    });
+  }
+
   enqueueChannelTask(conversationId: string, sourceMessageId: string, input: InboundMessage): { id: string; status: ChannelTaskStatus } {
     return this.memoryTransaction(() => {
       const source = this.db.prepare(`SELECT m.id,m.text,m.external_event_id,m.sender_name,m.sent_at,a.external_user_id,
@@ -1312,6 +1370,31 @@ export class ConversationStore {
       AND NOT EXISTS (SELECT 1 FROM agent_runs WHERE input_message_id=channel_tasks.message_id)`).run(now(), id).changes === 1;
   }
 
+  claimNextChannelTask(conversationId: string): ChannelTaskRecord | undefined {
+    return this.memoryTransaction(() => {
+      const row = this.db.prepare(`SELECT * FROM channel_tasks WHERE conversation_id=? AND status='queued'
+        AND NOT EXISTS (SELECT 1 FROM agent_runs WHERE input_message_id=channel_tasks.message_id)
+        ORDER BY created_at,rowid LIMIT 1`).get(conversationId);
+      if (!row) return undefined;
+      if (!this.claimChannelTask(String(row.id))) throw new Error('渠道任务领取状态冲突。');
+      return asChannelTask({...row,status:'running'});
+    });
+  }
+
+  queuedChannelTaskCount(conversationId: string): number {
+    return Number(this.db.prepare("SELECT count(*) n FROM channel_tasks WHERE conversation_id=? AND status='queued'")
+      .get(conversationId)!.n);
+  }
+
+  releaseUnstartedChannelTask(conversationId: string,taskId: string): boolean {
+    // Only local scheduling may be undone. A run marker is an irreversible boundary:
+    // it may already own a model request or a persisted control operation.
+    return this.db.prepare(`UPDATE channel_tasks SET status='queued',updated_at=?
+      WHERE id=? AND conversation_id=? AND status='running'
+      AND NOT EXISTS(SELECT 1 FROM agent_runs WHERE input_message_id=channel_tasks.message_id)`)
+      .run(now(),taskId,conversationId).changes===1;
+  }
+
   finishChannelTask(id: string, status: 'completed' | 'failed' | 'interrupted', deliveryId?: string): void {
     if (!['completed', 'failed', 'interrupted'].includes(status)) throw new Error('任务结束状态无效。');
     this.memoryTransaction(() => {
@@ -1342,10 +1425,11 @@ export class ConversationStore {
       const tasks = this.db.prepare(`SELECT t.id,t.status,r.status AS run_status,d.id AS delivery_id
         FROM channel_tasks t LEFT JOIN agent_runs r ON r.input_message_id=t.message_id
         LEFT JOIN deliveries d ON d.run_id=r.id
-        WHERE t.conversation_id=? AND t.status IN ('queued','running')`).all(conversationId);
+        WHERE t.conversation_id=? AND t.status='running'`).all(conversationId);
       for (const task of tasks) {
-        if (task.status === 'queued' && task.run_status == null) continue;
-        const status = task.run_status === 'completed' && task.delivery_id != null ? 'completed'
+        // No run means no model/control dispatch: undo a crash after claim.
+        const status = task.run_status == null ? 'queued'
+          : task.run_status === 'completed' && task.delivery_id != null ? 'completed'
           : task.run_status === 'failed' ? 'failed' : 'interrupted';
         this.db.prepare('UPDATE channel_tasks SET status=?,result_delivery_id=?,updated_at=? WHERE id=?')
           .run(status, status === 'completed' ? String(task.delivery_id) : null, now(), String(task.id));
@@ -1414,6 +1498,8 @@ export class ConversationStore {
       if(actualModelInput!==undefined) this.db.prepare('UPDATE messages SET model_input_text=? WHERE id=?').run(actualModelInput,inputMessageId);
       this.db.prepare(`INSERT INTO agent_runs (id, conversation_id, input_message_id, status, provider, model, started_at, pi_session_file)
         VALUES (?, ?, ?, 'running', ?, ?, ?, ?)`).run(id, conversationId, inputMessageId, provider, model, createdAt, piSessionFile ?? null);
+      this.db.prepare("UPDATE channel_tasks SET status='running',updated_at=? WHERE message_id=? AND conversation_id=? AND status='queued'")
+        .run(createdAt,inputMessageId,conversationId);
       for (const ref of memoryRefs) {
         this.db.prepare('INSERT INTO memory_uses (run_id, memory_id, revision) VALUES (?, ?, ?)').run(id, ref.id, ref.revision);
       }

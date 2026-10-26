@@ -43,7 +43,7 @@ async function main(): Promise<void> {
     console.log(`QQ harness: ${state}`);
     const snapshot = { pid: process.pid, updatedAt: new Date().toISOString(), state,
       provider: config.provider, model: config.model,
-      ...(state === 'stopped' ? {} : (harness?.info() ?? { calls: 0, maxCalls: qq.maxCalls })) };
+      ...(['stopped','persistence_failed'].includes(state) ? {} : (harness?.info() ?? { calls: 0, maxCalls: qq.maxCalls })) };
     statusQueue = statusQueue.then(() => writeFile(join(directory, 'status.json'), JSON.stringify(snapshot, null, 2), { mode: 0o600 }))
       .catch(() => { process.exitCode = 1; void stop(); });
   }
@@ -56,6 +56,14 @@ async function main(): Promise<void> {
     return stopping;
   }
   const signal = () => { void stop(); };
+  const taskResult = (result: import('./channel-harness.js').HarnessResult): void => {
+    if (result !== 'ignored' && result !== 'observed' && result !== 'duplicate') status(result);
+    if (qq.maxCalls > 0 && harness!.info().calls >= qq.maxCalls && !budgetDrain) {
+      budgetDrain = harness!.waitForTasks().then(async () => {
+        status('test_budget_complete'); await stop();
+      }).catch(() => {status('persistence_failed');process.exitCode=1;void stop();});
+    }
+  };
   process.once('SIGINT', signal);
   process.once('SIGTERM', signal);
   try {
@@ -66,22 +74,15 @@ async function main(): Promise<void> {
         if (state === 'connection_failed') { process.exitCode = 1; void stop(); }
       },
       onMessage: message => {
-        void harness!.handle(message).then(async result => {
-          if (result !== 'ignored' && result !== 'observed' && result !== 'duplicate') status(result);
-          if (qq.maxCalls > 0 && harness!.info().calls >= qq.maxCalls && !budgetDrain) {
-            // Reserved calls may still be computing or waiting for their send batch.
-            budgetDrain = harness!.waitForTasks().then(async () => {
-              status('test_budget_complete');
-              await stop();
-            });
-            await budgetDrain;
-          }
+        void harness!.handle(message,{waitForResult:false}).then(result => {
+          if(result==='accepted') status('accepted');
+          else taskResult(result);
         }).catch(() => { status('persistence_failed'); process.exitCode = 1; void stop(); });
       },
     });
     harness = new ChannelHarness(config, qq.routes, channel, qq.maxCalls, policy, undefined, () => {
       status('persistence_failed'); process.exitCode = 1; void stop();
-    });
+    },taskResult);
     await channel.start();
     // Recovered tasks may finish immediately; their transport must be READY first.
     if (!stopping) await harness.start();

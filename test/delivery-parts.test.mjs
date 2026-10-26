@@ -16,8 +16,9 @@ function fixture(t) {
   const b = store.ensureConversation('B', '/pi/b.jsonl', { ...route, roomId: 'other' });
   const run = store.beginRun(a.id, '问题', 'p', 'm', [], { eventId: 'input', senderId: 'member', modelInputText: '问题' });
   const delivery = store.completeRun(run.id, '**完整原文**', undefined, undefined);
+  const replyToPersonId=store.autoMemory.personForActor(store.findActor(a.id,'member'));
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
-  return { directory, path, get store() { return store; }, a, b, deliveryId: delivery.deliveryId,
+  return { directory, path, get store() { return store; }, a, b, deliveryId: delivery.deliveryId,replyToPersonId,
     reopen() { store.close(); store = new ConversationStore(path); return store; },
     inspect(operation) { const db = new DatabaseSync(path); try { return operation(db); } finally { db.close(); } } };
 }
@@ -34,7 +35,7 @@ test('last receipt and parent completion are atomic; cross-conversation child re
   f.inspect(db => db.exec('DROP TRIGGER prevent_completion'));
   f.store.ackDeliveryPart(f.a.id, f.deliveryId, 0, 'sent', 'real-id');
   // Parent and child have the same ID, but quote resolution returns the actual transmitted part once.
-  assert.deepEqual(f.store.quotedMessage(f.a.id, 'real-id'), { role: 'assistant', text: '实际文本', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id) });
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'real-id'), { role: 'assistant', text: '实际文本', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id),replyToPersonId:f.replyToPersonId });
   f.inspect(db => {
     db.exec('PRAGMA foreign_keys=ON');
     assert.throws(() => db.prepare(`INSERT INTO delivery_parts
@@ -59,8 +60,8 @@ test('v7 migration creates a consistent backup and preserves legacy replies and 
       DROP TABLE delivery_parts; DROP INDEX delivery_conversation_identity; PRAGMA user_version=7;`);
   });
   f.reopen();
-  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),30);
-  assert.deepEqual(f.store.quotedMessage(f.a.id, 'legacy-id'), { role: 'assistant', text: '**完整原文**', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id) });
+  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),31);
+  assert.deepEqual(f.store.quotedMessage(f.a.id, 'legacy-id'), { role: 'assistant', text: '**完整原文**', sourceMessageId:f.inspect(db=>db.prepare('SELECT message_id FROM deliveries WHERE id=?').get(f.deliveryId).message_id),replyToPersonId:f.replyToPersonId });
   assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM messages').get().n), 2);
   const backups = readdirSync(f.directory).filter(name => name.includes('.v7.') && name.endsWith('.bak'));
   assert.equal(backups.length, 1);

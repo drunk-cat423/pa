@@ -1,4 +1,15 @@
+export function downgradeSchema30(db) {
+  for(const row of db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'session_integrity_%'").all()) {
+    db.exec(`DROP TRIGGER "${row.name.replaceAll('"','""')}"`);
+  }
+  db.exec('DROP TABLE IF EXISTS session_integrity; DROP TABLE IF EXISTS session_integrity_sweeps; DROP TABLE IF EXISTS session_integrity_canonical_messages; DROP TABLE IF EXISTS maintenance_contracts; DROP INDEX IF EXISTS channel_tasks_ready; DROP INDEX IF EXISTS channel_unfinished_runs;');
+  for(const row of db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'session_integrity_%'").all()) {
+    db.exec(`DROP INDEX "${row.name.replaceAll('"','""')}"`);
+  }
+}
+
 export function downgradeSchema22(db) {
+  downgradeSchema30(db);
   db.exec('DROP TABLE IF EXISTS auto_memory_component_results;');
   db.exec('DROP TABLE IF EXISTS auto_memory_recoveries;');
   db.exec('DROP TABLE IF EXISTS channel_task_failures;');

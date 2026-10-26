@@ -53,6 +53,12 @@ systemctl disable --now mysql.service
 
 更新使用新的发布目录，完成构建和检查后停服务、备份数据，再切换 current 并启动。配置和数据不随发布包替换。若只有代码回退可兼容现有 schema，切回旧代码即可；schema 回退需要同一停机快照中的 SQLite 与 Pi JSONL 一起恢复，不能分别拼接。不要重新启动本机实例与服务器实例同时试用。
 
+### schema31增量核对与队列升级
+
+先完成本地回归、服务器构建，停止PA后使用统一storage锁创建`before-schema-31`完整检查点，再以pa用户打开新ConversationStore。迁移新增独立Pi完整性账本、canonical关联索引及research-retention契约1；旧queued且已有run的任务仅修正调度状态，不执行请求。核对原始消息、画像/旧版、研究及整理输入进度和文件哈希，保留env/policy及实际清理drop-in。服务器不重复回归，不手动重试失败研究。
+
+首次启动需要对所有旧任务JSONL建立真实核对checkpoint，可能比后续启动慢；确认QQ READY之外，还须检查`isolatedRooms`和`integrity`，不能把房间隔离误当完整上线。发生隔离保留原文件和账本、停止该房间后台，按[startup-and-scheduling.md](startup-and-scheduling.md)核查；不得直接将dirty/corrupt改成verified。回退旧schema30必须恢复同一完整快照。
+
 ### 研究功能与 schema24
 
 研究功能首次部署将 schema23 升级到24，停机快照标记 `before-schema-24` 检查点。报告目录位于 `PA_DATA_DIR/research`，由现有整个数据目录备份一并保留。先在新发布目录完成构建及研究端到端检查；停止服务并完成快照后，以pa用户打开新版本ConversationStore迁移，核对原文和外键，再切换并启动。不能把旧schema23代码直接指向升级后的数据库。

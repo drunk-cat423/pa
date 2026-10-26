@@ -62,7 +62,7 @@ test('真实v9迁移先备份，保留原文、已确认分段和旧canonical运
     assert.deepEqual(backup.prepare('PRAGMA foreign_key_check').all(), []);
     assert.equal(backup.prepare("SELECT name FROM pragma_table_info('agent_runs') WHERE name='pi_session_file'").get(), undefined);
   } finally { backup.close(); }
-  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),30);
+  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),31);
   assert.deepEqual(f.store.unfinishedRuns(f.other.id), [pendingRun]);
   assert.equal(f.store.quotedMessage(f.conversation.id, 'old-external').text, '原有已发送文本');
   assert.equal(f.inspect(db => db.prepare('SELECT text FROM messages WHERE id=?').get(result.messageId).text), '**原始答案**');
@@ -73,4 +73,19 @@ test('真实v9迁移先备份，保留原文、已确认分段和旧canonical运
   assert.deepEqual(f.inspect(db => db.prepare('PRAGMA foreign_key_check').all()), []);
   f.reopen();
   assert.equal(readdirSync(f.directory).filter(name => name.includes('.v9.') && name.endsWith('.bak')).length, 1);
+});
+
+test('崩溃恢复仅重排没有run的领取，不重排已记录模型调用的任务',t=>{
+  const f=fixture(t),neverStarted=f.enqueue('claimed'),started=f.enqueue('dispatched');
+  assert.equal(f.store.claimChannelTask(neverStarted.id),true);
+  const run=f.run(started);
+  assert.equal(f.store.listChannelTasks(f.conversation.id).find(t=>t.id===started.id).status,'running');
+  f.reopen();
+  f.store.failRun(run.id,'interrupted','interrupted','unknown request');
+  f.store.recoverChannelTasks(f.conversation.id);
+  const rows=f.store.listChannelTasks(f.conversation.id);
+  assert.equal(rows.find(t=>t.id===neverStarted.id).status,'queued');
+  assert.equal(rows.find(t=>t.id===started.id).status,'interrupted');
+  assert.equal(f.store.releaseUnstartedChannelTask(f.conversation.id,started.id),false);
+  assert.equal(f.store.claimNextChannelTask(f.conversation.id).id,neverStarted.id);
 });

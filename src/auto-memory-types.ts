@@ -51,7 +51,7 @@ export interface AutoMemoryMessage {
   images?: MessageImage[];
   imageFailure?: string;
   id: string; conversationId: string; actorId?: string; personId?: string;
-  contextSeq?: number; senderId?: string; senderName?: string; replyToSenderId?: string; replyToMessageId?: string;
+  contextSeq?: number; senderId?: string; senderName?: string; replyToSenderId?: string; replyToMessageId?: string; replyToPersonId?: string;
   role: 'user' | 'assistant'; text: string; ingestSeq: number; createdAt: string; sentAt?: string;
   mentionedSenderIds?: string[];
   runStatus?: string; deliveryStatus?: string; turnInputSeq?: number;
@@ -70,6 +70,8 @@ export interface SummaryCorrections {
 export interface AutoMemoryTaskInput {
   /** Single-target proposals and independently durable material components. */
   materialsProtocol?: 3;
+  /** Absent on frozen complete-list proposals; omitted facts are inherited only with this marker. */
+  profileProposalProtocol?: 'delta-v1';
   completedComponents?: string[];
   completedMaterialMessageIds?: string[];
   /** Read-only later evidence for chronological recovery; never grants write attribution. */

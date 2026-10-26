@@ -17,7 +17,7 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const preparing=body.tool_choice?.function?.name==='prepare_turn';
     const search = !preparing && body.tools?.some(tool => tool.function.name === 'web_search') && requests.filter(r=>r.tools?.some(tool=>tool.function.name==='web_search')).length===1;
-    const delta = preparing ? {role:'assistant',tool_calls:[{index:0,id:'prepare-'+requests.length,type:'function',function:{name:'prepare_turn',arguments:JSON.stringify({intent:'question',mode:'standard',updates:[]})}}]} : search ? { role: 'assistant', tool_calls: [{ index: 0, id: 'call_search_1', type: 'function',
+    const delta = preparing ? {role:'assistant',tool_calls:[{index:0,id:'prepare-'+requests.length,type:'function',function:{name:'prepare_turn',arguments:JSON.stringify({intent:'question',mode:'standard',updates:[],grounding:{freshness:'stable',experienceRefs:[]}})}}]} : search ? { role: 'assistant', tool_calls: [{ index: 0, id: 'call_search_1', type: 'function',
       function: { name: 'web_search', arguments: JSON.stringify({ query: 'SQLite 官方文档', startDate: '2026-10-08', endDate: '2026-10-15' }) } }] } : { role: 'assistant', content: '检索完成' };
     for (const choices of [[{ index: 0, delta, finish_reason: null }],
       [{ index: 0, delta: {}, finish_reason: preparing || search ? 'tool_calls' : 'stop' }]]) {

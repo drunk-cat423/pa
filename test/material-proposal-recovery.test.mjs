@@ -74,7 +74,7 @@ for (const kind of ["wire_subject","attribution"]) {
       assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM memory_topics WHERE job_id=?').get(f.first.id).n),1);
       assert.match(prepareMemoryWireExtraction(input, 1000000).systemPrompt, /唯一目标人物/);
       if (kind === 'wire_subject') return parseMemoryResponse({ stopReason: 'stop', content: [{ type: 'text', text:
-        JSON.stringify({ facts: [{ content: '无效来源', sources: ['m999999'] }] }) }] }, input);
+        JSON.stringify({ changes: [{ content: '无效来源', sources: ['m999999'] }] }) }] }, input);
       if (kind === 'structure') return { profiles: 'invalid' };
       if (kind.startsWith('model_')) throw new MemoryProviderError(kind, 'fixture response rejected');
       const proposal = valid(input), profile = proposal.profiles[0];

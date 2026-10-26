@@ -20,6 +20,7 @@ export function companionReply(body, fallback = '记住了。') {
     return { delta: { role: 'assistant', tool_calls: [{ index: 0, id: `fixture-${++callSequence}`,
       type: 'function', function: { name: 'prepare_turn', arguments: JSON.stringify({
         intent: updates.length ? 'memory_update' : 'question', mode: 'standard', updates,
+        grounding:{freshness:'stable',experienceRefs:[]},
       }) } }] }, finishReason: 'tool_calls' };
   }
   return { delta: { role: 'assistant', content: fallback }, finishReason: 'stop' };

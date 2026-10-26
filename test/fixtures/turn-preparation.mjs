@@ -11,8 +11,9 @@ export function isPreparationRequest(body) {
 }
 
 export function preparationDelta(id, plan = { intent: 'question', mode: 'standard', updates: [] }) {
+  const prepared={grounding:{freshness:'stable',experienceRefs:[]},...plan};
   return { role: 'assistant', tool_calls: [{ index: 0, id, type: 'function', function: {
-    name: 'prepare_turn', arguments: JSON.stringify(plan),
+    name: 'prepare_turn', arguments: JSON.stringify(prepared),
   } }] };
 }
 

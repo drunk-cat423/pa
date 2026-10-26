@@ -1,5 +1,6 @@
 import { MemoryError, type AttributionCorrection, type SharedFactAttributionInput } from './memory-types.js';
 import type { ProfileSubjectEvidence } from './profile-attribution.js';
+import { ANSWER_GROUNDING_SCHEMA, validateAnswerGrounding, type AnswerGroundingPlan } from './answer-grounding.js';
 
 export type ReplyMode = 'casual' | 'standard' | 'professional';
 export interface TurnUpdate {
@@ -16,6 +17,7 @@ export interface TurnPlan {
   mode: ReplyMode;
   updates: TurnUpdate[];
   progressText?: string;
+  grounding?: AnswerGroundingPlan;
 }
 export interface TurnReceipt {
   prepared: true;
@@ -26,6 +28,7 @@ export interface TurnReceipt {
 }
 
 export const TURN_PLAN_SCHEMA = { type: 'object', properties: {
+  grounding: ANSWER_GROUNDING_SCHEMA,
   intent: { type: 'string', enum: ['social', 'question', 'research', 'memory_update'] },
   mode: { type: 'string', enum: ['casual', 'standard', 'professional'] },
   progressText: { type: 'string', minLength: 1, maxLength: 60,
@@ -59,7 +62,7 @@ export const TURN_PLAN_SCHEMA = { type: 'object', properties: {
 
 export function validateTurnPlan(value: unknown): TurnPlan {
   const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
-  if (!object(value) || Object.keys(value).some(k => !['intent', 'mode', 'updates', 'progressText'].includes(k))
+  if (!object(value) || Object.keys(value).some(k => !['intent', 'mode', 'updates', 'progressText','grounding'].includes(k))
     || !['social', 'question', 'research', 'memory_update'].includes(String(value.intent))
     || !['casual', 'standard', 'professional'].includes(String(value.mode)) || !Array.isArray(value.updates)
     || value.updates.length > 8) throw new MemoryError('本轮准备协议无效。');
@@ -103,6 +106,7 @@ export function validateTurnPlan(value: unknown): TurnPlan {
     }
   }
   if (Buffer.byteLength(JSON.stringify(value), 'utf8') > 20000) throw new MemoryError('本轮资料更新总量过大。');
+  if(value.grounding!==undefined) validateAnswerGrounding(value.grounding);
   return value as unknown as TurnPlan;
 }
 

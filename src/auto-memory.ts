@@ -269,6 +269,7 @@ interface WorkItem {
 }
 interface Progress {
   materialsProtocol?: 3;
+  profileProposalProtocol?: 'delta-v1';
   version: 2 | 3;
   profileBaselineProtocol?: 1;
   profileAttributionProtocol?: 1;
@@ -813,6 +814,7 @@ export class BackgroundMemory {
       if(!record(existing)||!Number.isSafeInteger(existing.version)) throw new MemoryStatePersistenceError('后台整理检查点结构损坏。');
       if (existing.version !== (input.extractionProtocol === 2 ? 3 : 2)) throw new PersonProfileProtocolError();
       if (existing.materialsProtocol !== input.materialsProtocol) throw new PersonProfileProtocolError();
+      if (existing.profileProposalProtocol !== input.profileProposalProtocol) throw new PersonProfileProtocolError();
       if (existing.profileBaselineProtocol !== input.profileBaselineProtocol) throw new PersonProfileProtocolError();
       if(existing.profileAttributionProtocol!==input.profileAttributionProtocol||existing.selfProfileProtocol!==input.selfProfileProtocol) throw new PersonProfileProtocolError();
       if (!Array.isArray(existing.remaining) || !record(existing.extract)
@@ -868,6 +870,7 @@ export class BackgroundMemory {
           ...(input.selfProfile?.pending.length ? [{ messageIds: [] as string[], personIds: [] as string[], mode: 'self' as const }] : [])]
         : [{ messageIds, personIds: input.profiles.map(profile => profile.personId) }];
     return { ...(input.materialsProtocol===3?{materialsProtocol:3 as const}:{}),version: input.extractionProtocol === 2 ? 3 : 2,
+      ...(input.profileProposalProtocol ? { profileProposalProtocol: input.profileProposalProtocol } : {}),
       ...(input.profileBaselineProtocol === 1 ? { profileBaselineProtocol: 1 as const } : {}),
       ...(input.profileAttributionProtocol?{profileAttributionProtocol:input.profileAttributionProtocol}:{}),
       ...(input.selfProfileProtocol?{selfProfileProtocol:input.selfProfileProtocol}:{}),

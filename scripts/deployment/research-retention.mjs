@@ -4,6 +4,7 @@ import { dirname, join, parse, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { researchEvidence, validateResearchEvidence } from './research-retention-evidence.mjs';
+import { researchProjection, validateResearchRetentionContract } from './research-retention-contract.mjs';
 
 const DAY = 86400000;
 const TABLE = 'research_retention_runs';
@@ -45,17 +46,15 @@ function openDatabase(dataDir, readOnly) {
   const db = new DatabaseSync(path, { readOnly });
   try {
     db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;');
-    const schemaVersion = Number(db.prepare('PRAGMA user_version').get().user_version);
-    if (schemaVersion !== 27) fail('只支持已核验的schema27，不自动迁移数据。');
-    for (const table of tables) if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) fail('缺少研究数据表。');
-    return { db, root, identity: { dev: String(stat.dev), ino: String(stat.ino), schemaVersion } };
+    const contract = validateResearchRetentionContract(db);
+    return { db, root, identity: { dev: String(stat.dev), ino: String(stat.ino), contract } };
   } catch (error) { db.close(); throw error; }
 }
 
 function records(db, taskId) {
   const result = {};
   for (const table of tables) {
-    result[table] = db.prepare(`SELECT * FROM ${table} WHERE ${table === 'research_tasks' ? 'id' : 'task_id'}=? ORDER BY rowid`).all(taskId);
+    result[table] = db.prepare(`SELECT ${researchProjection(table)} FROM ${table} WHERE ${table === 'research_tasks' ? 'id' : 'task_id'}=? ORDER BY rowid`).all(taskId);
   }
   return result;
 }
@@ -168,7 +167,7 @@ function buildPlan(db, root, identity, now) {
         databasePayloadBytes, fileBytes: files.reduce((n, f) => n + f.bytes, 0) });
     } catch { skip('missing_or_unsafe_artifacts'); }
   }
-  return { version: 1, policy: POLICY, dataDir: root, database: identity, createdAt, retainDays: 30, candidates, skipped };
+  return { version: 2, policy: POLICY, dataDir: root, database: identity, createdAt, retainDays: 30, candidates, skipped };
 }
 
 /** Read-only: no application Store initialization, schema migration, or audit writes. */
@@ -176,6 +175,7 @@ export function previewResearchCleanup(dataDir, { now = new Date() } = {}) {
   const { db, root, identity } = openDatabase(dataDir, true);
   try {
     db.exec('BEGIN');
+    validateResearchRetentionContract(db);
     const plan = buildPlan(db, root, identity, now);
     db.exec('COMMIT');
     return plan;
@@ -218,13 +218,20 @@ export function applyResearchCleanup(dataDir, plan, { now = new Date(), afterCom
   try {
     if (!plan || typeof plan !== 'object') fail('清理计划无效。');
     const planJson = JSON.stringify(plan), cleanupId = hash(planJson);
-    if (plan?.version !== 1 || plan.retainDays !== 30 || plan.dataDir !== root || JSON.stringify(plan.database) !== JSON.stringify(identity)) fail('清理计划与数据目录不匹配。');
+    if (![1,2].includes(plan.version) || plan.retainDays !== 30 || plan.dataDir !== root
+      || plan.database?.dev !== identity.dev || plan.database?.ino !== identity.ino) fail('清理计划与数据目录不匹配。');
+    if (plan.version === 2 && JSON.stringify(plan.database) !== JSON.stringify(identity)) fail('清理计划契约不匹配。');
     const generated = timestamp(plan.createdAt);
     if (generated > now.getTime()) fail('不能执行未来的清理计划。');
     db.exec('BEGIN IMMEDIATE');
     try {
+      validateResearchRetentionContract(db);
       const hasJournal = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(TABLE);
       let run = hasJournal ? db.prepare(`SELECT * FROM ${TABLE} WHERE id=?`).get(cleanupId) : undefined;
+      // Legacy plans may cross an unrelated schema upgrade only after their exact
+      // original bytes/hash have already committed. Never rewrite the manifest.
+      if (plan.version === 1 && (!run || !Number.isInteger(plan.database.schemaVersion)
+        || plan.database.schemaVersion < 27 || plan.database.schemaVersion > 30)) fail('旧未提交预览或未知旧协议，请重新预览。');
       if (!run) {
         if (now.getTime() - generated > DAY) fail('清理预览已超过24小时，请重新预览。');
         const actual = buildPlan(db, root, identity, new Date(generated));
@@ -255,7 +262,8 @@ export function applyResearchCleanup(dataDir, plan, { now = new Date(), afterCom
           }
         }
         const postHashes = Object.fromEntries(actual.candidates.map(c => [c.taskId, recoveryHash(db, c.taskId)]));
-        db.prepare(`INSERT INTO ${TABLE} VALUES(?,1,?,?,'pending',?,NULL)`).run(cleanupId, planJson, JSON.stringify(postHashes), now.toISOString());
+        db.prepare(`INSERT INTO ${TABLE}(id,policy_version,plan_json,post_hashes_json,status,created_at,completed_at)
+          VALUES(?,1,?,?,'pending',?,NULL)`).run(cleanupId, planJson, JSON.stringify(postHashes), now.toISOString());
         run = { plan_json: planJson, post_hashes_json: JSON.stringify(postHashes), status: 'pending' };
       } else {
         if (run.policy_version !== 1 || run.plan_json !== planJson) fail('清理审计协议不一致。');
@@ -273,6 +281,7 @@ export function applyResearchCleanup(dataDir, plan, { now = new Date(), afterCom
     afterCommit?.();
     db.exec('BEGIN IMMEDIATE');
     try {
+      validateResearchRetentionContract(db);
       const run = db.prepare(`SELECT * FROM ${TABLE} WHERE id=?`).get(cleanupId);
       for (const candidate of plan.candidates) {
         if (JSON.parse(run.post_hashes_json)[candidate.taskId] !== recoveryHash(db, candidate.taskId)) fail('清理提交后任务已变化。');

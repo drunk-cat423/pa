@@ -14,6 +14,7 @@ import { appendReferenceUrls, splitReply, QQ_PASSIVE_REPLY_LIMIT } from './reply
 import { splitMarkdown } from './markdown-chunks.js';
 import { ImageAssets, ImageAssetError } from './image-assets.js';
 import { ResearchService } from './research-service.js';
+import { SessionIntegrityError } from './session-integrity.js';
 
 export interface ChannelTransport {
   send(message: OutboundMessage): Promise<DeliveryResult>;
@@ -26,7 +27,7 @@ export function channelConversationKey(route: ChannelRoute): string {
 }
 
 export type HarnessResult = 'ignored' | 'observed' | 'duplicate' | 'budget_exhausted'
-  | 'sent' | 'uncertain' | 'rejected' | 'failed';
+  | 'accepted' | 'sent' | 'uncertain' | 'rejected' | 'failed';
 
 const RESULT_COMMAND = /^\/result(?:\s+([0-9a-f-]+))?\s*$/i;
 
@@ -35,7 +36,12 @@ export class ChannelHarness {
   private readonly allowed: Set<string>;
   private readonly conversations = new Map<string, RecordedConversation>();
   private readonly outputs = new Map<string, Promise<unknown>>();
-  private readonly pending: { run: (release: () => void) => Promise<HarnessResult>; resolve: (value: HarnessResult) => void; reject: (error: unknown) => void }[] = [];
+  // Durable queued payloads stay in SQLite. Optional callers awaiting completion
+  // retain only resolvers; the production ingress returns after admission.
+  private readonly waiters = new Map<string, { key: string; resolve: (value: HarnessResult) => void; reject: (error: unknown) => void }>();
+  private readonly busyRooms = new Map<string,string>();
+  private readonly isolatedRooms = new Map<string, string>();
+  private nextRoom = 0;
   private readonly jobs = new Set<Promise<unknown>>();
   private computing = 0;
   private fatal: unknown;
@@ -50,7 +56,8 @@ export class ChannelHarness {
 
   constructor(private readonly config: PaConfig, private readonly routes: ChannelRoute[],
     private readonly transport: ChannelTransport, private readonly maxCalls: number, policy: HarnessPolicy = NO_OWNER_POLICY,
-    private readonly memoryProvider?: MemoryProvider, private readonly onTaskError?: () => void) {
+    private readonly memoryProvider?: MemoryProvider, private readonly onTaskError?: () => void,
+    private readonly onTaskResult?: (result: HarnessResult) => void) {
     if (!Number.isSafeInteger(maxCalls) || maxCalls < 0) throw new Error('调用上限必须是非负整数，0 表示不限次数。');
     if (!routes.length) throw new Error('必须显式配置允许接入的房间。');
     const concurrency = config.tasks?.maxConcurrent ?? 2;
@@ -63,7 +70,11 @@ export class ChannelHarness {
       () => { this.fatal = new Error('研究任务持久化失败。'); this.onTaskError?.(); });
   }
 
-  info() { return { calls: this.calls, maxCalls: this.maxCalls, computing: this.computing, queued: this.pending.length,
+  info() { return { calls: this.calls, maxCalls: this.maxCalls, computing: this.computing,
+    queued: [...this.conversations.values()].reduce((n,c) => n+c.queuedTaskCount(),0),
+    deliveringRooms: this.outputs.size, outstandingRooms: this.busyRooms.size,
+    isolatedRooms: [...this.isolatedRooms].map(([conversation,error]) => ({conversation,error})),
+    integrity: [...this.conversations].map(([conversation,c]) => ({conversation,...c.integrityStatus()})),
     ...(this.research ? { research: this.research.info() } : {}),
     memory: [...this.conversations].map(([key, conversation]) => ({ conversation: key, ...conversation.memoryStatus() })) }; }
 
@@ -72,7 +83,8 @@ export class ChannelHarness {
   }
 
   async waitForTasks(): Promise<void> {
-    // Include work admitted by a preceding job's released computation slot.
+    await Promise.allSettled([...this.admissions.values()]);
+    this.pump();
     while (this.jobs.size) await Promise.allSettled([...this.jobs]);
   }
 
@@ -80,7 +92,12 @@ export class ChannelHarness {
 
   async start(): Promise<void> {
     if (!this.closed) {
-      await Promise.all(this.routes.map(route => this.open(channelConversationKey(route), route)));
+      await Promise.all(this.routes.map(async route => {
+        const key=channelConversationKey(route);
+        try { await this.open(key,route); }
+        catch(error) { if (!(error instanceof SessionIntegrityError)) throw error; this.isolate(key,error); }
+      }));
+      this.pump();
       if (!this.closed) this.research?.start();
     }
   }
@@ -90,21 +107,21 @@ export class ChannelHarness {
     if (!pending) {
       pending = openRecordedConversation(this.config, key, route,
         { persons: configuredPersons(this.policy), policy: this.policy, ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}),
+          onIntegrityFailure:error=>{
+            if(error instanceof SessionIntegrityError) this.isolate(key,error);
+            else {this.fatal=error;this.onTaskError?.();}
+          },
           ...(this.research ? { researchContext: (conversationId, sourceId, send) => this.research!.context(conversationId, sourceId, send) } : {}) });
       this.opening.set(key, pending);
       pending.then(conversation => {
         this.conversations.set(key, conversation);
-        if (!this.closed) for (const task of conversation.tasks('queued')) {
-          void this.schedule(release => this.process(conversation, task.input, { id: task.messageId,
-            actorId: conversation.findActor(task.input.senderId)!, senderId: task.input.senderId, text: task.input.text }, task.id, release))
-            .catch(() => this.onTaskError?.());
-        }
+        if (!this.closed) this.pump();
       }).catch(() => this.opening.delete(key));
     }
     return pending;
   }
 
-  handle(message: InboundMessage): Promise<HarnessResult> {
+  handle(message: InboundMessage, options: { waitForResult?: boolean } = {}): Promise<HarnessResult> {
     const key = channelConversationKey(message.route);
     if (this.closed || !this.allowed.has(key) || !message.eventId || !message.senderId
       || (!message.text.trim() && !message.imageSources?.length && !message.images?.length) || message.text.length > 4000
@@ -116,14 +133,21 @@ export class ChannelHarness {
       ...(message.quote ? { quote: { ...message.quote,
         ...(message.quote.inlineMessages ? { inlineMessages: message.quote.inlineMessages.map(item => ({ ...item })) } : {}) } } : {}) };
     // Serialize only admission/preparation; model and complete output queues remain independent.
-    const admitted = (this.admissions.get(key) ?? Promise.resolve()).then(() => this.accept(key, input));
+    const admitted = (this.admissions.get(key) ?? Promise.resolve()).then(() => this.accept(key, input,options.waitForResult!==false))
+      .catch(error=>{
+        if(!(error instanceof SessionIntegrityError)) throw error;
+        this.isolate(key,error);return 'failed' as const;
+      });
     this.admissions.set(key, admitted.then(() => undefined, () => undefined));
     return admitted.then(result => this.closed ? 'ignored' : typeof result === 'function' ? result() : result);
   }
 
-  private async accept(key: string, message: InboundMessage): Promise<HarnessResult | (() => Promise<HarnessResult>)> {
+  private async accept(key: string, message: InboundMessage, waitForResult: boolean): Promise<HarnessResult | (() => Promise<HarnessResult>)> {
     if (this.fatal) throw this.fatal;
-    const conversation = await this.open(key, message.route);
+    if (this.isolatedRooms.has(key)) return 'failed';
+    let conversation: RecordedConversation;
+    try { conversation=await this.open(key,message.route); }
+    catch(error) { if (!(error instanceof SessionIntegrityError)) throw error; this.isolate(key,error); return 'failed'; }
     if (this.closed) return 'ignored';
     if (conversation.hasInbound(message.eventId)) return 'duplicate';
     if (message.imageSources?.length) {
@@ -153,37 +177,72 @@ export class ChannelHarness {
     }
     if (this.closed) return 'ignored';
     const memoryRequest = parseMemoryRequest(message.text);
-    const source = conversation.ingest(message.text, {
-      eventId: message.eventId, senderId: message.senderId, modelInputText: message.text, sentAt: message.sentAt,
-      ...(message.mentionedSenderIds ? { mentionedSenderIds: message.mentionedSenderIds } : {}),
-      ...(message.senderName ? { senderName: message.senderName.slice(0, 100) } : {}),
-      ...(memoryRequest || RESULT_COMMAND.test(message.text) ? { messageKind: 'memory' as const } : {}),
-      ...(message.quote ? { quote: message.quote } : {}),
-      ...(message.images?.length ? { images: message.images } : {}),
-    });
-    if (!source) return 'duplicate';
-    if (!message.text.trim() || (message.route.roomType === 'group' && !message.mentioned)) return 'observed';
-    const task = conversation.enqueueTask(source.id, message);
-    return () => this.schedule(release => this.process(conversation, message, source, task.id, release));
+    const admission = conversation.admit(message,memoryRequest || RESULT_COMMAND.test(message.text) ? 'memory' : 'chat');
+    if (!admission) return 'duplicate';
+    const {task} = admission;
+    if (!task) return 'observed';
+    return () => {
+      const completion=waitForResult ? new Promise<HarnessResult>((resolve,reject) => this.waiters.set(task.id,{key,resolve,reject}))
+        : Promise.resolve<HarnessResult>('accepted');
+      this.pump();
+      return completion;
+    };
   }
 
-  private schedule(run: (release: () => void) => Promise<HarnessResult>): Promise<HarnessResult> {
-    const result = new Promise<HarnessResult>((resolve, reject) => this.pending.push({ run, resolve, reject }));
-    this.pump();
-    return result;
+  private isolate(key: string,error: SessionIntegrityError): void {
+    this.isolatedRooms.set(key,error.message);
+    // Queued tasks remain durable; callers must not wait forever for an isolated room.
+    for (const [id,waiting] of this.waiters) {
+      if(waiting.key===key) {waiting.resolve('failed'); this.waiters.delete(id);}
+    }
   }
 
   private pump(): void {
-    while (!this.closed && !this.fatal && this.computing < (this.config.tasks?.maxConcurrent ?? 2) && this.pending.length) {
-      const job = this.pending.shift()!;
+    while (!this.closed && !this.fatal && this.computing < (this.config.tasks?.maxConcurrent ?? 2)) {
+      let selected: {key: string; conversation: RecordedConversation; task: ReturnType<RecordedConversation['claimNextTask']>} | undefined;
+      try {
+        for(let checked=0;checked<this.routes.length;checked++) {
+          const index=(this.nextRoom+checked)%this.routes.length;
+          const key=channelConversationKey(this.routes[index]!);
+          const conversation=this.conversations.get(key);
+          if(!conversation||this.busyRooms.has(key)||this.outputs.has(key)||this.isolatedRooms.has(key)) continue;
+          let task: ReturnType<RecordedConversation['claimNextTask']>;
+          try {task=conversation.claimNextTask();}
+          catch(error) {if(!(error instanceof SessionIntegrityError)) throw error;this.isolate(key,error);continue;}
+          if(!task) continue;
+          this.nextRoom=(index+1)%this.routes.length;
+          selected={key,conversation,task}; break;
+        }
+      } catch(error) {
+        this.fatal=error;
+        for(const waiting of this.waiters.values()) waiting.reject(error);
+        this.waiters.clear(); this.onTaskError?.(); return;
+      }
+      if(!selected?.task) return;
+      const {key,conversation,task}=selected;
+      this.busyRooms.set(key,task.id);
       this.computing++;
       let released = false;
       const release = () => { if (!released) { released = true; this.computing--; this.pump(); } };
-      const running = Promise.resolve().then(() => job.run(release)).then(job.resolve, error => {
-        this.fatal = error;
-        job.reject(error);
-        for (const waiting of this.pending.splice(0)) waiting.reject(error);
-      }).finally(() => { release(); this.jobs.delete(running); });
+      const running = Promise.resolve().then(() => this.process(conversation,task.input,{id:task.messageId,
+        actorId:conversation.findActor(task.input.senderId)!,senderId:task.input.senderId,text:task.input.text},task.id,release)).then(result => {
+          this.waiters.get(task.id)?.resolve(result);
+          this.onTaskResult?.(result);
+        }).catch(error => {
+          if(error instanceof SessionIntegrityError) {
+            try {conversation.releaseUnstartedTask(task.id);}
+            catch(persistenceError) {error=persistenceError;}
+          }
+          if(error instanceof SessionIntegrityError) {
+            this.isolate(key,error);this.waiters.get(task.id)?.resolve('failed');this.onTaskResult?.('failed');
+            return;
+          }
+          this.fatal=error;
+          for(const waiting of this.waiters.values()) waiting.reject(error);
+          this.waiters.clear(); this.onTaskError?.();
+        }).finally(() => {
+          this.waiters.delete(task.id); release(); this.busyRooms.delete(key); this.jobs.delete(running); this.pump();
+        });
       this.jobs.add(running);
     }
   }
@@ -193,7 +252,7 @@ export class ChannelHarness {
     const sending = (this.outputs.get(key) ?? Promise.resolve()).then(operation);
     const settled = sending.catch(() => {});
     this.outputs.set(key, settled);
-    void settled.then(() => { if (this.outputs.get(key) === settled) this.outputs.delete(key); });
+    void settled.then(() => { if (this.outputs.get(key) === settled) {this.outputs.delete(key);this.pump();} });
     return sending;
   }
 
@@ -203,8 +262,7 @@ export class ChannelHarness {
 
   private async process(conversation: RecordedConversation, message: InboundMessage, source: MemorySource,
     taskId: string, release: () => void): Promise<HarnessResult> {
-    if (this.closed) return 'ignored';
-    if (!conversation.claimTask(taskId)) return 'duplicate';
+    if (this.closed) {conversation.releaseUnstartedTask(taskId);return 'ignored';}
     const sender = {
       eventId: message.eventId, senderId: message.senderId, existingMessageId: source.id, taskId, sentAt: message.sentAt,
       ...(message.mentionedSenderIds ? { mentionedSenderIds: message.mentionedSenderIds } : {}),
@@ -343,7 +401,9 @@ export class ChannelHarness {
     this.closed = true;
     this.admissionAbort.abort();
     const researchClosing = this.research?.abort();
-    for (const waiting of this.pending.splice(0)) waiting.resolve('ignored');
+    for (const [id,waiting] of this.waiters) if(this.busyRooms.get(waiting.key)!==id) {
+      waiting.resolve('ignored'); this.waiters.delete(id);
+    }
     // Abort model work first; in-flight transport receipts still need the open store.
     await Promise.all([...this.conversations.values()].map(conversation => conversation.abort()));
     await Promise.allSettled(this.opening.values());

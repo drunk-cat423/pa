@@ -127,7 +127,9 @@ test('私聊完成50轮且容量较低时不按轮数自动压缩', { timeout: 1
 test('最终上下文达到85%才整理；摘要与检查点后消息跨新轮和重启继续', async t => {
   const gate = deferred(), started = deferred();
   let extractionStarted = false;
-  const f = await fixture(t, async (input, signal) => { extractionStarted = true; started.resolve(); await wait(signal, gate.promise); return extracted(input); }, { contextWindow: 20000 });
+  // Leave room for the expanded preparation protocol after compaction, while
+  // the growing 3500-character messages still cross the actual 85% boundary.
+  const f = await fixture(t, async (input, signal) => { extractionStarted = true; started.resolve(); await wait(signal, gate.promise); return extracted(input); }, { contextWindow: 32768 });
   const h = f.harness();
   let pending;
   for (let i = 1; i <= 10 && !extractionStarted; i++) {

@@ -64,6 +64,9 @@ export function assertCurrentMemoryProtocol(value: unknown): void {
   if (Array.isArray(value)) { value.forEach(assertCurrentMemoryProtocol); return; }
   const object = value as Record<string, unknown>;
   if (object.materialsProtocol !== undefined && object.materialsProtocol !== 3) throw new Error('未知资料组件协议。');
+  if (object.profileProposalProtocol !== undefined && (object.profileProposalProtocol !== 'delta-v1' || object.materialsProtocol !== 3)) {
+    throw new Error('未知人物增量提案协议；固定输入与进度保持不变。');
+  }
   if (object.extractionProtocol !== undefined && object.extractionProtocol !== 2) throw new Error('未知整理协议；固定输入与进度保持不变。');
   if (object.profileBaselineProtocol !== undefined && object.profileBaselineProtocol !== 1) throw new Error('未知画像基线协议；固定输入与进度保持不变。');
   if (object.profileAttributionProtocol !== undefined && object.profileAttributionProtocol !== 1) throw new Error('未知画像对象协议；固定输入与进度保持不变。');
@@ -771,12 +774,13 @@ export class AutoMemoryStore {
   private messages(ids: readonly string[]): AutoMemoryMessage[] {
     return ids.map(id=>{
       const r=this.db.prepare(`SELECT m.*,p.person_id,coalesce(r.status,CASE WHEN cf.status='sent' THEN 'failed' WHEN rd.status='sent' THEN 'completed' END) AS run_status,coalesce(d.status,rd.status,cf.status) AS delivery_status,input.ingest_seq AS turn_input_seq,
-        context.seq AS context_seq,a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) AS input_message_id FROM messages m
+        context.seq AS context_seq,a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,inputp.person_id AS reply_person_id,coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) AS input_message_id FROM messages m
         LEFT JOIN actor_person_bindings p ON p.actor_id=m.actor_id LEFT JOIN agent_runs r ON r.input_message_id=m.id OR r.response_message_id=m.id
         LEFT JOIN research_deliveries rd ON rd.message_id=m.id
         LEFT JOIN channel_task_failures cf ON cf.message_id=m.id LEFT JOIN channel_tasks failed_task ON failed_task.id=cf.task_id
         LEFT JOIN messages input ON input.id=coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) LEFT JOIN deliveries d ON d.message_id=m.id
         LEFT JOIN actors a ON a.id=m.actor_id LEFT JOIN actors inputa ON inputa.id=input.actor_id
+        LEFT JOIN actor_person_bindings inputp ON inputp.actor_id=input.actor_id
         LEFT JOIN conversation_context_messages context ON context.message_id=m.id WHERE m.id=?`).get(id)!;
       const images=this.db.prepare('SELECT metadata_json FROM message_images WHERE message_id=? ORDER BY ordinal').all(id)
         .map(row=>parse<import('./image-context.js').MessageImage>(row.metadata_json));
@@ -789,7 +793,8 @@ export class AutoMemoryStore {
         ...(r.context_seq==null?{}:{contextSeq:Number(r.context_seq)}),
         ...(r.sender_id==null?{}:{senderId:String(r.sender_id)}),...(r.sender_name==null?{}:{senderName:String(r.sender_name)}),
         ...(r.role!=='assistant'||r.input_message_id==null?{}:{replyToMessageId:String(r.input_message_id),
-          ...(r.reply_sender_id==null?{}:{replyToSenderId:String(r.reply_sender_id)})}),
+          ...(r.reply_sender_id==null?{}:{replyToSenderId:String(r.reply_sender_id)}),
+          ...(r.reply_person_id==null?{}:{replyToPersonId:String(r.reply_person_id)})}),
         ...(r.actor_id==null?{}:{actorId:String(r.actor_id)}),...(r.person_id==null?{}:{personId:String(r.person_id)}),...(r.sent_at==null?{}:{sentAt:String(r.sent_at)}),
         ...(r.run_status==null?{}:{runStatus:String(r.run_status)}),...(r.delivery_status==null?{}:{deliveryStatus:String(r.delivery_status)})};
     });
@@ -917,7 +922,7 @@ export class AutoMemoryStore {
     if(canonical.pipeline==='materials') selfProfile.pending=materialPending.filter(item=>item.kind==='self').map(item=>({
       id:item.payload.id,content:item.payload.content,sourceMessageId:item.payload.sourceMessageId}));
     const input:AutoMemoryTaskInput={...(canonical.pipeline==='materials'?{pipeline:'materials' as const,extractionProtocol:2 as const,profileBaselineProtocol:1 as const,
-      materialsProtocol:3 as const,profileAttributionProtocol:1 as const,selfProfileProtocol:2 as const,profileSubjects:this.profileSubjectCandidates(canonical.conversationId)}
+      materialsProtocol:3 as const,profileProposalProtocol:'delta-v1' as const,profileAttributionProtocol:1 as const,selfProfileProtocol:2 as const,profileSubjects:this.profileSubjectCandidates(canonical.conversationId)}
       :contextJob?{contextProtocol:1 as const,extractionProtocol:2 as const}:{}),profileProtocol:2,profileSources,profileFragments,
       ...(excludedProfileSourceIds.length?{excludedProfileSourceIds}:{}),...(deferredRanges.length?{deferredRanges}:{}),roomRules:this.roomRules(canonical.conversationId),
       job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles,selfProfile,

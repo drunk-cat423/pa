@@ -82,12 +82,13 @@ test('资料失败退出队列，重启后按原时间补旧事实且不能覆�
   assert.ok(person.pending.some(item=>item.sourceMessageId===old),
     'a deferred pending from a successful recovery must remain schedulable');
   const mergeInput={...followingInput,mode:'profiles',profiles:[person]};
-  const merged=parseMemoryResponse({stopReason:'stop',content:[{type:'text',text:JSON.stringify({facts:[
-    {content:'不再喝咖啡',replaces:['f0']},{keep:'f1'},
+  const merged=parseMemoryResponse({stopReason:'stop',content:[{type:'text',text:JSON.stringify({changes:[
+    {content:'不再喝咖啡',replaces:['f0']},
   ]})}]},mergeInput);
   f.store.autoMemory.commit(following.id,following.leaseToken,{...emptyExtraction(mergeInput),...merged},undefined,{key:'profile:alice',messageIds:[]});
   const revision=f.store.autoMemory.profile('alice').baseVersion;
-  assert.ok(f.inspect(db=>db.prepare('SELECT 1 FROM person_profile_revision_sources WHERE person_id=? AND revision=? AND fact_index=0 AND message_id=?').get('alice',revision,newer)),
+  const compactedIndex=f.store.autoMemory.profile('alice').facts.findIndex(fact=>fact.content==='不再喝咖啡');
+  assert.ok(f.inspect(db=>db.prepare('SELECT 1 FROM person_profile_revision_sources WHERE person_id=? AND revision=? AND fact_index=? AND message_id=?').get('alice',revision,compactedIndex,newer)),
     'compacting baseline facts must preserve their newer supplementary confirmation');
   assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
 });

@@ -15,8 +15,9 @@ function fixture(t) {
   const canonical='结论。\n\n'+'完整正文😀'.repeat(1000);
   const run=store.beginRun(a.id,'问题','p','m',[],{eventId:'question',senderId:'alice',modelInputText:'问题'});
   const result=store.completeRun(run.id,canonical);
+  const replyToPersonId=store.autoMemory.personForActor(store.findActor(a.id,'alice'));
   t.after(()=>{store.close();rmSync(dir,{recursive:true,force:true});});
-  return {dir,path,a,b,canonical,result,get store(){return store;},
+  return {dir,path,a,b,canonical,result,replyToPersonId,get store(){return store;},
     restart(){store.close();store=new ConversationStore(path);store.markPendingUncertain(a.id);},
     inspect(fn){const db=new DatabaseSync(path);try{return fn(db);}finally{db.close();}}};
 }
@@ -30,13 +31,13 @@ test('schema17只读保留旧页面正文与引用索引，不混入规范回答
     db.prepare(`INSERT INTO answer_page_views(id,conversation_id,answer_id,page_number,text,status,external_message_id,reference_index,delivery_mode,reply_slot,created_at,updated_at)
       VALUES ('legacy-view',?,?,1,'旧页面正文','sent','page-id','page-ref','active',NULL,?,?)`).run(f.a.id,id,createdAt,createdAt);
   });
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-id'),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId});
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId});
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-id'),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId,replyToPersonId:f.replyToPersonId});
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId,replyToPersonId:f.replyToPersonId});
   assert.equal(f.store.quotedMessage(f.b.id,'page-ref',true),undefined);
   assert.deepEqual(f.store.autoMemory.conversationContext(f.a.id).messages.map(m=>m.text),['问题',f.canonical]);
   f.restart();
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId});
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),30);
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'page-ref',true),{role:'assistant',text:'旧页面正文',sourceMessageId:f.result.messageId,replyToPersonId:f.replyToPersonId});
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),31);
 });
 
 test('schema16 migration keeps canonical history and creates an intact backup',t=>{
@@ -45,7 +46,7 @@ test('schema16 migration keeps canonical history and creates an intact backup',t
   f.inspect(db=>{downgradeSchema16(db);db.exec('PRAGMA user_version=16');});
   f.restart();
   assert.ok(readdirSync(f.dir).some(name=>name.includes('.v16.')&&name.endsWith('.bak')));
-  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),30);
-  assert.deepEqual(f.store.quotedMessage(f.a.id,'legacy'),{role:'assistant',text:f.canonical,sourceMessageId:f.result.messageId});
+  assert.equal(f.inspect(db=>db.prepare('PRAGMA user_version').get().user_version),31);
+  assert.deepEqual(f.store.quotedMessage(f.a.id,'legacy'),{role:'assistant',text:f.canonical,sourceMessageId:f.result.messageId,replyToPersonId:f.replyToPersonId});
   assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
 });

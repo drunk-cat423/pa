@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync } from 'node:fs';
 import { dirname, join, parse, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { validateResearchDiagnosticContract } from './research-retention-contract.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -42,8 +43,8 @@ export function researchEvidence(root, task, rows, removed = new Map()) {
     const db = new DatabaseSync(index,{readOnly:true});
     try {
       db.exec('PRAGMA busy_timeout=5000; BEGIN');
-      if (db.prepare('PRAGMA user_version').get().user_version !== 1) throw new Error('诊断索引协议未知。');
-      const calls = db.prepare("SELECT * FROM calls WHERE task_id=? OR json_extract(record_json,'$.taskId')=? ORDER BY call_id").all(task.id,task.id);
+      validateResearchDiagnosticContract(db);
+      const calls = db.prepare("SELECT call_id,job_id,task_id,trace_id,record_json FROM calls WHERE task_id=? OR json_extract(record_json,'$.taskId')=? ORDER BY call_id").all(task.id,task.id);
       diagnostics = {dev:String(indexStat.dev),ino:String(indexStat.ino),rowsHash:digest(JSON.stringify(calls)),callIds:calls.map(row=>row.call_id)};
       for (const row of calls) {
         const call = JSON.parse(row.record_json);

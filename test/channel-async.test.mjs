@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { ChannelHarness,  } from '../dist/channel-harness.js';
+import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
+import { openConversation } from '../dist/runtime.js';
 import { ConversationStore } from '../dist/store.js';
+import { downgradeSchema30 } from './fixtures/legacy-schema.mjs';
 import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
 
 async function until(predicate, description) {
@@ -72,7 +74,7 @@ async function fixture(t, maxConcurrent = 2) {
     const promise = new Promise(resolve => { release = resolve; });
     const value = { promise, release }; gates.push(value); return value;
   }
-  function harness(maxCalls = 0) {
+  function harness(maxCalls = 0,onError) {
     const h = new ChannelHarness(config, [route, other], { send: async message => {
       const persisted = inspect(db => db.prepare(`SELECT status,delivery_mode,reply_slot FROM delivery_parts
         WHERE status='sending' AND text=? UNION ALL
@@ -80,7 +82,7 @@ async function fixture(t, maxConcurrent = 2) {
         SELECT status,delivery_mode,reply_slot FROM channel_task_failures WHERE status='sending' AND text=?`).all(message.text, message.text, message.text));
       sent.push({ ...message, persisted });
       return send(message, sent.length);
-    } }, maxCalls);
+    } }, maxCalls,undefined,undefined,onError);
     harnesses.push(h); return h;
   }
   const message = (eventId, text, extra = {}) => ({ route, eventId, text, senderId: 'alice', senderName: '甲',
@@ -115,6 +117,7 @@ test('真实@从渠道首次入库保留到重启后的资料快照，文本伪@
   const oldDb=new DatabaseSync(join(f.config.dataDir,'pa.sqlite'));
   try {
     oldDb.prepare('DELETE FROM message_profile_context WHERE message_id=(SELECT id FROM messages WHERE external_event_id=?)').run('active-mention');
+    downgradeSchema30(oldDb);
     oldDb.exec('DROP TABLE IF EXISTS auto_memory_component_results; PRAGMA user_version=29;');
   } finally {oldDb.close();}
   const store=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
@@ -174,9 +177,10 @@ test('同群长回答分段与其它回答按队列顺序完成', async t => {
   const first = h.handle(f.message('long', '长问题'));
   await until(() => f.sent.length === 1, '第一段进入发送');
   const depth = h.handle(f.message('depth', '深入推导', { senderId: 'bob' }));
-  await until(() => f.tasks().find(task => task.eventId === 'depth')?.status === 'completed', '专业回答等待输出队列');
+  await until(() => f.tasks().find(task => task.eventId === 'depth')?.status === 'queued', '专业回答留在持久队列');
   const normal = h.handle(f.message('normal', '普通问题', { senderId: 'carol' }));
-  await until(() => f.tasks().find(task => task.eventId === 'normal')?.status === 'completed', '其它回答等待输出');
+  await until(() => f.tasks().find(task => task.eventId === 'normal')?.status === 'queued', '其它回答留在持久队列');
+  assert.equal(f.totalCalls(),2,'慢投递期间本房间不产生更多模型调用');
   assert.equal(f.sent.length, 1);
   output.release();
   assert.deepEqual(await Promise.all([first, depth, normal]), ['sent', 'sent', 'sent']);
@@ -187,7 +191,97 @@ test('同群长回答分段与其它回答按队列顺序完成', async t => {
   assert.ok(f.planningRequests.some(request => request.input.currentMessage.eventId === 'depth'));
   assert.equal(f.inspect(db => JSON.parse(db.prepare(`SELECT p.plan_json FROM turn_preparations p
     JOIN messages m ON m.id=p.source_message_id WHERE m.external_event_id='depth'`).get().plan_json).mode), 'professional');
-  assert.equal(f.sent.filter(message => message.text === '我仔细分析一下。').length, 0);
-  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM run_progress').get().n), 0);
+  assert.equal(f.sent.filter(message => message.text === '我仔细分析一下。').length, 1);
+  assert.equal(f.inspect(db => db.prepare('SELECT count(*) n FROM run_progress').get().n), 1);
   assert.equal(f.totalCalls(), 6);
+});
+
+test('慢房间投递不阻塞其他房间，生产入口立即入库返回，后续同房间任务重启恢复', async t => {
+  const f=await fixture(t,1),blocked=f.gate(),h=f.harness();
+  f.send(async(message,index)=>{
+    if(message.replyToMessageId==='a1') await blocked.promise;
+    return {status:'sent',externalMessageId:`sent-${index}`};
+  });
+  const first=h.handle(f.message('a1','房间A第一问'));
+  await until(()=>f.sent.length===1,'A开始慢投递');
+  assert.equal(await h.handle(f.message('a2','房间A第二问'),{waitForResult:false}),'accepted');
+  assert.equal(await h.handle(f.message('b1','房间B第一问',{route:f.other})),'sent');
+  assert.equal(f.tasks().find(task=>task.eventId==='a2').status,'queued');
+  assert.equal(f.totalCalls(),4);
+  assert.equal(h.info().queued,1);
+  const closing=h.close();blocked.release();
+  assert.equal(await first,'sent');await closing;
+  assert.equal(f.tasks().find(task=>task.eventId==='a2').status,'queued');
+  const reopened=f.harness();await reopened.start();await reopened.waitForTasks();
+  assert.equal(f.tasks().find(task=>task.eventId==='a2').status,'completed');
+  assert.equal(f.sent.filter(message=>message.replyToMessageId==='a2').length,1);
+  assert.equal(f.totalCalls(),6);
+});
+
+test('持续热房间队列按房间轮转，单房间保持入队顺序',async t=>{
+  const f=await fixture(t,1),gate=f.gate(),h=f.harness();
+  f.plans.set('a0',[{gate,answer:'first'}]);
+  const first=h.handle(f.message('a0','first'));
+  await until(()=>f.requests.length===1,'第一请求占据计算槽');
+  for(let i=1;i<=8;i++) assert.equal(await h.handle(f.message(`a${i}`,`A ${i}`),{waitForResult:false}),'accepted');
+  assert.equal(await h.handle(f.message('b','B',{route:f.other}),{waitForResult:false}),'accepted');
+  gate.release();await first;await h.waitForTasks();
+  assert.deepEqual(f.requests.map(r=>r.input.currentMessage.eventId),['a0','b',...Array.from({length:8},(_,i)=>`a${i+1}`)]);
+});
+
+test('claim到执行之间关闭时，尚无run的任务安全退回queued，重启只执行一次',async t=>{
+  const f=await fixture(t),h=f.harness();await h.start();
+  const original=ConversationStore.prototype.claimNextChannelTask;
+  let closing;
+  ConversationStore.prototype.claimNextChannelTask=function(id){
+    const task=original.call(this,id);
+    if(task&&!closing) closing=h.close();
+    return task;
+  };
+  try {assert.equal(await h.handle(f.message('close-gap','不能丢掉的任务')),'ignored');await closing;}
+  finally{ConversationStore.prototype.claimNextChannelTask=original;}
+  assert.equal(f.tasks()[0].status,'queued');assert.equal(f.totalCalls(),0);
+  const next=f.harness();await next.start();await next.waitForTasks();
+  assert.equal(f.tasks()[0].status,'completed');assert.equal(f.totalCalls(),2);
+});
+
+test('旧SQL损坏隔离一间房并保留新任务，另一个房间继续回答',async t=>{
+  const f=await fixture(t),h=f.harness();
+  assert.equal(await h.handle(f.message('original','原始问题')),'sent');
+  const mutator=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
+  try{mutator.db.prepare("UPDATE messages SET text='篡改原文' WHERE external_event_id='original'").run();}
+  finally{mutator.close();}
+  assert.equal(await h.handle(f.message('blocked','原文异常时不可调用模型')),'failed');
+  await h.waitForTasks();
+  assert.equal(f.tasks().find(task=>task.eventId==='blocked').status,'queued');
+  assert.equal(f.totalCalls(),2);
+  assert.equal(h.info().isolatedRooms.length,1);
+  assert.equal(await h.handle(f.message('safe','另一个房间',{route:f.other})),'sent');
+  assert.equal(f.totalCalls(),4);
+});
+
+test('损坏canonical JSONL只隔离所属房间，不阻止其他房间启动',async t=>{
+  const f=await fixture(t);
+  const rt=await openConversation(f.config,channelConversationKey(f.route));
+  const file=rt.info().sessionFile;await rt.close();await writeFile(file,'{broken\n');
+  const h=f.harness();await h.start();
+  assert.equal(h.info().isolatedRooms.length,1);
+  assert.equal(await h.handle(f.message('safe','正常问题',{route:f.other})),'sent');
+  assert.equal(await h.handle(f.message('bad','异常房间问题')),'failed');
+  assert.equal(f.totalCalls(),2);
+});
+
+test('隔离时退回未执行任务遇到持久化失败必须全局停调度并上报',async t=>{
+  const f=await fixture(t);let fatal=0;const h=f.harness(0,()=>fatal++);
+  assert.equal(await h.handle(f.message('original','原始问题')),'sent');
+  const mutator=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
+  try{mutator.db.prepare("UPDATE messages SET text='篡改' WHERE external_event_id='original'").run();}finally{mutator.close();}
+  const release=ConversationStore.prototype.releaseUnstartedChannelTask;
+  ConversationStore.prototype.releaseUnstartedChannelTask=()=>{throw new Error('injected rollback persistence failure');};
+  try{
+    await h.handle(f.message('blocked','新问题')).catch(()=>{});await h.waitForTasks();
+    assert.equal(fatal,1);
+    await assert.rejects(h.handle(f.message('other','另一个房间',{route:f.other})),/持久化失败/);
+    assert.equal(f.totalCalls(),2);
+  }finally{ConversationStore.prototype.releaseUnstartedChannelTask=release;}
 });

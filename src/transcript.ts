@@ -5,6 +5,10 @@ import { RESEARCH_TOOL_SPECS } from './research-tools.js';
 const recordedTools = new Set(['web_search', 'web_fetch', 'update_profile', 'read_history', 'read_image',
   'answer_in_depth', 'prepare_turn', ...RESEARCH_TOOL_SPECS.map(tool => tool.name)]);
 
+export class TranscriptIntegrityError extends Error {
+  constructor(message: string,options?: ErrorOptions) {super(message,options);this.name='TranscriptIntegrityError';}
+}
+
 export type RecordedTurn = {
   runId: string;
   user?: { entryId: string; text: string };
@@ -82,7 +86,7 @@ export async function readSessionEntries(file: string): Promise<SessionEntry[] |
     text = await readFile(file, 'utf8');
   } catch (error) {
     if (missing(error)) return undefined;
-    throw error;
+    throw new TranscriptIntegrityError('Pi 会话文件不可读取或不是普通文件。',{cause:error});
   }
   try {
     // Pi ignores some malformed JSONL lines. Reject them here instead of losing history.
@@ -119,7 +123,7 @@ export async function readSessionEntries(file: string): Promise<SessionEntry[] |
     }
     return entries.slice(1) as unknown as SessionEntry[];
   } catch (error) {
-    throw new Error(`会话文件损坏，请检查：${file}`, { cause: error });
+    throw new TranscriptIntegrityError(`会话文件损坏，请检查：${file}`, { cause: error });
   }
 }
 

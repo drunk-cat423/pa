@@ -406,6 +406,213 @@
       "file": "test/material-components-e2e.test.mjs",
       "name": "画像请求未知失败保留其他组件，单目标来源和真实权限仍不能越界",
       "evidence": "2026-10-23 live saved-response replay: readonly evidence references, summaryExtra and redundant empty profiles rejected whole batches; channel ingress omitted actual mentionedSenderIds. User authorized simpler single-person proposals and durable partial success."
+    },
+    {
+      "file": "test/material-profile-delta.test.mjs",
+      "name": "delta-v1无变更继承全部46条旧画像，旧冻结完整协议仍拒绝遗漏",
+      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
+    },
+    {
+      "file": "test/material-profile-delta.test.mjs",
+      "name": "delta-v1只纠正一项仍保留其他45条，pending只按显式q引用合并",
+      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
+    },
+    {
+      "file": "test/material-profile-delta.test.mjs",
+      "name": "delta-v1拒绝重复替换、非法引用、越界来源及版本，容量和恢复时间边界继续有效",
+      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
+    },
+    {
+      "file": "test/material-profile-delta.test.mjs",
+      "name": "delta-v1容量提炼继承候选新增facts、原基线updates和pending，cN合并不混用fN",
+      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
+    },
+    {
+      "file": "test/material-profile-delta.test.mjs",
+      "name": "新捕获与检查点保存delta-v1，恢复拒绝将旧进度混入新增量任务",
+      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
+    },
+    {
+      "file": "test/material-profile-delta.test.mjs",
+      "name": "delta-v1工作器容量提炼仅消费一次共享预算，保留候选新增事实和pending审计",
+      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
+    },
+    {
+      "file": "test/answer-grounding.test.mjs",
+      "name": "真实串人材料的归属绑定区分发言者与对象，拒绝伪造原文、其他房间及已纠正来源",
+      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
+    },
+    {
+      "file": "test/answer-grounding.test.mjs",
+      "name": "跨人物经历才进入有界无工具核验，修正回复和原始草稿均保留且前缀不重排",
+      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
+    },
+    {
+      "file": "test/answer-grounding.test.mjs",
+      "name": "普通群聊和私聊不增加核验调用，跨人物核验无余预算或协议无效时不发送未核验草稿",
+      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
+    },
+    {
+      "file": "test/answer-grounding.test.mjs",
+      "name": "现况回答强制先搜索绑定的当前问题，日期未核验的结果必须明示且不自动追加搜索",
+      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
+    },
+    {
+      "file": "test/answer-grounding.test.mjs",
+      "name": "现况搜索失败、未启用或预算不足时明确未核验，不重试收费请求也不放行猜测结论",
+      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
+    },
+    {
+      "file": "test/answer-grounding.test.mjs",
+      "name": "归属核验的未知响应、取消和诊断持久化失败均停止，不放行草稿或追加请求",
+      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
+    },
+    {
+      "file": "test/answer-grounding.test.mjs",
+      "name": "同轮纠正不再引用已否定旧说法，拒绝发生在保存之前且核验保留已保存纠正",
+      "evidence": "2026-10-26 independent review reproduced correction-versus-grounding regression; .local/server-audit-20261026/findings.md"
+    },
+    {
+      "file": "test/material-profile-delta.test.mjs",
+      "name": "五次历史画像遗漏事故按旧契约拒绝，新任务仅提交真实修改仍继承遗漏条目",
+      "evidence": "Five saved 2026-10-24/25 failed profile responses: four omitted f44, one replaced f44 while omitting f24; anonymized reference structures in production-incidents.mjs. Exact raw-response replay and hashes remain in .local/incident-test-audit-20261026/."
+    },
+    {
+      "file": "test/answer-grounding.test.mjs",
+      "name": "历史事故对照：旧准备响应缺grounding时拒绝放行，明确跨人引用后可阻止旧错答",
+      "evidence": "Saved 2026-10-24 speaker-swap incident; old prepare response lacked grounding. Tests the schema boundary and controlled uncertain review, not real-model semantic accuracy."
+    },
+    {
+      "file": "test/context-people.test.mjs",
+      "name": "speaker swap incident keeps source speaker, original AI reply target, quote identities, and history labels",
+      "evidence": "2026-10-24 saved speaker-swap incident; 2026-10-26 review additionally reproduced user self-reply labels and known Bot inline quote attribution loss/conflict. Checks canonical attribution metadata, not scripted model semantic correctness."
+    },
+    {
+      "file": "test/context-people.test.mjs",
+      "name": "adding people, changing sender, restart, and another room preserve the existing context prefix and raw records",
+      "evidence": "2026-10-24 saved speaker-swap incident and 2026-10-26 approved stable-label design: nonempty history prefix must remain stable when sender, nickname or participants change; no extra model calls or cross-room access."
+    },
+    {
+      "file": "test/context-people.test.mjs",
+      "name": "background memory projections keep stable person labels across local reference remapping and unknown legacy identity",
+      "evidence": "2026-10-26 attribution investigation: batch-local pN identifiers cannot serve as persistent summary identities; compression/Topic/profile labels must agree without rewriting frozen input or guessing missing identity."
+    },
+    {
+      "file": "test/channel-admission-atomic.test.mjs",
+      "name": "admission rolls back raw event with failed task insert, then restart preserves one queued intent and observation boundaries",
+      "evidence": "2026-10-26 architecture audit reproduced a committed inbound message without a channel task after interruption; .local/architecture-audit-20261026/reproduction.json. SQL fault injection now requires atomic rollback and one durable queued task after replay."
+    },
+    {
+      "file": "test/channel-admission-atomic.test.mjs",
+      "name": "channel ingress uses the atomic transaction and a replay after rollback executes only once",
+      "evidence": "2026-10-26 real ChannelHarness offline reproduction returned duplicate for a stranded inbound event. The integrated regression verifies rollback, restart and one model run/delivery, using a localhost provider only."
+    },
+    {
+      "file": "test/research-retention-schema.test.mjs",
+      "name": "schema30 preview/apply only clears eligible research; unsupported schema and stale plans fail closed",
+      "evidence": "2026-10-26 architecture audit reproduced schema30 rejection by the schema27-only cleanup entry point. The current-schema temporary database covers preview/apply, protected data and fail-closed version/plan checks; no production deletion."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "实际启动：首次核对历史任务，二次启动不stat/read已verified JSONL；分页SQL不扫描任务消息",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "SQL输入/输出变更和删除留下dirty记录，核对失败留corrupt并隔离房间",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "运行关联改路径同时标记OLD和NEW；CAS无法清除核对期间的新变更",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "JSONL离线篡改由持久分页hash巡检发现，SQL无关更新不能洗掉已有hash",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "JSONL语法/链接损坏不降级；真实文件与SQL回执逐项绑定",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "未完成成功JSONL恢复仅补SQL并保留unknown投递，不重发、不调用模型；普通请求前拒绝dirty损坏",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "巡检发现损坏立即关闭本房间后台；数据库错误立即上报服务",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/channel-async.test.mjs",
+      "name": "慢房间投递不阻塞其他房间，生产入口立即入库返回，后续同房间任务重启恢复",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/channel-async.test.mjs",
+      "name": "持续热房间队列按房间轮转，单房间保持入队顺序",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/channel-async.test.mjs",
+      "name": "claim到执行之间关闭时，尚无run的任务安全退回queued，重启只执行一次",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/channel-async.test.mjs",
+      "name": "旧SQL损坏隔离一间房并保留新任务，另一个房间继续回答",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/channel-async.test.mjs",
+      "name": "损坏canonical JSONL只隔离所属房间，不阻止其他房间启动",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/channel-async.test.mjs",
+      "name": "隔离时退回未执行任务遇到持久化失败必须全局停调度并上报",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/channel-task-store.test.mjs",
+      "name": "崩溃恢复仅重排没有run的领取，不重排已记录模型调用的任务",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+    },
+    {
+      "file": "test/research-retention-schema.test.mjs",
+      "name": "unrelated future schema, tables and additive columns preserve a frozen v2 plan",
+      "evidence": "Confirmed schema compatibility incident extended to frozen-plan recovery and exact structural dependency validation; offline temp SQLite apply in .local/long-task-20261026/full-final.log."
+    },
+    {
+      "file": "test/research-retention-schema.test.mjs",
+      "name": "committed legacy pending resumes across compatible upgrade; uncommitted legacy preview is refused",
+      "evidence": "Confirmed schema compatibility incident extended to frozen-plan recovery and exact structural dependency validation; offline temp SQLite apply in .local/long-task-20261026/full-final.log."
+    },
+    {
+      "file": "test/research-retention-schema.test.mjs",
+      "name": "exact session-integrity ledger triggers are compatible; same-name altered SQL is refused",
+      "evidence": "Confirmed schema compatibility incident extended to frozen-plan recovery and exact structural dependency validation; offline temp SQLite apply in .local/long-task-20261026/full-final.log."
+    }
+  ],
+  "modelEvaluations": [
+    {
+      "fixture": "test/fixtures/production-incidents.mjs#speakerSwapIncident",
+      "purpose": "Compare attribution quality using real model outputs. If the plugin experience is mentioned, attribute it to its speaker, not the current questioner. The program is not required to override arbitrary wrong model outputs.",
+      "evidence": ".local/incident-test-audit-20261026/report.md; 2026-10-26 user approved improving context representation without additional semantic intervention."
+    },
+    {
+      "fixture": "test/fixtures/production-incidents.mjs#currentOpinionIncident",
+      "status": "accepted_model_boundary",
+      "purpose": "Freshness misclassification does not require an additional program-level search detector; user explicitly deferred this issue on 2026-10-26."
+    },
+    {
+      "fixture": "test/fixtures/production-incidents.mjs#speakerSwapIncident",
+      "status": "accepted_model_boundary",
+      "purpose": "A verifier deliberately returning ok for a wrong draft is a model fault injection, not an authorization failure; no independent semantic proof is required. Original replay and failure evidence remain in .local/incident-test-audit-20261026/."
     }
   ]
 }
