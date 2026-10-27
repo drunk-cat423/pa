@@ -13,13 +13,13 @@ import { conversationContext, currentTurnInput } from './fixtures/conversation-c
 import { companionReply } from './fixtures/companion-tools.mjs';
 import { emptyExtraction } from './fixtures/memory-output.mjs';
 
-async function fixture(t) {
+async function fixture(t, answer = 'A说B以前用的免费插件，花了八个小时才写了几行代码。') {
   const directory = await mkdtemp(join(tmpdir(), 'pa-context-people-'));
   const requests = [], sent = [], harnesses = [];
   const server = createServer(async (request, response) => {
     let raw = ''; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); requests.push(body);
-    const reply = companionReply(body, 'A说B以前用的免费插件，花了八个小时才写了几行代码。');
+    const reply = companionReply(body, typeof answer === 'function' ? answer(body) : answer);
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const [delta, finish] of [[reply.delta, null], [{}, reply.finishReason]])
       response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
@@ -223,6 +223,69 @@ test('Pi续问与旧Bot话题同时出现时，真实请求保留最近对象并
   assert.ok(serialized.includes('当前问题与紧邻问答决定本轮对象'));
   assert.equal(currentTurnInput(request).currentMessage.text, '仔细讲讲身份隔离的部分吧');
   assert.equal(f.requests.length, 6, 'reference handling adds no classifier call to the three normal turns');
+});
+
+test('旧画像报错保留为历史，回答阶段仍携带现行契约且不重启写入', async t => {
+  const question = '给我看一下你现在的画像';
+  const oldError = '当时画像没有保存，因为系统要求连续摘录原话；50多条画像合并成8组的提案仍待授权。';
+  const f = await fixture(t, body => currentTurnInput(body).currentMessage.text === question
+    ? '我当前的设定是用中文交流的长期伙伴。' : oldError);
+  f.config.memory = { enabled: true, maxCalls: 1, timeoutMs: 1000 };
+  f.route.roomType = 'private';
+  const harness = f.open();
+  const sourceText = '回顾以前的画像归纳保存失败。';
+  assert.equal(await harness.handle(f.message('old-profile-error', sourceText, 'a')), 'sent');
+  const store = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  let frozenJob, topic, oldMessages;
+  try {
+    const conversationId = f.conversationId(f.route), now = Date.now();
+    store.autoMemory.reserveMaterialsIfDue(conversationId, now);
+    const reserved = store.autoMemory.reserveMaterialsIfDue(conversationId, now + 600001);
+    const job = store.autoMemory.claimNext(conversationId, { owner: 'historical-rules', leaseMs: 60000, pipeline: 'materials' });
+    assert.equal(job.id, reserved.id);
+    const input = store.autoMemory.taskInput(job), output = emptyExtraction(input);
+    store.autoMemory.commit(job.id, job.leaseToken, { ...output,
+      topics: [{ summary: '画像保存曾要求连续摘录原话，50多条合并成8组的旧提案仍待授权。',
+        messageIds: [], sourceRange: output.processedRanges[0] }] });
+    store.autoMemory.selfProfile.review(0, '', '我是用中文交流的长期伙伴。');
+    frozenJob = store.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(job.id);
+    topic = store.db.prepare('SELECT * FROM memory_topics WHERE job_id=?').get(job.id);
+    oldMessages = store.db.prepare('SELECT * FROM messages ORDER BY rowid').all();
+  } finally { store.close(); }
+
+  const prefix = conversationContext(f.requests.at(-1)).historyRaw;
+  const callsBefore = f.requests.length;
+  assert.equal(await harness.handle(f.message('current-profile', question, 'a')), 'sent');
+  const [preparation, response] = f.requests.slice(callsBefore);
+  assert.equal(f.requests.length, callsBefore + 2, 'no rule classifier, rewrite or extra model request');
+  const prepareTool = preparation.tools.find(tool => tool.function.name === 'prepare_turn');
+  assert.match(prepareTool.function.description, /不必连续摘录currentMessage.text/);
+  assert.ok(!response.tools.some(tool => tool.function.name === 'prepare_turn'), 'answer cannot reopen the write phase');
+  const responseRules = response.messages.filter(message => message.role === 'system').map(message => message.content).join('\n');
+  assert.match(responseRules, /当前画像内容契约（本阶段仍不可写入）/);
+  assert.match(responseRules, /不必连续摘录currentMessage.text/);
+  assert.match(responseRules, /当前明确确认紧邻提议时可归纳被确认内容/);
+  for (const request of [preparation, response]) {
+    const system = request.messages.filter(message => message.role === 'system').map(message => message.content).join('\n');
+    assert.match(system, /旧限制、旧报错解释或待授权提案只说明当时情况/);
+    assert.match(system, /不在本轮未问及时追办旧提案/);
+    assert.ok(conversationContext(request).historyRaw.startsWith(prefix), 'stable history remains append-only');
+    assert.ok(conversationContext(request).historyRaw.includes(oldError), 'old AI explanation remains historical evidence');
+    const serialized = JSON.stringify(request.messages);
+    assert.ok(serialized.includes(topic.summary), 'retrieved historical Topic remains available for explicit historical questions');
+    assert.ok(serialized.includes('我是用中文交流的长期伙伴。'), 'current profile snapshot remains available');
+    assert.equal(currentTurnInput(request).currentMessage.text, question);
+  }
+  const reopened = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
+  try {
+    assert.deepEqual(reopened.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(frozenJob.id), frozenJob);
+    assert.deepEqual(reopened.db.prepare('SELECT * FROM memory_topics WHERE id=?').get(topic.id), topic);
+    for (const message of oldMessages)
+      assert.deepEqual(reopened.db.prepare('SELECT * FROM messages WHERE id=?').get(message.id), message);
+    assert.equal(reopened.autoMemory.selfProfile.snapshot().baseVersion, 1, 'query does not save or rewrite the profile');
+    assert.equal(reopened.db.prepare('SELECT COUNT(*) n FROM self_profile_revisions').get().n, 2, 'old and current versions remain');
+    assert.equal(reopened.db.prepare('SELECT COUNT(*) n FROM person_profile_pending').get().n, 0);
+  } finally { reopened.close(); }
 });
 
 test('background memory projections keep stable person labels across local reference remapping and unknown legacy identity', () => {

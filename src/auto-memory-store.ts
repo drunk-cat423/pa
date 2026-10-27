@@ -1385,20 +1385,30 @@ export class AutoMemoryStore {
       this.registerRecovery(jobId,Date.now());});
   }
   private registerRecovery(jobId:string,now:number): void {
-    const row=this.db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(jobId);
+    const row=this.db.prepare(`SELECT status,pipeline,error,
+      EXISTS(SELECT 1 FROM auto_memory_recoveries WHERE failed_job_id=j.id) AS registered,
+      EXISTS(SELECT 1 FROM auto_memory_job_deferrals WHERE job_id=j.id) AS deferred
+      FROM auto_memory_jobs j WHERE id=?`).get(jobId);
     if(!row||row.status!=='failed'||!['materials','compression'].includes(String(row.pipeline))) return;
+    if(row.registered&&row.deferred) return;
     if(/\[(?:state|diagnostic)_persistence\]/.test(String(row.error))) return;
     if(this.db.prepare(`SELECT 1 FROM auto_memory_job_retirements WHERE job_id=? UNION ALL
       SELECT 1 FROM auto_memory_legacy_isolations WHERE job_id=?`).get(jobId,jobId)) return;
-    const prior=this.db.prepare('SELECT root_job_id,attempt FROM auto_memory_recoveries WHERE replacement_job_id=?').get(jobId);
-    const attempt=prior?Number(prior.attempt)+1:0;
-    const delay=[60000,300000,1800000][Math.min(attempt,2)]!;
-    this.db.prepare(`INSERT OR IGNORE INTO auto_memory_recoveries
-      (failed_job_id,root_job_id,attempt,due_at,created_at) VALUES (?,?,?,?,?)`)
-      .run(jobId,prior?String(prior.root_job_id):jobId,attempt,now+delay,timestamp());
-    this.db.prepare(`INSERT OR IGNORE INTO auto_memory_job_deferrals(job_id,reason,created_at,input_hash,progress_hash) VALUES (?,?,?,?,?)`)
-      .run(jobId,'自动记忆失败缺口；原尝试关闭，新任务按持久退避独立恢复，最多三次。',timestamp(),
-        row.input_json==null?null:hash(String(row.input_json)),row.progress_json==null?null:hash(String(row.progress_json)));
+    if(!row.registered) {
+      const prior=this.db.prepare('SELECT root_job_id,attempt FROM auto_memory_recoveries WHERE replacement_job_id=?').get(jobId);
+      const attempt=prior?Number(prior.attempt)+1:0;
+      const delay=[60000,300000,1800000][Math.min(attempt,2)]!;
+      this.db.prepare(`INSERT OR IGNORE INTO auto_memory_recoveries
+        (failed_job_id,root_job_id,attempt,due_at,created_at) VALUES (?,?,?,?,?)`)
+        .run(jobId,prior?String(prior.root_job_id):jobId,attempt,now+delay,timestamp());
+    }
+    if(!row.deferred) {
+      // Frozen bodies are needed only once to complete the original failure's audit.
+      const frozen=this.db.prepare('SELECT input_json,progress_json FROM auto_memory_jobs WHERE id=?').get(jobId)!;
+      this.db.prepare(`INSERT OR IGNORE INTO auto_memory_job_deferrals(job_id,reason,created_at,input_hash,progress_hash) VALUES (?,?,?,?,?)`)
+        .run(jobId,'自动记忆失败缺口；原尝试关闭，新任务按持久退避独立恢复，最多三次。',timestamp(),
+          frozen.input_json==null?null:hash(String(frozen.input_json)),frozen.progress_json==null?null:hash(String(frozen.progress_json)));
+    }
   }
   recoveryInfo(jobId:string): {rootJobId:string;attempt:number;dueAt:number;replacementJobId?:string;exhausted:boolean;manualReason?:string}|undefined {
     const row=this.db.prepare('SELECT * FROM auto_memory_recoveries WHERE failed_job_id=?').get(jobId);
@@ -1424,8 +1434,10 @@ export class AutoMemoryStore {
   reserveRecoveryJobs(conversationId:string,now=Date.now(),authorization?:{jobId:string;reason:string}): string[] {
     if(!Number.isSafeInteger(now)||now<0) throw new Error('恢复时钟无效。');
     return this.atomic(()=>{
-      for(const row of this.db.prepare(`SELECT id FROM auto_memory_jobs WHERE conversation_id=?
-        AND pipeline IN ('materials','compression') AND status='failed'`).all(conversationId)) this.registerRecovery(String(row.id),now);
+      for(const row of this.db.prepare(`SELECT j.id FROM auto_memory_jobs j WHERE j.conversation_id=?
+        AND j.pipeline IN ('materials','compression') AND j.status='failed'
+        AND (NOT EXISTS(SELECT 1 FROM auto_memory_recoveries r WHERE r.failed_job_id=j.id)
+          OR NOT EXISTS(SELECT 1 FROM auto_memory_job_deferrals d WHERE d.job_id=j.id))`).all(conversationId)) this.registerRecovery(String(row.id),now);
       const result:string[]=[];
       for(const failure of this.db.prepare(`SELECT r.*,j.pipeline FROM auto_memory_recoveries r JOIN auto_memory_jobs j ON j.id=r.failed_job_id
         WHERE j.conversation_id=? AND r.replacement_job_id IS NULL

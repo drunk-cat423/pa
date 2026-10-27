@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, constants } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
 import { BackgroundMemory } from '../dist/auto-memory.js';
+import { AutoMemoryStore } from '../dist/auto-memory-store.js';
 import { emptyExtraction } from './fixtures/memory-output.mjs';
 import { parseMemoryResponse } from '../dist/memory-provider.js';
 
@@ -30,6 +32,106 @@ function fixture(t) {
 }
 const evidence=(messageId,factQuote)=>({messageId,factQuote,subjectKind:'self',subjectQuote:'我'});
 const fact=(content,messageId)=>({content,sourceType:'self',messageIds:[messageId]});
+
+test('已登记旧失败的空闲巡检不读取大正文或重复写审计，重启不改变旧记录',t=>{
+  const f=fixture(t),now=1700000000000;
+  const input=JSON.stringify({frozen:'i'.repeat(192*1024)}),progress=JSON.stringify({checkpoint:'p'.repeat(64*1024)});
+  const digest=value=>createHash('sha256').update(value).digest('hex');
+  const snapshot=db=>({
+    jobs:db.prepare('SELECT * FROM auto_memory_jobs ORDER BY rowid').all(),
+    recoveries:db.prepare('SELECT * FROM auto_memory_recoveries ORDER BY rowid').all(),
+    deferrals:db.prepare('SELECT * FROM auto_memory_job_deferrals ORDER BY rowid').all(),
+  });
+  f.inspect(db=>{
+    const job=db.prepare(`INSERT INTO auto_memory_jobs(id,conversation_id,reason,status,start_seq,end_seq,attempts,error,input_json,progress_json,created_at,pipeline)
+      VALUES (?,?,'backfill','failed',1,1,7,'fixture old failure',?,?,? ,?)`);
+    const recovery=db.prepare(`INSERT INTO auto_memory_recoveries
+      (failed_job_id,root_job_id,attempt,due_at,replacement_job_id,created_at,manual_reason,manual_at) VALUES (?,?,?,?,?,?,?,?)`);
+    const deferred=db.prepare('INSERT INTO auto_memory_job_deferrals VALUES (?,?,?,?,?)');
+    for(let i=0;i<116;i++) {
+      const id='old-'+i;
+      job.run(id,f.a.id,input,progress,'2020-01-01T00:00:00.000Z',i%2?'materials':'compression');
+      // Include exhausted, future-due and already-replaced attempts, with manual audit fields.
+      recovery.run(id,id,i%3===0?3:1,i%3===1?now+300000:now-1,i%3===2?id:null,
+        '2020-01-01T00:00:00.000Z','original explicit authorization','2020-01-02T00:00:00.000Z');
+      deferred.run(id,'original reason','2020-01-01T00:00:00.000Z',digest(input),digest(progress));
+    }
+  });
+  const before=f.inspect(snapshot);
+  for(let restart=0;restart<2;restart++) {
+    f.restart();
+    f.inspect(db=>{
+      const store=new AutoMemoryStore(db),forbidden=[];
+      db.setAuthorizer((action,table,column)=>{
+        if(action===constants.SQLITE_READ&&table==='auto_memory_jobs'&&['input_json','progress_json'].includes(column)
+          ||action===constants.SQLITE_INSERT&&['auto_memory_recoveries','auto_memory_job_deferrals'].includes(table)) {
+          forbidden.push({action,table,column});return constants.SQLITE_DENY;
+        }
+        return constants.SQLITE_OK;
+      });
+      try {
+        for(let tick=0;tick<8;tick++) assert.deepEqual(store.reserveRecoveryJobs(f.a.id,now+tick*1000),[]);
+      } finally {db.setAuthorizer(null);}
+      assert.deepEqual(forbidden,[],'idle polling must neither read frozen columns nor attempt duplicate audit inserts');
+    });
+  }
+  assert.deepEqual(f.inspect(snapshot),before,'all frozen bodies, hashes, retry budgets, times and authorization records remain byte-for-byte unchanged');
+});
+
+test('旧失败缺登记或缺搁置审计只补缺项，持久化失败回滚并传播',async t=>{
+  for(const missing of ['recovery','deferral','both']) await t.test(missing,()=>{
+    const f=fixture(t),now=1700000000000;
+    f.inbound(f.a,'保留原始失败任务与冻结输入');f.reserve(f.a);
+    const failed=f.claim(f.a,'materials');f.store.autoMemory.taskInput(failed);
+    f.inspect(db=>db.prepare('UPDATE auto_memory_jobs SET progress_json=? WHERE id=?').run('{"step":"original"}',failed.id));
+    f.store.autoMemory.fail(failed.id,failed.leaseToken,'fixture original failure');
+    const original=f.inspect(db=>({
+      job:db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(failed.id),
+      recovery:db.prepare('SELECT * FROM auto_memory_recoveries WHERE failed_job_id=?').get(failed.id),
+      deferral:db.prepare('SELECT * FROM auto_memory_job_deferrals WHERE job_id=?').get(failed.id),
+    }));
+    f.inspect(db=>{
+      if(missing!=='deferral') db.prepare('DELETE FROM auto_memory_recoveries WHERE failed_job_id=?').run(failed.id);
+      if(missing!=='recovery') db.prepare('DELETE FROM auto_memory_job_deferrals WHERE job_id=?').run(failed.id);
+    });
+    f.restart();
+    f.inspect(db=>{
+      const store=new AutoMemoryStore(db),bodyReads=[];
+      db.setAuthorizer((action,table,column)=>{
+        if(action===constants.SQLITE_READ&&table==='auto_memory_jobs'&&['input_json','progress_json'].includes(column)) {
+          bodyReads.push(column);
+          if(missing==='recovery') return constants.SQLITE_DENY;
+        }
+        return constants.SQLITE_OK;
+      });
+      try {assert.deepEqual(store.reserveRecoveryJobs(f.a.id,now),[]);}
+      finally {db.setAuthorizer(null);}
+      assert.deepEqual(bodyReads.sort(),missing==='recovery'?[]:['input_json','progress_json']);
+      assert.deepEqual(db.prepare('SELECT * FROM auto_memory_jobs WHERE id=?').get(failed.id),original.job);
+      const recovery=db.prepare('SELECT * FROM auto_memory_recoveries WHERE failed_job_id=?').get(failed.id);
+      if(missing==='deferral') assert.deepEqual(recovery,original.recovery,'audit repair must not reset due time, attempts or authorization');
+      else {
+        assert.equal(recovery.root_job_id,failed.id);assert.equal(recovery.attempt,0);assert.equal(recovery.due_at,now+60000);
+        assert.equal(recovery.replacement_job_id,null);assert.equal(recovery.manual_reason,null);
+      }
+      const deferral=db.prepare('SELECT * FROM auto_memory_job_deferrals WHERE job_id=?').get(failed.id);
+      if(missing==='recovery') assert.deepEqual(deferral,original.deferral,'registration must retain the original audit without rehashing');
+      else for(const field of ['input_hash','progress_hash']) assert.equal(deferral[field],original.deferral[field]);
+      assert.deepEqual(store.reserveRecoveryJobs(f.a.id,now+1),[]);
+    });
+  });
+  const f=fixture(t),now=1700000000000;
+  f.inbound(f.a,'持久化故障不能伪装成功');f.reserve(f.a);const failed=f.claim(f.a,'materials');
+  f.store.autoMemory.taskInput(failed);f.store.autoMemory.fail(failed.id,failed.leaseToken,'fixture failure');
+  f.inspect(db=>{
+    db.prepare('DELETE FROM auto_memory_recoveries WHERE failed_job_id=?').run(failed.id);
+    db.prepare('DELETE FROM auto_memory_job_deferrals WHERE job_id=?').run(failed.id);
+    db.exec(`CREATE TRIGGER refuse_deferral BEFORE INSERT ON auto_memory_job_deferrals BEGIN SELECT RAISE(ABORT,'fixture audit persistence failed'); END;`);
+    assert.throws(()=>new AutoMemoryStore(db).reserveRecoveryJobs(f.a.id,now),/fixture audit persistence failed/);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM auto_memory_recoveries WHERE failed_job_id=?').get(failed.id).n,0);
+    assert.equal(db.prepare('SELECT status FROM auto_memory_jobs WHERE id=?').get(failed.id).status,'failed');
+  });
+});
 
 test('资料失败退出队列，重启后按原时间补旧事实且不能覆盖跨房间新画像',async t=>{
   const f=fixture(t),prior=f.inbound(f.b,'我现在不喝咖啡');f.reserve(f.b);

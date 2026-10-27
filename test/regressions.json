@@ -3,6 +3,21 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/memory-recovery-e2e.test.mjs",
+      "name": "已登记旧失败的空闲巡检不读取大正文或重复写审计，重启不改变旧记录",
+      "evidence": "2026-10-27 production idle CPU about 46 percent: 116 registered failures repeatedly read and hashed 29.5 MB each second; SQLite authorizer checks real column access and duplicate writes while snapshots preserve bodies, hashes and recovery metadata"
+    },
+    {
+      "file": "test/memory-recovery-e2e.test.mjs",
+      "name": "旧失败缺登记或缺搁置审计只补缺项，持久化失败回滚并传播",
+      "evidence": "Compatibility boundary of the confirmed 2026-10-27 idle recovery incident: repair only missing registration or audit without resetting existing clocks, attempts, original hashes or progress"
+    },
+    {
+      "file": "test/context-people.test.mjs",
+      "name": "旧画像报错保留为历史，回答阶段仍携带现行契约且不重启写入",
+      "evidence": "2026-10-27 07:29 production profile query repeated an obsolete exact-quote restriction from old history and a Topic after prepare_turn description was removed; checks actual two-stage requests and preserved records, not mocked semantic correctness"
+    },
+    {
       "file": "test/self-profile-store.test.mjs",
       "name": "本地审阅AI画像执行CAS并保留历史来源与待整理建议",
       "evidence": "2026-10-26 production AI profile mixed a sender's topical preference into global identity; operator review must preserve old sources and pending while normalizing the current view"
