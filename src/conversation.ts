@@ -120,7 +120,7 @@ function memoryContext(memories: MemoryRecord[], channel = false): { content?: s
 
 export async function openRecordedConversation(config: PaConfig, conversationKey: string, route?: ChannelRoute,
   options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy;
-    reminderContext?: (conversationId:string,sourceMessageId:string,sourceText:string)=>ReminderToolContext;
+    reminderContext?: (conversationId:string,sourceMessageId:string)=>ReminderToolContext;
     onIntegrityFailure?: (error: Error) => void;
     researchContext?: (conversationId: string, sourceMessageId: string, send?: ResearchSender) => ResearchToolContext } = {}): Promise<RecordedConversation> {
   // Acquire the Pi conversation lock before inspecting or mutating its business records.
@@ -626,7 +626,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
                 ...(config.fetch?.enabled && /能(?:不能|否)?.{0,12}(?:看|读)|(?:读|看|打开|访问)(?:一下|下|这个|链接|网页|仓库)|(?:总结|分析).{0,12}(?:网页|链接|仓库)/u.test(text)
                   && researchUrls(text).length === 1 ? { verifyLink: researchUrls(text)[0] } : {}),
                 ...(options.researchContext ? { research: options.researchContext(conversation.id, run.inputMessageId, sendResearch) } : {}),
-                ...(options.reminderContext ? {reminders:options.reminderContext(conversation.id,run.inputMessageId,text)} : {}),
+                ...(options.reminderContext ? {reminders:options.reminderContext(conversation.id,run.inputMessageId)} : {}),
                 prepareTurn: (plan: import('./turn-plan.js').TurnPlan) => persist(()=>openedStore.prepareTurn(
                   conversation.id,run.inputMessageId,plan,policy,inputExternal.mentionedSenderIds,
                   selfProfileBudget(runtime.estimate('').contextWindow)),text),

@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const testDir = join(root, 'test');
 const scopeFiles = {
+  ops: ['ops-status.test.mjs'],
   chat: [
     'answer-grounding.test.mjs',
     'context-people.test.mjs',

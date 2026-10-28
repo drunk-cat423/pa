@@ -36,18 +36,16 @@ export class ReminderService {
     return this.store??=new ConversationStore(join(this.config.dataDir,'pa.sqlite'));
   }
 
-  context(conversationId:string,sourceMessageId:string,sourceText:string):ReminderToolContext {
-    return {execute:(name,params)=>this.execute(conversationId,sourceMessageId,sourceText,name,params)};
+  context(conversationId:string,sourceMessageId:string):ReminderToolContext {
+    return {execute:(name,params)=>this.execute(conversationId,sourceMessageId,name,params)};
   }
 
-  private execute(conversationId:string,sourceMessageId:string,sourceText:string,name:ReminderToolName,params:unknown):unknown {
+  private execute(conversationId:string,sourceMessageId:string,name:ReminderToolName,params:unknown):unknown {
     if(!params||typeof params!=='object'||Array.isArray(params))throw new MemoryError('提醒参数必须是对象。');
     const p=params as Record<string,unknown>,ledger=this.storage().workLedger;
-    const keys={create_reminder:['key','goal','remindAt','timezone','requestQuote'],list_reminders:['offset','limit'],get_reminder:['id'],cancel_reminder:['id']}[name];
+    const keys={create_reminder:['key','goal','remindAt','timezone'],list_reminders:['offset','limit'],get_reminder:['id'],cancel_reminder:['id']}[name];
     if(!keys||Object.keys(p).some(k=>!keys.includes(k)))throw new MemoryError('提醒参数包含未允许字段。');
     if(name==='create_reminder') {
-      if(typeof p.requestQuote!=='string'||!p.requestQuote.trim()||!sourceText.includes(p.requestQuote))
-        throw new MemoryError('请依据当前发言者本条消息明确交代的提醒；引用、历史和画像不能自行授权创建。');
       const input={key:p.key,goal:p.goal,remindAt:p.remindAt,timezone:p.timezone} as ReminderInput;
       const work=ledger.createReminder(conversationId,sourceMessageId,input);
       if(work.status!=='scheduled'&&work.status!=='running')

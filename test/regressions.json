@@ -3,6 +3,21 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/reminder-service.test.mjs",
+      "name": "私聊补充时间继承原事项，第二轮两次模型请求后绑定本条来源并落库",
+      "evidence": "2026-10-28 private reminder clarification: user supplied only the selected time, but concatenating prior request and confirmation as requestQuote failed the current-message substring gate; anonymized local HTTP and real SQLite regression"
+    },
+    {
+      "file": "test/ops-status.test.mjs",
+      "name": "巡检不把sent和正常claim/input阶段报异常，隔离旧队列不掩盖当前活动且仅读元数据",
+      "evidence": "2026-10-28 live collector validation misclassified sent as not ready and omitted the real claim/input diagnostic stages; retired legacy rows must not displace current work"
+    },
+    {
+      "file": "test/ops-status.test.mjs",
+      "name": "自动搁置不能隐藏耗尽缺口，资源耗尽和新unknown调用必须报出",
+      "evidence": "2026-10-28 collector review reproduced zero memory/disk as healthy and found automatic deferrals masked terminal recovery gaps and failed/unknown diagnostic calls"
+    },
+    {
       "file": "test/memory-recovery-e2e.test.mjs",
       "name": "已登记旧失败的空闲巡检不读取大正文或重复写审计，重启不改变旧记录",
       "evidence": "2026-10-27 production idle CPU about 46 percent: 116 registered failures repeatedly read and hashed 29.5 MB each second; SQLite authorizer checks real column access and duplicate writes while snapshots preserve bodies, hashes and recovery metadata"

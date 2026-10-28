@@ -121,7 +121,7 @@ export class ChannelHarness {
             if(error instanceof SessionIntegrityError) this.isolate(key,error);
             else {this.fatal=error;this.onTaskError?.();}
           },
-          reminderContext:(conversationId,sourceId,text)=>this.reminders.context(conversationId,sourceId,text),
+          reminderContext:(conversationId,sourceId)=>this.reminders.context(conversationId,sourceId),
           ...(this.research ? { researchContext: (conversationId, sourceId, send) => this.research!.context(conversationId, sourceId, send) } : {}) });
       this.opening.set(key, pending);
       pending.then(conversation => {

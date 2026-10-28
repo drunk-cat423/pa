@@ -15,6 +15,7 @@
 
 | 任务 | 优先看代码 | 对应资料 | 检查 scope |
 |---|---|---|---|
+| 拉取仓库、对齐线上版本、只读状态巡检 | `scripts/ops/sync-and-check.mjs`、`scripts/ops/server-status.mjs` | [同步与巡检](operations.md) | 脚本修改用 `ops`；日常巡检不启动产品或跑全套回归 |
 | 对话、工具循环、准备与回答 | `runtime.ts`、`turn-plan.ts`、`answer-grounding.ts`、`channel-harness.ts`、`cli.ts` | [模块与边界](development.md#模块与边界)、[循环流程](design/companion-tool-loop.md) | `chat` |
 | 人物/AI 画像、Topic、资料失败恢复 | `auto-memory.ts`、`auto-memory-store.ts`、`material-profile-wire.ts`、`profile-*.ts`、`self-profile-store.ts` | [记忆](memory.md) | `memory` |
 | 历史投影、人物标签、token 校准、容量压缩 | `conversation.ts`、`context-people.ts`、`context-tokens.ts`、`runtime.ts`、`image-context.ts` | [记忆](memory.md)、[存储](storage.md) | `context` |
@@ -67,3 +68,5 @@ node scripts/repo-check.mjs all
 跨会话接续时，现有 Issue/PR 可承载进度；没有时给出简短交接即可：目标、分支/提交及未提交文件、已跑命令与结果、剩余问题和下一步。说明真实模型/生产验证是否执行以及未获授权的操作，不把历史授权当成未来部署许可。
 
 当前开发事实见本页、AGENTS 与对应主题文档；旧设计解释取舍，历史快照解释迁移。数字限制尽量指向配置或定义位置，例如人物容量在 `src/profile-limits.ts`，避免多处维护相互冲突的值。
+
+本项目用户约定“拉仓库/同步最新代码”同时包含服务器只读巡检；按[同步与巡检](operations.md)执行。同步分支不代表线上已经部署，服务active也不代表任务和记忆恢复正常。报告分别说明本地/远端/部署版本、检查窗口、具体异常和未检查项。检查结果放忽略的`.local/ops/`，不把聊天、画像、凭据或某次生产快照写进本页。新增模块或运维入口时维护上表及对应主题文档，避免再维护第二套检查清单。

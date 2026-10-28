@@ -12,8 +12,8 @@ import { preparationDelta } from './fixtures/turn-preparation.mjs';
 
 const call = (name, args) => ({ role: 'assistant', tool_calls: [{ index: 0, id: `call-${name}`, type: 'function',
   function: { name, arguments: JSON.stringify(args) } }] });
-const params = { key: 'medicine', goal: '吃药', remindAt: '2026-10-27T09:00:00+08:00', timezone: 'Asia/Shanghai',
-  requestQuote: '明天早上九点提醒我吃药' };
+const params = { key: 'medicine', goal: '吃药', remindAt: '2026-10-27T09:00:00+08:00', timezone: 'Asia/Shanghai' };
+const sourceText = '明天早上九点提醒我吃药';
 const confirmation = '已安排：北京时间2026年10月27日09:00，在原会话提醒你吃药。';
 const context = reminders => ({ prepareTurn: plan => ({ prepared: true, mode: plan.mode, saved: [] }),
   readHistory: () => [], reminders });
@@ -51,7 +51,7 @@ test('提醒成功使用prepare和create两次本地SSE请求，程序确认并�
   const f = await fixture(t, (_body, n) => n === 1 ? preparationDelta('prepare') : call('create_reminder', params));
   const runtime = await f.open('create');
   let executions = 0;
-  const answer = await runtime.prompt(params.requestQuote, { runId: 'run-create', companionTools: context({
+  const answer = await runtime.prompt(sourceText, { runId: 'run-create', companionTools: context({
     execute(name, input) { executions++; assert.equal(name, 'create_reminder'); assert.deepEqual(input, params);
       return { saved: true, id: 'reminder-1', remindAt: params.remindAt, goal: params.goal, confirmation }; },
   }) });
@@ -75,7 +75,7 @@ test('提醒拒绝不确认成功，已保存画像也不能授权无回执的�
   const runtime = await f.open('rejected');
   const tools = context({ execute() { throw new MemoryError('本次提醒被拒绝：原文没有有效授权。'); } });
   tools.prepareTurn = plan => ({ prepared: true, mode: plan.mode, saved: [{ target: 'sender', status: 'saved' }] });
-  assert.equal(await runtime.prompt(params.requestQuote, { runId: 'run-rejected', companionTools: tools }), '这次提醒没有安排成功。');
+  assert.equal(await runtime.prompt(sourceText, { runId: 'run-rejected', companionTools: tools }), '这次提醒没有安排成功。');
   assert.equal(f.requests.length, 4);
 });
 
@@ -96,7 +96,7 @@ test('时间schema拒绝自然语言和无时区参数，模型可在原预算�
       return call('create_reminder',params);
     });
     const runtime=await f.open('time-format');
-    const reply=await runtime.prompt(params.requestQuote,{runId:'time-format',companionTools:context({execute(_name,p){
+    const reply=await runtime.prompt(sourceText,{runId:'time-format',companionTools:context({execute(_name,p){
       executions++;assert.equal(p.remindAt,params.remindAt);
       return {saved:true,id:'time-ok',goal:p.goal,remindAt:p.remindAt,confirmation};
     }})});
@@ -122,7 +122,7 @@ test('提醒与研究同时可用时按实际工具调用分流，普通待办�
       assert.ok(body.tools.some(tool=>tool.function.name==='create_reminder'));
       assert.ok(body.tools.some(tool=>tool.function.name==='create_research'));
       assert.match(JSON.stringify(body.messages),/普通待办/);
-      if(sample.tool==='create_reminder')return call(sample.tool,{...params,goal:'调研 DeepSeek-Bot',requestQuote:sample.text});
+      if(sample.tool==='create_reminder')return call(sample.tool,{...params,goal:'调研 DeepSeek-Bot'});
       if(sample.tool==='create_research')return call(sample.tool,{key:'research',title:'DeepSeek-Bot',goal:'解释产品',requiresOriginal:false});
       return {role:'assistant',content:sample.answer};
     },{research:{enabled:true,maxModelCalls:16,maxToolCalls:24,maxSearchCalls:6}});
@@ -144,14 +144,14 @@ test('提醒成功后阻止同批后续工具并确认未执行项', async t => 
   const runtime = await f.open('siblings');
   const tools = context({ execute: () => ({ saved: true, id: 'reminder-1', remindAt: params.remindAt, goal: params.goal, confirmation }) });
   tools.readHistory = () => assert.fail('成功后不能继续执行工具');
-  const answer = await runtime.prompt(params.requestQuote, { runId: 'run-siblings', companionTools: tools });
+  const answer = await runtime.prompt(sourceText, { runId: 'run-siblings', companionTools: tools });
   assert.equal(answer, confirmation + '\n本轮其他操作未执行。'); assert.equal(f.requests.length, 2);
 });
 
 test('提醒已保存后取消本轮请求，RequestError保留实际成功确认', async t => {
   const f = await fixture(t, (_body, n) => n === 1 ? preparationDelta('prepare') : call('create_reminder', params));
   const runtime = await f.open('cancel-after-save');
-  await assert.rejects(runtime.prompt(params.requestQuote, { runId: 'cancel-after-save', companionTools: context({
+  await assert.rejects(runtime.prompt(sourceText, { runId: 'cancel-after-save', companionTools: context({
     execute() {
       // Cancel after the synchronous saved receipt has reached the tool, before Pi finishes its turn.
       queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => { void runtime.abort(); })));
