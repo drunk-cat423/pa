@@ -9,7 +9,7 @@ import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.
 import { openConversation } from '../dist/runtime.js';
 import { ConversationStore } from '../dist/store.js';
 import { downgradeSchema30 } from './fixtures/legacy-schema.mjs';
-import { isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
+import { conversationMessages, isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
 
 async function until(predicate, description) {
   const deadline = Date.now() + 5000;
@@ -20,7 +20,7 @@ async function until(predicate, description) {
 }
 
 function currentInput(body) {
-  const user = body.messages.findLast(message => message.role === 'user');
+  const user = conversationMessages(body).findLast(message => message.role === 'user');
   const raw = typeof user.content === 'string' ? user.content : user.content.map(part => part.text ?? '').join('');
   return JSON.parse(raw.slice(raw.lastIndexOf('\n') + 1));
 }
@@ -219,7 +219,11 @@ test('慢房间投递不阻塞其他房间，生产入口立即入库返回，�
 });
 
 test('持续热房间队列按房间轮转，单房间保持入队顺序',async t=>{
-  const f=await fixture(t,1),gate=f.gate(),h=f.harness();
+  const f=await fixture(t,1);
+  // This case checks nine queued turns, without provider usage calibration.
+  // Leave capacity for their full history so every task reaches scheduling.
+  f.config.contextWindow=65536;
+  const gate=f.gate(),h=f.harness();
   f.plans.set('a0',[{gate,answer:'first'}]);
   const first=h.handle(f.message('a0','first'));
   await until(()=>f.requests.length===1,'第一请求占据计算槽');

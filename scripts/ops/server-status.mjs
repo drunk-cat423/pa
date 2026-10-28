@@ -55,6 +55,20 @@ function fixedCode(value){
   const direct=value.match(/^([a-z][a-z0-9_]*)$/)?.[1];
   const code=bracket??direct;return code&&DIAG_CODES.has(code)?code:'other';
 }
+function safeTokenCount(value){return Number.isSafeInteger(value)&&value>=0?value:null;}
+function safePositiveTokenCount(value){return Number.isSafeInteger(value)&&value>0?value:null;}
+function safeFingerprint(value){return typeof value==='string'&&/^[a-f0-9]{64}$/i.test(value)?value.toLowerCase():null;}
+function cacheStage(value){return value==='prepare'||value==='answer'?value:null;}
+function median(values){if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b),middle=Math.floor(sorted.length/2);
+  return sorted.length%2?sorted[middle]:(sorted[middle-1]+sorted[middle])/2;}
+function cacheRate(usage){
+  if(!usage||typeof usage!=='object'||Array.isArray(usage))return null;
+  const keys=['input','cacheRead','cacheWrite','output','totalTokens'];
+  if(!keys.every(key=>Number.isSafeInteger(usage[key])&&usage[key]>=0))return null;
+  const input=usage.input+usage.cacheRead+usage.cacheWrite;
+  if(!Number.isSafeInteger(input)||input<=0||input+usage.output!==usage.totalTokens)return null;
+  return {input,cacheRead:usage.cacheRead,rate:usage.cacheRead/input};
+}
 function sqliteReport(path, hours, findings, now, system) {
   const report={status:'unknown',schemaVersion:null,integrity:null,tables:{},recent:{},active:[]};
   let db;
@@ -275,6 +289,135 @@ function diagnosticsSummary(path,hours,findings,now) {
     if(result.callsByStatus.unknown)findings.push(finding('recent_model_call_unknown','attention','Recent diagnostic calls have unknown outcomes; they must not be automatically retried.',{count:result.callsByStatus.unknown}));
     const failures=Object.values(result.errorCodes).reduce((sum,n)=>sum+n,0);
     if(failures)findings.push(finding('recent_diagnostic_failure','attention','Recent diagnostic events include recorded failures.',{count:failures}));
+
+    // Cache health is an intentionally small metadata-only view of recent completed
+    // foreground calls. Never select artifacts, prompts, messages, or full JSON blobs.
+    const contextCache={status:'ok',sampleLimit:160,sampledCalls:0,truncated:false,sampleBoundary:{oldestUpdatedAt:null,newestUpdatedAt:null},
+      contextKind:{channel:0,legacy:0,excludedResearch:0,excludedCli:0,excludedReview:0,missingStage:0,unknown:0,classificationScannedCalls:0,classificationScanTruncated:false},
+      legacyClassificationLimited:true,legacyClassificationNote:'Unmarked records use legacy chat classification and are not confirmed channel calls.',
+      stages:{prepare:{samples:0,withUsage:0,inputTokens:{min:null,median:null,max:null},weightedCacheRate:null,latestInputToWindowRatio:null,latestUsage:{callId:null,inputTokens:null,contextWindow:null},missingUsage:0,missingPrefix:0,largeInputLowCache:0},
+      answer:{samples:0,withUsage:0,inputTokens:{min:null,median:null,max:null},weightedCacheRate:null,latestInputToWindowRatio:null,latestUsage:{callId:null,inputTokens:null,contextWindow:null},missingUsage:0,missingPrefix:0,largeInputLowCache:0}},cacheDrops:[]};
+    const hasCallId=eventCols.has('call_id'),hasEventAt=eventCols.has('event_json');
+    if(hasCallId&&hasEventAt&&callCols.has('call_id')){
+      const sampled=db.prepare(`SELECT call_id AS callId,
+        json_extract(record_json,'$.kind') AS kind,json_extract(record_json,'$.status') AS status,
+        json_extract(record_json,'$.provider') AS provider,json_extract(record_json,'$.model') AS model,
+        json_extract(record_json,'$.conversationId') AS conversationId,
+        json_extract(record_json,'$.contextCalibration.key') AS calibrationKey,
+        json_extract(record_json,'$.usage.input') AS input,json_extract(record_json,'$.usage.cacheRead') AS cacheRead,
+        json_extract(record_json,'$.usage.cacheWrite') AS cacheWrite,json_extract(record_json,'$.usage.output') AS output,
+        json_extract(record_json,'$.usage.totalTokens') AS totalTokens,
+        json_extract(record_json,'$.updatedAt') AS updatedAt
+        FROM calls WHERE json_valid(record_json) AND json_extract(record_json,'$.kind')='chat'
+        AND json_extract(record_json,'$.status')='completed' AND json_extract(record_json,'$.updatedAt')>=?
+        ORDER BY json_extract(record_json,'$.updatedAt') DESC LIMIT 5001`).all(cutoff);
+      const callIds=sampled.map(row=>String(row.callId));
+      const metadata=new Map(),otherStages=new Map();
+      if(callIds.length){
+        const placeholders=callIds.map(()=>'?').join(',');
+        const eventMeta=db.prepare(`SELECT call_id AS callId,
+          json_extract(event_json,'$.at') AS at,json_extract(event_json,'$.event') AS event,
+          json_extract(event_json,'$.details.stage') AS stage,
+          json_extract(event_json,'$.details.contextKind') AS contextKind,
+          json_extract(event_json,'$.details.cachePrefix.version') AS prefixVersion,
+          json_extract(event_json,'$.details.cachePrefix.systemHash') AS systemHash,
+          json_extract(event_json,'$.details.cachePrefix.toolsHash') AS toolsHash,
+          json_extract(event_json,'$.details.contextWindow') AS contextWindow
+          FROM events WHERE call_id IN (${placeholders}) AND json_valid(event_json)
+          AND json_extract(event_json,'$.event')='model.request_prepared'
+          ORDER BY json_extract(event_json,'$.at')`).all(...callIds);
+        for(const event of eventMeta){const stage=cacheStage(event.stage);if(!stage){
+          otherStages.set(String(event.callId),event.stage==='attribution_review'?'review':event.contextKind);
+          continue;
+        }
+          metadata.set(String(event.callId),{stage,at:typeof event.at==='string'?event.at:null,
+            contextKind:event.contextKind===null?null:event.contextKind==='channel'||event.contextKind==='research'||event.contextKind==='cli'?event.contextKind:'unknown',
+            systemHash:event.prefixVersion===1?safeFingerprint(event.systemHash):null,
+            toolsHash:event.prefixVersion===1?safeFingerprint(event.toolsHash):null,
+            contextWindow:safePositiveTokenCount(event.contextWindow)});}
+      }
+      const eligibleRows=[];
+      for(const row of sampled){const meta=metadata.get(String(row.callId));
+        contextCache.contextKind.classificationScannedCalls++;
+        if(!meta){const kind=otherStages.get(String(row.callId));
+          if(kind==='review')contextCache.contextKind.excludedReview++;
+          else if(kind==='research')contextCache.contextKind.excludedResearch++;
+          else if(kind==='cli')contextCache.contextKind.excludedCli++;
+          else contextCache.contextKind.missingStage++;
+          continue;
+        }
+        if(meta.contextKind==='research'){contextCache.contextKind.excludedResearch++;continue;}
+        if(meta.contextKind==='cli'){contextCache.contextKind.excludedCli++;continue;}
+        if(meta.contextKind!=='channel'&&meta.contextKind!==null){contextCache.contextKind.unknown++;continue;}
+        eligibleRows.push(row);
+      }
+      contextCache.contextKind.classificationScanTruncated=sampled.length>5000;
+      if(contextCache.contextKind.missingStage){
+        contextCache.status='partial';
+        findings.push(finding('cache_stage_metadata_missing','attention','Some completed chat calls lack valid stage metadata; cache statistics are incomplete.',
+          {count:contextCache.contextKind.missingStage}));
+      }
+      const sampledRows=eligibleRows.slice(0,contextCache.sampleLimit);contextCache.sampledCalls=sampledRows.length;
+      contextCache.truncated=eligibleRows.length>contextCache.sampleLimit||sampled.length>5000;
+      for(const row of sampledRows){const kind=metadata.get(String(row.callId))?.contextKind;
+        if(kind==='channel')contextCache.contextKind.channel++;else contextCache.contextKind.legacy++;}
+      if(sampledRows.length){contextCache.sampleBoundary.newestUpdatedAt=String(sampledRows[0].updatedAt??'')||null;
+        contextCache.sampleBoundary.oldestUpdatedAt=String(sampledRows.at(-1).updatedAt??'')||null;}
+      const grouped=new Map(),stageInputs={prepare:[],answer:[]},stageUsage={prepare:[],answer:[]},latestByStage={prepare:null,answer:null};
+      for(const row of sampledRows){
+        const provider=typeof row.provider==='string'&&/^[\w.-]{1,80}$/.test(row.provider)?row.provider:'unknown';
+        const model=typeof row.model==='string'&&/^[\w./:-]{1,120}$/.test(row.model)?row.model:'unknown';
+        const usage=cacheRate({input:row.input,cacheRead:row.cacheRead,cacheWrite:row.cacheWrite,output:row.output,totalTokens:row.totalTokens});
+        const scope=typeof row.calibrationKey==='string'&&row.calibrationKey.length?row.calibrationKey:
+          typeof row.conversationId==='string'&&row.conversationId.length?row.conversationId:null;
+        const meta=metadata.get(String(row.callId));if(meta){
+          const stageResult=contextCache.stages[meta.stage];stageResult.samples++;
+          if(!meta.systemHash||!meta.toolsHash)stageResult.missingPrefix++;
+          if(!usage){stageResult.missingUsage++;continue;}
+          stageResult.withUsage++;stageInputs[meta.stage].push(usage.input);stageUsage[meta.stage].push(usage);
+          if(!latestByStage[meta.stage]||String(row.updatedAt??'')>latestByStage[meta.stage].at)
+            latestByStage[meta.stage]={at:String(row.updatedAt??''),callId:String(row.callId),inputTokens:usage.input,contextWindow:meta.contextWindow};
+          if(scope!==null){
+            const bucketKey=`${scope}\u0000${provider}\u0000${model}\u0000${meta.stage}`;
+            const bucket=grouped.get(bucketKey)??[];bucket.push({callId:String(row.callId),scope,provider,model,stage:meta.stage,at:meta.at??String(row.updatedAt??''),
+              input:usage.input,cacheRead:usage.cacheRead,rate:usage.rate,systemHash:meta.systemHash,toolsHash:meta.toolsHash,contextWindow:meta.contextWindow});grouped.set(bucketKey,bucket);
+          }
+          if(usage.input>=50000&&usage.rate<0.2)stageResult.largeInputLowCache++;
+        }
+      }
+      for(const stage of ['prepare','answer']){
+        const latest=latestByStage[stage];
+        if(latest){contextCache.stages[stage].latestUsage={callId:latest.callId,inputTokens:latest.inputTokens,contextWindow:latest.contextWindow};
+          contextCache.stages[stage].latestInputToWindowRatio=latest.contextWindow>0?latest.inputTokens/latest.contextWindow:null;}
+      }
+      for(const [stage,values] of Object.entries(stageInputs))if(values.length){
+        const info=contextCache.stages[stage];info.inputTokens={min:Math.min(...values),median:median(values),max:Math.max(...values)};
+      }
+      for(const bucket of grouped.values()){
+        bucket.sort((a,b)=>a.at.localeCompare(b.at));
+        for(let i=1;i<bucket.length;i++){
+          const previous=bucket[i-1],current=bucket[i];
+          if(current.input<50000||current.rate>=0.2||previous.rate<0.8)continue;
+          const reason=!current.systemHash||!current.toolsHash||!previous.systemHash||!previous.toolsHash?'unknown_prefix':
+            current.systemHash!==previous.systemHash?'system_prefix_changed':current.toolsHash!==previous.toolsHash?'tool_schema_changed':'prefix_unchanged_or_provider';
+          const pair={scope:current.scope===null?null:'scoped',provider:current.provider,model:current.model,stage:current.stage,
+            previous:{callId:previous.callId,at:previous.at,inputTokens:previous.input,cacheRate:previous.rate},
+            current:{callId:current.callId,at:current.at,inputTokens:current.input,cacheRate:current.rate,
+              systemHash:current.systemHash,toolsHash:current.toolsHash},
+            fingerprintChanges:{system:previous.systemHash&&current.systemHash?previous.systemHash!==current.systemHash:null,
+              tools:previous.toolsHash&&current.toolsHash?previous.toolsHash!==current.toolsHash:null},reason};
+          contextCache.cacheDrops.push(pair);
+          findings.push(finding('context_cache_efficiency_drop','attention',
+            'A large model request had a sharp cache hit-rate drop compared with an earlier call in the same scope and stage.',pair));
+        }
+      }
+      contextCache.cacheDrops.sort((a,b)=>String(a.current.at).localeCompare(String(b.current.at)));
+      for(const stage of ['prepare','answer']){
+        const values=stageUsage[stage],total=values.reduce((sum,sample)=>sum+sample.input,0),cached=values.reduce((sum,sample)=>sum+sample.cacheRead,0);
+        contextCache.stages[stage].weightedCacheRate=total?cached/total:null;
+      }
+    }
+    result.contextCache=contextCache;
     db.exec('COMMIT');return result;
   } catch(error) {
     try{db?.exec('ROLLBACK');}catch{}

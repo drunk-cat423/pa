@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { conversationMessages } from './turn-preparation.mjs';
 
 export function messageText(message) {
   if (typeof message.content === 'string') return message.content;
@@ -6,7 +7,7 @@ export function messageText(message) {
 }
 
 export function currentTurnInput(body) {
-  const user = body.messages.filter(message => message.role === 'user').at(-1);
+  const user = conversationMessages(body).filter(message => message.role === 'user').at(-1);
   assert.ok(user, 'request should contain its current user input');
   const text = messageText(user);
   return JSON.parse(text.slice(text.lastIndexOf('\n') + 1));

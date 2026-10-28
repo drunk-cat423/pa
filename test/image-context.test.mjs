@@ -108,8 +108,9 @@ test('QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、
   store.close();h=open();
   assert.equal(await h.handle(message('after-summary','摘要后继续')),'sent');assert.equal(files(requests.at(-1)).length,0);
   assert.equal(await h.handle(message('read-again','取原图')),'sent');assert.equal(files(requests.at(-1)).length,1);
-  assert.match(requests.at(-1).messages.at(-2).tool_call_id,/^history-/);
-  assert.equal(requests.at(-1).messages.at(-1).role,'user');assert.equal(requests.at(-1).messages.at(-1).content.at(-1).type,'file');
+  assert.match(requests.at(-1).messages.at(-3).tool_call_id,/^history-/);
+  assert.equal(requests.at(-1).messages.at(-2).role,'user');assert.equal(requests.at(-1).messages.at(-2).content.at(-1).type,'file');
+  assert.match(JSON.stringify(requests.at(-1).messages.at(-1).content),/\[PA本轮控制｜应用生成\]/);
   assert.equal(await h.handle(message('foreign-read','取原图',{route:other})),'sent');assert.equal(files(requests.at(-1)).length,0);
   assert.match(JSON.stringify(requests.at(-1)),/当前房间没有可访问/);
   assert.equal(uploads,1);

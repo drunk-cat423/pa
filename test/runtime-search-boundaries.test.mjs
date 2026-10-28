@@ -7,7 +7,7 @@ import test from 'node:test';
 import { openRecordedConversation,  } from '../dist/conversation.js';
 import { estimateContext, openConversation } from '../dist/runtime.js';
 
-async function harness(t, { repeatedToolCall = false, truncatedSummary = false, contextWindow = 32768 } = {}) {
+async function harness(t, { repeatedToolCall = false, truncatedSummary = false, includeSummary = false, contextWindow = 32768 } = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-search-boundary-'));
   const requests = [];
   let callId = 0;
@@ -44,7 +44,7 @@ async function harness(t, { repeatedToolCall = false, truncatedSummary = false, 
     const citations = results.map(item => ({ url: item.url, cited_text: 's'.repeat(1000) }));
     return new Response(JSON.stringify({ stop_reason: truncatedSummary ? 'max_tokens' : 'end_turn', content: [
       { type: 'web_search_tool_result', content: results },
-      { type: 'text', citations, ...(truncatedSummary ? { text: 'SUMMARY'.repeat(1000) } : {}) },
+      { type: 'text', citations, ...(truncatedSummary || includeSummary ? { text: 'SUMMARY'.repeat(1000) } : {}) },
     ], usage: { input_tokens: 100, output_tokens: 10 } }));
   };
 
@@ -71,8 +71,9 @@ async function harness(t, { repeatedToolCall = false, truncatedSummary = false, 
 
 test('搜索结果使最终请求超过窗口时发送前硬检查仍拦截', async t => {
   const companionTools = { prepareTurn: p => ({ prepared: true, mode: p.mode, saved: [] }), readHistory: () => [] };
-  // Allow enough tool-result space for search data to exceed the preparation schema itself.
-  const calibration = await harness(t, { contextWindow: 65536 });
+  // Include a valid search summary so the result request exceeds both stable
+  // stage prompts, then place the unchanged hard limit inside that measured growth.
+  const calibration = await harness(t, { contextWindow: 65536, includeSummary: true });
   const probe = await openConversation(calibration.config, 'calibration', { enableSearch: true });
   await probe.prompt('搜索', { runId: 'probe', companionTools });
   const sizes = calibration.requests.map(body => estimateContext(body, calibration.config.contextWindow, calibration.config.maxOutputTokens).inputTokens);
@@ -81,7 +82,7 @@ test('搜索结果使最终请求超过窗口时发送前硬检查仍拦截', as
   const growth = sizes[2] - largestBeforeResults;
   assert.ok(growth > 0, JSON.stringify(sizes));
   await probe.close();
-  const fixture = await harness(t, { contextWindow: 65536 });
+  const fixture = await harness(t, { contextWindow: 65536, includeSummary: true });
   const runtime = await openConversation(fixture.config, 'final-context-limit', { enableSearch: true });
   try {
     const reserve = fixture.config.maxOutputTokens + Math.max(128, Math.ceil(fixture.config.contextWindow * 0.01));

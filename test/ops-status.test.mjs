@@ -25,9 +25,9 @@ function fixture(t){
     CREATE TABLE auto_memory_job_retirements(job_id);
     CREATE TABLE auto_memory_legacy_isolations(job_id);`);
   const diag=new DatabaseSync(join(dir,'diagnostics/index.sqlite'));
-  diag.exec('PRAGMA user_version=1; CREATE TABLE calls(call_id,record_json); CREATE TABLE events(id,event_json);');
+  diag.exec('PRAGMA user_version=1; CREATE TABLE calls(call_id,record_json); CREATE TABLE events(id,call_id,event_json);');
   diag.prepare('INSERT INTO calls VALUES (?,?)').run('call',JSON.stringify({updatedAt:at,status:'completed',phase:'response',privateText:'NEVER_OUTPUT_PRIVATE_TEXT'}));
-  for(const phase of ['claim','input'])diag.prepare('INSERT INTO events VALUES (?,?)').run(phase,JSON.stringify({at,phase,details:{privateText:'NEVER_OUTPUT_PRIVATE_TEXT'}}));
+  for(const phase of ['claim','input'])diag.prepare('INSERT INTO events(id,event_json) VALUES (?,?)').run(phase,JSON.stringify({at,phase,details:{privateText:'NEVER_OUTPUT_PRIVATE_TEXT'}}));
   const files=[join(dir,'pa.sqlite'),join(dir,'diagnostics/index.sqlite')];
   const fingerprint=()=>files.map(path=>createHash('sha256').update(readFileSync(path)).digest('hex'));
   const system=zero=>({
@@ -69,5 +69,64 @@ test('自动搁置不能隐藏耗尽缺口，资源耗尽和新unknown调用必�
   const before=f.fingerprint(),r=f.collect(true),codes=r.findings.map(x=>x.code);
   assert.equal(r.complete,true);assert.equal(r.ok,false);assert.equal(r.database.memoryRecoveryGaps.exhausted,1);
   for(const code of ['memory_recovery_exhausted','host_memory_low','host_disk_low','recent_model_call_unknown'])assert.ok(codes.includes(code),code);
+  assert.deepEqual(f.fingerprint(),before);
+});
+
+test('缓存巡检按scope和stage发现命中骤降且不读取正文或修改诊断库',t=>{
+  const f=fixture(t),systemA='a'.repeat(64),systemB='b'.repeat(64),tools='c'.repeat(64);
+  let sequence=0;
+  const add=(callId,{scope='room-a',stage='prepare',cacheRead,input=100000,systemHash=systemA,toolsHash=tools,usage=true,window=200000,
+    prefix=true,contextKind}={})=>{
+    const at=new Date(f.now+sequence++).toISOString();
+    const usageData=usage?{input:0,cacheRead,cacheWrite:input-cacheRead,output:100,totalTokens:input+100}:undefined;
+    const record={kind:'chat',provider:'anthropic',model:'claude-test',conversationId:scope,contextCalibration:{key:`cal-${scope}`},
+      status:'completed',phase:'response',createdAt:at,updatedAt:at,...(usage?{usage:usageData}:{})};
+    f.diag.prepare('INSERT INTO calls VALUES (?,?)').run(callId,JSON.stringify(record));
+    const event={at,phase:'request',event:'model.request_prepared',callId,details:{stage,requestNumber:1,
+      cachePrefix:prefix&&systemHash&&toolsHash?{version:1,systemHash,toolsHash}:undefined,contextWindow:window,
+      ...(contextKind?{contextKind}:{}),
+      privateText:'NEVER_OUTPUT_CACHE_BODY'}};
+    f.diag.prepare('INSERT INTO events(id,call_id,event_json) VALUES (?,?,?)').run(`event-${callId}`,callId,JSON.stringify(event));
+  };
+  add('high-system',{cacheRead:90000});
+  add('low-system',{cacheRead:7000,systemHash:systemB});
+  add('answer-only',{scope:'room-a',stage:'answer',cacheRead:7000});
+  add('high-same-prefix',{scope:'room-c',cacheRead:90000});
+  add('low-same-prefix',{scope:'room-c',cacheRead:7000});
+  add('cold-room',{scope:'room-cold',cacheRead:7000});
+  add('high-unknown-prefix',{scope:'room-d',cacheRead:90000,prefix:false});
+  add('low-unknown-prefix',{scope:'room-d',cacheRead:7000,prefix:false});
+  add('newest-without-window',{cacheRead:90000,window:null});
+  add('missing-usage',{cacheRead:0,usage:false,contextKind:'channel'});
+  add('research-call',{scope:'research-room',cacheRead:7000,contextKind:'research'});
+  add('cli-call',{scope:'cli-room',cacheRead:7000,contextKind:'cli'});
+  add('review-call',{scope:'review-room',stage:'attribution_review',cacheRead:7000,contextKind:'channel'});
+  add('missing-stage',{scope:'missing-room',cacheRead:7000,contextKind:'channel'});
+  f.diag.prepare('DELETE FROM events WHERE call_id=?').run('missing-stage');
+  f.diag.prepare('INSERT INTO events(id,call_id,event_json) VALUES (?,?,?)').run('duplicate-prepared','high-system',
+    JSON.stringify({at:new Date(f.now).toISOString(),phase:'request',event:'model.request_prepared',callId:'high-system',
+      details:{stage:'prepare',requestNumber:2,contextWindow:200000,cachePrefix:{version:1,systemHash:systemA,toolsHash:tools}}}));
+  const before=f.fingerprint(),r=f.collect(false),cache=r.diagnostics.contextCache;
+  assert.equal(r.complete,true);assert.equal(cache.sampledCalls,10);
+  assert.equal(cache.contextKind.channel,1);assert.equal(cache.contextKind.legacy,9);
+  assert.equal(cache.contextKind.excludedResearch,1);assert.equal(cache.contextKind.excludedCli,1);
+  assert.equal(cache.contextKind.excludedReview,1);assert.equal(cache.contextKind.missingStage,1);
+  assert.equal(cache.status,'partial');
+  assert.ok(r.findings.some(item=>item.code==='cache_stage_metadata_missing'));
+  assert.equal(cache.truncated,false);assert.equal(cache.sampleBoundary.newestUpdatedAt,new Date(f.now+9).toISOString());
+  assert.equal(cache.stages.prepare.missingUsage,1);
+  assert.equal(cache.stages.prepare.samples,9);
+  assert.equal(cache.stages.prepare.latestUsage.callId,'newest-without-window');
+  assert.equal(cache.stages.prepare.latestUsage.contextWindow,null);
+  assert.equal(cache.stages.prepare.latestInputToWindowRatio,null);
+  assert.deepEqual(cache.cacheDrops.map(drop=>[drop.previous.callId,drop.current.callId,drop.reason]),[
+    ['high-system','low-system','system_prefix_changed'],['high-same-prefix','low-same-prefix','prefix_unchanged_or_provider'],
+    ['high-unknown-prefix','low-unknown-prefix','unknown_prefix'],
+  ]);
+  assert.equal(cache.cacheDrops[0].fingerprintChanges.system,true);
+  assert.equal(cache.cacheDrops[2].fingerprintChanges.system,null);
+  assert.equal(cache.stages.answer.largeInputLowCache,1);
+  assert.equal(r.findings.filter(item=>item.code==='context_cache_efficiency_drop').length,3);
+  assert.equal(JSON.stringify(r).includes('NEVER_OUTPUT_CACHE_BODY'),false);
   assert.deepEqual(f.fingerprint(),before);
 });

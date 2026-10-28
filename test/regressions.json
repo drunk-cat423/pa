@@ -3,6 +3,21 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/runtime-cache-prefix.test.mjs",
+      "name": "channel wire keeps per-stage system fixed across three modes while link/target controls follow long history",
+      "evidence": "2026-10-28 final SDK request audit: three same-room answer mode changes preserved all old history and the tool schema, but changed front-loaded system text and cache hit rate fell to 1.59-7.27 percent; local HTTP regression checks real Pi wire projection, not provider cache performance"
+    },
+    {
+      "file": "test/runtime-cache-prefix.test.mjs",
+      "name": "save-claim correction closes tools in trailing controls without changing fixed answer system at the default context window",
+      "evidence": "2026-10-28 prefix audit identified the existing save-claim correction as another variable system branch; the same local HTTP regression verifies fixed protocol with actual tool closure after an unbacked save claim"
+    },
+    {
+      "file": "test/ops-status.test.mjs",
+      "name": "缓存巡检按scope和stage发现命中骤降且不读取正文或修改诊断库",
+      "evidence": "2026-10-28 production cache audit found three high-to-low same-stage drops while the existing health collector only reported completed calls; metadata-only SQLite regression checks detection, attribution limits, phase isolation and no business writes"
+    },
+    {
       "file": "test/reminder-service.test.mjs",
       "name": "私聊补充时间继承原事项，第二轮两次模型请求后绑定本条来源并落库",
       "evidence": "2026-10-28 private reminder clarification: user supplied only the selected time, but concatenating prior request and confirmation as requestQuote failed the current-message substring gate; anonymized local HTTP and real SQLite regression"

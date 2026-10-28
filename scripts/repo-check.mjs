@@ -7,6 +7,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const testDir = join(root, 'test');
 const scopeFiles = {
   ops: ['ops-status.test.mjs'],
+  cache: ['runtime-cache-prefix.test.mjs', 'ops-status.test.mjs'],
   chat: [
     'answer-grounding.test.mjs',
     'context-people.test.mjs',
@@ -17,6 +18,7 @@ const scopeFiles = {
     'channel-web-tools.test.mjs',
     'research-e2e.test.mjs',
     'reminder-runtime.test.mjs',
+    'runtime-cache-prefix.test.mjs',
     'session-integrity.test.mjs',
   ],
   memory: [
@@ -48,6 +50,7 @@ const scopeFiles = {
     'rolling-memory-store.test.mjs',
     'runtime-search-boundaries.test.mjs',
     'runtime-token-calibration.test.mjs',
+    'runtime-cache-prefix.test.mjs',
   ],
   delivery: [
     'answer-documents.test.mjs',

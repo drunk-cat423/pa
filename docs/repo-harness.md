@@ -19,6 +19,7 @@
 | 对话、工具循环、准备与回答 | `runtime.ts`、`turn-plan.ts`、`answer-grounding.ts`、`channel-harness.ts`、`cli.ts` | [模块与边界](development.md#模块与边界)、[循环流程](design/companion-tool-loop.md) | `chat` |
 | 人物/AI 画像、Topic、资料失败恢复 | `auto-memory.ts`、`auto-memory-store.ts`、`material-profile-wire.ts`、`profile-*.ts`、`self-profile-store.ts` | [记忆](memory.md) | `memory` |
 | 历史投影、人物标签、token 校准、容量压缩 | `conversation.ts`、`context-people.ts`、`context-tokens.ts`、`runtime.ts`、`image-context.ts` | [记忆](memory.md)、[存储](storage.md) | `context` |
+| 缓存前缀、命中骤降、提示/工具投影或 Pi 升级 | `runtime.ts`、`scripts/ops/server-status.mjs` | [缓存契约与故障检查](context-cache.md) | `cache`；按实际 HTTP 请求核对前缀，巡检读取真实用量及指纹 |
 | 队列、分段、重复或未知投递 | `channel-harness.ts`、`store.ts`、`markdown-chunks.ts`、`qq-channel.ts` | [QQ 长回答](qq-long-replies.md)、[恢复边界](robustness-review.md) | `delivery` |
 | 研究清单、材料、报告和清理 | `research-*.ts`、`scripts/deployment/research-retention.mjs` | [研究](research.md)、[正文保留](research-retention.md) | `research` |
 | 搜索、抓网页、代理、图片 | `web-search.ts`、`web-fetch*.ts`、`image-assets.ts`、`image-context.ts` | [开发说明](development.md)、[网页代理](deployment.md#pa-网页读取代理) | `web` |

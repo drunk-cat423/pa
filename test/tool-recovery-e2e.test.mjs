@@ -7,7 +7,7 @@ import test from 'node:test';
 import { MemoryError } from '../dist/memory-types.js';
 import { openConversation } from '../dist/runtime.js';
 import { ResearchMaterialReader } from '../dist/research-material-reader.js';
-import { preparationDelta } from './fixtures/turn-preparation.mjs';
+import { conversationMessages, preparationDelta } from './fixtures/turn-preparation.mjs';
 
 const call = (name, args, id='call') => ({ role:'assistant',tool_calls:[{index:0,id,type:'function',function:{name,arguments:JSON.stringify(args)}}] });
 async function fixture(t, respond, overrides={}) {
@@ -39,11 +39,13 @@ test('真实Pi循环：准备schema和跨目标字段被拒后可修正，未保
   let preparations=0;
   const f=await fixture(t,(body,n)=>{
     if(n===1)return call('prepare_turn',{intent:'question',mode:'invalid',updates:[]},'schema');
-    if(n===2){assert.equal(body.messages.at(-1).role,'tool');return preparationDelta('business',{
+    if(n===2){assert.equal(conversationMessages(body).at(-1).role,'tool');return preparationDelta('business',{
       intent:'question',mode:'standard',updates:[{target:'ai_self',content:'轻松一点',attribution:{kind:'statement',subjectSenderIds:[],excludedSenderIds:[],correctsMessageIds:[]}}]});}
     if(n===3){assert.match(JSON.stringify(body.messages),/群事实归属信息无效/);return preparationDelta('valid');}
     if(n===4)return {role:'assistant',content:'你可以在设置中修改。记下了。'};
-    assert.equal(n,5);assert.equal(body.tool_choice,'none');assert.match(JSON.stringify(body.messages),/刚才草稿含无持久化回执/);
+    assert.equal(n,5);assert.equal(body.tool_choice,'none');
+    const control=body.messages.at(-1).content;
+    assert.match(typeof control==='string'?control:control.map(part=>part.text??'').join(''),/"saveClaimCorrection":true/);
     return {role:'assistant',content:'你可以在设置中修改。'};
   });
   const runtime=await f.open('recover-prepare');

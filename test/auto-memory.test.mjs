@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { companionReply } from './fixtures/companion-tools.mjs';
+import { conversationMessages } from './fixtures/turn-preparation.mjs';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
 import { BackgroundMemory } from "../dist/auto-memory.js";
 import { ConversationStore } from '../dist/store.js';
@@ -34,7 +35,7 @@ function extracted(input) {
 }
 
 function currentMessageText(body) {
-  const user = body.messages.filter(message => message.role === 'user').at(-1);
+  const user = conversationMessages(body).filter(message => message.role === 'user').at(-1);
   if (!user) return '';
   const content = typeof user.content === 'string' ? user.content : user.content.map(part => part.text ?? '').join('');
   try { return JSON.parse(content.slice(content.lastIndexOf('\n') + 1)).currentMessage?.text ?? content; }
@@ -143,8 +144,8 @@ test('最终上下文达到85%才整理；摘要与检查点后消息跨新轮�
   let finished = false; void pending.then(() => { finished = true; });
   await new Promise(resolve => setTimeout(resolve, 50));
   assert.equal(finished, false);
-  const before = f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length; gate.resolve();
-  assert.equal(await pending, 'sent'); assert.equal(f.requests.filter(request=>request.messages.at(-1)?.role==='tool').length, before + 1);
+  const before = f.requests.filter(request=>request.messages.at(-2)?.role==='tool').length; gate.resolve();
+  assert.equal(await pending, 'sent'); assert.equal(f.requests.filter(request=>request.messages.at(-2)?.role==='tool').length, before + 1);
   await h.waitForMemory(); assert.equal(f.inputs[0].contextProtocol, 1);
   assert.equal(await h.handle(f.message('capacity-follow-up', 'CAPACITY_FOLLOW_UP', { route: f.privateRoute })), 'sent');
   let context = conversationContext(f.requests.at(-1));

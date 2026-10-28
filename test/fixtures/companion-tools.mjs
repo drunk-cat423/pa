@@ -1,10 +1,13 @@
 // Deterministic model protocol fixture, not a test of language understanding.
+import { conversationMessages } from './turn-preparation.mjs';
+
 let callSequence = 0;
 export function companionReply(body, fallback = '记住了。') {
-  if (body.messages.at(-1)?.role === 'tool' && body.tool_choice?.function?.name !== 'prepare_turn') return {
+  const messages = conversationMessages(body);
+  if (messages.at(-1)?.role === 'tool' && body.tool_choice?.function?.name !== 'prepare_turn') return {
     delta: { role: 'assistant', content: fallback }, finishReason: 'stop',
   };
-  const last = body.messages.findLast(message => message.role === 'user');
+  const last = messages.findLast(message => message.role === 'user');
   const raw = typeof last?.content === 'string' ? last.content : last?.content?.map(block => block.text ?? '').join('') ?? '';
   let text = raw;
   try { text = JSON.parse(raw.slice(raw.lastIndexOf('\n') + 1)).currentMessage?.text ?? raw; } catch {}
