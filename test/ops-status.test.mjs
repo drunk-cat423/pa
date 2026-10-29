@@ -49,6 +49,7 @@ function fixture(t){
 
 test('巡检不把sent和正常claim/input阶段报异常，隔离旧队列不掩盖当前活动且仅读元数据',t=>{
   const f=fixture(t);
+  f.diag.prepare('INSERT INTO calls VALUES (?,?)').run('digest',JSON.stringify({updatedAt:f.at,status:'completed',phase:'trending_digest',kind:'memory'}));
   for(let n=0;n<25;n++){
     f.db.prepare('INSERT INTO auto_memory_jobs VALUES (?,\'queued\',\'legacy\',?,NULL)').run('old-'+n,f.at);
     f.db.prepare('INSERT INTO auto_memory_job_retirements VALUES (?)').run('old-'+n);
@@ -56,6 +57,7 @@ test('巡检不把sent和正常claim/input阶段报异常，隔离旧队列不�
   f.db.prepare('INSERT INTO auto_memory_jobs VALUES (?,\'running\',\'materials\',?,?)').run('current',f.at,f.now+60000);
   const before=f.fingerprint(),r=f.collect(false);
   assert.equal(r.complete,true);assert.equal(r.ok,true,JSON.stringify(r.findings));
+  assert.equal(r.diagnostics.callsByStage.trending_digest,1);
   assert.deepEqual(r.database.active.map(x=>x.id),['current']);assert.equal(r.diagnostics.events,2);
   assert.equal(JSON.stringify(r).includes('NEVER_OUTPUT_PRIVATE_TEXT'),false);assert.deepEqual(f.fingerprint(),before);
 });

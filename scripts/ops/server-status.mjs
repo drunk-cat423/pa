@@ -44,7 +44,7 @@ function ageCount(db, table, timeColumn, cutoff) {
 }
 function addCount(target,key,count){target[key]=(target[key]??0)+Number(count);}
 const DIAG_STATUS=new Set(['started','completed','failed','unknown']);
-const DIAG_PHASE=new Set(['claim','input','request','response','parse','validate','commit','ledger','completed','http','prepare','answer','tool','attribution','checkpoint','recover','extract','plan','collect','write','review','persist','send','profile_capacity','profile_refine','model_proposal']);
+const DIAG_PHASE=new Set(['claim','input','request','response','parse','validate','commit','ledger','completed','http','prepare','answer','tool','attribution','checkpoint','recover','extract','plan','collect','write','review','persist','send','profile_capacity','profile_refine','model_proposal','trending_digest']);
 const DIAG_CODES=new Set(['model_length','model_request','model_empty','model_json','model_contract','state_persistence','obsolete_personal_memory',
   'profile_protocol','profile_capacity','profile_refinement','output_budget','input_too_large','profile_conflict','budget','closed','unexpected',
   'model_proposal_rejected','search_request_failed','search_http_failed','search_parse_failed','search_response_failed','search_persistence_failed']);
