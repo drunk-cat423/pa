@@ -19,6 +19,8 @@ export interface ResearchTask {
   /** Authorized follow-ups are task instructions, separate from fetched evidence. */
   followups: { attempt: number; requirements: string; sourceMessageId: string }[];
 }
+/** Queue and notification state never needs to expand saved research materials. */
+export type ResearchTaskMetadata = Omit<ResearchTask, 'evidence' | 'followups'>;
 export interface ResearchListParams { date?: string; query?: string; limit?: number; offset?: number }
 export interface ResearchList {
   total: number; offset: number; nextOffset?: number;

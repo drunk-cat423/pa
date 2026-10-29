@@ -637,12 +637,16 @@ export class AutoMemoryStore {
       .all(conversationId??null,conversationId??null,limit).map(row=>this.materialBackfillRun(String(row.id))!));
   }
   private advanceMaterialCheckpoint(conversationId:string): void {
-    let completed=0;
+    // Coverage is append-only: completed jobs and their source links are retained.
+    // Resume at the contiguous watermark; a later success must not skip a gap.
+    let completed=Number(this.db.prepare('SELECT completed_seq FROM auto_memory_material_state WHERE conversation_id=?')
+      .get(conversationId)?.completed_seq??0);
     for(const row of this.db.prepare(`SELECT m.ingest_seq,
       (EXISTS(SELECT 1 FROM auto_memory_material_legacy_messages l WHERE l.message_id=m.id AND l.disposition='done')
       OR EXISTS(SELECT 1 FROM auto_memory_material_job_messages jm JOIN auto_memory_jobs j ON j.id=jm.job_id
         WHERE jm.message_id=m.id AND j.status='done')) AS covered
-      FROM messages m WHERE m.conversation_id=? AND m.role='user' AND m.message_kind='chat' ORDER BY m.ingest_seq`).all(conversationId)) {
+      FROM messages m WHERE m.conversation_id=? AND m.role='user' AND m.message_kind='chat'
+        AND m.ingest_seq>? ORDER BY m.ingest_seq`).iterate(conversationId,completed)) {
       if(!row.covered) break;
       completed=Number(row.ingest_seq);
     }
@@ -1655,8 +1659,13 @@ export class AutoMemoryStore {
       const cursor=canUseSummary?Number(state.cursor):0;
       const deferred=this.deferredContextIds(conversationId);
       const rows=this.db.prepare(`SELECT message_id,seq FROM conversation_context_messages WHERE conversation_id=?
-        AND (? IS NULL OR seq<?) ORDER BY seq`).all(conversationId,boundary??null,boundary??null)
-        .filter(row=>Number(row.seq)>cursor||deferred.has(String(row.message_id)));
+        AND seq>? AND seq<? ORDER BY seq`).all(conversationId,cursor,boundary??Number.MAX_SAFE_INTEGER);
+      // Query deferred old sources by primary key, rather than scanning the
+      // already summarized prefix. Newer deferred sources are already in rows.
+      if(deferred.size&&cursor>0) rows.push(...this.db.prepare(`SELECT message_id,seq FROM conversation_context_messages
+        WHERE message_id IN (SELECT value FROM json_each(?)) AND conversation_id=? AND seq<=? AND seq<?`)
+        .all(JSON.stringify([...deferred]),conversationId,cursor,boundary??Number.MAX_SAFE_INTEGER));
+      rows.sort((a,b)=>Number(a.seq)-Number(b.seq));
       const ranges=this.deferredRanges(conversationId);
       return {checkpoint:canUseSummary?Number(state.completed_seq):0,summaryCursor:cursor,summaryVersion:canUseSummary?Number(state.revision):0,
         ...(canUseSummary&&state.summary!=null?{summary:String(state.summary)}:{}),

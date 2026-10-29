@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const testDir = join(root, 'test');
 const scopeFiles = {
+  efficiency: ['search-concurrency.test.mjs', 'research-scheduling.test.mjs', 'storage-efficiency.test.mjs', 'context-efficiency.test.mjs'],
   trending: ['trending-content.test.mjs', 'trending-service.test.mjs'],
   ops: ['ops-status.test.mjs'],
   cache: ['runtime-cache-prefix.test.mjs', 'ops-status.test.mjs'],
@@ -41,6 +42,8 @@ const scopeFiles = {
     'self-profile-store.test.mjs',
   ],
   context: [
+    'context-efficiency.test.mjs',
+    'storage-efficiency.test.mjs',
     'answer-grounding.test.mjs',
     'auto-memory.test.mjs',
     'calibrated-compression.test.mjs',
@@ -63,6 +66,7 @@ const scopeFiles = {
     'reminder-service.test.mjs',
   ],
   research: [
+    'research-scheduling.test.mjs',
     'research-archive.test.mjs',
     'research-context.test.mjs',
     'research-e2e.test.mjs',
@@ -73,6 +77,7 @@ const scopeFiles = {
     'tool-recovery-e2e.test.mjs',
   ],
   web: [
+    'search-concurrency.test.mjs',
     'channel-web-tools.test.mjs',
     'image-context.test.mjs',
     'research-context.test.mjs',
@@ -83,6 +88,7 @@ const scopeFiles = {
     'runtime-search-boundaries.test.mjs',
   ],
   storage: [
+    'storage-efficiency.test.mjs',
     'answer-documents.test.mjs',
     'auto-memory-store.test.mjs',
     'channel-admission-atomic.test.mjs',

@@ -3,6 +3,71 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/search-concurrency.test.mjs",
+      "name": "共享无限预算允许四条请求并发，额外请求排队可取消且不占预算",
+      "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
+    },
+    {
+      "file": "test/search-concurrency.test.mjs",
+      "name": "不同进程同时预约共享预算仍不超额，重启后持久预算继续生效",
+      "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
+    },
+    {
+      "file": "test/search-concurrency.test.mjs",
+      "name": "旧JSONL与未知预约仍计数，请求失败不重发也不退还预算",
+      "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
+    },
+    {
+      "file": "test/search-concurrency.test.mjs",
+      "name": "等待跨进程预算短锁时可取消，取消不发送也不预约",
+      "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
+    },
+    {
+      "file": "test/research-scheduling.test.mjs",
+      "name": "SQL领取一项只读元信息，checkpoint及状态核验不展开旧证据，单材料读取保持原编号",
+      "evidence": "2026-10-30 offline reproduction: selecting one of 50 research jobs loaded all 50 evidence sets; a held notification also prevented the next research job from starting. Covers metadata-only selection/checkpoints, independent delivery and obsolete/unknown notification handling."
+    },
+    {
+      "file": "test/research-scheduling.test.mjs",
+      "name": "慢A房间通知不阻塞B研究；通知单并发且wait等待持久回执",
+      "evidence": "2026-10-30 offline reproduction: selecting one of 50 research jobs loaded all 50 evidence sets; a held notification also prevented the next research job from starting. Covers metadata-only selection/checkpoints, independent delivery and obsolete/unknown notification handling."
+    },
+    {
+      "file": "test/research-scheduling.test.mjs",
+      "name": "通知在房间实际发送前复核归档、续作及关闭；重启未知投递不重发",
+      "evidence": "2026-10-30 offline reproduction: selecting one of 50 research jobs loaded all 50 evidence sets; a held notification also prevented the next research job from starting. Covers metadata-only selection/checkpoints, independent delivery and obsolete/unknown notification handling."
+    },
+    {
+      "file": "test/storage-efficiency.test.mjs",
+      "name": "压缩后只读取增量和旧缺口，资料水位从已有位置推进且不越缺口",
+      "evidence": "2026-10-30 architecture audit: summarized context IDs and material coverage were scanned from the beginning, idle memory/Trending polls visited finished work, and room connections repeated full FK checks. Covers bounded incremental reads with gaps, idle indexes and scoped bootstrap without disabling corruption checks."
+    },
+    {
+      "file": "test/storage-efficiency.test.mjs",
+      "name": "空闲记忆轮询不汇总历史状态，pending查询不扫描done任务",
+      "evidence": "2026-10-30 architecture audit: summarized context IDs and material coverage were scanned from the beginning, idle memory/Trending polls visited finished work, and room connections repeated full FK checks. Covers bounded incremental reads with gaps, idle indexes and scoped bootstrap without disabling corruption checks."
+    },
+    {
+      "file": "test/storage-efficiency.test.mjs",
+      "name": "同一次harness初始化共用完整性核验，新scope和结构变化仍核验损坏",
+      "evidence": "2026-10-30 architecture audit: summarized context IDs and material coverage were scanned from the beginning, idle memory/Trending polls visited finished work, and room connections repeated full FK checks. Covers bounded incremental reads with gaps, idle indexes and scoped bootstrap without disabling corruption checks."
+    },
+    {
+      "file": "test/context-efficiency.test.mjs",
+      "name": "百炼只读一次且payload相同，旧大图可纠正并继续会话，损坏原图仍停止",
+      "evidence": "2026-10-30 call-chain audit: Bailian image projection read/hashed each original five times, four admission projections repeated exact chunk hashing, and cold calibration keys scanned diagnostic history. Covers identical payload/estimates, original corruption detection, indexed lookup and read-only diagnostics."
+    },
+    {
+      "file": "test/context-efficiency.test.mjs",
+      "name": "同次准备和三种回答估算复用分片hash，v1/v2上界与原分片完全相同",
+      "evidence": "2026-10-30 call-chain audit: Bailian image projection read/hashed each original five times, four admission projections repeated exact chunk hashing, and cold calibration keys scanned diagnostic history. Covers identical payload/estimates, original corruption detection, indexed lookup and read-only diagnostics."
+    },
+    {
+      "file": "test/context-efficiency.test.mjs",
+      "name": "旧v1诊断索引增补校准索引，冷key查询使用索引且不改历史正文",
+      "evidence": "2026-10-30 call-chain audit: Bailian image projection read/hashed each original five times, four admission projections repeated exact chunk hashing, and cold calibration keys scanned diagnostic history. Covers identical payload/estimates, original corruption detection, indexed lookup and read-only diagnostics."
+    },
+    {
       "file": "test/trending-content.test.mjs",
       "name": "真实Pi最终请求单次JSON Object且关闭thinking，程序固定slug/数量/链接并独立记录诊断",
       "evidence": "2026-10-30 paid preview repeated a source homepage domain and an overlong feature list, rejecting the whole digest. Regression checks source URL removal from model input with original snapshot retained, bounded introduction length, exact project mapping and program-built links."

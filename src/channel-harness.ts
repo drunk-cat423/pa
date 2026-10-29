@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { PaConfig } from './config.js';
 import type { ChannelRoute, DeliveryResult, InboundMessage, OutboundMessage } from './channel-types.js';
 import { openRecordedConversation, type RecordedConversation } from './conversation.js';
-import { DuplicateMessageError } from './store.js';
+import { DuplicateMessageError, StoreInitializationScope } from './store.js';
 import { RequestError } from './runtime.js';
 import { configuredPersons, isMemoryOwner, NO_OWNER_POLICY, validateHarnessPolicy, type HarnessPolicy } from './harness-policy.js';
 import { executeMemoryRequest, parseMemoryRequest, safeProfileError } from './memory-service.js';
@@ -37,6 +37,7 @@ const RESULT_COMMAND = /^\/result(?:\s+([0-9a-f-]+))?\s*$/i;
 export class ChannelHarness {
   private readonly allowed: Set<string>;
   private readonly conversations = new Map<string, RecordedConversation>();
+  private readonly storeInitialization = new StoreInitializationScope();
   private readonly outputs = new Map<string, Promise<unknown>>();
   // Durable queued payloads stay in SQLite. Optional callers awaiting completion
   // retain only resolvers; the production ingress returns after admission.
@@ -82,7 +83,8 @@ export class ChannelHarness {
       }),(route,operation)=>this.output(route,operation),message=>this.transport.send(message),
       error=>{this.fatal=error;this.onTaskError?.();});
     if (config.research?.enabled) this.research = new ResearchService(config, routes,
-      message => this.output(message.route, () => this.closed ? Promise.resolve({ status: 'rejected' as const }) : this.transport.send(message)),
+      (message, shouldSend) => this.output(message.route, () => this.closed || (shouldSend && !shouldSend())
+        ? Promise.resolve({ status: 'rejected' as const }) : this.transport.send(message)),
       () => { this.fatal = new Error('研究任务持久化失败。'); this.onTaskError?.(); });
   }
 
@@ -126,7 +128,8 @@ export class ChannelHarness {
     let pending = this.opening.get(key);
     if (!pending) {
       pending = openRecordedConversation(this.config, key, route,
-        { persons: configuredPersons(this.policy), policy: this.policy, ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}),
+        { persons: configuredPersons(this.policy), policy: this.policy, storeInitialization:this.storeInitialization,
+          ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}),
           onIntegrityFailure:error=>{
             if(error instanceof SessionIntegrityError) this.isolate(key,error);
             else {this.fatal=error;this.onTaskError?.();}

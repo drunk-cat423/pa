@@ -26,7 +26,13 @@ export class TrendingStore {
         CREATE TABLE IF NOT EXISTS editions(id TEXT PRIMARY KEY,date TEXT NOT NULL,manual INTEGER NOT NULL,body TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS parts(edition_id TEXT NOT NULL REFERENCES editions(id),route_key TEXT NOT NULL,
           ordinal INTEGER NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','uncertain','rejected')),
-          external_id TEXT,PRIMARY KEY(edition_id,route_key,ordinal));`);
+          external_id TEXT,PRIMARY KEY(edition_id,route_key,ordinal));
+        CREATE INDEX IF NOT EXISTS editions_pending_manual ON editions(manual)
+          WHERE manual=1 AND COALESCE(json_extract(body,'$.preview'),0)=0
+          AND json_extract(body,'$.state') IN ('pending','collect_failed','ready');
+        CREATE INDEX IF NOT EXISTS editions_pending_expiry ON editions(date)
+          WHERE manual=0 AND json_extract(body,'$.state') IN ('pending','collect_failed','ready');
+        CREATE INDEX IF NOT EXISTS editions_latest ON editions(manual,date DESC);`);
       this.db=db;
     }catch(error){db?.close();throw new TrendingPersistenceError(error);}
   }
@@ -78,15 +84,20 @@ export class TrendingStore {
       edition.updatedAt=at;this.db.prepare('UPDATE editions SET body=? WHERE id=?').run(JSON.stringify(edition),edition.id);
     }
   });}
-  expire(at:number):void {this.transaction(()=>{
+  expire(at:number):void {
     const cutoff=new Date(at+8*3_600_000-10*3_600_000).toISOString().slice(0,10);
-    for(const row of this.db.prepare(`SELECT body FROM editions WHERE manual=0 AND date<=?
+    // Empty polls must not reserve the writer or scan completed editions.
+    if(!this.safe(()=>this.db.prepare(`SELECT 1 FROM editions INDEXED BY editions_pending_expiry WHERE manual=0 AND date<=?
+      AND json_extract(body,'$.state') IN ('pending','collect_failed','ready') LIMIT 1`).get(cutoff)))return;
+    this.transaction(()=>{
+    for(const row of this.db.prepare(`SELECT body FROM editions INDEXED BY editions_pending_expiry WHERE manual=0 AND date<=?
       AND json_extract(body,'$.state') IN ('pending','collect_failed','ready')`).all(cutoff)){
       const edition=JSON.parse(String(row.body)) as TrendingEdition;
       edition.state='expired';edition.code='expired';edition.updatedAt=at;
       this.db.prepare('UPDATE editions SET body=? WHERE id=?').run(JSON.stringify(edition),edition.id);
     }
-  });}
+    });
+  }
   close():void {this.safe(()=>this.db.close());}
 }
 export const routeKey=(route:ChannelRoute)=>JSON.stringify([route.channel,route.accountId,route.roomType,route.roomId]);

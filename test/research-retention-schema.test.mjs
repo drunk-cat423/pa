@@ -87,7 +87,7 @@ test('current schema preview/apply protects unfinished research, ordinary chat a
   db.exec(`CREATE TABLE IF NOT EXISTS maintenance_contracts(domain TEXT PRIMARY KEY,version INTEGER NOT NULL);
     INSERT OR REPLACE INTO maintenance_contracts VALUES('research-retention',2); PRAGMA user_version=999`);
   assert.throws(()=>previewResearchCleanup(directory,{now:nowCut}),/未知 maintenance contract/);
-  db.prepare("UPDATE maintenance_contracts SET version=1").run();
+  db.prepare("UPDATE maintenance_contracts SET version=1 WHERE domain='research-retention'").run();
   if(!hadMarker) {
     db.exec('DROP TABLE maintenance_contracts');
     assert.throws(()=>previewResearchCleanup(directory,{now:nowCut}),/缺少 maintenance contract/);

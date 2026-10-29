@@ -20,6 +20,8 @@ export interface ContextFootprint {
   blocks: { hash: string; bytes: number; count: number }[];
   imageIds?: string[];
 }
+/** Owned by one admission estimate, never retained across prompts or sample updates. */
+export type ContextFootprintCache = Map<string, { hash: string; bytes: number }[]>;
 export interface ContextCalibration {
   version: 1 | 2;
   key: string;
@@ -36,7 +38,8 @@ export function contextCalibrationKey(provider: string, model: string, api: stri
 }
 
 /** Fingerprint an exact partition of the serialized wire bytes, never normalized text. */
-export function contextFootprint(payload: unknown, version: 1 | 2 = VERSION): ContextFootprint | undefined {
+export function contextFootprint(payload: unknown, version: 1 | 2 = VERSION,
+  cache?: ContextFootprintCache): ContextFootprint | undefined {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
   const visual = imageTokenPayload(payload);
   if (visual.imageIds.length > MAX_REQUEST_IMAGES) return undefined;
@@ -44,18 +47,32 @@ export function contextFootprint(payload: unknown, version: 1 | 2 = VERSION): Co
   if (!Array.isArray(messages)) return undefined;
   const blocks = new Map<string, { hash: string; bytes: number; count: number }>();
   let bytes = 0, count = 0, invalid = false;
+  const addBlock = (digest: string, size: number) => {
+    if (++count > (version === 1 ? LEGACY_MAX_BLOCKS : MAX_PARTS)) { invalid = true; return; }
+    const key = `${digest}:${size}`;
+    const previous = blocks.get(key);
+    if (previous) previous.count++;
+    else blocks.set(key, { hash: digest, bytes: size, count: 1 });
+    if (blocks.size > (version === 1 ? LEGACY_MAX_BLOCKS : MAX_BLOCKS)) invalid = true;
+  };
   const add = (value: string) => {
+    const cached = cache?.get(value);
+    if (cached) {
+      for (const chunk of cached) {
+        if (invalid) break;
+        addBlock(chunk.hash, chunk.bytes);
+      }
+      return;
+    }
     const data = Buffer.from(value, 'utf8');
+    const chunks: { hash: string; bytes: number }[] | undefined = cache ? [] : undefined;
     for (let offset = 0; offset < data.length && !invalid; offset += CHUNK_BYTES) {
-      if (++count > (version === 1 ? LEGACY_MAX_BLOCKS : MAX_PARTS)) { invalid = true; break; }
       const chunk = data.subarray(offset, offset + CHUNK_BYTES);
       const digest = hash(chunk);
-      const key = `${digest}:${chunk.length}`;
-      const previous = blocks.get(key);
-      if (previous) previous.count++;
-      else blocks.set(key, { hash: digest, bytes: chunk.length, count: 1 });
-      if (blocks.size > (version === 1 ? LEGACY_MAX_BLOCKS : MAX_BLOCKS)) invalid = true;
+      chunks?.push({ hash: digest, bytes: chunk.length });
+      addBlock(digest, chunk.length);
     }
+    if (chunks && !invalid) cache!.set(value, chunks);
   };
   const escaped = (value: string) => JSON.stringify(value).slice(1, -1);
   // Strings can themselves hold JSON/JSONL history (including inside content[].text).
@@ -245,10 +262,10 @@ export class ContextTokenEstimator {
     return footprint ? { version: VERSION, key: this.key, footprint } : undefined;
   }
 
-  estimate(payload: unknown): CalibratedInput | undefined {
+  estimate(payload: unknown, cache?: ContextFootprintCache): CalibratedInput | undefined {
     const footprints = new Map<1 | 2, ContextFootprint | undefined>();
     for (const sample of this.samples.toReversed()) {
-      if (!footprints.has(sample.version)) footprints.set(sample.version, contextFootprint(payload, sample.version));
+      if (!footprints.has(sample.version)) footprints.set(sample.version, contextFootprint(payload, sample.version, cache));
       const current = footprints.get(sample.version);
       if (!current) continue;
       const blocks = new Map(current.blocks.map(block => [`${block.hash}:${block.bytes}`, block]));

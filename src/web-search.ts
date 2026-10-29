@@ -63,6 +63,74 @@ type LedgerEvent =
 
 const ENDPOINT = 'https://api.deepseek.com/anthropic/v1/messages';
 const MAX_RESPONSE_BYTES = 1024 * 1024;
+const MAX_CONCURRENT_SEARCHES = 4;
+const LEDGER_LOCK_WAIT_MS = 5000;
+
+let activeSearches = 0;
+const waitingSearches: (() => void)[] = [];
+
+async function acquireSearchSlot(signal?: AbortSignal): Promise<() => void> {
+  if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+  if (activeSearches >= MAX_CONCURRENT_SEARCHES) {
+    await new Promise<void>((resolve, reject) => {
+      const ready = () => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      const onAbort = () => {
+        const index = waitingSearches.indexOf(ready);
+        if (index !== -1) waitingSearches.splice(index, 1);
+        reject(new WebSearchError('网页搜索已取消。'));
+      };
+      waitingSearches.push(ready);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  } else activeSearches++;
+  // A released slot is transferred directly to the next waiter.
+  return () => {
+    const next = waitingSearches.shift();
+    if (next) next();
+    else activeSearches--;
+  };
+}
+
+async function waitForLedgerLock(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, 10);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new WebSearchError('网页搜索已取消。'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function withSearchLedger<T>(config: PaConfig, budgetId: string,
+  callback: (directory: string, entries: LedgerEvent[], append: (event: LedgerEvent) => Promise<void>) => Promise<T>,
+  signal?: AbortSignal): Promise<T> {
+  const deadline = Date.now() + LEDGER_LOCK_WAIT_MS;
+  let lock: Awaited<ReturnType<typeof acquireConversationLock>>;
+  while (true) {
+    if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+    try {
+      lock = await acquireConversationLock(config.dataDir, `web-search-budget:${budgetId}`);
+      break;
+    } catch (error) {
+      if (!(error instanceof Error && (('code' in error && error.code === 'EEXIST')
+        || error.message.startsWith('此会话已被锁定：')))) throw new WebSearchPersistenceError();
+      if (Date.now() >= deadline) throw new WebSearchError('网页搜索预算当前被其他请求占用。');
+      await waitForLedgerLock(signal);
+    }
+  }
+  try { return await withLedger(lock.directory, (entries, append) => callback(lock.directory, entries, append)); }
+  finally {
+    try { await lock.release(); } catch { throw new WebSearchPersistenceError(); }
+  }
+}
 
 export function bailianSearchEndpoint(baseUrl?: string): string | undefined {
   if (!baseUrl || !/^https:\/\/ws-[a-z0-9]+\.cn-beijing\.maas\.aliyuncs\.com\/compatible-mode\/v1\/?$/.test(baseUrl)) return undefined;
@@ -355,18 +423,9 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
   const requestedDateRange = checkedDateRange(dateRange);
   if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
 
-  let lock: Awaited<ReturnType<typeof acquireConversationLock>>;
-  try { lock = await acquireConversationLock(config.dataDir, `web-search-budget:${search.budgetId}`); }
-  catch (error) {
-    if (error instanceof Error && (('code' in error && error.code === 'EEXIST') || error.message.startsWith('此会话已被锁定：'))) {
-      throw new WebSearchError('网页搜索预算当前被其他请求占用。');
-    }
-    throw new WebSearchPersistenceError();
-  }
-
+  const releaseSlot = await acquireSearchSlot(signal);
   try {
-    if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
-    return await withLedger(lock.directory, async (entries, append) => {
+    const { directory, attemptId } = await withSearchLedger(config, search.budgetId, async (directory, entries, append) => {
       if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
       const reservations = entries.filter(entry => entry.type === 'reserved');
       if (search.maxUses > 0 && entries.some(entry => entry.type === 'completed' && entry.usage.serverSearches !== null
@@ -378,103 +437,106 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
       }
       const attemptId = randomUUID();
       await append({ type: 'reserved', attemptId, timestamp: new Date().toISOString(), query });
-      const clock = requestTimeData();
-      const body = {
-        model: search.model, max_tokens: search.maxTokens,
-        ...(config.provider === 'bailian' ? { thinking: { type: 'disabled' },
-          system: [{ type: 'text', text: 'x-anthropic-billing-header: cc_entrypoint=cli;' }] } : {}),
-        messages: [{ role: 'user', content: [{ type: 'text', text:
-          '[搜索时间环境｜由harness提供]\n' + JSON.stringify({ ...clock, requestedDateRange }) + '\n'
-          + '以上日期范围按北京时间理解，是查询约束提示，不是搜索引擎已执行的过滤。将相对时间明确为日期；核对来源发布时间、页面更新时间和事件发生日期，三者不能混同。'
-          + '优先与目标日期范围相关的原始来源，实时可用性应查当前状态页；没有日期证据或结果过时时明确说明，不能称为最新。\n'
-          + outputLengthGuidance(search.maxTokens)
-          + '只输出简短的最终检索结论，最多列出5条关键信息并保留对应来源与日期；不预告搜索步骤、不重复问题、不列冗长的检索过程。\n'
-          + `Perform a web search for the query: ${query}` }] }],
-        tools: [{ type: 'web_search_20250305', name: 'web_search',
-          ...(search.maxUses > 0 ? { max_uses: search.maxUses } : {}) }],
-      };
-      await saveEvidence(lock.directory, attemptId, 'request', { endpoint, body }, config.apiKey);
-      const controller = new AbortController();
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const onAbort = () => controller.abort();
-      signal?.addEventListener('abort', onAbort, { once: true });
-      let diagnostics: DiagnosticLog | undefined;
-      let callId: string | undefined;
-      let phase = 'request';
-      let httpStatus: number | undefined;
+      return { directory, attemptId };
+    }, signal);
+    const append = (event: LedgerEvent) => withSearchLedger(config, search.budgetId,
+      async (_directory, _entries, append) => append(event));
+    const clock = requestTimeData();
+    const body = {
+      model: search.model, max_tokens: search.maxTokens,
+      ...(config.provider === 'bailian' ? { thinking: { type: 'disabled' },
+        system: [{ type: 'text', text: 'x-anthropic-billing-header: cc_entrypoint=cli;' }] } : {}),
+      messages: [{ role: 'user', content: [{ type: 'text', text:
+        '[搜索时间环境｜由harness提供]\n' + JSON.stringify({ ...clock, requestedDateRange }) + '\n'
+        + '以上日期范围按北京时间理解，是查询约束提示，不是搜索引擎已执行的过滤。将相对时间明确为日期；核对来源发布时间、页面更新时间和事件发生日期，三者不能混同。'
+        + '优先与目标日期范围相关的原始来源，实时可用性应查当前状态页；没有日期证据或结果过时时明确说明，不能称为最新。\n'
+        + outputLengthGuidance(search.maxTokens)
+        + '只输出简短的最终检索结论，最多列出5条关键信息并保留对应来源与日期；不预告搜索步骤、不重复问题、不列冗长的检索过程。\n'
+        + `Perform a web search for the query: ${query}` }] }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search',
+        ...(search.maxUses > 0 ? { max_uses: search.maxUses } : {}) }],
+    };
+    await saveEvidence(directory, attemptId, 'request', { endpoint, body }, config.apiKey);
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    let diagnostics: DiagnosticLog | undefined;
+    let callId: string | undefined;
+    let phase = 'request';
+    let httpStatus: number | undefined;
+    try {
+      if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+      diagnostics = new DiagnosticLog(config.dataDir, [config.apiKey]);
+      const context = diagnosticContext ?? { traceId: attemptId };
+      // This captures bounded parsed JSON, not raw HTTP bytes or request headers.
+      callId = diagnostics.startCall({ ...context, kind: 'search', captureLevel: 'http-json',
+        provider: config.provider === 'bailian' ? 'bailian' : 'deepseek', model: search.model, phase }, { endpoint, body }, { maxResults: search.maxResults });
+      diagnostics.event(context, phase, 'search_reserved', { attemptId }, callId);
+      if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
+      timer = setTimeout(() => controller.abort(), search.timeoutMs);
+      let response: Response;
       try {
-        if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
-        diagnostics = new DiagnosticLog(config.dataDir, [config.apiKey]);
-        const context = diagnosticContext ?? { traceId: attemptId };
-        // This captures bounded parsed JSON, not raw HTTP bytes or request headers.
-        callId = diagnostics.startCall({ ...context, kind: 'search', captureLevel: 'http-json',
-          provider: config.provider === 'bailian' ? 'bailian' : 'deepseek', model: search.model, phase }, { endpoint, body }, { maxResults: search.maxResults });
-        diagnostics.event(context, phase, 'search_reserved', { attemptId }, callId);
-        if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
-        timer = setTimeout(() => controller.abort(), search.timeoutMs);
-        let response: Response;
-        try {
-          response = await fetcher(endpoint, {
-            method: 'POST', redirect: 'error',
-            headers: {
-              'Content-Type': 'application/json', 'x-api-key': config.apiKey,
-              Authorization: `Bearer ${config.apiKey}`, 'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-          });
-        } catch (error) {
-          if (error instanceof DiagnosticPersistenceError) throw error;
-          throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求失败或超时。');
-        }
-        if (controller.signal.aborted) {
-          throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求超时。');
-        }
-        if (!response.ok) {
-          phase = 'http'; httpStatus = response.status;
-          try {
-            const errorResponse = await readBoundedBody(response);
-            diagnostics.saveResponse(callId, errorResponse);
-          } catch (error) {
-            // Non-JSON and oversized error bodies stay bounded; retain the original HTTP failure.
-            if (error instanceof DiagnosticPersistenceError) throw error;
-          }
-          throw new WebSearchError(`DeepSeek 网页搜索请求失败（HTTP ${response.status}）。`);
-        }
-        phase = 'response';
-        const rawResponse = await readBoundedBody(response);
-        diagnostics.saveResponse(callId, rawResponse);
-        await saveEvidence(lock.directory, attemptId, 'response', rawResponse, config.apiKey);
-        const safeResponse: unknown = JSON.parse(JSON.stringify(rawResponse).split(config.apiKey).join('[redacted]'));
-        phase = 'parse';
-        const parsed = parseSearchResponse(safeResponse, search.maxResults);
-        if (controller.signal.aborted) {
-          throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求超时。');
-        }
-        const result: WebSearchResult = { ...parsed, attemptId, freshness: {
-          searchedAt: clock.currentTime, timeZone: clock.timeZone, requestedDateRange,
-          dateFilterApplied: false, verification: 'unverified',
-        } };
-        phase = 'ledger';
-        await append({ type: 'completed', attemptId, timestamp: new Date().toISOString(), sources: result.sources,
-          usage: result.usage, ...(result.summary ? { summary: result.summary } : {}) });
-        diagnostics.finishCall(callId, 'completed', 'completed');
-        return result;
+        response = await fetcher(endpoint, {
+          method: 'POST', redirect: 'error',
+          headers: {
+            'Content-Type': 'application/json', 'x-api-key': config.apiKey,
+            Authorization: `Bearer ${config.apiKey}`, 'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
       } catch (error) {
         if (error instanceof DiagnosticPersistenceError) throw error;
-        if (callId) diagnostics!.finishCall(callId, phase === 'request' ? 'unknown' : 'failed', phase,
-          { failure: phase === 'request' ? 'search_request_failed' : phase === 'http' ? 'search_http_failed'
-            : phase === 'parse' ? 'search_parse_failed' : phase === 'response' ? 'search_response_failed' : 'search_persistence_failed',
-          ...(httpStatus === undefined ? {} : { httpStatus }) });
-        if (error instanceof WebSearchPersistenceError) throw error;
-        const safeReason = error instanceof WebSearchError ? error.message.slice(0, 200) : '网页搜索处理失败。';
-        await append({ type: 'failed', attemptId, timestamp: new Date().toISOString(), reason: safeReason });
-        if (error instanceof WebSearchError) throw error;
-        throw new WebSearchError('DeepSeek 网页搜索处理失败。');
-      } finally {
-        clearTimeout(timer);
-        signal?.removeEventListener('abort', onAbort);
+        throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求失败或超时。');
       }
-    });
-  } finally { await lock.release(); }
+      if (controller.signal.aborted) {
+        throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求超时。');
+      }
+      if (!response.ok) {
+        phase = 'http'; httpStatus = response.status;
+        try {
+          const errorResponse = await readBoundedBody(response);
+          diagnostics.saveResponse(callId, errorResponse);
+        } catch (error) {
+          // Non-JSON and oversized error bodies stay bounded; retain the original HTTP failure.
+          if (error instanceof DiagnosticPersistenceError) throw error;
+        }
+        throw new WebSearchError(`DeepSeek 网页搜索请求失败（HTTP ${response.status}）。`);
+      }
+      phase = 'response';
+      const rawResponse = await readBoundedBody(response);
+      diagnostics.saveResponse(callId, rawResponse);
+      await saveEvidence(directory, attemptId, 'response', rawResponse, config.apiKey);
+      const safeResponse: unknown = JSON.parse(JSON.stringify(rawResponse).split(config.apiKey).join('[redacted]'));
+      phase = 'parse';
+      const parsed = parseSearchResponse(safeResponse, search.maxResults);
+      if (controller.signal.aborted) {
+        throw new WebSearchError(signal?.aborted ? '网页搜索已取消。' : 'DeepSeek 网页搜索请求超时。');
+      }
+      const result: WebSearchResult = { ...parsed, attemptId, freshness: {
+        searchedAt: clock.currentTime, timeZone: clock.timeZone, requestedDateRange,
+        dateFilterApplied: false, verification: 'unverified',
+      } };
+      phase = 'ledger';
+      await append({ type: 'completed', attemptId, timestamp: new Date().toISOString(), sources: result.sources,
+        usage: result.usage, ...(result.summary ? { summary: result.summary } : {}) });
+      diagnostics.finishCall(callId, 'completed', 'completed');
+      return result;
+    } catch (error) {
+      if (error instanceof DiagnosticPersistenceError) throw error;
+      if (callId) diagnostics!.finishCall(callId, phase === 'request' ? 'unknown' : 'failed', phase,
+        { failure: phase === 'request' ? 'search_request_failed' : phase === 'http' ? 'search_http_failed'
+          : phase === 'parse' ? 'search_parse_failed' : phase === 'response' ? 'search_response_failed' : 'search_persistence_failed',
+        ...(httpStatus === undefined ? {} : { httpStatus }) });
+      if (error instanceof WebSearchPersistenceError) throw error;
+      const safeReason = error instanceof WebSearchError ? error.message.slice(0, 200) : '网页搜索处理失败。';
+      await append({ type: 'failed', attemptId, timestamp: new Date().toISOString(), reason: safeReason });
+      if (error instanceof WebSearchError) throw error;
+      throw new WebSearchError('DeepSeek 网页搜索处理失败。');
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    }
+  } finally { releaseSlot(); }
 }

@@ -358,17 +358,10 @@ export class BackgroundMemory {
         this.diagnosticFailed = true;
         for (const controller of this.controllers) controller.abort();
       })
-        .finally(() => {
-          this.work.delete(pipeline);
-          if (!this.closed && !this.diagnosticFailed && !this.scope) {
-            const status = this.store.status(this.conversationId, pipeline);
-            // A different process may hold the database-wide materials lease.
-            // Let the normal timer retry rather than spinning microtasks while
-            // no local job is claimable (and starving cancellation/timers).
-            if (pipeline !== 'materials' && status.queued && !status.failed && !status.running
-              &&!(this.config.memory!.maxCalls>0&&this.budget.calls>=this.config.memory!.maxCalls)) queueMicrotask(() => this.start());
-          }
-        });
+        // run() drains claimable work itself. A concurrent arrival or expired
+        // lease is picked up by start()/the timer; no full historical status
+        // aggregation is needed after an empty poll.
+        .finally(() => { this.work.delete(pipeline); });
       this.work.set(pipeline, work);
     }
   }

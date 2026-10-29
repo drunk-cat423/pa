@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { SessionIntegrityStore, migrateSessionIntegrity } from './session-integrity-store.js';
@@ -189,6 +189,23 @@ function validateRevision(revision: number | undefined): void {
   if (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 1)) throw new MemoryError('记忆版本必须是正整数。');
 }
 
+/** Explicitly shared only by connections opened during one harness lifetime.
+ * Standalone tools and a new harness still perform their own integrity check. */
+export class StoreInitializationScope {
+  private readonly verified = new Map<string,string>();
+  initialize(path:string, db:DatabaseSync, operation:()=>void):void {
+    const signature=()=>{
+      const file=statSync(path);
+      return JSON.stringify([file.dev,file.ino,file.birthtimeMs,
+        db.prepare('PRAGMA user_version').get()?.user_version,db.prepare('PRAGMA schema_version').get()?.schema_version]);
+    };
+    if(this.verified.get(path)===signature())return;
+    this.verified.delete(path);
+    operation();
+    this.verified.set(path,signature());
+  }
+}
+
 export class ConversationStore {
   readonly databasePath: string;
   readonly autoMemory: AutoMemoryStore;
@@ -199,14 +216,17 @@ export class ConversationStore {
   private closed = false;
   private transactionDepth = 0;
 
-  constructor(databasePath: string) {
+  constructor(databasePath: string, initialization?:StoreInitializationScope) {
     this.databasePath = resolve(databasePath);
     mkdirSync(dirname(this.databasePath), { recursive: true });
     this.db = new DatabaseSync(this.databasePath);
     try {
       this.db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
       this.db.function('history_tokens', { deterministic: true }, value => historyTokens(String(value ?? '')).join(' '));
-      this.initialize();
+      if(initialization)initialization.initialize(this.databasePath,this.db,()=>this.initialize());
+      else this.initialize();
+      // Durability settings belong to every connection, not just the bootstrap.
+      this.enableWal();
       this.autoMemory = new AutoMemoryStore(this.db, operation => this.memoryTransaction(operation));
       this.research = new ResearchStore(this.db, operation => this.memoryTransaction(operation), dirname(this.databasePath));
       this.sessionIntegrity = new SessionIntegrityStore(this.db);
@@ -220,6 +240,11 @@ export class ConversationStore {
 
   private initialize(): void {
     const oldVersion = Number(this.db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
+    if(oldVersion===SCHEMA_VERSION){
+      if(this.db.prepare('PRAGMA foreign_key_check').get())throw new Error('数据库已有外键损坏，拒绝打开。');
+      this.ensureHotPathIndexes();
+      return;
+    }
     if (oldVersion > 0 && oldVersion < SCHEMA_VERSION) {
       const backupPath = `${this.databasePath}.v${oldVersion}.${randomUUID()}.bak`;
       this.db.exec(`VACUUM INTO '${backupPath.replaceAll("'", "''")}'`);
@@ -566,6 +591,7 @@ export class ConversationStore {
       }
       if(version<32) migrateWorkLedger(this.db);
       if(version<33) migrateReminderDelivery(this.db);
+      this.ensureHotPathIndexes();
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
       this.db.exec('COMMIT');
     } catch (error) {
@@ -574,7 +600,11 @@ export class ConversationStore {
     } finally {
       this.db.exec('PRAGMA foreign_keys = ON;');
     }
-    this.enableWal();
+  }
+
+  private ensureHotPathIndexes():void {
+    this.db.exec(`CREATE INDEX IF NOT EXISTS auto_memory_pending_order
+      ON auto_memory_jobs(conversation_id,pipeline) WHERE status<>'done';`);
   }
 
   private migrateChannels(): void {

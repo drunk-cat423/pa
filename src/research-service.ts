@@ -8,7 +8,7 @@ import { MemoryError } from './memory-types.js';
 import { normalizeWebFetchUrl } from './web-fetch.js';
 import { WebFetchReader } from './web-fetch-reader.js';
 import type { ResearchToolContext, ResearchToolName, ResearchRuntimeEvent } from './research-tools.js';
-import type { ContinueResearchInput, CreateResearchInput, ResearchListParams, ResearchReadParams, ResearchTask } from './research-types.js';
+import type { ContinueResearchInput, CreateResearchInput, ResearchListParams, ResearchReadParams, ResearchTask, ResearchTaskMetadata } from './research-types.js';
 import { toPlainText } from './plain-text.js';
 import { projectResearchMaterials, withMaterialOmissionGap } from './research-materials.js';
 import { ResearchMaterialReader } from './research-material-reader.js';
@@ -32,11 +32,14 @@ export class ResearchService {
   private allowed: Set<string>;
   private closed = false;
   private active: Promise<void> | undefined;
+  private notifications: Promise<void> | undefined;
+  private wakeRequested = false;
+  private notificationWakeRequested = false;
   private runtime: ConversationRuntime | undefined;
   private fatal?: unknown;
   private activeTask: string | undefined;
-  constructor(private readonly config: PaConfig, routes: readonly ChannelRoute[],
-    private readonly send: (message: OutboundMessage) => Promise<DeliveryResult>, private readonly onError: () => void) {
+  constructor(private readonly config: PaConfig, private readonly routes: readonly ChannelRoute[],
+    private readonly send: (message: OutboundMessage, shouldSend?: () => boolean) => Promise<DeliveryResult>, private readonly onError: () => void) {
     this.allowed = new Set(routes.map(routeKey));
   }
 
@@ -106,20 +109,42 @@ export class ResearchService {
   }
 
   private wake(): void {
+    this.wakeNotifications();
+    this.wakeRequested = true;
     if (this.closed || this.active || this.fatal || !this.store) return;
+    this.wakeRequested = false;
     this.active = Promise.resolve().then(async () => {
-      while (!this.closed) {
-        const notification = this.store!.research.pendingNotifications().find(task => this.allowed.has(routeKey(task.route)));
-        if (notification) { await this.notify(notification); continue; }
-        const next = this.store!.research.queued().find(task => this.allowed.has(routeKey(task.route)));
-        if (!next) break;
-        const budget = this.config.research!;
-        const task = this.store!.research.claim(next.id, budget);
-        if (task) await this.run(task);
+      while (!this.closed && !this.fatal) {
+        this.wakeRequested = false;
+        const task = this.store!.research.claimNext(this.config.research!,this.routes);
+        if (!task) break;
+        await this.run(task);
       }
-    }).catch(error => { this.fatal = error; this.onError(); }).finally(() => { this.active = undefined; this.activeTask = undefined; });
+    }).catch(error => { this.fatal = error; this.onError(); }).finally(() => {
+      this.active = undefined; this.activeTask = undefined;
+      if (this.wakeRequested) this.wake();
+    });
   }
-  async wait(): Promise<void> { while (this.active) await this.active; }
+  /** One delivery at a time; durable task state remains the notification queue. */
+  private wakeNotifications(): void {
+    this.notificationWakeRequested = true;
+    if (this.closed || this.notifications || this.fatal || !this.store) return;
+    this.notificationWakeRequested = false;
+    this.notifications = Promise.resolve().then(async () => {
+      while (!this.closed && !this.fatal) {
+        this.notificationWakeRequested = false;
+        const task = this.store!.research.nextNotification(this.routes);
+        if (!task) break;
+        await this.notify(task);
+      }
+    }).catch(error => { this.fatal = error; this.onError(); }).finally(() => {
+      this.notifications = undefined;
+      if (this.notificationWakeRequested) this.wakeNotifications();
+    });
+  }
+  async wait(): Promise<void> {
+    while (this.active || this.notifications) await Promise.all([this.active,this.notifications]);
+  }
   async abort(): Promise<void> {
     this.closed = true;
     await this.runtime?.abort();
@@ -130,7 +155,7 @@ export class ResearchService {
     this.store?.close(); this.store = undefined;
   }
 
-  private async run(task: ResearchTask, options = { notify: true, retryNetwork: true }): Promise<void> {
+  private async run(task: ResearchTaskMetadata, options = { notify: true, retryNetwork: true }): Promise<void> {
     this.activeTask = task.id;
     const store = this.store!.research;
     const budget = this.config.research!;
@@ -147,7 +172,6 @@ export class ResearchService {
       ...(options.retryNetwork ? { maxNetworkAttempts: 2 as const } : {}), onNetworkAttempt: (url, attempt) => persist(() => store.checkpoint(task.id, task.attempt,
         { ...current, evidence: { tool: 'web_fetch_network', input: { url, attempt } } })),
     }) : undefined;
-    let finished: ResearchTask;
     try {
       // New tasks need no paid chapter-planning call. The persisted protocol is
       // fixed once; existing v1 plans and their reviews are never rewritten.
@@ -159,6 +183,7 @@ export class ResearchService {
         activeCycle = undefined;
       }
       while (current.modelCalls < budget.maxModelCalls) {
+        if (this.fatal) throw this.fatal;
         if (this.closed) throw new RequestError('研究服务正在关闭。', 'cancelled');
         const workflow = persist(() => store.workflow.load(task.id));
         const lightweight = workflow.plan?.version === 2;
@@ -176,7 +201,7 @@ export class ResearchService {
         const material = saved.evidence.map((evidence, index) => ({ id: `e${index + 1}`, ...evidence }))
           .filter(evidence => ['web_fetch', 'web_search', ...(lightweight ? ['read_research_material'] : [])].includes(evidence.tool)
             && (!lightweight || evidence.result !== undefined || evidence.error !== undefined));
-        const materialQuery = {goal:task.goal,followups:task.followups,gaps:workflow.sections.flatMap(item=>item.gaps)};
+        const materialQuery = {goal:task.goal,followups:saved.followups,gaps:workflow.sections.flatMap(item=>item.gaps)};
         const failedMaterials = material.filter(item=>item.error).slice(-8);
         const lightweightProjection = lightweight && phase !== 'review' ? projectResearchMaterials(material,materialQuery,phase==='collect'?'collect':'write') : undefined;
         const previousMaterial = lightweightProjection ?? boundedText(JSON.stringify(material.slice(-24).map(item => ({ ...item,
@@ -196,11 +221,11 @@ export class ResearchService {
             ...(end < points.length ? { nextOffset: end } : {}) };
         });
         const bodyReader = lightweight && phase === 'collect' ? new ResearchMaterialReader(id => {
-          const evidence = store.get(task.id)!.evidence[Number(id.slice(1))-1];
+          const evidence = store.evidence(task.id,Number(id.slice(1)));
           return evidence ? {...evidence,id} : undefined;
         }) : undefined;
         const input = { ...(bodyReader ? {materialReadProtocol:'body-v1'} : {}), task: { id: task.id, title: task.title, goal: task.goal, originalRequest: task.originalText,
-          followups: task.followups,
+          followups: saved.followups,
           urls: task.urls, requiresOriginal: task.requiresOriginal }, phase, researchedAt: new Date().toISOString(),
           ...(['collect','write'].includes(phase) ? {remainingGaps:workflow.sections.flatMap(item=>item.gaps),previousMaterial}:{}),
           ...(lightweight && phase === 'write' ? { collectionNote: boundedText(String(saved.evidence.findLast(item => item.tool === 'collection_note')?.result ?? ''), 8000) } : {}),
@@ -247,11 +272,11 @@ export class ResearchService {
               maxSearchCalls: budget.maxSearchCalls - current.searchCalls, record,
               ...(bodyReader ? {materialReadProtocol:'body-v1' as const}:{}),
               ...(lightweight ? {compactResearchContext:true,resolveMaterialReference:(tool:string,toolInput:unknown,result:unknown)=>{
-                const evidence=store.get(task.id)!.evidence;
                 if(tool==='read_research_material' && result && typeof result==='object' && 'id' in result && typeof result.id==='string' && /^e[1-9][0-9]*$/.test(result.id)) {
-                  const original=evidence[Number(result.id.slice(1))-1];
+                  const original=store.evidence(task.id,Number(result.id.slice(1)));
                   return original && ['web_fetch','web_search'].includes(original.tool) ? {id:result.id}:undefined;
                 }
+                const evidence=store.get(task.id)!.evidence;
                 const index=evidence.findLastIndex(item=>item.tool===tool&&JSON.stringify(item.input)===JSON.stringify(toolInput)&&JSON.stringify(item.result)===JSON.stringify(result));
                 return index>=0?{id:`e${index+1}`}:undefined;
               }}:{}),
@@ -259,7 +284,7 @@ export class ResearchService {
               readMaterial: (params,maxResultBytes) => {
                 if (bodyReader) return bodyReader.read(params,maxResultBytes);
                 if (!/^e[1-9][0-9]*$/u.test(params.id)) throw new MemoryError('材料编号无效。');
-                const evidence = store.get(task.id)!.evidence[Number(params.id.slice(1)) - 1];
+                const evidence = store.evidence(task.id,Number(params.id.slice(1)));
                 if (!evidence || !['web_fetch', 'web_search'].includes(evidence.tool)) throw new MemoryError('该材料不属于当前任务的联网资料。');
                 const text = JSON.stringify(evidence), points = [...text], offset = params.offset ?? 0;
                 if (!Number.isSafeInteger(offset) || offset < 0 || offset > points.length) throw new MemoryError('材料读取位置无效。');
@@ -269,6 +294,7 @@ export class ResearchService {
                   ...(end < points.length ? { nextOffset: end } : {}) };
               }, onFinalResponse: response => { stopReason = response.stopReason; },
             } });
+          if (this.fatal) throw this.fatal;
           if (this.closed) throw new RequestError('研究服务正在关闭。', 'cancelled');
           const output = await this.runtime.prompt(JSON.stringify(input), { runId: randomUUID(), taskId: task.id, conversationId: task.conversationId });
           persist(() => store.checkpoint(task.id, task.attempt, { ...current, evidence: { tool: phase === 'collect' ? 'collection_note' : 'report_draft',
@@ -308,6 +334,7 @@ export class ResearchService {
           await runtime?.close();
         }
       }
+      if (this.fatal) throw this.fatal;
       if (this.closed) throw new RequestError('研究服务正在关闭。', 'cancelled');
       const workflow = persist(() => store.workflow.load(task.id));
       const lightweight = workflow.plan?.version === 2;
@@ -331,22 +358,22 @@ export class ResearchService {
       const report = !originalMissing && (pages.length || hasSearchEvidence) && hasText
         ? assembleResearchReport(task, workflow, done ? 'completed' : 'partial', done ? undefined : reason)
         : { status: 'blocked' as const, reason };
-      finished = persist(() => store.finish(task.id, task.attempt, report));
+      persist(() => store.finish(task.id, task.attempt, report));
     } catch (error) {
-      if (persistenceFailed) throw error;
+      if (persistenceFailed || this.fatal) throw error;
       if (activeCycle !== undefined) persist(() => store.workflow.failCycle(task.id, task.attempt, activeCycle!,
         error instanceof MemoryError ? error.message : '调用未确认成功；不自动重复，需检查原始诊断。', !(error instanceof MemoryError)));
       // Unknown provider outcomes and invalid contracts stop this attempt, not a paid retry.
-      finished = store.finish(task.id, task.attempt, { status: this.closed ? 'interrupted' : 'failed',
+      store.finish(task.id, task.attempt, { status: this.closed ? 'interrupted' : 'failed',
         reason: this.closed ? '服务停止，执行已中断；不会自动重复模型调用。'
           : error instanceof MemoryError ? error.message : '研究调用未成功完成；已有资料和调用记录已保留，需明确要求继续。' });
     } finally {
       fetchReader?.dispose();
     }
-    if (!this.closed && options.notify) await this.notify(finished);
+    if (!this.closed && options.notify) this.wakeNotifications();
   }
 
-  private async notify(task: ResearchTask): Promise<void> {
+  private async notify(task: ResearchTaskMetadata): Promise<void> {
     if (this.store!.research.notificationObsolete(task.id,task.attempt)) return;
     try { await this.notifyCurrent(task); }
     catch (error) {
@@ -357,7 +384,7 @@ export class ResearchService {
     }
   }
 
-  private async notifyCurrent(task: ResearchTask): Promise<void> {
+  private async notifyCurrent(task: ResearchTaskMetadata): Promise<void> {
     const state = { completed: '已完成', partial: '已有阶段性报告', blocked: '暂时受阻', failed: '执行失败', interrupted: '执行中断', running: '执行中', queued: '排队中' }[task.status];
     let text = `研究 ${task.id}「${shortPlain(task.title,60)}」${state}。`;
     if (task.status === 'completed' || task.status === 'partial') {
@@ -372,9 +399,14 @@ export class ResearchService {
     } else text += shortPlain(task.reason ?? '可查询清单或明确要求继续。',260);
     const receipt = this.store!.research.reserveNotification(task.id, task.attempt, text);
     if (!receipt.shouldSend) return;
+    let stateFailed = false, stateError: unknown;
+    const shouldSend = () => {
+      try { return !this.closed && !this.fatal && !this.store!.research.notificationObsolete(task.id,task.attempt); }
+      catch (error) { stateFailed = true; stateError = error; throw error; }
+    };
     let result: DeliveryResult;
-    try { result = await this.send({ route: receipt.route, deliveryMode: 'active', text, plainText: true }); }
-    catch { result = { status: 'uncertain' }; }
+    try { result = await this.send({ route: receipt.route, deliveryMode: 'active', text, plainText: true },shouldSend); }
+    catch { if (stateFailed) throw stateError; result = { status: 'uncertain' }; }
     this.store!.research.finishDelivery(receipt.deliveryId, result.status,
       result.status === 'sent' ? result.externalMessageId : undefined, result.status === 'sent' ? result.referenceIndex : undefined);
   }

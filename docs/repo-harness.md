@@ -15,6 +15,7 @@
 
 | 任务 | 优先看代码 | 对应资料 | 检查 scope |
 |---|---|---|---|
+| 已确认并发与本地效率回归 | `web-search.ts`、`research-service.ts`、`auto-memory-store.ts`、`context-tokens.ts` | [效率修复](efficiency.md) | `efficiency`；只覆盖本轮确认问题 |
 | 拉取仓库、对齐线上版本、只读状态巡检 | `scripts/ops/sync-and-check.mjs`、`scripts/ops/server-status.mjs` | [同步与巡检](operations.md) | 脚本修改用 `ops`；日常巡检不启动产品或跑全套回归 |
 | 对话、工具循环、准备与回答 | `runtime.ts`、`turn-plan.ts`、`answer-grounding.ts`、`channel-harness.ts`、`cli.ts` | [模块与边界](development.md#模块与边界)、[循环流程](design/companion-tool-loop.md) | `chat` |
 | 人物/AI 画像、Topic、资料失败恢复 | `auto-memory.ts`、`auto-memory-store.ts`、`material-profile-wire.ts`、`profile-*.ts`、`self-profile-store.ts` | [记忆](memory.md) | `memory` |

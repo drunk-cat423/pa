@@ -30,9 +30,9 @@ import { compactResearchContext, researchContextReference, type ResearchContextR
 import { RESEARCH_MATERIAL_PREFIX, type MaterialReadParams } from './research-material-reader.js';
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
 import { ContextTokenEstimator, contextCalibrationKey, normalizedInputTokens, upgradeContextCalibration,
-  validContextCalibration, type ContextCalibration } from './context-tokens.js';
-import { imageContent, imageMetadata, imageTokenPayload, imageRequestFits, projectImagePayload, IMAGE_TOKENS, MAX_REQUEST_IMAGES, type ImageProjection, type MessageImage } from './image-context.js';
-import { ImageAssets, ImageAssetError } from './image-assets.js';
+  validContextCalibration, type ContextCalibration, type ContextFootprintCache } from './context-tokens.js';
+import { imageMetadata, imageTokenPayload, imageRequestFits, projectImagePayload, IMAGE_TOKENS, MAX_REQUEST_IMAGES, type ImageContent, type ImageProjection, type MessageImage } from './image-context.js';
+import { ImageAssetError } from './image-assets.js';
 import { PREPARE_TURN_PROMPT, PREPARE_TURN_DESCRIPTION, RESPONSE_STAGE_PROMPT, CLI_STAGE_PROMPT, RESPONSE_MODE_PROMPTS, TURN_PLAN_SCHEMA,
   validateTurnPlan, hasUnbackedSaveClaim, hasUnbackedReminderClaim, type TurnPlan, type TurnReceipt, type ReplyMode } from './turn-plan.js';
 import { ANSWER_GROUNDING_PROMPT, ATTRIBUTION_REVIEW_PROMPT, bindAnswerGrounding, parseAttributionReview,
@@ -83,7 +83,7 @@ export interface CompanionToolContext {
   verifyLink?: string;
   prepareTurn(plan: TurnPlan): TurnReceipt | Promise<TurnReceipt>;
   readHistory(params: ReadHistoryParams): unknown | Promise<unknown>;
-  readImage?(imageId: string): MessageImage | Promise<MessageImage>;
+  readImage?(imageId: string): { image: MessageImage; content: ImageContent } | Promise<{ image: MessageImage; content: ImageContent }>;
   onProgress?(text: string): Promise<void>;
   research?: ResearchToolContext;
   reminders?: ReminderToolContext;
@@ -223,7 +223,6 @@ export async function openConversation(config: PaConfig, conversationId: string,
     let fetchUrl: string | undefined;
     let fetchReader: WebFetchReader | undefined;
     let companionTools: CompanionToolContext | undefined;
-    const imageAssets = new ImageAssets(config);
     let imageProjections: ImageProjection[] = [];
     let latestInputTokens = 0;
     let referenceUrls: string[] = [];
@@ -437,10 +436,9 @@ export async function openConversation(config: PaConfig, conversationId: string,
         startTool(signal, _id);
         if (!companionTools?.readImage) throw new Error('当前没有原图读取权限。');
         try {
-          const image = await cancellable(() => companionTools!.readImage!((params as { imageId: string }).imageId), signal);
+          const { image, content } = await cancellable(() => companionTools!.readImage!((params as { imageId: string }).imageId), signal);
           const output = result({ image: imageMetadata(image), source: '当前房间已保存原图，归属以图片元数据为准' });
           const text = output.content[0]!.text;
-          const content = imageContent(imageAssets, image);
           const imageKey = imageTokenPayload({ content: [content] }).imageIds[0];
           const visibleImages = imageTokenPayload({ content: imageProjections.flatMap(item => item.content) }).imageIds;
           if (imageKey && visibleImages.includes(imageKey)) return result({ image: imageMetadata(image), alreadyVisible: true });
@@ -648,7 +646,10 @@ export async function openConversation(config: PaConfig, conversationId: string,
       model.baseUrl, options.contextCalibrationScope ?? conversationId));
     // Prefer bounded metadata. Before the first v2 sample, upgrade a bounded set
     // of legacy fingerprints only from hash-verified, exactly matching requests.
-    const recentCalls = recordDiagnostic(() => diagnostics.calibrationCalls(tokenEstimator.key, 100));
+    const recentCalls = recordDiagnostic(() => {
+      diagnostics.prepareCalibrationIndex();
+      return diagnostics.calibrationCalls(tokenEstimator.key, 100);
+    });
     const calibrationCalls = recentCalls.filter(call => call.provider === model.provider && call.model === model.id
       && validContextCalibration(call.contextCalibration) && call.contextCalibration.key === tokenEstimator.key
       && normalizedInputTokens(call.usage) !== undefined).slice(0, 8);
@@ -672,9 +673,9 @@ export async function openConversation(config: PaConfig, conversationId: string,
     for (const sample of restored.reverse()) {
       tokenEstimator.learn(sample.metadata, sample.usage);
     }
-    function estimatePayload(payload: unknown, transportReserve = 0): ContextEstimate {
+    function estimatePayload(payload: unknown, transportReserve = 0, footprintCache?: ContextFootprintCache): ContextEstimate {
       const fallback = estimateContext(payload, model.contextWindow, outputReserve);
-      const calibrated = tokenEstimator.estimate(payload);
+      const calibrated = tokenEstimator.estimate(payload, footprintCache);
       const inputTokens = (calibrated?.inputTokens ?? fallback.inputTokens) + transportReserve;
       const total = inputTokens + fallback.reservedOutputTokens + fallback.safetyTokens;
       const imageOverflow = !imageRequestFits(payload,imageProjections);
@@ -777,7 +778,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
         ...(forcePreparation || forceSearch || forceFetch ? { parallel_tool_calls: false } : {}) };
     }
     function projectedEstimate(messages: Transcript, channel: boolean, ready: boolean, mode: ReplyMode,
-      controls = emptyControlHistory()): ContextEstimate {
+      controls = emptyControlHistory(), footprintCache?: ContextFootprintCache): ContextEstimate {
       const noTools = options.research ? toolsClosed(1)
         : loop.maxToolCalls === 0 || loop.maxModelCalls <= (ready ? 2 : 1) || (ready && loop.maxToolCalls <= 1);
       const projected = convertToLlm(projectStage(messages, channel, ready, mode, noTools, controls));
@@ -793,7 +794,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           name: tool.name, description: tool.description, parameters: tool.parameters, strict: false } })),
       }, channel && !ready, noTools);
       // Transport flags and provider-specific field names are outside the transcript projection.
-      return estimatePayload(projectImagePayload(payload, imageProjections), 256);
+      return estimatePayload(projectImagePayload(payload, imageProjections), 256, footprintCache);
     }
     const previousTransform = agentSession.agent.transformContext;
     agentSession.agent.transformContext = async (messages, signal) => projectStage(
@@ -1024,7 +1025,8 @@ export async function openConversation(config: PaConfig, conversationId: string,
         // Admission probes own their control history; each answer-mode branch
         // starts from the same simulated preparation request, never the live run.
         const controls = emptyControlHistory();
-        const initial = projectedEstimate(messages, channel, false, 'standard', controls);
+        const footprintCache: ContextFootprintCache = new Map();
+        const initial = projectedEstimate(messages, channel, false, 'standard', controls, footprintCache);
         if (!channel) return initial;
         // The answer request also contains the generated preparation call and bounded receipt.
         const preparedMessages: Transcript = [...messages,
@@ -1035,7 +1037,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           { role: 'toolResult', toolCallId: 'prepare-reserve', toolName: 'prepare_turn', content: [{ type: 'text',
             text: ' '.repeat(toolResultMaxBytes) }], isError: false, timestamp: Date.now() }];
         return (Object.keys(RESPONSE_MODE_PROMPTS) as ReplyMode[]).reduce((largest, mode) => {
-          const candidate = projectedEstimate(preparedMessages, true, true, mode, { ...controls, entries: [...controls.entries] });
+          const candidate = projectedEstimate(preparedMessages, true, true, mode, { ...controls, entries: [...controls.entries] }, footprintCache);
           return candidate.inputTokens > largest.inputTokens ? candidate : largest;
         }, initial);
         } finally { imageProjections = previousProjections; }

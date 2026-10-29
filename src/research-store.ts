@@ -2,13 +2,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import type { ChannelRoute } from './channel-types.js';
 import { memoryWords } from './memory-text.js';
 import { MemoryError } from './memory-types.js';
 import { researchTargetContext, validateResearchTarget, type ResearchTargetContext } from './research-target.js';
 import { ResearchWorkflowStore } from './research-workflow-store.js';
 import type { ResearchBudget, ResearchDelivery, ResearchDeliveryStatus, ResearchEvidence, ResearchFinishInput,
   ResearchList, ResearchListParams, ResearchProgress, ResearchReadParams, ResearchReadResult, ResearchReport,
-  ResearchStatus, ResearchTask, CreateResearchInput, ContinueResearchInput } from './research-types.js';
+  ResearchStatus, ResearchTask, ResearchTaskMetadata, CreateResearchInput, ContinueResearchInput } from './research-types.js';
 export type * from './research-types.js';
 
 export function migrateResearch(db: DatabaseSync): void {
@@ -171,6 +172,17 @@ export class ResearchStore {
   }
 
   get(id: string): ResearchTask | undefined {
+    const task = this.metadata(id);
+    if (!task) return undefined;
+    return { ...task, evidence: this.db.prepare('SELECT evidence_json FROM research_evidence WHERE task_id=? ORDER BY attempt,ordinal').all(id)
+      .map(item => JSON.parse(String(item.evidence_json)) as ResearchEvidence),
+      followups:this.db.prepare(`SELECT e.attempt,e.evidence_json,a.source_message_id FROM research_evidence e
+        JOIN research_attempts a ON a.task_id=e.task_id AND a.attempt=e.attempt
+        WHERE e.task_id=? AND e.ordinal=1 AND json_extract(e.evidence_json,'$.tool')='research_followup' ORDER BY e.attempt`).all(id)
+        .map(item=>({attempt:Number(item.attempt),requirements:String(JSON.parse(String(item.evidence_json)).input.requirements),sourceMessageId:String(item.source_message_id)})) };
+  }
+
+  metadata(id: string): ResearchTaskMetadata | undefined {
     validId(id);
     const row = this.db.prepare(`SELECT t.*,a.budget_json,a.usage_json,r.channel,r.account,r.room_type,r.external_chat_id,
       m.text AS original_text,x.external_user_id FROM research_tasks t
@@ -178,8 +190,6 @@ export class ResearchStore {
       JOIN conversations c ON c.id=t.conversation_id JOIN rooms r ON r.id=c.room_id
       JOIN messages m ON m.id=t.source_message_id JOIN actors x ON x.id=t.actor_id WHERE t.id=?`).get(id);
     if (!row) return undefined;
-    const evidence = this.db.prepare('SELECT evidence_json FROM research_evidence WHERE task_id=? ORDER BY attempt,ordinal').all(id)
-      .map(item => JSON.parse(String(item.evidence_json)) as ResearchEvidence);
     return { id, conversationId:String(row.conversation_id), sourceMessageId:String(row.source_message_id),
       actorId:String(row.actor_id),personId:String(row.person_id),
       route:{channel:String(row.channel),accountId:String(row.account),roomId:String(row.external_chat_id),roomType:row.room_type as 'group'|'private'},
@@ -189,11 +199,14 @@ export class ResearchStore {
       ...(row.latest_version == null ? {} : {reportVersion:Number(row.latest_version)}),
       ...(row.reason == null ? {} : {reason:String(row.reason)}),
       ...(row.budget_json == null ? {} : {budget:JSON.parse(String(row.budget_json)) as ResearchBudget}),
-      usage:JSON.parse(String(row.usage_json)),evidence,
-      followups:this.db.prepare(`SELECT e.attempt,e.evidence_json,a.source_message_id FROM research_evidence e
-        JOIN research_attempts a ON a.task_id=e.task_id AND a.attempt=e.attempt
-        WHERE e.task_id=? AND e.ordinal=1 AND json_extract(e.evidence_json,'$.tool')='research_followup' ORDER BY e.attempt`).all(id)
-        .map(item=>({attempt:Number(item.attempt),requirements:String(JSON.parse(String(item.evidence_json)).input.requirements),sourceMessageId:String(item.source_message_id)})) };
+      usage:JSON.parse(String(row.usage_json)) };
+  }
+
+  /** Evidence IDs are the stable ordering across attempts used by existing prompts. */
+  evidence(id: string, ordinal: number): ResearchEvidence | undefined {
+    validId(id); integer(ordinal,'研究材料编号',1,1_000_000);
+    const row = this.db.prepare('SELECT evidence_json FROM research_evidence WHERE task_id=? ORDER BY attempt,ordinal LIMIT 1 OFFSET ?').get(id,ordinal-1);
+    return row ? JSON.parse(String(row.evidence_json)) as ResearchEvidence : undefined;
   }
 
   /** Shared archival entry; records and artifacts remain readable by their owner. */
@@ -238,25 +251,60 @@ export class ResearchStore {
       .map(row => this.get(String(row.id))!);
   }
 
+  private routeFilter(routes: readonly ChannelRoute[]): { sql: string; bindings: string[] } {
+    return { sql: routes.length ? routes.map(() => '(r.channel=? AND r.account=? AND r.room_type=? AND r.external_chat_id=?)').join(' OR ') : '0',
+      bindings: routes.flatMap(route => [route.channel,route.accountId,route.roomType,route.roomId]) };
+  }
+
+  /** The service claims one allowed task without loading any saved evidence. */
+  claimNext(budget: ResearchBudget, routes: readonly ChannelRoute[]): ResearchTaskMetadata | undefined {
+    return this.transaction(() => {
+      const filter = this.routeFilter(routes);
+      const row = this.db.prepare(`SELECT t.id FROM research_tasks t JOIN conversations c ON c.id=t.conversation_id
+        JOIN rooms r ON r.id=c.room_id WHERE t.status='queued' AND (${filter.sql})
+        AND NOT EXISTS (SELECT 1 FROM research_task_archives ar WHERE ar.task_id=t.id)
+        ORDER BY t.created_at,t.id LIMIT 1`).get(...filter.bindings);
+      return row ? this.claimMetadata(String(row.id),budget) : undefined;
+    });
+  }
+
+  nextNotification(routes: readonly ChannelRoute[]): ResearchTaskMetadata | undefined {
+    const filter = this.routeFilter(routes);
+    const retention = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_retention_runs'").get()
+      ? `AND NOT EXISTS (SELECT 1 FROM research_retention_runs runs,json_each(runs.plan_json,'$.candidates') candidate
+          WHERE runs.status IN ('pending','done') AND json_extract(candidate.value,'$.taskId')=t.id)` : '';
+    const row = this.db.prepare(`SELECT t.id FROM research_tasks t JOIN conversations c ON c.id=t.conversation_id
+      JOIN rooms r ON r.id=c.room_id WHERE t.status NOT IN ('queued','running') AND (${filter.sql})
+      AND NOT EXISTS (SELECT 1 FROM research_task_archives ar WHERE ar.task_id=t.id)
+      AND NOT EXISTS (SELECT 1 FROM research_deliveries d WHERE d.task_id=t.id AND d.attempt=t.attempt AND d.kind='notice')
+      ${retention} ORDER BY t.updated_at,t.id LIMIT 1`).get(...filter.bindings);
+    return row ? this.metadata(String(row.id)) : undefined;
+  }
+
   notificationObsolete(id: string, attempt: number): boolean {
-    const task = this.get(id);
-    return !task || task.attempt !== attempt || task.status === 'queued' || task.status === 'running'
+    validId(id);
+    const task = this.db.prepare('SELECT status,attempt FROM research_tasks WHERE id=?').get(id);
+    return !task || Number(task.attempt) !== attempt || task.status === 'queued' || task.status === 'running'
       || this.archived(id) || this.contentExpired(id);
   }
 
   claim(id: string, budget: ResearchBudget, expectedAttempt?: number): ResearchTask | undefined {
+    return this.transaction(() => this.claimMetadata(id,budget,expectedAttempt) ? this.get(id) : undefined);
+  }
+
+  private claimMetadata(id: string, budget: ResearchBudget, expectedAttempt?: number): ResearchTaskMetadata | undefined {
     validId(id);
     if (expectedAttempt !== undefined) integer(expectedAttempt,'研究预约批次',1,1_000_000);
     integer(budget.maxModelCalls,'研究模型次数',1,100); integer(budget.maxToolCalls,'研究工具次数',1,200); integer(budget.maxSearchCalls,'研究搜索次数',0,100);
     return this.transaction(() => {
-      const task = this.get(id);
+      const task = this.metadata(id);
       if (!task || task.status !== 'queued' || this.archived(id)
         || (expectedAttempt !== undefined && task.attempt !== expectedAttempt)) return undefined;
       const at = timestamp();
       this.db.prepare("UPDATE research_attempts SET status='running',budget_json=?,updated_at=? WHERE task_id=? AND attempt=? AND status='queued'")
         .run(JSON.stringify(budget),at,id,task.attempt);
       this.db.prepare("UPDATE research_tasks SET status='running',updated_at=? WHERE id=? AND status='queued'").run(at,id);
-      return this.get(id)!;
+      return this.metadata(id)!;
     });
   }
 
@@ -283,7 +331,7 @@ export class ResearchStore {
   }
 
   finish(id: string, attempt: number, input: ResearchFinishInput): ResearchTask {
-    const task = this.running(id,attempt);
+    this.running(id,attempt);
     if (!['completed','partial','blocked','failed','interrupted'].includes(input.status)) throw new MemoryError('研究结束状态无效。');
     if (input.status === 'completed' && this.workflow.load(id).plan) this.workflow.assertComplete(id);
     const reason = input.reason === undefined ? null : text(input.reason,'研究说明',2000);
@@ -460,7 +508,7 @@ export class ResearchStore {
   }
 
   private reserveNotificationSnapshot(id: string, attempt: number, notificationText: string): ResearchDelivery {
-    const task = this.get(id);
+    const task = this.metadata(id);
     if (task && this.archived(id)) throw new MemoryError('该研究已归档，不再自动通知。');
     if (!task || this.notificationObsolete(id,attempt)) throw new MemoryError('研究通知已失效、过期或任务状态改变。');
     const body = text(notificationText,'研究通知',2000);
@@ -469,7 +517,7 @@ export class ResearchStore {
     return {...reservation,...(reservation.shouldSend ? {text:body} : {})};
   }
 
-  private reserve(task: ResearchTask, sourceMessageId: string, kind:'file'|'notice',version:number,format:string,attempt:number,body?:string): ResearchDelivery {
+  private reserve(task: ResearchTaskMetadata, sourceMessageId: string, kind:'file'|'notice',version:number,format:string,attempt:number,body?:string): ResearchDelivery {
     return this.transaction(() => {
       if (kind === 'notice' && this.archived(task.id)) throw new MemoryError('该研究已归档，不再自动通知。');
       const destination = this.db.prepare(`SELECT r.channel,r.account,r.room_type,r.external_chat_id FROM messages m
@@ -547,10 +595,13 @@ export class ResearchStore {
     });
   }
 
-  private running(id: string, attempt: number): ResearchTask {
-    const task = this.get(id);
-    if (!task || task.status !== 'running' || task.attempt !== attempt) throw new MemoryError('研究任务状态或执行批次已改变，拒绝迟到写入。');
-    return task;
+  private running(id: string, attempt: number): Pick<ResearchTask, 'budget' | 'usage'> {
+    validId(id);
+    const row = this.db.prepare(`SELECT t.status,t.attempt,a.budget_json,a.usage_json FROM research_tasks t
+      JOIN research_attempts a ON a.task_id=t.id AND a.attempt=t.attempt WHERE t.id=?`).get(id);
+    if (!row || row.status !== 'running' || Number(row.attempt) !== attempt) throw new MemoryError('研究任务状态或执行批次已改变，拒绝迟到写入。');
+    return { ...(row.budget_json == null ? {} : {budget:JSON.parse(String(row.budget_json)) as ResearchBudget}),
+      usage:JSON.parse(String(row.usage_json)) };
   }
 
   private updateIndex(id: string): void {

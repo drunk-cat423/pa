@@ -58,6 +58,7 @@ export class DiagnosticPersistenceError extends Error {
 export const DIAGNOSTIC_MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
 const MAX_EVENT_BYTES = 256 * 1024;
 const VERSION = 1;
+const CALIBRATION_INDEX = 'calls_calibration_eligible_v1';
 const RETENTION_NOTICE = '研究诊断正文已按30天保留规则清理；调用用量/失败阶段/审计仍保留，无法离线重放。';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const names = new Set(['request', 'response', 'input']);
@@ -271,6 +272,13 @@ export class DiagnosticLog {
             CREATE INDEX IF NOT EXISTS events_task ON events(task_id);
             PRAGMA user_version=1;`);
         } else if (version !== VERSION) fail('诊断索引版本未知，已拒绝读取或迁移。');
+        // The implicit rowid suffix also serves ORDER BY rowid DESC for one key.
+        // Additive to existing v1 indexes; no call records or artifacts are rewritten.
+        if (write) database.exec(`CREATE INDEX IF NOT EXISTS ${CALIBRATION_INDEX}
+          ON calls(json_extract(record_json, '$.contextCalibration.key'))
+          WHERE json_extract(record_json, '$.status') = 'completed'
+            AND json_extract(record_json, '$.kind') = 'chat'
+            AND json_extract(record_json, '$.usageSource') = 'sdk-normalized'`);
         const result = action(database);
         if (write) database.exec('COMMIT');
         return result;
@@ -460,6 +468,15 @@ export class DiagnosticLog {
 
   calls(filter: DiagnosticFilter = {}): DiagnosticCallRecord[] { return this.query('calls', filter); }
   events(filter: DiagnosticFilter = {}): DiagnosticEvent[] { return this.query('events', filter); }
+
+  /** Explicit application write preparation; read-only diagnostic queries never build indexes. */
+  prepareCalibrationIndex(): void {
+    this.guard(() => {
+      const indexed = this.withDatabase(false, database => Boolean(database.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(CALIBRATION_INDEX)), () => true);
+      if (!indexed) this.withDatabase(true, () => undefined, () => undefined);
+    });
+  }
 
   /** Apply calibration scope/eligibility before the bound, so active rooms cannot evict other rooms' samples. */
   calibrationCalls(key: string, limit = 100): DiagnosticCallRecord[] {

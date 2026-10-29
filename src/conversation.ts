@@ -5,7 +5,7 @@ import { TranscriptIntegrityError } from './transcript.js';
 export { SessionIntegrityError } from './session-integrity.js';
 import type { PaConfig } from './config.js';
 import { openConversation, RequestError, type ConversationRuntime, type RecordedTurn } from './runtime.js';
-import { ConversationStore, DuplicateMessageError, type MessageRecord, type ChannelTaskRecord, type ChannelTaskStatus } from './store.js';
+import { ConversationStore, DuplicateMessageError, type StoreInitializationScope, type MessageRecord, type ChannelTaskRecord, type ChannelTaskStatus } from './store.js';
 import type { ChannelRoute, ExternalRunInput } from './channel-types.js';
 import { MemoryError, type MemoryChange, type MemoryInput, type MemoryRecord, type MemoryRef } from './memory-types.js';
 import type { PrimaryPerson, SharedFactContext } from './memory-types.js';
@@ -15,8 +15,8 @@ import type { MemoryProvider } from './memory-provider.js';
 import { selfProfileBudget } from './self-profile-store.js';
 import { requestTimeContext } from './request-time.js';
 import { NO_OWNER_POLICY, type HarnessPolicy } from './harness-policy.js';
-import { imageContent, imageMetadata, type ImageProjection, type ImageContent } from './image-context.js';
-import { ImageAssets } from './image-assets.js';
+import { imageMetadata, type ImageProjection, type ImageContent } from './image-context.js';
+import { ImageAssets, ImageAssetError } from './image-assets.js';
 import { DiagnosticLog } from './diagnostics.js';
 import type { ResearchToolContext } from './research-tools.js';
 import type {ReminderToolContext} from './reminder-tools.js';
@@ -120,6 +120,7 @@ function memoryContext(memories: MemoryRecord[], channel = false): { content?: s
 
 export async function openRecordedConversation(config: PaConfig, conversationKey: string, route?: ChannelRoute,
   options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy;
+    storeInitialization?:StoreInitializationScope;
     reminderContext?: (conversationId:string,sourceMessageId:string)=>ReminderToolContext;
     onIntegrityFailure?: (error: Error) => void;
     researchContext?: (conversationId: string, sourceMessageId: string, send?: ResearchSender) => ResearchToolContext } = {}): Promise<RecordedConversation> {
@@ -134,13 +135,16 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
   function persist<T>(operation: () => T, input = ''): T {
     try { return operation(); } catch (error) {
       if (error instanceof MemoryError || error instanceof DuplicateMessageError || error instanceof SessionIntegrityError) throw error;
+      // Projection capacity/format rejection is a tool/input error, not damaged
+      // storage. Preserve it for runtime's correctable image-error handling.
+      if (error instanceof ImageAssetError && error.code !== 'persistence') throw error;
       broken = true;
       const message = safeMessage(error, config, input);
       throw new PersistenceError(`对话持久化失败：${message}`, { cause: new Error(message) });
     }
   }
   try {
-    const openedStore = persist(() => new ConversationStore(join(config.dataDir, 'pa.sqlite')));
+    const openedStore = persist(() => new ConversationStore(join(config.dataDir, 'pa.sqlite'), options.storeInitialization));
     store = openedStore;
     const sessionFile = runtime.info().sessionFile;
     if (!sessionFile) throw new PersistenceError('Pi 会话缺少持久化路径。');
@@ -517,11 +521,10 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
             const addImages = (images: import('./image-context.js').MessageImage[], content: ImageContent[]) => {
               for (const image of images) if (!seenImages.has(image.imageId)) {
                 seenImages.add(image.imageId);
-                const currentAsset = persist(() => imageAssets.get(image.imageId));
-                if (!currentAsset) throw new RequestError('当前模型账号没有这张图片的可用引用，请重新引用或发送原图。','error');
-                persist(() => imageAssets.read(image.imageId));
+                const loaded = persist(() => imageAssets.loadContent(image.imageId));
+                if (!loaded) throw new RequestError('当前模型账号没有这张图片的可用引用，请重新引用或发送原图。','error');
                 content.push({ type: 'text', text: `[图片 imageId=${image.imageId}；归属与引用关系见前面的images元数据]\n` });
-                content.push(imageContent(imageAssets, currentAsset));
+                content.push(loaded.content);
               }
             };
             // Stable summary first, then JSON lines: adding a message preserves
@@ -634,10 +637,9 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
                 readImage: imageId => {
                   const image = persist(() => openedStore.accessibleImage(conversation.id,imageId));
                   if (!image) throw new MemoryError('当前房间没有可访问的该图片。');
-                  const currentAsset = persist(() => imageAssets.get(imageId));
-                  if (!currentAsset) throw new MemoryError('当前模型账号没有这张图片的可用引用，请重新发送原图。');
-                  persist(() => imageAssets.read(imageId));
-                  return { ...image, ...currentAsset };
+                  const loaded = persist(() => imageAssets.loadContent(imageId));
+                  if (!loaded) throw new MemoryError('当前模型账号没有这张图片的可用引用，请重新发送原图。');
+                  return { image: { ...image, ...loaded.image }, content: loaded.content };
                 },
                 ...(onProgress ? { onProgress: async (progressText: string) => {
                   // Admission and queue reservation below are synchronous up to

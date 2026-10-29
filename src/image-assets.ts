@@ -162,11 +162,7 @@ export class ImageAssets {
       // stable local reference from the original, including images saved before
       // the provider switch; never send the previous provider's file_id.
       if (isBailianDeepSeek(this.config)) {
-        const local = join(this.root, `${imageId}.bin`); inspectPath(local);
-        if (!existsSync(local)) return undefined;
-        const data = readPrivate(local, IMAGE_MAX_BYTES);
-        if (digest(data) !== imageId) fail('persistence');
-        return { imageId, fileId: `local-${imageId}`, ...dimensions(data), bytes: data.length, tokenEstimate: 1024 };
+        return this.readOriginal(imageId)?.image;
       }
       const path = this.metadataPath(imageId); inspectPath(path);
       if (!existsSync(path)) return undefined;
@@ -183,14 +179,35 @@ export class ImageAssets {
       return image;
     });
   }
-  read(imageId: string): Buffer {
-    const image = this.get(imageId);
-    if (!image) fail('persistence');
+  private readOriginal(imageId: string): { image: StoredImage; data: Buffer } | undefined {
+    this.supported();
+    if (!ID.test(imageId)) fail('persistence');
     return this.persist(() => {
-      const data = readPrivate(join(this.root, `${imageId}.bin`), IMAGE_MAX_BYTES);
+      const local = join(this.root, `${imageId}.bin`);
+      if (isBailianDeepSeek(this.config)) {
+        inspectPath(local);
+        if (!existsSync(local)) return undefined;
+        const data = readPrivate(local, IMAGE_MAX_BYTES);
+        if (digest(data) !== imageId) fail('persistence');
+        return { image: { imageId, fileId: `local-${imageId}`, ...dimensions(data), bytes: data.length, tokenEstimate: 1024 }, data };
+      }
+      const image = this.get(imageId);
+      if (!image) return undefined;
+      const data = readPrivate(local, IMAGE_MAX_BYTES);
       if (data.length !== image.bytes || digest(data) !== imageId) fail('persistence');
-      return data;
+      return { image, data };
     });
+  }
+  read(imageId: string): Buffer {
+    const loaded = this.readOriginal(imageId);
+    if (!loaded) fail('persistence');
+    return loaded.data;
+  }
+  /** A construction-local verified snapshot; no original Buffer survives in a cache. */
+  loadContent(imageId: string): { image: StoredImage; content: ReturnType<ImageAssets['content']> } | undefined {
+    const loaded = this.readOriginal(imageId);
+    if (!loaded) return undefined;
+    return { image: loaded.image, content: this.projectContent(loaded.image, loaded.data) };
   }
   content(image: StoredImage): { type: 'file'; file_id: string; bytes: number }
     | { type: 'image_url'; image_url: { url: string }; bytes: number } {
@@ -199,6 +216,11 @@ export class ImageAssets {
     // the selected provider and must not silently discard or resize history.
     if (image.bytes > 10 * 1024 * 1024) fail('too_large');
     const data = this.read(image.imageId);
+    return this.projectContent(image, data);
+  }
+  private projectContent(image: StoredImage, data: Buffer): ReturnType<ImageAssets['content']> {
+    if (!isBailianDeepSeek(this.config)) return { type: 'file', file_id: image.fileId, bytes: image.bytes };
+    if (image.bytes > 10 * 1024 * 1024) fail('too_large');
     return { type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${data.toString('base64')}` }, bytes: data.length };
   }
   async prepare(source: ImageSource, signal?: AbortSignal): Promise<StoredImage> {
