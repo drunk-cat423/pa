@@ -346,19 +346,24 @@ function isHttpDate(value: string): boolean {
   return Number.isFinite(timestamp) && new Date(timestamp).toUTCString().toLowerCase() === value.toLowerCase();
 }
 
-function textContent(bytes: Uint8Array, contentType: string): { text: string; dateEvidence: WebFetchDateEvidence[] } {
+function decodeDocument(bytes: Uint8Array, contentType: string): string {
   const charset = /;\s*charset\s*=\s*(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
   const encoding = (charset?.[1] ?? charset?.[2] ?? 'utf-8').toLowerCase();
   if (!['utf-8', 'utf8', 'us-ascii'].includes(encoding)) fail('encoding');
   let text: string;
   try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { return fail('encoding'); }
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) fail('type');
+  return text;
+}
+
+function textContent(text: string, contentType: string): { text: string; dateEvidence: WebFetchDateEvidence[] } {
   const parsed = contentType.split(';')[0]?.trim().toLowerCase() !== 'text/plain'
     ? htmlText(text) : { text, dateEvidence: [] as WebFetchDateEvidence[] };
   return { text: parsed.text.replace(/[\t \u00a0]+/g, ' ').replace(/ *\r?\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim(), dateEvidence: parsed.dateEvidence };
 }
 
-export async function fetchWebPage(url: string, config: WebFetchConfig, signal?: AbortSignal, deps: WebFetchDeps = {}): Promise<{ url: string; statusCode: number; text: string; truncated: boolean; fetchedAt: string; dateEvidence: WebFetchDateEvidence[] }> {
+/** Internal structured readers share the same bounded, public-only download path as web_fetch. */
+export async function fetchWebDocument(url: string, config: WebFetchConfig, signal?: AbortSignal, deps: WebFetchDeps = {}): Promise<{ url: string; statusCode: number; body: string; contentType: string; fetchedAt: string; lastModified?: string }> {
   if (!config || config.enabled !== true) fail('disabled');
   if (config.publicDns !== undefined && typeof config.publicDns !== 'boolean') fail('config');
   let proxy: URL | undefined;
@@ -411,15 +416,12 @@ export async function fetchWebPage(url: string, config: WebFetchConfig, signal?:
       if (size > config.maxResponseBytes) fail('size');
       chunks.push(chunk.value);
     }
-    const content = textContent(Buffer.concat(chunks, size), type);
-    const dateEvidence = [...content.dateEvidence];
+    const body = decodeDocument(Buffer.concat(chunks, size), type);
     const lastModified = response.headers['last-modified'];
-    if (typeof lastModified === 'string') dateEvidence.push({ kind: 'http_last_modified', value: lastModified, source: 'header:last-modified' });
-    const normalizedDateEvidence = normalizeDateEvidence(dateEvidence);
     if (Date.now() >= deadline) fail('timeout');
-    // Keep the complete extracted text within the existing response-byte bound.
-    // Task-local readers paginate it before it can enter model context.
-    return { url: parsed.href, statusCode: response.statusCode, text: content.text, truncated: false, fetchedAt: new Date().toISOString(), dateEvidence: normalizedDateEvidence };
+    // Structured readers receive complete text within the same response-byte bound.
+    return { url: parsed.href, statusCode: response.statusCode, body, contentType: type, fetchedAt: new Date().toISOString(),
+      ...(typeof lastModified === 'string' ? { lastModified } : {}) };
   } catch (error) {
     if (controller.signal.aborted) throw controller.signal.reason;
     if (error instanceof WebFetchError) throw error;
@@ -429,4 +431,16 @@ export async function fetchWebPage(url: string, config: WebFetchConfig, signal?:
     signal?.removeEventListener('abort', abort);
     response?.destroy?.();
   }
+}
+
+export async function fetchWebPage(url: string, config: WebFetchConfig, signal?: AbortSignal, deps: WebFetchDeps = {}): Promise<{ url: string; statusCode: number; text: string; truncated: boolean; fetchedAt: string; dateEvidence: WebFetchDateEvidence[] }> {
+  const startedAt = Date.now();
+  const document = await fetchWebDocument(url, config, signal, deps);
+  const content = textContent(document.body, document.contentType);
+  const dateEvidence = [...content.dateEvidence];
+  if (document.lastModified) dateEvidence.push({ kind: 'http_last_modified', value: document.lastModified, source: 'header:last-modified' });
+  if (signal?.aborted) fail('cancelled');
+  if (Date.now() - startedAt >= config.timeoutMs) fail('timeout');
+  return { url: document.url, statusCode: document.statusCode, text: content.text, truncated: false,
+    fetchedAt: document.fetchedAt, dateEvidence: normalizeDateEvidence(dateEvidence) };
 }

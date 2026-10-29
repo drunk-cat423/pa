@@ -3,6 +3,16 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/trending-content.test.mjs",
+      "name": "真实Pi最终请求单次JSON Object且关闭thinking，程序固定slug/数量/链接并独立记录诊断",
+      "evidence": "2026-10-30 paid preview repeated a source homepage domain and an overlong feature list, rejecting the whole digest. Regression checks source URL removal from model input with original snapshot retained, bounded introduction length, exact project mapping and program-built links."
+    },
+    {
+      "file": "test/trending-service.test.mjs",
+      "name": "关闭中止模型等待，生成中崩溃/发送中崩溃恢复均保留未知结果",
+      "evidence": "2026-10-30 independent review reproduced a late DiagnosticPersistenceError being swallowed after the outer cancellation promise settled. Existing shutdown acceptance case verifies a late failure still notifies the harness exactly once."
+    },
+    {
       "file": "test/runtime-cache-prefix.test.mjs",
       "name": "channel tool continuations append to the complete previous wire prefix without persisting or leaking controls",
       "evidence": "2026-10-29 production search continuation: old request had seven messages but only the first six survived; the wire-only control block disappeared before new tools and was regenerated at the end, with 0.81 to 1.64 percent cache read despite identical system/tools/history. Local Pi and HTTP regression checks full message-prefix retention, estimate isolation and per-prompt reset; no provider performance claim."

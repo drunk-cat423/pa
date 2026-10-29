@@ -19,6 +19,7 @@ export interface PaConfig {
   search?: WebSearchConfig;
   fetch?: WebFetchConfig;
   research?: { enabled: boolean; maxModelCalls: number; maxToolCalls: number; maxSearchCalls: number };
+  trending?: { enabled: boolean; groupIds: string[] };
 }
 
 export interface AutoMemoryConfig {
@@ -113,10 +114,21 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     tasks: { maxConcurrent: maxConcurrentTasks },
     loop,
     research,
+    trending: readTrendingConfig(env),
     memory: readAutoMemoryConfig(env),
     search: readWebSearchConfig(env, provider!, baseUrl),
     fetch: readWebFetchConfig(env),
   };
+}
+
+export function readTrendingConfig(env:NodeJS.ProcessEnv):NonNullable<PaConfig['trending']> {
+  const flag=env.PA_TRENDING_ENABLED?.trim()||'false';
+  if(!['true','false'].includes(flag))throw new Error('PA_TRENDING_ENABLED 必须为 true 或 false。');
+  const groupIds=[...new Set((env.PA_TRENDING_GROUP_IDS??'').split(',').map(id=>id.trim()).filter(Boolean))];
+  const allowed=new Set((env.PA_QQ_ALLOWED_GROUPS??'').split(',').map(id=>id.trim()).filter(Boolean));
+  if(flag==='true'&&(!groupIds.length||groupIds.some(id=>!allowed.has(id))))
+    throw new Error('开启 Trending 需要显式 PA_TRENDING_GROUP_IDS，且必须是 PA_QQ_ALLOWED_GROUPS 的非空子集。');
+  return {enabled:flag==='true',groupIds};
 }
 
 export function readWebFetchConfig(env: NodeJS.ProcessEnv): WebFetchConfig {

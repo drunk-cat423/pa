@@ -26,6 +26,7 @@
 | schema、迁移、原文与任务状态 | `store.ts`、`auto-memory-store.ts`、`research-store.ts` | [存储](storage.md) | `storage`，再加受影响业务范围 |
 | 启动核验、Pi损坏隔离与渠道调度 | `session-integrity.ts`、`session-integrity-store.ts`、`channel-harness.ts` | [启动和调度](startup-and-scheduling.md) | `storage chat` |
 | 一次性提醒、取消、到期通知与重启恢复 | `reminder-tools.ts`、`reminder-service.ts`、`work-ledger-store.ts` | [提醒](reminders.md)、[工作台账](work-ledger.md) | `chat delivery storage`；精确命令见提醒文档 |
+| GitHub Trending 群日报、定时生成与投递 | `trending-*.ts`、`channel-harness.ts` | [Trending日报](trending.md) | `trending`；改网页下载时加`web`，改输出队列时加`delivery` |
 | 诊断与离线解析重放 | `diagnostics.ts`、`logs.ts`、`logs-cli.ts` | [统一日志](logging.md) | 对应业务范围；整理诊断用 `memory` |
 | 发布、备份、轮换、回退 | `scripts/deployment/` | [部署](deployment.md) | 先验证相关代码；生产操作按本次授权执行 |
 
