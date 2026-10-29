@@ -16,6 +16,8 @@ PA_SEARCH_MODEL=deepseek-v4.1-flash-1017
 
 复制控制台实际提供的地址，不把通用 DashScope 地址、原 DeepSeek 地址或其他地域密钥混用。前台、研究和记忆共用此模型配置，QQ凭证与网页代理保持独立。`model-capabilities.ts`集中处理已接入模型的参数差异；其他兼容服务不会自动获得这些能力。
 
+百炼此模型不接受`developer`消息角色。Pi模型兼容参数显式设置`supportsDeveloperRole=false`，系统协议发送为`system`；容量估算采用同一转换规则。兼容验证必须包含系统提示词和准备/回答工具循环，单条纯用户消息的连通测试不能覆盖这一点。
+
 | 能力 | 实际验证 / PA 使用方式 |
 | --- | --- |
 | 文本与SSE流式 | 已通过真实调用及Pi本地HTTP链路验证 |

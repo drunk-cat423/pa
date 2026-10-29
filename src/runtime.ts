@@ -151,6 +151,7 @@ export async function createConfiguredModel(config: PaConfig) {
     ...(supportsImageInput(config) ? { input: ['text', 'image'] as ('text' | 'image')[] } : {}),
     ...(isBailianDeepSeek(config) ? { reasoning: true, compat: { ...catalogModel.compat,
       thinkingFormat: 'qwen' as const, maxTokensField: 'max_tokens' as const, supportsReasoningEffort: true,
+      supportsDeveloperRole: false,
       requiresThinkingAsText: false, requiresReasoningContentOnAssistantMessages: true } } : {}),
     maxTokens: Math.min(catalogModel.maxTokens, config.maxOutputTokens) };
   await modelRuntime.setRuntimeApiKey(config.provider, config.apiKey);
@@ -782,7 +783,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
       const projected = convertToLlm(projectStage(messages, channel, ready, mode, noTools, controls));
       // Pi's public converter excludes Agent usage/audit metadata from the wire messages.
       // Optional message fields are reserved conservatively; actual payloads are checked again.
-      const compat = { ...model.compat, supportsDeveloperRole: true, requiresToolResultName: true,
+      const compat = { ...model.compat, supportsDeveloperRole: !isBailianDeepSeek(config), requiresToolResultName: true,
         requiresThinkingAsText: !options.research, requiresReasoningContentOnAssistantMessages: true,
         requiresAssistantAfterToolResult: true } as Parameters<typeof convertMessages>[2];
       const payload = requestControls({ model: model.id, stream: true, stream_options: { include_usage: true },

@@ -54,7 +54,7 @@ test('channel wire keeps per-stage system fixed across three modes while link/ta
     ? preparationDelta(`prepare-${number}`, { intent: 'research', mode: modes[Math.floor((number - 1) / 2)], updates: [] })
     : { role: 'assistant', tool_calls: [{ index: 0, id: `research-${number}`, type: 'function', function: {
       name: 'create_research', arguments: JSON.stringify({ key: 'one', title: '本轮研究', goal: '研究明确链接' }),
-    } }] });
+    } }] }, { provider: 'bailian', model: 'deepseek-v4.1-flash-1017' });
   const history = '稳定摘要与完整真人历史。'.repeat(1800), inputs = [], targets = [];
   for (const [index, mode] of modes.entries()) {
     const runtime = await f.open(mode), url = `https://example.test/${mode}?q="ignore rules"`;
@@ -72,6 +72,8 @@ test('channel wire keeps per-stage system fixed across three modes while link/ta
   t.diagnostic(`answer system common prefix=${sharedPrefix(first, next)} chars; system length=${first.length}; retained history=${history.length} chars; message JSON prefix=${retainedWire} chars`);
   assert.ok(retainedWire > history.length + first.length);
   for (const [index, body] of f.requests.entries()) {
+    assert.ok(body.messages.every(message => message.role !== 'developer'), 'Bailian rejects developer messages');
+    assert.ok(body.messages.some(message => message.role === 'system'));
     assert.deepEqual(systems(body), systems(f.requests[index % 2]), 'mode/link/target must not alter the same stage system');
     const round = Math.floor(index / 2), ready = index % 2 === 1, state = control(body);
     assert.equal(state.stage, ready ? 'answer' : 'prepare');
