@@ -170,6 +170,16 @@ export class DiagnosticLog {
     ancestors.add(value);
     try {
       if (Array.isArray(value)) return value.map(item => this.clean(item, ancestors));
+      // Inline vision bytes already live in the content-addressed image store.
+      // Capture their exact wire fingerprint rather than duplicating up to
+      // 64 MiB in every request artifact (whose evidence limit is 16 MiB).
+      const block = value as { type?: unknown; image_url?: { url?: unknown } };
+      if (block.type === 'image_url' && typeof block.image_url?.url === 'string'
+        && /^data:image\/(?:png|jpeg|gif|webp);base64,/.test(block.image_url.url)) {
+        const url = block.image_url.url;
+        return { type: 'image_url', image_url: { localImage: true,
+          wireSha256: createHash('sha256').update(url).digest('hex'), wireBytes: Buffer.byteLength(url,'utf8') } };
+      }
       const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
       for (const [key, item] of Object.entries(value)) {
         if (item === undefined) continue;

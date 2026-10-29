@@ -23,6 +23,7 @@ if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 - 使用 Pi 内置供应商：填写其 provider 与实际模型 ID，`PA_BASE_URL` 留空。
 - 内置 Google Vertex 仅支持显式 API 密钥，拒绝会触发本机 ADC 的标记或占位密钥。
 - 使用 **OpenAI Chat Completions 兼容接口**：填写 API 根地址到 `PA_BASE_URL`（通常以 `/v1` 结尾），`PA_PROVIDER` 为服务标识，`PA_MODEL` 为服务实际模型 ID；此模式不适用于仅支持 Responses 的端点。
+- 百炼 DeepSeek V4.1 使用 `PA_PROVIDER=bailian`、`PA_MODEL=deepseek-v4.1-flash-1017` 和控制台提供的北京工作空间地址；设置真实窗口 `1000000`，搜索模型使用相同 ID。思考、图片及原生搜索的接口差异和已核实能力见[模型供应商](docs/model-providers.md)。
 - `PA_CONTEXT_WINDOW` 是兼容接口的真实上下文容量配置；`PA_MAX_OUTPUT_TOKENS` 控制最大输出，`PA_TIMEOUT_MS` 控制单个模型请求超时。默认分别为 32768、2048、60000。整个工具循环默认最多6次模型请求、8次工具执行，不设总时间限制，配置见 `PA_LOOP_*`。
 
 ```powershell
@@ -146,4 +147,4 @@ node scripts/repo-check.mjs all
 
 参见 [开发说明](docs/development.md)、[服务器部署](docs/deployment.md)、[Shiori 记忆参考映射](docs/shiori-memory-reference.md) 和 [v0.2 设计基线](docs/design/pi_evolving_companion_technical_design_v0.2.md)。
 
-图片每张最多32MiB、每边4096px，支持JPEG/PNG/GIF/WebP；单请求最多600张、原图合计200MiB。85%上下文容量仍是整理主规则；图像API硬限制也会复用容量整理，不能静默删图。每图按1024 tokens保守预留并参加实测usage校准。签名下载URL和QQ auth_token不写入聊天、任务或普通日志；原图独立保存在 `PA_DATA_DIR/images`，Files句柄只优化传输，不保证供应商KV缓存命中。图片网络失败会给出简短原因，持久化失败停止会话。
+本地原图每张最多32MiB、每边4096px，支持JPEG/PNG/GIF/WebP；DeepSeek原平台单请求最多600张、原图合计200MiB。百炼通过稳定Base64 `image_url` 传图，单图最多10MiB、整次JSON请求最多64MiB；旧图从本地原图读取，不复用原平台file_id。超限明确报错并保留磁盘原图，不静默删图或缩图；较大历史可能需要先完成容量压缩。85%上下文容量仍是整理主规则；图像API硬限制也复用容量整理。每图按1024 tokens保守预留并参加实测usage校准，Base64长度不当作文本token。签名下载URL和QQ auth_token不写入聊天、任务或普通日志；原图独立保存在 `PA_DATA_DIR/images`。句柄或稳定图片内容都不保证供应商KV缓存命中。图片网络失败会给出简短原因，持久化失败停止会话。

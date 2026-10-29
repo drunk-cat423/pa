@@ -1,12 +1,13 @@
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { PaConfig } from './config.js';
+import { applyModelPayload, isBailianDeepSeek } from './model-capabilities.js';
 import { createConfiguredModel, estimateContext } from './runtime.js';
 import type { AutoMemoryTaskInput } from './auto-memory-types.js';
 import { assertCurrentMemoryProtocol } from './auto-memory-store.js';
 import { MemoryProviderError, memoryFailure, memoryFailurePhase } from './memory-diagnostics.js';
 import { DiagnosticLog, DiagnosticPersistenceError } from './diagnostics.js';
 import { personProfileCapacityPrompt, profileCapacity, profileStepPrompt } from './profile-limits.js';
-import { imageMetadata, imageRequestFits, projectImagePayload, type ImageProjection } from './image-context.js';
+import { imageContent, imageMetadata, imageRequestFits, projectImagePayload, type ImageProjection } from './image-context.js';
 import { ImageAssets } from './image-assets.js';
 import { decodeMemoryWireResponse, memoryWireReferences, prepareMemoryWireExtraction } from './memory-wire.js';
 import { PERSON_PROFILE_POLICY, SELF_PROFILE_POLICY } from './profile-policy.js';
@@ -141,12 +142,14 @@ export function createMemoryProvider(config: PaConfig): MemoryProvider {
       const projections: ImageProjection[] = images.length ? [{ text: userContent,
         content: [{ type: 'text', text: userContent }, ...images.flatMap(image => [
           { type: 'text' as const, text: `[图片 imageId=${image.imageId}；所属消息=${input.messages.filter(message => message.images?.some(item => item.imageId === image.imageId)).map(message => messageRefs?.get(message.id) ?? message.id).join(',')}；归属与引用关系见images元数据]` },
-          { type: 'file' as const, file_id: image.fileId, bytes: image.bytes }])] }] : [];
+          imageContent(imageAssets, image)])] }] : [];
       const userMessage = { role: 'user' as const, content: userContent, timestamp: Date.now() };
-      const jsonMode = config.provider === 'deepseek' && model.api === 'openai-completions';
+      const jsonMode = (config.provider === 'deepseek' || isBailianDeepSeek(config)) && model.api === 'openai-completions';
       const projectMemoryPayload = (payload: Parameters<typeof projectImagePayload>[0]) => {
         const projected = projectImagePayload(payload, projections) as Record<string, unknown>;
-        return jsonMode ? { ...projected, response_format: { type: 'json_object' as const } } : projected;
+        return applyModelPayload(config,
+          jsonMode ? { ...projected, response_format: { type: 'json_object' as const } } : projected,
+          { thinking: false, maxTokens });
       };
       const projectedInput = projectMemoryPayload({
         systemPrompt,

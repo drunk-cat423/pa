@@ -92,4 +92,4 @@ src/turn-plan.ts集中管理intent/mode/updates协议及三种回答提示；cha
 
 [v0.2 基线](design/pi_evolving_companion_technical_design_v0.2.md)、[记忆 v1 设计](design/companion_memory_v1.md) 与 [Shiori 参考](shiori-memory-reference.md) 保留设计来源；当前规则见根目录AGENTS和主题文档，用户最新决定优先。不要按旧设计重新引入已取消的向量或个人事件记忆功能。
 
-图片链路由 `image-assets.ts` 下载/验证/去重/保存原图并上传Files，`message_images`负责房间与消息关联；`image-context.ts`只依据harness可信metadata投影真正的DeepSeek user file blocks，同一投影用于估算和发送，不改Pi内部或伪造Base64图片文本。`image-context.test.mjs`用QQ真实字段fixture、CDN下载stub和本地HTTP模型验证准备/回答、完整图片历史、重启、后台冻结压缩、摘要切换、原图工具、跨群权限与关闭中的admission取消。后台画像专用任务不额外注入图片。
+图片链路由 `image-assets.ts` 下载/验证/去重/保存原图，`message_images`负责房间与消息关联。DeepSeek原平台上传Files，百炼V4.1从原图生成稳定Base64 `image_url`，不会上传到不支持该模型视觉的Files接口或发送旧平台句柄。`image-context.ts`只依据harness可信metadata投影真正的多模态块，同一投影用于估算和发送，图片字节不作为文本估算，不改Pi内部。`image-context.test.mjs`用QQ真实字段fixture、CDN下载stub和本地HTTP模型验证准备/回答、完整图片历史、重启、后台冻结压缩、摘要切换、原图工具、跨群权限与关闭中的admission取消。后台画像专用任务不额外注入图片。供应商参数、能力及边界见[模型供应商](model-providers.md)。

@@ -1,5 +1,5 @@
 import { resolve } from 'node:path';
-import type { WebSearchConfig } from './web-search.js';
+import { bailianSearchEndpoint, type WebSearchConfig } from './web-search.js';
 import type { WebFetchConfig } from './web-fetch.js';
 import { parseWebFetchProxyUrl } from './web-fetch-proxy.js';
 
@@ -146,18 +146,19 @@ export function readWebSearchConfig(env: NodeJS.ProcessEnv, provider: string, ba
   if (!['true', 'false'].includes(flag)) throw new Error('PA_SEARCH_ENABLED 必须为 true 或 false。');
   const budgetId = env.PA_SEARCH_BUDGET_ID?.trim() || '';
   if (flag === 'true' && (!/^[a-zA-Z0-9_-]{1,80}$/.test(budgetId)
-    || provider !== 'deepseek' || (baseUrl && !/^https:\/\/api\.deepseek\.com\/?(?:v1\/?)?$/.test(baseUrl)))) {
-    throw new Error('搜索需官方 DeepSeek 配置及明确的 PA_SEARCH_BUDGET_ID；不会把其他供应商的密钥发送到 DeepSeek。');
+    || !(provider === 'bailian' ? bailianSearchEndpoint(baseUrl)
+      : provider === 'deepseek' && (!baseUrl || /^https:\/\/api\.deepseek\.com\/?(?:v1\/?)?$/.test(baseUrl))))) {
+    throw new Error('搜索需官方 DeepSeek 或已支持的百炼北京工作空间地址及明确的 PA_SEARCH_BUDGET_ID；密钥不会跨供应商发送。');
   }
   const result: WebSearchConfig = { enabled: flag === 'true', budgetId,
-    model: env.PA_SEARCH_MODEL?.trim() || 'deepseek-flash',
+    model: env.PA_SEARCH_MODEL?.trim() || (provider === 'bailian' ? 'deepseek-v4.1-flash-1017' : 'deepseek-flash'),
     maxRequests: nonNegativeInteger(env, 'PA_SEARCH_MAX_REQUESTS', 0),
     maxUses: nonNegativeInteger(env, 'PA_SEARCH_MAX_USES', 0),
     maxTokens: positiveInteger(env, 'PA_SEARCH_MAX_TOKENS', 2048),
     timeoutMs: positiveInteger(env, 'PA_SEARCH_TIMEOUT_MS', 60000),
     maxResults: positiveInteger(env, 'PA_SEARCH_MAX_RESULTS', 5) };
   if (result.maxRequests > 100 || result.maxUses > 5 || result.maxTokens > 4096
-    || result.timeoutMs > 120000 || result.maxResults > 10 || !/^[a-zA-Z0-9_-]{1,100}$/.test(result.model)) {
+    || result.timeoutMs > 120000 || result.maxResults > 10 || !/^[a-zA-Z0-9_.-]{1,100}$/.test(result.model)) {
     throw new Error('搜索预算、模型或结果上限超出支持范围。');
   }
   return result;

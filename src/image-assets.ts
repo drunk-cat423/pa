@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, parse, resolve, sep } from 'node:path';
 import type { PaConfig } from './config.js';
+import { isBailianDeepSeek, supportsImageInput } from './model-capabilities.js';
 
 export interface ImageSource { url: string; contentType?: string; width?: number; height?: number; size?: number }
 export type ImageMime = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
@@ -144,7 +145,7 @@ export class ImageAssets {
     this.fetchImpl = dependencies.fetch ?? fetch;
   }
   private supported(): void {
-    if (this.config.provider !== 'deepseek' || this.config.model !== 'deepseek-flash') fail('unsupported_model');
+    if (!supportsImageInput(this.config)) fail('unsupported_model');
   }
   private persist<T>(operation: () => T): T {
     try { return operation(); } catch (error) { if (error instanceof ImageAssetError) throw error; return fail('persistence'); }
@@ -157,6 +158,16 @@ export class ImageAssets {
     this.supported();
     if (!ID.test(imageId)) fail('persistence');
     return this.persist(() => {
+      // Bailian's Files API does not supply DeepSeek vision handles. Derive a
+      // stable local reference from the original, including images saved before
+      // the provider switch; never send the previous provider's file_id.
+      if (isBailianDeepSeek(this.config)) {
+        const local = join(this.root, `${imageId}.bin`); inspectPath(local);
+        if (!existsSync(local)) return undefined;
+        const data = readPrivate(local, IMAGE_MAX_BYTES);
+        if (digest(data) !== imageId) fail('persistence');
+        return { imageId, fileId: `local-${imageId}`, ...dimensions(data), bytes: data.length, tokenEstimate: 1024 };
+      }
       const path = this.metadataPath(imageId); inspectPath(path);
       if (!existsSync(path)) return undefined;
       const image = JSON.parse(readPrivate(path, 4096).toString('utf8')) as StoredImage;
@@ -180,6 +191,15 @@ export class ImageAssets {
       if (data.length !== image.bytes || digest(data) !== imageId) fail('persistence');
       return data;
     });
+  }
+  content(image: StoredImage): { type: 'file'; file_id: string; bytes: number }
+    | { type: 'image_url'; image_url: { url: string }; bytes: number } {
+    if (!isBailianDeepSeek(this.config)) return { type: 'file', file_id: image.fileId, bytes: image.bytes };
+    // The input original remains stored up to 32 MiB. Wire limits belong to
+    // the selected provider and must not silently discard or resize history.
+    if (image.bytes > 10 * 1024 * 1024) fail('too_large');
+    const data = this.read(image.imageId);
+    return { type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${data.toString('base64')}` }, bytes: data.length };
   }
   async prepare(source: ImageSource, signal?: AbortSignal): Promise<StoredImage> {
     this.supported();
@@ -206,6 +226,7 @@ export class ImageAssets {
     const info = dimensions(data), imageId = digest(data);
     this.initialize();
     this.persist(() => immutableWrite(join(this.root, `${imageId}.bin`), data));
+    if (isBailianDeepSeek(this.config) && data.length > 10 * 1024 * 1024) fail('too_large');
     const saved = this.get(imageId); if (saved) return saved;
     const key = `${this.root}:${this.providerKey}:asset:${imageId}`;
     const existing = pending.get(key); if (existing) return existing;

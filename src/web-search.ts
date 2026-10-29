@@ -64,6 +64,11 @@ type LedgerEvent =
 const ENDPOINT = 'https://api.deepseek.com/anthropic/v1/messages';
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
+export function bailianSearchEndpoint(baseUrl?: string): string | undefined {
+  if (!baseUrl || !/^https:\/\/ws-[a-z0-9]+\.cn-beijing\.maas\.aliyuncs\.com\/compatible-mode\/v1\/?$/.test(baseUrl)) return undefined;
+  return new URL('/apps/anthropic/v1/messages', baseUrl).href;
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
@@ -343,6 +348,8 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
   const search = (config as PaConfig & { search?: WebSearchConfig }).search;
   if (!search) throw new WebSearchError('网页搜索配置缺失。');
   validateConfig(search);
+  const endpoint = config.provider === 'bailian' ? bailianSearchEndpoint(config.baseUrl) : ENDPOINT;
+  if (!endpoint) throw new WebSearchError('百炼搜索地址无效；未发送请求或密钥。');
   if (!config.apiKey) throw new WebSearchError('DeepSeek API 密钥未配置。');
   if (typeof query !== 'string' || !query.trim() || query.length > 500) throw new WebSearchError('网页搜索问题必须为 1 至 500 个字符。');
   const requestedDateRange = checkedDateRange(dateRange);
@@ -374,6 +381,8 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
       const clock = requestTimeData();
       const body = {
         model: search.model, max_tokens: search.maxTokens,
+        ...(config.provider === 'bailian' ? { thinking: { type: 'disabled' },
+          system: [{ type: 'text', text: 'x-anthropic-billing-header: cc_entrypoint=cli;' }] } : {}),
         messages: [{ role: 'user', content: [{ type: 'text', text:
           '[搜索时间环境｜由harness提供]\n' + JSON.stringify({ ...clock, requestedDateRange }) + '\n'
           + '以上日期范围按北京时间理解，是查询约束提示，不是搜索引擎已执行的过滤。将相对时间明确为日期；核对来源发布时间、页面更新时间和事件发生日期，三者不能混同。'
@@ -384,7 +393,7 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
         tools: [{ type: 'web_search_20250305', name: 'web_search',
           ...(search.maxUses > 0 ? { max_uses: search.maxUses } : {}) }],
       };
-      await saveEvidence(lock.directory, attemptId, 'request', { endpoint: ENDPOINT, body }, config.apiKey);
+      await saveEvidence(lock.directory, attemptId, 'request', { endpoint, body }, config.apiKey);
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const onAbort = () => controller.abort();
@@ -399,13 +408,13 @@ export async function searchDeepSeek(config: PaConfig, query: string, signal?: A
         const context = diagnosticContext ?? { traceId: attemptId };
         // This captures bounded parsed JSON, not raw HTTP bytes or request headers.
         callId = diagnostics.startCall({ ...context, kind: 'search', captureLevel: 'http-json',
-          provider: 'deepseek', model: search.model, phase }, { endpoint: ENDPOINT, body }, { maxResults: search.maxResults });
+          provider: config.provider === 'bailian' ? 'bailian' : 'deepseek', model: search.model, phase }, { endpoint, body }, { maxResults: search.maxResults });
         diagnostics.event(context, phase, 'search_reserved', { attemptId }, callId);
         if (signal?.aborted) throw new WebSearchError('网页搜索已取消。');
         timer = setTimeout(() => controller.abort(), search.timeoutMs);
         let response: Response;
         try {
-          response = await fetcher(ENDPOINT, {
+          response = await fetcher(endpoint, {
             method: 'POST', redirect: 'error',
             headers: {
               'Content-Type': 'application/json', 'x-api-key': config.apiKey,

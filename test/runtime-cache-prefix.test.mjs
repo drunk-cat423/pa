@@ -118,3 +118,55 @@ test('save-claim correction closes tools in trailing controls without changing f
   assert.doesNotMatch(await readFile(runtime.info().sessionFile, 'utf8'), /\[PA本轮控制｜应用生成\]/,
     'wire-only controls must not accumulate in saved conversation history');
 });
+
+test('channel tool continuations append to the complete previous wire prefix without persisting or leaking controls', async t => {
+  let round = 0, answerCall = 0, runtime;
+  const reads = [];
+  const f = await fixture(t, body => {
+    if (isPreparationRequest(body)) {
+      round++; answerCall = 0;
+      return preparationDelta(`prepare-${round}`, { intent: 'question', mode: round === 1 ? 'professional' : 'casual', updates: [] });
+    }
+    answerCall++;
+    return answerCall <= 2 ? { role: 'assistant', tool_calls: [{ index: 0, id: `history-${round}-${answerCall}`,
+      type: 'function', function: { name: 'read_history', arguments: JSON.stringify({ query: `part-${answerCall}` }) } }] }
+      : { role: 'assistant', content: '查询完成。' };
+  }, { loop: { maxModelCalls: 4, maxToolCalls: 3 } });
+  runtime = await f.open('append-only');
+  const estimate = () => runtime.estimate('estimate-only-sentinel', undefined, { channel: true });
+  assert.deepEqual(estimate(), estimate(), 'admission probes must be repeatable');
+  for (let turn = 1; turn <= 2; turn++) {
+    assert.equal(await runtime.prompt(`第${turn}轮查询`, { runId: `append-${turn}`, companionTools: {
+      prepareTurn: plan => ({ prepared: true, mode: plan.mode, saved: [] }),
+      readHistory: params => {
+        reads.push(`${turn}:${params.query}`);
+        assert.deepEqual(estimate(), estimate(), 'active multi-mode probes must not mutate live controls');
+        return { messages: [{ id: `result-${turn}-${params.query}`, role: 'user', text: `history-visible-${turn}-${params.query}` }] };
+      },
+    } }), '查询完成。');
+    const requests = f.requests.slice((turn - 1) * 4, turn * 4), answers = requests.slice(1);
+    assert.equal(requests.length, 4, 'preparation and two ordinary tool calls keep the original model budget');
+    for (let index = 1; index < answers.length; index++) {
+      assert.deepEqual(answers[index].messages.slice(0, answers[index - 1].messages.length), answers[index - 1].messages,
+        'the complete previous same-stage wire messages, including old application controls, must remain the next request prefix');
+      assert.ok(answers[index].messages.some(message => message.role === 'tool'
+        && text(message.content).includes(`history-visible-${turn}-part-${index}`)), 'new tool results must be visible');
+    }
+    const controls = body => body.messages.filter(message => message.role === 'user' && text(message.content).startsWith(controlPrefix));
+    assert.deepEqual(requests.map(body => controls(body).length), [1, 2, 2, 3],
+      'unchanged controls are replayed at their original position; only changed controls append');
+    assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['prepare_turn']);
+    assert.equal(requests[0].tool_choice.function.name, 'prepare_turn');
+    assert.ok(answers[0].tools.some(tool => tool.function.name === 'read_history'));
+    assert.deepEqual(answers[2].tools, []); assert.equal(answers[2].tool_choice, 'none');
+    assert.equal(JSON.parse(text(controls(requests[0])[0].content).slice(controlPrefix.length)).stage, 'prepare');
+    assert.ok(controls(answers[0]).every(message => !text(message.content).includes(turn === 2 ? 'professional' : 'casual')),
+      'a new prompt must not inherit the previous prompt controls');
+    assert.doesNotMatch(JSON.stringify(requests), /estimate-only-sentinel|prepare-reserve/);
+  }
+  assert.deepEqual(reads, ['1:part-1', '1:part-2', '2:part-1', '2:part-2']);
+  assert.deepEqual(f.log.events().filter(event => event.event === 'turn.completed')
+    .map(event => [event.details.modelCalls, event.details.toolCalls]), [[4, 3], [4, 3]]);
+  assert.doesNotMatch(await readFile(runtime.info().sessionFile, 'utf8'), /\[PA本轮控制｜应用生成\]/,
+    'controls must remain wire-only rather than enter Pi JSONL');
+});

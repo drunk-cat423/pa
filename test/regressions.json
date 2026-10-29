@@ -4,6 +4,11 @@
   "tests": [
     {
       "file": "test/runtime-cache-prefix.test.mjs",
+      "name": "channel tool continuations append to the complete previous wire prefix without persisting or leaking controls",
+      "evidence": "2026-10-29 production search continuation: old request had seven messages but only the first six survived; the wire-only control block disappeared before new tools and was regenerated at the end, with 0.81 to 1.64 percent cache read despite identical system/tools/history. Local Pi and HTTP regression checks full message-prefix retention, estimate isolation and per-prompt reset; no provider performance claim."
+    },
+    {
+      "file": "test/runtime-cache-prefix.test.mjs",
       "name": "channel wire keeps per-stage system fixed across three modes while link/target controls follow long history",
       "evidence": "2026-10-28 final SDK request audit: three same-room answer mode changes preserved all old history and the tool schema, but changed front-loaded system text and cache hit rate fell to 1.59-7.27 percent; local HTTP regression checks real Pi wire projection, not provider cache performance"
     },

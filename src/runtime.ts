@@ -16,6 +16,7 @@ import {
 import { readSessionEntries, recordedTurnsFromEntries, type RecordedTurn } from './transcript.js';
 export type { RecordedTurn } from './transcript.js';
 import type { PaConfig } from './config.js';
+import { applyModelPayload, isBailianDeepSeek, supportsImageInput } from './model-capabilities.js';
 import { acquireConversationLock } from './conversation-lock.js';
 import { MemoryError, type MemoryRef } from './memory-types.js';
 import { searchDeepSeek, WebSearchError, WebSearchPersistenceError, type SearchDateRange } from './web-search.js';
@@ -30,7 +31,8 @@ import { RESEARCH_MATERIAL_PREFIX, type MaterialReadParams } from './research-ma
 import { DiagnosticLog, DiagnosticPersistenceError, type DiagnosticContext } from './diagnostics.js';
 import { ContextTokenEstimator, contextCalibrationKey, normalizedInputTokens, upgradeContextCalibration,
   validContextCalibration, type ContextCalibration } from './context-tokens.js';
-import { imageMetadata, imageTokenPayload, imageRequestFits, projectImagePayload, IMAGE_TOKENS, MAX_REQUEST_IMAGES, type ImageProjection, type MessageImage } from './image-context.js';
+import { imageContent, imageMetadata, imageTokenPayload, imageRequestFits, projectImagePayload, IMAGE_TOKENS, MAX_REQUEST_IMAGES, type ImageProjection, type MessageImage } from './image-context.js';
+import { ImageAssets, ImageAssetError } from './image-assets.js';
 import { PREPARE_TURN_PROMPT, PREPARE_TURN_DESCRIPTION, RESPONSE_STAGE_PROMPT, CLI_STAGE_PROMPT, RESPONSE_MODE_PROMPTS, TURN_PLAN_SCHEMA,
   validateTurnPlan, hasUnbackedSaveClaim, hasUnbackedReminderClaim, type TurnPlan, type TurnReceipt, type ReplyMode } from './turn-plan.js';
 import { ANSWER_GROUNDING_PROMPT, ATTRIBUTION_REVIEW_PROMPT, bindAnswerGrounding, parseAttributionReview,
@@ -61,8 +63,8 @@ function cachePrefixMetadata(payload: unknown) {
   return { version: 1, systemHash: hash(system), toolsHash: hash(object?.tools ?? []) };
 }
 
-// DeepSeek's default thinking output allowance is 64K. This is an admission
-// reserve, not a wire output cap, and must not shrink to the chat output limit.
+// Reserve the research output budget independently of the chat output limit.
+// Bailian must also receive this explicit cap instead of its larger default.
 const RESEARCH_OUTPUT_RESERVE = 65536;
 
 export interface ReadHistoryParams {
@@ -139,14 +141,17 @@ export async function createConfiguredModel(config: PaConfig) {
   });
   if (config.baseUrl) modelRuntime.registerProvider(config.provider, {
     baseUrl: config.baseUrl, api: 'openai-completions',
-    models: [{ id: config.model, name: config.model, reasoning: config.provider === 'deepseek', input: config.provider === 'deepseek' && config.model === 'deepseek-flash' ? ['text', 'image'] : ['text'],
+    models: [{ id: config.model, name: config.model, reasoning: config.provider === 'deepseek' || isBailianDeepSeek(config), input: supportsImageInput(config) ? ['text', 'image'] : ['text'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: config.contextWindow, maxTokens: config.maxOutputTokens }],
   });
   const catalogModel = modelRuntime.getModel(config.provider, config.model);
   if (!catalogModel) throw new Error(`Pi 内置模型目录中没有 ${config.provider}/${config.model}；请明确配置 base URL 或使用有效模型。`);
   const model = { ...catalogModel, contextWindow: Math.min(catalogModel.contextWindow, config.contextWindow),
-    ...(config.provider === 'deepseek' && config.model === 'deepseek-flash' ? { input: ['text', 'image'] as ('text' | 'image')[] } : {}),
+    ...(supportsImageInput(config) ? { input: ['text', 'image'] as ('text' | 'image')[] } : {}),
+    ...(isBailianDeepSeek(config) ? { reasoning: true, compat: { ...catalogModel.compat,
+      thinkingFormat: 'qwen' as const, maxTokensField: 'max_tokens' as const, supportsReasoningEffort: true,
+      requiresThinkingAsText: false, requiresReasoningContentOnAssistantMessages: true } } : {}),
     maxTokens: Math.min(catalogModel.maxTokens, config.maxOutputTokens) };
   await modelRuntime.setRuntimeApiKey(config.provider, config.apiKey);
   return { modelRuntime, model };
@@ -217,6 +222,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
     let fetchUrl: string | undefined;
     let fetchReader: WebFetchReader | undefined;
     let companionTools: CompanionToolContext | undefined;
+    const imageAssets = new ImageAssets(config);
     let imageProjections: ImageProjection[] = [];
     let latestInputTokens = 0;
     let referenceUrls: string[] = [];
@@ -433,13 +439,15 @@ export async function openConversation(config: PaConfig, conversationId: string,
           const image = await cancellable(() => companionTools!.readImage!((params as { imageId: string }).imageId), signal);
           const output = result({ image: imageMetadata(image), source: '当前房间已保存原图，归属以图片元数据为准' });
           const text = output.content[0]!.text;
-          const visibleFiles = imageProjections.flatMap(item => item.content.filter(block => block.type === 'file').map(block => block.file_id));
-          if (visibleFiles.includes(image.fileId)) return result({ image: imageMetadata(image), alreadyVisible: true });
-          if (visibleFiles.length >= MAX_REQUEST_IMAGES) throw new MemoryError('本轮图片数量已达上限，无法追加原图。');
-          const projection: ImageProjection = { text, content: [{ type: 'text', text }, { type: 'file', file_id: image.fileId, bytes: image.bytes }] };
+          const content = imageContent(imageAssets, image);
+          const imageKey = imageTokenPayload({ content: [content] }).imageIds[0];
+          const visibleImages = imageTokenPayload({ content: imageProjections.flatMap(item => item.content) }).imageIds;
+          if (imageKey && visibleImages.includes(imageKey)) return result({ image: imageMetadata(image), alreadyVisible: true });
+          if (visibleImages.length >= MAX_REQUEST_IMAGES) throw new MemoryError('本轮图片数量已达上限，无法追加原图。');
+          const projection: ImageProjection = { text, content: [{ type: 'text', text }, content] };
           const candidate = projectImagePayload({ messages: [{ role: 'user', content: text }] }, [projection]);
-          const allFiles = [...imageProjections,projection].flatMap(item=>item.content.filter(block=>block.type==='file'));
-          if (!imageRequestFits({messages:[{role:'user',content:allFiles}]},[...imageProjections,projection])) throw new MemoryError('本轮图片总容量已达上限，无法追加原图。');
+          const allContent = [...imageProjections,projection].flatMap(item=>item.content);
+          if (!imageRequestFits({messages:[{role:'user',content:allContent}]},[...imageProjections,projection])) throw new MemoryError('本轮图片总容量已达上限，无法追加原图。');
           const extra = estimateContext(candidate,model.contextWindow,model.maxTokens);
           if (latestInputTokens + extra.inputTokens + extra.reservedOutputTokens + extra.safetyTokens + toolResultMaxBytes > model.contextWindow) {
             throw new MemoryError('本轮剩余上下文无法容纳原图，请先完成会话容量整理。');
@@ -447,6 +455,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           imageProjections.push(projection);
           return output;
         } catch (error) {
+          if (error instanceof ImageAssetError && error.code !== 'persistence') return rejectArguments(_id, new MemoryError(error.message));
           if (error instanceof MemoryError) return rejectArguments(_id,error);
           if (error instanceof RequestError) throw error;
           return failPersistence(error);
@@ -511,7 +520,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
         }
       },
     });
-    if (config.provider !== 'deepseek' || config.model !== 'deepseek-flash') customTools.splice(customTools.findIndex(tool => tool.name === 'read_image'),1);
+    if (!supportsImageInput(config)) customTools.splice(customTools.findIndex(tool => tool.name === 'read_image'),1);
     if (options.research) customTools.splice(0);
     if (options.research?.readMaterial && (researchCollects || researchPhase === 'review')) customTools.push({
       name: 'read_research_material', label: '读取已保存研究材料',
@@ -616,7 +625,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
     // Pi preserves reasoning_content using the thinking block signature. Explicit
     // compat also keeps OpenAI-compatible fixture providers on the same wire path.
     const model = options.research ? { ...configured.model, reasoning: true, compat: {
-      ...configured.model.compat, thinkingFormat: 'deepseek' as const, supportsReasoningEffort: true,
+      ...configured.model.compat, thinkingFormat: isBailianDeepSeek(config) ? 'qwen' as const : 'deepseek' as const, supportsReasoningEffort: true,
       requiresThinkingAsText: false, requiresReasoningContentOnAssistantMessages: true,
     } } : configured.model;
     const outputReserve = options.research ? RESEARCH_OUTPUT_RESERVE : model.maxTokens;
@@ -681,7 +690,39 @@ export async function openConversation(config: PaConfig, conversationId: string,
         || (!researchCollects && nextCall >= loop.maxModelCalls-(needsAttributionReview()?1:0));
     }
     type Transcript = Parameters<typeof convertToLlm>[0];
-    function projectStage(messages: Transcript, channel: boolean, ready: boolean, mode: ReplyMode, noTools: boolean): Transcript {
+    type ControlHistory = { length: number; hash: string; entries: { after: number; text: string; message: Transcript[number] }[] };
+    const emptyControlHistory = (): ControlHistory => ({ length: 0, hash: '', entries: [] });
+    let wireControls = emptyControlHistory();
+    function transcriptHash(messages: Transcript, length: number): string {
+      const hash = createHash('sha256');
+      for (let index = 0; index < length; index++) hash.update(JSON.stringify(messages[index]));
+      return hash.digest('hex');
+    }
+    function projectControls(messages: Transcript, text: string, history: ControlHistory): Transcript {
+      // Pi appends to the unprojected transcript during a tool loop. Keep only
+      // bounded control messages/offsets and a digest, never a second history.
+      // A context edit, rollback or replacement invalidates the old offsets.
+      if (messages.length < history.length || (history.hash && transcriptHash(messages, history.length) !== history.hash)) {
+        history.entries = [];
+      }
+      if (history.entries.at(-1)?.text !== text) {
+        if (history.entries.length >= loop.maxModelCalls) throw new Error('本轮应用控制投影次数超过模型请求预算。');
+        history.entries.push({ after: messages.length, text,
+          message: { role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() } });
+      }
+      history.length = messages.length;
+      history.hash = transcriptHash(messages, messages.length);
+      const projected: Transcript = [];
+      let start = 0;
+      for (const entry of history.entries) {
+        projected.push(...messages.slice(start, entry.after), entry.message);
+        start = entry.after;
+      }
+      projected.push(...messages.slice(start));
+      return projected;
+    }
+    function projectStage(messages: Transcript, channel: boolean, ready: boolean, mode: ReplyMode, noTools: boolean,
+      controls = emptyControlHistory()): Transcript {
       if(attributionReviewActive) return [{role:'system',content:ATTRIBUTION_REVIEW_PROMPT,timestamp:Date.now(),
         toolsRemoved:customTools.map(tool=>({name:tool.name}))},
         {role:'user',content:[{type:'text',text:JSON.stringify({currentQuestion:companionTools?.answerGrounding?.currentQuestion,
@@ -690,6 +731,11 @@ export async function openConversation(config: PaConfig, conversationId: string,
       // the new fixed preparation instructions there as well as on the wire.
       const hasGrounding=channel&&(!companionTools||Boolean(companionTools.answerGrounding));
       if (researchCollects && options.research?.compactResearchContext) messages = compactResearchContext(messages, researchContextReferences);
+      if (channel && !options.research) messages = projectControls(messages,
+        '[PA本轮控制｜应用生成]\n' + JSON.stringify({ stage: ready ? 'answer' : 'prepare', mode: ready ? mode : null,
+          groundingRequired: hasGrounding, verifyLink: companionTools?.verifyLink ?? null,
+          researchTarget: companionTools?.research?.target ?? null, saveClaimCorrection, toolsClosed: noTools,
+          linkReadAttempted, currentSearch: currentSearch ?? null }), controls);
       if (!messages.some(message => message.role === 'system')) {
         messages = [{ role: 'system', content: agentSession.systemPrompt, timestamp: Date.now() }, ...messages];
       }
@@ -708,17 +754,12 @@ export async function openConversation(config: PaConfig, conversationId: string,
         toolsAdded: available.map(tool => ({ name: tool.name, description: tool.description, parameters:
           tool.name==='prepare_turn' && hasGrounding
             ? {...TURN_PLAN_SCHEMA,required:[...TURN_PLAN_SCHEMA.required,'grounding']} : tool.parameters })),
-        toolsRemoved: customTools.filter(tool => !available.some(active => active.name === tool.name)).map(tool => ({ name: tool.name })) },
-        ...(channel && !options.research ? [{ role: 'user' as const, content: [{ type: 'text' as const,
-          text: '[PA本轮控制｜应用生成]\n' + JSON.stringify({ stage: ready ? 'answer' : 'prepare', mode: ready ? mode : null,
-            groundingRequired: hasGrounding, verifyLink: companionTools?.verifyLink ?? null,
-            researchTarget: companionTools?.research?.target ?? null, saveClaimCorrection, toolsClosed: noTools,
-            linkReadAttempted, currentSearch: currentSearch ?? null }) }], timestamp: Date.now() }] : [])];
+        toolsRemoved: customTools.filter(tool => !available.some(active => active.name === tool.name)).map(tool => ({ name: tool.name })) }];
     }
     function requestControls(payload: Record<string, unknown>, forcePreparation: boolean, noTools: boolean) {
       const tools = Array.isArray(payload.tools) ? payload.tools : [];
-      const controlled = { ...payload };
-      if (options.research) {
+      const controlled = applyModelPayload(config, { ...payload }, { thinking: Boolean(options.research), maxTokens: outputReserve });
+      if (options.research && !isBailianDeepSeek(config)) {
         delete controlled.max_tokens; delete controlled.max_completion_tokens;
         controlled.thinking = { type: 'enabled' };
         controlled.reasoning_effort = 'high';
@@ -734,10 +775,11 @@ export async function openConversation(config: PaConfig, conversationId: string,
           ? { type: 'function', function: { name: 'web_fetch' } } : noTools || !tools.length ? 'none' : 'auto',
         ...(forcePreparation || forceSearch || forceFetch ? { parallel_tool_calls: false } : {}) };
     }
-    function projectedEstimate(messages: Transcript, channel: boolean, ready: boolean, mode: ReplyMode): ContextEstimate {
+    function projectedEstimate(messages: Transcript, channel: boolean, ready: boolean, mode: ReplyMode,
+      controls = emptyControlHistory()): ContextEstimate {
       const noTools = options.research ? toolsClosed(1)
         : loop.maxToolCalls === 0 || loop.maxModelCalls <= (ready ? 2 : 1) || (ready && loop.maxToolCalls <= 1);
-      const projected = convertToLlm(projectStage(messages, channel, ready, mode, noTools));
+      const projected = convertToLlm(projectStage(messages, channel, ready, mode, noTools, controls));
       // Pi's public converter excludes Agent usage/audit metadata from the wire messages.
       // Optional message fields are reserved conservatively; actual payloads are checked again.
       const compat = { ...model.compat, supportsDeveloperRole: true, requiresToolResultName: true,
@@ -755,7 +797,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
     const previousTransform = agentSession.agent.transformContext;
     agentSession.agent.transformContext = async (messages, signal) => projectStage(
       await previousTransform?.(messages, signal) ?? messages, Boolean(companionTools), prepared, replyMode,
-      toolsClosed(providerCalls + 1));
+      toolsClosed(providerCalls + 1), wireControls);
     const previousFinishTurn = agentSession.agent.finishTurn;
     agentSession.agent.finishTurn = async (turn, signal) => {
       // Preserve Pi's session boundary and tool-result persistence before ending.
@@ -978,7 +1020,10 @@ export async function openConversation(config: PaConfig, conversationId: string,
           ...(memoryContext ? [{ role: 'user' as const, content: [{ type: 'text' as const, text: memoryContext }], timestamp: Date.now() }] : []),
           { role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() }];
         const channel = Boolean(options?.channel);
-        const initial = projectedEstimate(messages, channel, false, 'standard');
+        // Admission probes own their control history; each answer-mode branch
+        // starts from the same simulated preparation request, never the live run.
+        const controls = emptyControlHistory();
+        const initial = projectedEstimate(messages, channel, false, 'standard', controls);
         if (!channel) return initial;
         // The answer request also contains the generated preparation call and bounded receipt.
         const preparedMessages: Transcript = [...messages,
@@ -989,7 +1034,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           { role: 'toolResult', toolCallId: 'prepare-reserve', toolName: 'prepare_turn', content: [{ type: 'text',
             text: ' '.repeat(toolResultMaxBytes) }], isError: false, timestamp: Date.now() }];
         return (Object.keys(RESPONSE_MODE_PROMPTS) as ReplyMode[]).reduce((largest, mode) => {
-          const candidate = projectedEstimate(preparedMessages, true, true, mode);
+          const candidate = projectedEstimate(preparedMessages, true, true, mode, { ...controls, entries: [...controls.entries] });
           return candidate.inputTokens > largest.inputTokens ? candidate : largest;
         }, initial);
         } finally { imageProjections = previousProjections; }
@@ -1016,6 +1061,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
         }
         // Public SDK method rebuilds the canonical projection and the live Agent.
         agentSession.refreshContext();
+        wireControls = emptyControlHistory();
       },
       prompt(text, metadata) {
         if (closed) return Promise.reject(new Error('会话已关闭。'));
@@ -1037,6 +1083,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           referenceUrls = [];
           usedWebSearch = false;
           companionTools = metadata?.companionTools;
+          wireControls = emptyControlHistory();
           imageProjections = metadata?.imageProjections ?? [];
           prepared = false; preparationError = undefined; preparationReceipt = undefined; replyMode = 'standard'; progressAttempted = false;
           saveClaimCorrection = false; saveClaimFallback = false; enteredTools.clear(); recoverableTools.clear();
@@ -1166,6 +1213,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
             fetchReader = undefined;
             clearTimeout(requestTimer);
             companionTools = undefined;
+            wireControls = emptyControlHistory();
             attributionReviewActive=false;attributionCandidate=undefined;answerGrounding=undefined;currentSearch=undefined;
             activeAbortController = undefined;
             active = undefined;

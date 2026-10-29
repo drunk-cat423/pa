@@ -15,7 +15,7 @@ import type { MemoryProvider } from './memory-provider.js';
 import { selfProfileBudget } from './self-profile-store.js';
 import { requestTimeContext } from './request-time.js';
 import { NO_OWNER_POLICY, type HarnessPolicy } from './harness-policy.js';
-import { imageMetadata, type ImageProjection, type ImageContent } from './image-context.js';
+import { imageContent, imageMetadata, type ImageProjection, type ImageContent } from './image-context.js';
 import { ImageAssets } from './image-assets.js';
 import { DiagnosticLog } from './diagnostics.js';
 import type { ResearchToolContext } from './research-tools.js';
@@ -521,7 +521,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
                 if (!currentAsset) throw new RequestError('当前模型账号没有这张图片的可用引用，请重新引用或发送原图。','error');
                 persist(() => imageAssets.read(image.imageId));
                 content.push({ type: 'text', text: `[图片 imageId=${image.imageId}；归属与引用关系见前面的images元数据]\n` });
-                content.push({ type: 'file', file_id: currentAsset.fileId, bytes: currentAsset.bytes });
+                content.push(imageContent(imageAssets, currentAsset));
               }
             };
             // Stable summary first, then JSON lines: adding a message preserves
