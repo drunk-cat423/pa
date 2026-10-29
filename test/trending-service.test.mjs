@@ -11,7 +11,7 @@ import {DiagnosticPersistenceError} from '../dist/diagnostics.js';
 const route={channel:'qq',accountId:'offline',roomType:'group',roomId:'one'};
 const at=time=>Date.parse(`2026-10-30T${time}+08:00`);
 const snapshot={fetchedAt:'2026-10-30T00:55:00Z',sections:['daily','weekly','monthly'].map((period,index)=>({period,sourceUrl:`https://github.com/trending?since=${period}`,projects:Array.from({length:[5,3,2][index]},(_,i)=>({slug:`owner/project-${period}-${i}`,url:`https://github.com/owner/project-${period}-${i}`,description:'source'}))}))};
-const digest={snapshot,sections:snapshot.sections.map(s=>({period:s.period,text:`## ${s.period}\n`+s.projects.map(p=>`### ${p.slug}\n${'中'.repeat(100)}\n${p.url}`).join('\n')}))};
+const digest={snapshot,sections:snapshot.sections.map(s=>({period:s.period,text:`## ${s.period}\n\n`+s.projects.map(p=>`### ${p.slug}\n${'中'.repeat(100)}\n${p.url}`).join('\n\n')}))};
 function fixture(t,{clock=at('08:55:00'),routes=[route],collect=async()=>snapshot,generate=async()=>digest,send=async()=>({status:'sent',externalMessageId:'receipt'}),allowed}={}){
   const dir=mkdtempSync(join(tmpdir(),'pa-trending-')),services=[],errors=[],messages=[];
   const config={cwd:dir,dataDir:dir,provider:'offline',model:'offline',apiKey:'offline',contextWindow:32768,maxOutputTokens:2048,timeoutMs:2000,trending:{enabled:true,groupIds:routes.map(r=>r.roomId)}};
@@ -33,6 +33,7 @@ test('8:55持久生成、9点按完整批次分段主动Markdown投递，同日�
   await tick(service);assert.equal(batches,1);assert.ok(f.messages.length>1&&f.messages.length<=5);
   assert.ok(f.messages.every(m=>m.deliveryMode==='active'&&m.markdown===true&&Buffer.byteLength(m.text)<=1500));
   for(const section of snapshot.sections)for(const p of section.projects)assert.ok(f.messages.map(m=>m.text).join('').includes(p.url));
+  for(const section of snapshot.sections)for(const p of section.projects)assert.ok(f.messages.some(m=>m.text.includes(`### ${p.slug}\n${'中'.repeat(100)}\n${p.url}`)),'project description and URL stay in one message');
   assert.equal(service.info().status,'sent');assert.equal(existsSync(join(f.dir,'pa.sqlite')),false);
   const count=f.messages.length;await service.close();service=f.create();await tick(service);
   assert.equal(f.messages.length,count);assert.equal(generates,1);assert.equal(collects,1);
