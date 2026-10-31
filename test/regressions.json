@@ -3,6 +3,11 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "给定正确计划时Bot名称落AI pending，下一轮注入并归档原来源，个人称呼和偏好隔离",
+      "evidence": "2026-10-30 production inspection found a direct Bot-name correction routed to sender and later rejected by personal-profile consolidation. This isolated Pi/SQLite test verifies given correct ai_self versus sender plans, immediate pending injection, independent self archival and source preservation; model classification remains a separately evaluated semantic behavior."
+    },
+    {
       "file": "test/search-concurrency.test.mjs",
       "name": "共享无限预算允许四条请求并发，额外请求排队可取消且不占预算",
       "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
@@ -601,6 +606,11 @@
       "file": "test/answer-grounding.test.mjs",
       "name": "真实串人材料的归属绑定区分发言者与对象，拒绝伪造原文、其他房间及已纠正来源",
       "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
+    },
+    {
+      "file": "test/answer-grounding.test.mjs",
+      "name": "同一真人消息可提交两段摘录并在两次模型调用内完成回答，仍拒绝无效第二段",
+      "evidence": "Confirmed production bug: answer-grounding rejected two distinct consecutive quotes from one real user message as duplicate messageId, causing repeated preparation and budget exhaustion. Local Pi/HTTP regression verifies both excerpts bind to the same real speaker in the normal two-call flow; forged, corrected, and unknown sources remain rejected."
     },
     {
       "file": "test/answer-grounding.test.mjs",

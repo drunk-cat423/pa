@@ -66,6 +66,35 @@ test('真实串人材料的归属绑定区分发言者与对象，拒绝伪造�
   assert.equal(shared.crossPersonExperience,false);
 });
 
+test('同一真人消息可提交两段摘录并在两次模型调用内完成回答，仍拒绝无效第二段',async t=>{
+  const sameSpeakerContext={...context,currentSender:{senderId:'chocolate',personId:'person-chocolate',senderName:'巧克力'}};
+  const excerpts=[
+    {messageId:'source',quote:'之前用的免费插件'},
+    {messageId:'source',quote:'8个小时才写了几行代码'},
+  ];
+  const f=await fixture(t,(body,n)=>{
+    if(n===1)return preparationDelta('same-message-excerpts',plan(excerpts));
+    assert.equal(n,2);
+    const content=body.messages.findLast(m=>m.role==='tool').content;
+    const receipt=JSON.parse(content.split('\n').at(-1)).answerGrounding;
+    assert.equal(receipt.references.length,2);
+    assert.deepEqual(receipt.references.map(ref=>ref.speaker.senderId),['chocolate','chocolate']);
+    assert.deepEqual(receipt.references.map(ref=>ref.quote),excerpts.map(ref=>ref.quote));
+    return {role:'assistant',content:'巧克力提到过这段插件经历。'};
+  });
+  const runtime=await f.open('same-message-excerpts');
+  assert.equal(await runtime.prompt(sameSpeakerContext.currentQuestion,metadata(sameSpeakerContext)),'巧克力提到过这段插件经历。');
+  assert.equal(f.requests.length,2);
+  const correctedContext={...context,sources:[...context.sources,
+    {id:'corrected-source',role:'user',text:excerpts[1].quote,senderId:'chocolate',personId:'person-chocolate',senderName:'巧克力',corrected:true},
+  ]};
+  for(const second of [
+    {...excerpts[1],quote:'伪造摘录'},
+    {...excerpts[1],messageId:'corrected-source'},
+    {...excerpts[1],messageId:'unknown-source'},
+  ]) assert.throws(()=>bindAnswerGrounding(plan([excerpts[0],second]).grounding,correctedContext));
+});
+
 test('同轮纠正不再引用已否定旧说法，拒绝发生在保存之前且核验保留已保存纠正',async t=>{
   let saves=0;
   const correction={memoryId:'correction',sourceMessageId:'now',speakerSenderId:'owner',subjectSenderIds:['owner'],excludedSenderIds:['chocolate'],correctsMessageIds:['other-old']};

@@ -4,9 +4,14 @@ import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+import { createServer } from 'node:http';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
+import { openRecordedConversation } from '../dist/conversation.js';
+import { prepareMemoryExtraction } from '../dist/memory-provider.js';
+import { SELF_PROFILE_POLICY } from '../dist/profile-policy.js';
 import { emptyExtraction } from './fixtures/memory-output.mjs';
+import { currentMessage, isPreparationRequest, preparationDelta } from './fixtures/turn-preparation.mjs';
 import { decodeMemoryWireResponse } from '../dist/memory-wire.js';
 import { validateExtract } from '../dist/auto-memory.js';
 
@@ -98,6 +103,89 @@ test('即时画像接受归纳正文和当前确认，保留来源绑定而不�
     assert.ok(evidence.length > 0);
     assert.ok(evidence.every(row => !Object.hasOwn(JSON.parse(row.evidence_json), 'factQuote')), 'do not duplicate original text after validation');
   } finally { f.close(); }
+});
+
+test('给定正确计划时Bot名称落AI pending，下一轮注入并归档原来源，个人称呼和偏好隔离', async () => {
+  // Scripted plans verify persistence and final SDK payloads, not model classification accuracy.
+  const directory = mkdtempSync(join(tmpdir(), 'pa-profile-ownership-'));
+  const requests = [], errors = [];
+  const botName = '名称改为星河';
+  const personal = ['希望被称为小林', '偏好短回答'];
+  const plans = new Map([
+    ['不是的，星河指的就是你，以后就叫这个名字', [{ target: 'ai_self', content: botName,
+      subject: { subjectKind: 'ai', subjectQuote: '你' } }]],
+    ['我希望你以后叫我小林；我偏好短回答，请记住', personal.map(content => ({ target: 'sender', content,
+      subject: { subjectKind: 'self', subjectQuote: '我' } }))],
+  ]);
+  const server = createServer(async (request, response) => {
+    try {
+      let raw = ''; for await (const chunk of request) raw += chunk;
+      const body = JSON.parse(raw); requests.push(body);
+      const preparing = isPreparationRequest(body);
+      const delta = preparing ? preparationDelta(`ownership-${requests.length}`, {
+        intent: 'memory_update', mode: 'casual', updates: plans.get(currentMessage(body)?.text) ?? [],
+      }) : { role: 'assistant', content: '好。' };
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const [value, finish] of [[delta, null], [{}, preparing ? 'tool_calls' : 'stop']]) {
+        response.write(`data: ${JSON.stringify({ id: 'ownership', object: 'chat.completion.chunk', created: 1,
+          model: 'fixture', choices: [{ index: 0, delta: value, finish_reason: finish }] })}\n\n`);
+      }
+      response.end('data: [DONE]\n\n');
+    } catch (error) { errors.push(error); response.destroy(); }
+  });
+  let conversation, store;
+  try {
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const route = { channel: 'qq', accountId: 'test', roomType: 'group', roomId: 'ownership' };
+    conversation = await openRecordedConversation({ cwd: directory, dataDir: directory,
+      provider: 'fixture', model: 'fixture', apiKey: 'local-key',
+      baseUrl: `http://127.0.0.1:${server.address().port}`, contextWindow: 32768,
+      maxOutputTokens: 512, timeoutMs: 10000 }, 'ownership', route);
+    let sequence = 0;
+    for (const text of [...plans.keys(), '你好']) {
+      const result = await conversation.prompt(text, { eventId: String(++sequence), senderId: 'alice', modelInputText: text });
+      conversation.acknowledge(result.deliveryId, 'sent', `out-${sequence}`);
+    }
+    assert.deepEqual(errors, []);
+    assert.equal(requests.length, 6, 'three turns retain exactly preparation + answer');
+    for (const request of requests.slice(2)) {
+      const text = request.messages.map(message => typeof message.content === 'string' ? message.content
+        : (message.content ?? []).map(part => part.text ?? '').join('')).join('\n');
+      const block = text.split('[AI自身画像｜已归档与未归档]\n')[1];
+      assert.ok(block, 'the next preparation and answer must both receive AI pending');
+      const self = block.split('\n').map(line => { try { return JSON.parse(line); } catch { return undefined; } })
+        .find(value => value && typeof value.archived === 'string' && Array.isArray(value.pending));
+      assert.deepEqual(self, { archived: '', pending: [botName] });
+    }
+    store = new ConversationStore(join(directory, 'pa.sqlite'));
+    const room = store.db.prepare('SELECT id FROM conversations').get();
+    const source = store.externalMessage(room.id, '1');
+    const personId = store.autoMemory.personForActor(store.findActor(room.id, 'alice'));
+    assert.deepEqual(store.autoMemory.profile(personId).pending.map(item => item.content), personal);
+    const snapshot = store.autoMemory.selfProfile.snapshot();
+    assert.deepEqual(snapshot.pending.map(item => [item.content, item.sourceMessageId]), [[botName, source.id]]);
+    store.autoMemory.reserveMaterialsIfDue(room.id, 1000);
+    store.autoMemory.reserveMaterialsIfDue(room.id, 601000);
+    const job = store.autoMemory.claimNext(room.id, { owner: 'ownership', leaseMs: 60000, pipeline: 'materials' });
+    const input = store.autoMemory.taskInput(job);
+    const step = { ...input, mode: 'self', profiles: [], messages: input.messages.filter(message => message.id === source.id) };
+    assert.ok(prepareMemoryExtraction(step, 32768).systemPrompt.includes(SELF_PROFILE_POLICY));
+    const organized = validateExtract(decodeMemoryWireResponse({ selfProfile: {
+      baseVersion: snapshot.baseVersion, content: botName, pendingIds: ['s0'], updates: [],
+    } }, step), step);
+    store.autoMemory.commit(job.id, job.leaseToken, organized, undefined, { key: 'self', messageIds: [] });
+    assert.equal(store.autoMemory.selfProfile.snapshot().content, botName);
+    assert.deepEqual(store.autoMemory.selfProfile.snapshot().pending, []);
+    assert.deepEqual(store.autoMemory.profile(personId).pending.map(item => item.content), personal);
+    const archived = store.db.prepare('SELECT message_id,pending_id FROM self_profile_update_sources').all();
+    assert.deepEqual(archived.map(row => [row.message_id, row.pending_id]), [[source.id, snapshot.pending[0].id]]);
+  } finally {
+    await conversation?.close();
+    store?.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('第三方归纳仍须管理员与真实对象定位，仅保存对象token兼容旧协议', () => {

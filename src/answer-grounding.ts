@@ -43,12 +43,10 @@ export function validateAnswerGrounding(value: unknown): AnswerGroundingPlan {
     || value.experienceRefs.length>6 || (value.searchQuery!==undefined&&!bounded(value.searchQuery,500))) {
     throw new MemoryError('回答依据计划无效。');
   }
-  const seen=new Set<string>();
   for(const ref of value.experienceRefs) {
     if(!object(ref)||Object.keys(ref).some(k=>!['messageId','quote','subjectSenderId'].includes(k))
-      ||!bounded(ref.messageId,128)||!bounded(ref.quote,400)||seen.has(ref.messageId)
-      ||(ref.subjectSenderId!==undefined&&!bounded(ref.subjectSenderId,512))) throw new MemoryError('经历引用必须是唯一消息编号及不超过400字符的原文摘录。');
-    seen.add(ref.messageId);
+      ||!bounded(ref.messageId,128)||!bounded(ref.quote,400)
+      ||(ref.subjectSenderId!==undefined&&!bounded(ref.subjectSenderId,512))) throw new MemoryError('经历引用必须包含消息编号及不超过400字符的原文摘录。');
   }
   if(Buffer.byteLength(JSON.stringify(value))>10000) throw new MemoryError('回答依据超过本轮容量。');
   return value as unknown as AnswerGroundingPlan;

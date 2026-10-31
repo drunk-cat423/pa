@@ -1,0 +1,4 @@
+interface:
+  display_name: "对话提示词实测"
+  short_description: "用真实对话验证风格与工具链，并审查提示冗余、缓存前缀和调用开销"
+  default_prompt: "使用 $companion-prompt-eval 调整对话表达，复现实测失败并检查缓存与开销。"
