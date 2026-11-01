@@ -3,6 +3,11 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/trending-service.test.mjs",
+      "name": "真实故障3条有效7条typo占位逐项降级，真实Pi/SQLite正式期恢复与投递幂等",
+      "evidence": "2026-11-01 production daily edition collected 10 projects but rejected a normal-stop response with three valid introductions and seven indroduction:placeholder items, so nothing was delivered. Local Pi/HTTP and SQLite regression checks partial fallback, harmless legacy format tolerance, no paid retry, canonical links, bounded Markdown, same-edition operator recovery and restart/delivery idempotency. Private evidence stays in .local."
+    },
+    {
       "file": "test/person-profile-policy.test.mjs",
       "name": "给定正确计划时Bot名称落AI pending，下一轮注入并归档原来源，个人称呼和偏好隔离",
       "evidence": "2026-10-30 production inspection found a direct Bot-name correction routed to sender and later rejected by personal-profile consolidation. This isolated Pi/SQLite test verifies given correct ai_self versus sender plans, immediate pending injection, independent self archival and source preservation; model classification remains a separately evaluated semantic behavior."

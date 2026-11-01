@@ -2,7 +2,7 @@ import {join} from 'node:path';
 import type {PaConfig} from './config.js';
 import type {ChannelRoute,DeliveryResult,OutboundMessage} from './channel-types.js';
 import {DiagnosticPersistenceError} from './diagnostics.js';
-import {collectTrending,generateTrendingDigest,type TrendingDigest,type TrendingSnapshot} from './trending-content.js';
+import {collectTrending,generateTrendingDigest,fallbackTrendingDigest,type TrendingDigest,type TrendingSnapshot} from './trending-content.js';
 import {TrendingStore,TrendingPersistenceError,routeKey,type TrendingEdition,type TrendingCode} from './trending-store.js';
 
 const DAY=86_400_000,OFFSET=8*60*60_000;
@@ -14,6 +14,7 @@ export interface TrendingDependencies {
   generator?:(config:PaConfig,snapshot:TrendingSnapshot,signal:AbortSignal)=>Promise<TrendingDigest>;
 }
 export interface TrendingRunOptions {id:string;groupIds?:string[];preview?:boolean}
+class GenerationCleanupPending extends Error {}
 
 /** A program-owned daily job. There is deliberately no chat tool or personal context. */
 export class TrendingService {
@@ -58,6 +59,8 @@ export class TrendingService {
         const edition=store.create({id:date,date,manual:false,state:'pending',routes:this.targets.map(r=>({...r})),attempts:0,nextAttemptAt:0,createdAt:at,updatedAt:at});
         await this.process(edition,false);
       }
+      const recovery=store.pendingRecovery(this.now());
+      if(recovery)await this.process(recovery,false);
       const manual=store.pendingManual(this.now());
       if(manual)await this.process(manual,false);
     });
@@ -74,19 +77,31 @@ export class TrendingService {
   private lastCode:TrendingCode|undefined;
   private persistenceFailure(error:unknown):boolean{return error instanceof TrendingPersistenceError||error instanceof DiagnosticPersistenceError;}
   private setState(id:string,state:TrendingEdition['state'],code?:TrendingCode):TrendingEdition {
-    return this.storage().update(id,e=>{e.state=state;e.updatedAt=this.now();if(code)e.code=code;else delete e.code;});
+    return this.storage().update(id,e=>{e.state=state;e.updatedAt=this.now();if(code)e.code=code;else delete e.code;if(state==='delivered'&&e.recovery)e.recovery.status='completed';});
   }
-  private async bounded<T>(operation:(signal:AbortSignal)=>Promise<T>):Promise<T>{
+  private async bounded<T>(operation:(signal:AbortSignal)=>Promise<T>,settleGeneration=false):Promise<T>{
     const signal=AbortSignal.any([this.abort.signal,AbortSignal.timeout(Math.min(this.config.timeoutMs,120_000))]);
     signal.throwIfAborted();
     return new Promise<T>((resolve,reject)=>{
-      const onAbort=()=>reject(signal.reason);signal.addEventListener('abort',onAbort,{once:true});
-      Promise.resolve().then(()=>operation(signal)).then(resolve,error=>{
-        // Cancellation can settle the outer wait before model/diagnostic cleanup fails.
-        // Still notify the harness, including after close(), without waiting for cleanup.
+      let settled=false,cleanupTimer:ReturnType<typeof setTimeout>|undefined;
+      const finish=(failed:boolean,value:unknown)=>{
+        if(settled)return;settled=true;
+        clearTimeout(cleanupTimer);signal.removeEventListener('abort',onAbort);this.abort.signal.removeEventListener('abort',onClose);
+        if(failed)reject(value);else resolve(value as T);
+      };
+      const onClose=()=>finish(true,this.abort.signal.reason);
+      const onAbort=()=>{
+        // Generation timeout must include diagnostic cleanup before fallback can be delivered.
+        // A nonsettling operation remains unknown; it must not block tomorrow's edition forever.
+        if(settleGeneration&&!this.abort.signal.aborted)cleanupTimer=setTimeout(()=>finish(true,new GenerationCleanupPending()),1000);
+        else finish(true,signal.reason);
+      };
+      signal.addEventListener('abort',onAbort,{once:true});this.abort.signal.addEventListener('abort',onClose,{once:true});
+      Promise.resolve().then(()=>operation(signal)).then(value=>finish(signal.aborted,signal.aborted?signal.reason:value),error=>{
+        // Even after bounded cleanup/close, a late persistence error remains fatal to the harness.
         if(this.persistenceFailure(error))this.fail(error);
-        reject(error);
-      }).catch(reject).finally(()=>signal.removeEventListener('abort',onAbort));
+        finish(true,error);
+      }).catch(error=>finish(true,error));
     });
   }
   private async process(original:TrendingEdition,preview:boolean):Promise<void>{
@@ -94,6 +109,10 @@ export class TrendingService {
     if(!this.enabled())return;
     if(this.now()<edition.nextAttemptAt)return;
     if(edition.routes.some(route=>!this.targets.some(r=>routeKey(r)===routeKey(route)))){this.setState(edition.id,'failed','route_unavailable');return;}
+    if(edition.recovery?.status==='requested'){
+      const recovered=store.prepareRecovery(edition.id,fallbackTrendingDigest(edition.snapshot!,'operator_recovery'),this.now());
+      if(!recovered)return;edition=recovered;
+    }
     if(['pending','collect_failed'].includes(edition.state)){
       if(edition.attempts>=3){this.setState(edition.id,'failed','collect_exhausted');return;}
       if(this.now()<edition.nextAttemptAt)return;
@@ -104,14 +123,18 @@ export class TrendingService {
       if(!this.enabled()){this.setState(edition.id,'collect_failed','collect_failed');return;}
       edition=store.update(edition.id,e=>{e.snapshot=snapshot;e.state='generating';e.updatedAt=this.now();});
       let digest:TrendingDigest;
-      try{digest=await this.bounded(signal=>this.generator(this.config,snapshot,signal));}
-      catch(error){if(this.persistenceFailure(error))throw error;this.setState(edition.id,'uncertain','generation_unknown');return;}
+      try{digest=await this.bounded(signal=>this.generator(this.config,snapshot,signal),true);}
+      catch(error){
+        if(this.persistenceFailure(error))throw error;
+        if(this.abort.signal.aborted||error instanceof GenerationCleanupPending){this.setState(edition.id,'uncertain','generation_unknown');return;}
+        digest=fallbackTrendingDigest(snapshot,'generation_failed');
+      }
       if(!this.enabled()){this.setState(edition.id,'uncertain','generation_unknown');return;}
       if(!digest.sections?.length||digest.sections.some(s=>typeof s.text!=='string'||!s.text.trim())){this.setState(edition.id,'failed','digest_invalid');return;}
       edition=store.update(edition.id,e=>{e.digest=digest;e.state='ready';e.updatedAt=this.now();});
     }
     if(edition.state!=='ready'||preview||!this.enabled())return;
-    if(!edition.manual){const due=dueAt(edition.date);if(this.now()<due)return;if(this.now()>=due+60*60_000){this.setState(edition.id,'expired','expired');return;}}
+    if(!edition.manual){const due=dueAt(edition.date);if(this.now()<due)return;if(edition.recovery?dayAt(this.now())!==edition.date:this.now()>=due+60*60_000){this.setState(edition.id,'expired','expired');return;}}
     if(!edition.parts){
       const late=!edition.manual&&this.now()>=dueAt(edition.date)+60_000;
       const title=`# GitHub Trending · ${edition.date}${edition.manual?' · 试运行':''}\n${late?'延迟补发：原定北京时间 09:00。\n':''}`;
@@ -142,7 +165,7 @@ export class TrendingService {
         for(const part of parts){
           if(part.status!=='pending')continue;
           if(!this.enabled())return;
-          if(!edition.manual&&this.now()>=dueAt(edition.date)+60*60_000){this.setState(edition.id,'expired','expired');return;}
+          if(!edition.manual&&(edition.recovery?dayAt(this.now())!==edition.date:this.now()>=dueAt(edition.date)+60*60_000)){this.setState(edition.id,'expired','expired');return;}
           if(!this.allowedRoutes().some(r=>routeKey(r)===routeKey(route))||!this.targets.some(r=>routeKey(r)===routeKey(route))){
             store.update(edition.id,e=>{e.code='route_unavailable';e.nextAttemptAt=this.now()+60_000;e.updatedAt=this.now();});return;
           }
@@ -200,7 +223,7 @@ export class TrendingService {
     const nextRun=terminal||generated||at>=due+3_600_000?tomorrow:Math.max(due-300_000,at,edition?.nextAttemptAt??0);
     const nextSend=terminal||at>=due+3_600_000?tomorrow+300_000:Math.max(due,at,edition?.nextAttemptAt??0);
     return {enabled:this.config.trending?.enabled===true,started:Boolean(this.timer),running:Boolean(this.pending),failed:this.fatal||Boolean(edition?.code??this.lastCode),
-      ...(edition?{latestDate:edition.date,status}:{}),...(this.lastCode??edition?.code?{errorCode:this.lastCode??edition?.code}:{}),
+      ...(edition?{latestDate:edition.date,status,...(edition.digest?.degraded?{degraded:edition.digest.degraded}:{}),...(edition.recovery?{recovery:edition.recovery}:{})}:{}),...(this.lastCode??edition?.code?{errorCode:this.lastCode??edition?.code}:{}),
       nextDue:this.enabled()?new Date(Math.min(nextRun,nextSend)).toISOString():null,
       nextRunAt:this.enabled()?new Date(nextRun).toISOString():null,
       nextSendAt:this.enabled()?new Date(nextSend).toISOString():null};

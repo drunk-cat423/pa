@@ -3,6 +3,8 @@ import test from 'node:test';
 import {mkdtempSync,rmSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {createServer} from 'node:http';
+import {generateTrendingDigest} from '../dist/trending-content.js';
 import {TrendingService} from '../dist/trending-service.js';
 import {TrendingStore} from '../dist/trending-store.js';
 import {readTrendingConfig} from '../dist/config.js';
@@ -52,13 +54,14 @@ test('部分sent和未知回执不重发，未知段停止该群整批；无外�
   const count=f.messages.length;await tick(service);assert.equal(f.messages.length,count);
 });
 
-test('采集仅3次、模型未知仅1次且不堵次日；10点以后不补历史期',async t=>{
+test('采集仅3次、模型失败单次降级且不堵次日；10点以后不补历史期',async t=>{
   let collects=0,generates=0;
   const f=fixture(t,{collect:async()=>{collects++;if(collects<=3)throw new Error('offline');return snapshot;},generate:async()=>{generates++;throw new Error('unknown model result');}});
   const service=f.create();await tick(service);await tick(service);assert.equal(collects,1);
   f.clock+=60_000;await tick(service);f.clock+=60_000;await tick(service);assert.equal(collects,3);assert.equal(service.info().errorCode,'collect_exhausted');
-  f.clock=Date.parse('2026-10-31T09:10:00+08:00');await tick(service);await tick(service);assert.equal(generates,1);assert.equal(service.info().errorCode,'generation_unknown');
-  f.clock=Date.parse('2026-11-01T10:00:00+08:00');await tick(service);assert.equal(generates,1);assert.equal(collects,4);assert.equal(f.messages.length,0);
+  f.clock=Date.parse('2026-10-31T09:10:00+08:00');await tick(service);await tick(service);assert.equal(generates,1);assert.equal(service.info().status,'sent');assert.equal(service.info().degraded.length,10);
+  const sent=f.messages.length;assert.ok(sent>0);
+  f.clock=Date.parse('2026-11-01T10:00:00+08:00');await tick(service);assert.equal(generates,1);assert.equal(collects,4);assert.equal(f.messages.length,sent);
 });
 
 test('持久manual请求由运行harness消费，跨进程幂等、不占正式日期，群路由冻结且分段CAS',async t=>{
@@ -98,6 +101,34 @@ test('关闭中止模型等待，生成中崩溃/发送中崩溃恢复均保留�
     const d=store.requestManual('send-crash',[route],f.clock);store.prepareParts(d.id,['part'],f.clock);assert.equal(store.beginPart(d.id,route,0),true);assert.equal(store.beginPart(d.id,route,0),false);store.recover(f.clock);
     assert.equal(store.parts(d.id,route)[0].status,'uncertain');assert.equal(store.beginPart(d.id,route,0),false);
   }finally{store.close();}
+  // Reproduce timeout -> delayed diagnostic failure: no fallback may leave before cleanup settles.
+  const timed=fixture(t,{clock:at('09:00:00'),generate:async(_c,_s,signal)=>new Promise((_resolve,reject)=>{
+    signal.addEventListener('abort',()=>setTimeout(()=>reject(new DiagnosticPersistenceError()),30),{once:true});
+  })});
+  timed.config.timeoutMs=20;
+  const timedService=timed.create();await tick(timedService);
+  assert.equal(timed.messages.length,0);assert.equal(timedService.info().errorCode,'persistence_failed');
+  assert.equal(timed.errors.length,1);assert.ok(timed.errors.pop() instanceof DiagnosticPersistenceError);
+  // Ordinary cleanup completes before the fallback is sent.
+  let cleaned=false;
+  const clean=fixture(t,{clock:at('09:00:00'),generate:async(_c,_s,signal)=>new Promise((_resolve,reject)=>{
+    signal.addEventListener('abort',()=>setTimeout(()=>{cleaned=true;reject(new Error('model cancelled'));},30),{once:true});
+  }),send:async()=>{assert.equal(cleaned,true);return {status:'sent',externalMessageId:'after-cleanup'};}});
+  clean.config.timeoutMs=20;const cleanService=clean.create();await tick(cleanService);
+  assert.equal(cleanService.info().status,'sent');assert.ok(clean.messages.length);
+  // A cleanup that never settles is bounded, keeps this edition unknown, and releases the next day's schedule.
+  let abandon;
+  const stuck=fixture(t,{clock:at('09:00:00')});
+  stuck.config.timeoutMs=20;let modelCalls=0;
+  const stuckService=stuck.create({deps:{generator:async(c,s,signal)=>{modelCalls++;return modelCalls===1?new Promise((_resolve,reject)=>{
+    signal.addEventListener('abort',()=>{abandon=()=>reject(new DiagnosticPersistenceError());},{once:true});
+  }):digest;}}});
+  await tick(stuckService);assert.equal(stuck.messages.length,0);assert.equal(stuckService.info().errorCode,'generation_unknown');
+  stuck.clock=Date.parse('2026-10-31T09:00:00+08:00');await tick(stuckService);
+  assert.equal(modelCalls,2);assert.equal(stuckService.info().status,'sent');
+  abandon();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(stuck.errors.length,1);assert.ok(stuck.errors.pop() instanceof DiagnosticPersistenceError);
+
 });
 
 test('开启要求显式当前QQ群子集，过长日报不裁链接、不发送，普通失败不触发fatal',async t=>{
@@ -108,4 +139,91 @@ test('开启要求显式当前QQ群子集，过长日报不裁链接、不发送
   await tick(service);assert.equal(service.info().status,'failed');assert.equal(service.info().errorCode,'digest_invalid');assert.equal(f.messages.length,0);
   const fatal=f.create({deps:{now:()=>Date.parse('2026-10-31T09:00:00+08:00'),generator:async()=>{throw new DiagnosticPersistenceError();}}});
   await tick(fatal);assert.equal(fatal.info().failed,true);assert.equal(f.errors.length,1);assert.ok(f.errors.pop() instanceof DiagnosticPersistenceError);
+});
+
+
+test('真实故障3条有效7条typo占位逐项降级，真实Pi/SQLite正式期恢复与投递幂等',async t=>{
+  let requests=0,mode='recorded';
+  const server=createServer(async(request,response)=>{
+    let raw='';for await(const chunk of request)raw+=chunk;
+    const body=JSON.parse(raw);requests++;
+    const input=JSON.parse(body.messages.find(message=>message.role==='user').content);
+    if(mode==='timeout')return;
+    if(mode==='transport'){response.writeHead(503,{'content-type':'application/json'});response.end(JSON.stringify({error:{message:'fixture unavailable'}}));return;}
+    let text='{invalid json';
+    if(mode==='recorded'){
+      const projects=input.projects.map((p,index)=>({slug:p.slug,...(index<3?{introduction:`有效简介：管理文件的工具${index}。`}:{indroduction:'placeholder'})}));
+      text=JSON.stringify({projects});
+    }else if(mode==='tolerant'){
+      const projects=input.projects.map(p=>({slug:p.slug,indroduction:'  管理文件的\n中文工具。 ',extra:true,url:'https://invented.example'})).reverse();
+      projects.push({slug:'invented/project',introduction:'伪造项目'});
+      projects.push({...projects.find(p=>p.slug===input.projects[0].slug)}); // ambiguous duplicate falls back, other items survive
+      text='```json\n'+JSON.stringify({projects,extra:'ignored'})+'\n```';
+    }else if(mode==='mapping'){
+      text=JSON.stringify(Object.fromEntries(input.projects.map(p=>[p.slug,'管理文件。'.repeat(200)])));
+    }
+    response.writeHead(200,{'content-type':'text/event-stream'});
+    response.write(`data: ${JSON.stringify({id:'fixture',object:'chat.completion.chunk',created:1,model:'deepseek-v4.1-flash',choices:[{index:0,delta:{role:'assistant',content:text},finish_reason:null}]})}\n\n`);
+    response.end(`data: ${JSON.stringify({id:'fixture',object:'chat.completion.chunk',created:1,model:'deepseek-v4.1-flash',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));});
+  const f=fixture(t,{clock:at('09:00:00')}),base={...f.config,provider:'bailian',model:'deepseek-v4.1-flash',apiKey:'fixture-key',baseUrl:`http://127.0.0.1:${server.address().port}/v1`};
+  let batches=0;
+  const generator=(_config,frozen,signal)=>generateTrendingDigest(base,frozen,signal);
+  let service=f.create({deps:{generator},output:async(_route,op)=>{batches++;await op();}});
+  await tick(service);
+  assert.equal(requests,1);assert.equal(batches,1);assert.equal(service.info().status,'sent');
+  assert.equal(service.info().failed,false);assert.equal(service.info().degraded.length,7);
+  let store=f.inspect();try{
+    const edition=store.get('2026-10-30');assert.equal(edition.state,'delivered');assert.equal(edition.digest.degraded.length,7);
+    const text=f.messages.map(m=>m.text).join('\n');
+    assert.match(text,/有效简介：管理文件的工具0。/);assert.match(text,/原始描述：source/);assert.ok(!text.includes('placeholder'));
+    let position=-1;for(const section of snapshot.sections)for(const project of section.projects){const next=text.indexOf(project.url);assert.ok(next>position);position=next;}
+    assert.ok(f.messages.length<=5&&f.messages.every(m=>Buffer.byteLength(m.text)<=1500&&!m.text.includes('试运行')));
+    assert.throws(()=>store.requestRecovery('2026-10-30',f.clock),/从未开始投递/);
+  }finally{store.close();}
+  const count=f.messages.length;await service.close();service=f.create({deps:{generator}});await tick(service);
+  assert.equal(f.messages.length,count);assert.equal(requests,1);
+  // Small protocol/transport variations share the same real Pi endpoint; each edition still makes exactly one call.
+  for(const scenario of ['tolerant','json','transport','timeout','mapping']){
+    mode=scenario;const before=requests;
+    const frozen=structuredClone(snapshot);
+    if(mode==='mapping')for(const section of frozen.sections)for(const [index,p]of section.projects.entries()){
+      const repo=section.period+'-'+index;p.slug='a'.repeat(39)+'/'+repo+'x'.repeat(100-repo.length);p.url='https://github.com/'+p.slug;
+    }
+    if(mode==='json')frozen.sections[0].projects[0].description='';
+    const generated=await generateTrendingDigest(mode==='timeout'?{...base,timeoutMs:1000}:base,frozen);
+    assert.equal(requests,before+1);
+    if(mode==='tolerant'){assert.equal(generated.degraded.length,1);assert.match(generated.sections[0].text,/管理文件的 中文工具。/);assert.ok(!generated.sections[0].text.includes('invented'));}
+    if(mode==='json'||mode==='transport'||mode==='timeout'){assert.equal(generated.degraded.length,10);assert.match(generated.sections[0].text,mode==='json'?/资料有限/:/原始描述：/);}
+    const id='scenario-'+scenario;
+    const writer=f.inspect();try{writer.requestManual(id,[route],f.clock);writer.update('manual:'+id,e=>{e.snapshot=frozen;e.digest=generated;e.state='ready';});}finally{writer.close();}
+    await tick(service);const inspector=f.inspect();try{assert.equal(inspector.get('manual:'+id).state,'delivered');}finally{inspector.close();}
+    assert.equal(requests,before+1,'sending a persisted digest never calls the model');
+  }
+  await service.close();
+  // Model failures from a previous release are explicitly recovered on the same formal edition, after 10:00.
+  f.clock=Date.parse('2026-10-31T12:00:00+08:00');store=f.inspect();try{
+    store.create({id:'2026-10-31',date:'2026-10-31',manual:false,state:'uncertain',code:'generation_unknown',snapshot,routes:[route],attempts:1,nextAttemptAt:0,createdAt:f.clock,updatedAt:f.clock});
+    const recovered=store.requestRecovery('2026-10-31',f.clock);assert.equal(recovered.recovery.previousCode,'generation_unknown');
+    assert.deepEqual(store.requestRecovery('2026-10-31',f.clock).recovery,recovered.recovery);
+    assert.throws(()=>store.requestRecovery('2026-10-30',f.clock),/今天/);
+  }finally{store.close();}
+  const beforeRecovery=requests,priorMessages=f.messages.length;service=f.create({deps:{generator}});await tick(service);
+  assert.equal(requests,beforeRecovery);assert.equal(service.info().status,'sent');assert.equal(service.info().failed,false);
+  assert.ok(f.messages.length>priorMessages);assert.ok(f.messages.slice(priorMessages).every(m=>m.text.includes('2026-10-31')||!m.text.includes('GitHub Trending ·')));
+  store=f.inspect();try{
+    const recovered=store.get('2026-10-31');assert.equal(recovered.state,'delivered');assert.equal(recovered.recovery.previousState,'uncertain');assert.equal(recovered.recovery.previousCode,'generation_unknown');assert.equal(recovered.recovery.status,'completed');
+  }finally{store.close();}
+  const recoveredMessages=f.messages.length;await service.close();service=f.create({deps:{generator}});await tick(service);
+  assert.equal(requests,beforeRecovery);assert.equal(f.messages.length,recoveredMessages);
+  await service.close();f.clock=Date.parse('2026-11-01T23:59:00+08:00');store=f.inspect();try{
+    store.create({id:'2026-11-01',date:'2026-11-01',manual:false,state:'uncertain',code:'generation_unknown',snapshot,routes:[route],attempts:1,nextAttemptAt:0,createdAt:f.clock,updatedAt:f.clock});
+    store.prepareParts('2026-11-01',['must not retry'],f.clock);store.beginPart('2026-11-01',route,0);
+    store.update('2026-11-01',e=>{e.state='uncertain';e.code='generation_unknown';});
+    assert.throws(()=>store.requestRecovery('2026-11-01',f.clock),/从未开始投递/);
+  }finally{store.close();}
+  f.clock=Date.parse('2026-11-02T08:00:00+08:00');service=f.create({deps:{generator}});await tick(service);
+  assert.equal(requests,beforeRecovery);assert.equal(f.messages.length,recoveredMessages);
 });

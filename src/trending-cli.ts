@@ -7,9 +7,9 @@ import {TrendingStore} from './trending-store.js';
 
 async function main():Promise<void>{
   const [command,id,...extra]=process.argv.slice(2);
-  if(extra.length||!['preview','request-test','status'].includes(command??'')
-    ||(command==='preview'&&id)||(command==='request-test'&&!id)
-    ||(id&&!/^[a-zA-Z0-9_-]{1,80}$/.test(id)))throw new Error('用法：trending-cli.js preview | request-test <唯一编号> | status [手工编号]');
+  if(extra.length||!['preview','request-test','recover','status'].includes(command??'')
+    ||(command==='preview'&&id)||(['request-test','recover'].includes(command??'')&&!id)
+    ||(id&&!/^[a-zA-Z0-9_-]{1,80}$/.test(id)))throw new Error('用法：trending-cli.js preview | request-test <唯一编号> | recover YYYY-MM-DD | status [手工编号]');
   const config=readConfig();
   if(command==='preview'){
     const snapshot=await collectTrending(config),digest=await generateTrendingDigest(config,snapshot);
@@ -19,6 +19,11 @@ async function main():Promise<void>{
   if(command==='status'&&!existsSync(path)){console.log(JSON.stringify({state:'not_initialized'}));return;}
   const store=new TrendingStore(path);
   try{
+    if(command==='recover'){
+      if(!config.trending?.enabled)throw new Error('Trending 未启用，未安排恢复。');
+      const e=store.requestRecovery(id!);
+      console.log(JSON.stringify({id:e.id,state:e.state,recovery:e.recovery,notice:'由运行中的PA服务使用原快照和原群路由补发正式日报，不重新请求模型。'}));return;
+    }
     if(command==='request-test'){
       if(!config.trending?.enabled)throw new Error('Trending 未启用，未安排试发。');
       const routes=readQQSettings().routes.filter(r=>r.roomType==='group'&&config.trending!.groupIds.includes(r.roomId));
@@ -27,7 +32,7 @@ async function main():Promise<void>{
       console.log(JSON.stringify({id:e.id,state:e.state,groups:e.routes.length,notice:'由运行中的PA服务生成并发送；不会建立第二个QQ连接。'}));return;
     }
     const e=id?store.get(`manual:${id}`):store.latest();
-    console.log(JSON.stringify(e?{id:e.id,date:e.date,state:e.state,code:e.code,attempts:e.attempts,
+    console.log(JSON.stringify(e?{id:e.id,date:e.date,state:e.state,code:e.code,attempts:e.attempts,degraded:e.digest?.degraded,recovery:e.recovery,
       groups:e.routes.map((r,index)=>({index,parts:store.parts(e.id,r).map(p=>({index:p.index,status:p.status}))})),updatedAt:new Date(e.updatedAt).toISOString()}: {state:'not_found'},null,2));
   }finally{store.close();}
 }

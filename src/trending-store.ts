@@ -9,6 +9,7 @@ export interface TrendingEdition {
   id:string; date:string; manual:boolean; preview?:boolean; state:'pending'|'collecting'|'collect_failed'|'generating'|'ready'|'delivered'|'failed'|'uncertain'|'expired';
   routes:ChannelRoute[]; attempts:number; nextAttemptAt:number; createdAt:number; updatedAt:number;
   code?:TrendingCode; snapshot?:TrendingSnapshot; digest?:TrendingDigest; parts?:string[];
+  recovery?:{requestedAt:number;previousState:TrendingEdition['state'];previousCode:TrendingCode;status:'requested'|'ready'|'completed'};
 }
 export interface TrendingPart {index:number; status:'pending'|'sending'|'sent'|'uncertain'|'rejected'; externalMessageId?:string}
 export class TrendingPersistenceError extends Error {
@@ -50,6 +51,36 @@ export class TrendingStore {
     if(JSON.stringify(edition.routes.map(routeKey).sort())!==JSON.stringify(targets.map(routeKey).sort()))throw new Error('同一手工日报编号不能变更群路由。');
     return edition;
   }
+  /** Explicit recovery preserves the failed edition and its original frozen routes. Never retries delivery. */
+  requestRecovery(date:string,at=Date.now()):TrendingEdition {
+    const today=new Date(at+8*3_600_000).toISOString().slice(0,10);
+    if(date!==today)throw new Error('仅能恢复北京时间今天的正式日报。');
+    const result=this.transaction(()=>{
+      const edition=this.get(date);
+      if(!edition||edition.manual||edition.date!==date)return undefined;
+      if(edition.recovery)return edition; // Repeated operator requests are idempotent.
+      if(!edition.snapshot||!['failed','uncertain'].includes(edition.state)||!['generation_unknown','digest_invalid'].includes(edition.code??'')
+        ||edition.parts||this.db.prepare('SELECT 1 FROM parts WHERE edition_id=? LIMIT 1').get(date))return undefined;
+      edition.recovery={requestedAt:at,previousState:edition.state,previousCode:edition.code!,status:'requested'};
+      edition.nextAttemptAt=0;edition.updatedAt=at;this.db.prepare('UPDATE editions SET body=? WHERE id=?').run(JSON.stringify(edition),date);
+      return edition;
+    });
+    if(!result)throw new Error('恢复需要当天已有快照、生成失败且从未开始投递的正式日报。');
+    return result;
+  }
+  pendingRecovery(at:number):TrendingEdition|undefined {return this.safe(()=>{
+    const date=new Date(at+8*3_600_000).toISOString().slice(0,10);
+    const edition=this.get(date);
+    return edition?.recovery&&edition.nextAttemptAt<=at&&((edition.recovery.status==='requested'&&['failed','uncertain'].includes(edition.state)
+      &&['generation_unknown','digest_invalid'].includes(edition.code??''))||(edition.recovery.status==='ready'&&edition.state==='ready'))?edition:undefined;
+  });}
+  prepareRecovery(id:string,digest:TrendingDigest,at:number):TrendingEdition|undefined {return this.transaction(()=>{
+    const edition=this.get(id);
+    if(!edition||edition.manual||edition.date!==new Date(at+8*3_600_000).toISOString().slice(0,10)||edition.recovery?.status!=='requested'
+      ||!['failed','uncertain'].includes(edition.state)||!['generation_unknown','digest_invalid'].includes(edition.code??'')||edition.parts||this.db.prepare('SELECT 1 FROM parts WHERE edition_id=? LIMIT 1').get(id))return undefined;
+    edition.digest=digest;edition.state='ready';edition.recovery.status='ready';edition.updatedAt=at;delete edition.code;
+    this.db.prepare('UPDATE editions SET body=? WHERE id=?').run(JSON.stringify(edition),id);return edition;
+  });}
   pendingManual(at:number):TrendingEdition|undefined {return this.safe(()=>{
     const row=this.db.prepare(`SELECT body FROM editions WHERE manual=1 AND COALESCE(json_extract(body,'$.preview'),0)=0
       AND json_extract(body,'$.state') IN ('pending','collect_failed','ready')
@@ -85,13 +116,16 @@ export class TrendingStore {
     }
   });}
   expire(at:number):void {
+    const today=new Date(at+8*3_600_000).toISOString().slice(0,10);
     const cutoff=new Date(at+8*3_600_000-10*3_600_000).toISOString().slice(0,10);
     // Empty polls must not reserve the writer or scan completed editions.
     if(!this.safe(()=>this.db.prepare(`SELECT 1 FROM editions INDEXED BY editions_pending_expiry WHERE manual=0 AND date<=?
-      AND json_extract(body,'$.state') IN ('pending','collect_failed','ready') LIMIT 1`).get(cutoff)))return;
+      AND json_extract(body,'$.state') IN ('pending','collect_failed','ready')
+      AND (date<? OR json_extract(body,'$.recovery') IS NULL) LIMIT 1`).get(cutoff,today)))return;
     this.transaction(()=>{
     for(const row of this.db.prepare(`SELECT body FROM editions INDEXED BY editions_pending_expiry WHERE manual=0 AND date<=?
-      AND json_extract(body,'$.state') IN ('pending','collect_failed','ready')`).all(cutoff)){
+      AND json_extract(body,'$.state') IN ('pending','collect_failed','ready')
+      AND (date<? OR json_extract(body,'$.recovery') IS NULL)`).all(cutoff,today)){
       const edition=JSON.parse(String(row.body)) as TrendingEdition;
       edition.state='expired';edition.code='expired';edition.updatedAt=at;
       this.db.prepare('UPDATE editions SET body=? WHERE id=?').run(JSON.stringify(edition),edition.id);
