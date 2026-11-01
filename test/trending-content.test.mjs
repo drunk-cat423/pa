@@ -51,25 +51,19 @@ test('原HTML和普通web_fetch共用公开地址、响应大小和HTML提取边
   await assert.rejects(fetchWebDocument('https://github.com', { ...config.fetch, maxResponseBytes: 1 }, undefined, deps), { code: 'size' });
 });
 
-test('真实Pi最终请求单次JSON Object且关闭thinking，程序固定slug/数量/链接并独立记录诊断', async t => {
+test('真实Pi最终请求严格工具参数且关闭thinking，程序固定slug/数量/链接并独立记录诊断', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-trending-content-'));
   const requests = [];
   const server = createServer(async (request, response) => {
     let text = ''; for await (const chunk of request) text += chunk;
     const body = JSON.parse(text); requests.push(body);
     const input = JSON.parse(body.messages.find(message => message.role === 'user').content);
-    const projects = input.projects.map(project => ({ slug: project.slug,
-      introduction: project.description ? '这是一个管理本地文件的工具，适用于整理和管理本地文件。' : '项目没有提供榜单描述，目前资料有限。' }));
-    if (requests.length === 1) projects[0].introduction = '管理本地文件。'.repeat(20);
-    if (requests.length === 2) projects[0].slug = 'invented/project';
-    if (requests.length === 3) projects[0].url = 'https://invented.example';
-    if (requests.length === 4) projects.pop();
-    if (requests.length === 6) projects[0].introduction = '项目地址为 deeptutor.info，可查看资料。';
-    if (requests.length === 7) projects[0].introduction = '管理本地文件。'.repeat(26);
+    const args = Object.fromEntries(input.projects.map(project => [project.slug, project.description
+      ? '**管理本地文件。**'.repeat(30) : '项目没有提供榜单描述，目前资料有限，无法确认用途。']));
     response.writeHead(200, { 'content-type': 'text/event-stream' });
-    for (const choices of [[{ index: 0, delta: { role: 'assistant', content: JSON.stringify({ projects }) }, finish_reason: null }],
-      [{ index: 0, delta: {}, finish_reason: 'stop' }]]) response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: config.model, choices })}\n\n`);
-    response.end('data: [DONE]\n\n');
+    response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: config.model,
+      choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: body.tools[0].function.name, arguments: JSON.stringify(args) } }] }, finish_reason: null }] })}\n\n`);
+    response.end(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: config.model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await rm(dataDir, { recursive: true, force: true }); });
@@ -77,18 +71,31 @@ test('真实Pi最终请求单次JSON Object且关闭thinking，程序固定slug/
   const snapshot = await collectTrending(localConfig, undefined, { fetchDocument });
   snapshot.sections[0].projects[0].description = 'Manage local files. https://deeptutor.info/ http://docs.example/path?q=1。Local tools.';
   const originalDescription = snapshot.sections[0].projects[0].description;
-  const digest = await generateTrendingDigest(localConfig, snapshot);
+  const progress = [];
+  const digest = await generateTrendingDigest(localConfig, snapshot, undefined, { onProgress: value => progress.push(value) });
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].enable_thinking, false);
-  assert.equal(requests[0].thinking, undefined);
-  assert.equal(requests[0].reasoning_effort, undefined);
-  assert.deepEqual(requests[0].response_format, { type: 'json_object' });
-  assert.equal(requests[0].tools, undefined);
-  const modelInput = JSON.parse(requests[0].messages.find(message => message.role === 'user').content);
-  assert.equal(modelInput.projects[0].description, 'Manage local files. 。Local tools.');
+  const payload = requests[0], tool = payload.tools[0].function;
+  assert.equal(payload.enable_thinking, false);
+  assert.equal(payload.thinking, undefined);
+  assert.equal(payload.response_format, undefined);
+  assert.equal(tool.strict, true);
+  assert.deepEqual(payload.tool_choice, { type: 'function', function: { name: tool.name } });
+  assert.equal(payload.parallel_tool_calls, false);
+  const slugs = snapshot.sections.flatMap(section => section.projects.map(project => project.slug));
+  assert.deepEqual(tool.parameters.required, slugs);
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.ok(Object.values(tool.parameters.properties).every(field => field.type === 'string'));
+  const input = JSON.parse(payload.messages.find(message => message.role === 'user').content);
+  assert.equal(input.projects[0].description, 'Manage local files. 。Local tools.');
   assert.equal(snapshot.sections[0].projects[0].description, originalDescription);
-  assert.ok(digest.sections[0].text.includes('管理本地文件。'.repeat(10)));
-  assert.ok(!digest.sections[0].text.includes('管理本地文件。'.repeat(20)));
+  assert.ok(digest.sections[0].text.includes('管理本地文件。'));
+  assert.ok(digest.sections[0].text.includes('…'));
+  assert.ok(!digest.sections[0].text.includes('管理本地文件。'.repeat(30)));
+  assert.ok(!digest.sections[0].text.includes('**'));
+  assert.equal(digest.degraded, undefined);
+  assert.equal(progress[0].attempts, 1);
+  assert.deepEqual(progress[0].introductions, {});
+  assert.equal(Object.keys(progress.at(-1).introductions).length, 10);
   assert.deepEqual(digest.sections.map(section => section.period), periods);
   for (const section of snapshot.sections) for (const project of section.projects) assert.ok(digest.sections.find(item => item.period === section.period).text.includes(project.url));
   assert.match(digest.sections[0].text, /资料有限/);
@@ -97,24 +104,8 @@ test('真实Pi最终请求单次JSON Object且关闭thinking，程序固定slug/
   assert.equal(records[0].kind, 'memory');
   assert.equal(records[0].phase, 'trending_digest');
   assert.match(records[0].traceId, /^trending:/);
-  const renamed = await generateTrendingDigest(localConfig, snapshot);
-  assert.equal(renamed.degraded[0].slug, snapshot.sections[0].projects[0].slug);
-  assert.ok(!renamed.sections[0].text.includes('invented'));
-  const extra = await generateTrendingDigest(localConfig, snapshot);
-  assert.equal(extra.degraded, undefined);
-  assert.ok(!extra.sections[0].text.includes('invented.example'));
-  const missing = await generateTrendingDigest(localConfig, snapshot);
-  assert.equal(missing.degraded.length, 1);
-  assert.equal(requests.length, 4);
   const shortSnapshot = await collectTrending(localConfig, undefined, { fetchDocument: async url => ({ ...await fetchDocument(url), body: row('u/only') }) });
   const shortDigest = await generateTrendingDigest(localConfig, shortSnapshot);
-  assert.equal(requests.length, 5);
+  assert.equal(requests.length, 2);
   assert.match(shortDigest.sections[1].text, /本榜当前项目已在前面分组介绍。\nhttps:\/\/github.com\/trending\?since=weekly$/);
-  assert.match(shortDigest.sections[2].text, /本榜当前项目已在前面分组介绍。\nhttps:\/\/github.com\/trending\?since=monthly$/);
-  const address = await generateTrendingDigest(localConfig, snapshot);
-  assert.equal(address.degraded[0].slug, snapshot.sections[0].projects[0].slug);
-  assert.match(address.sections[0].text, /原始描述：/);
-  const long = await generateTrendingDigest(localConfig, snapshot);
-  assert.ok(!long.sections[0].text.includes('管理本地文件。'.repeat(26)));
-  assert.equal(requests.length, 7);
 });

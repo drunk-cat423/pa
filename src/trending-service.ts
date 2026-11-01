@@ -2,7 +2,7 @@ import {join} from 'node:path';
 import type {PaConfig} from './config.js';
 import type {ChannelRoute,DeliveryResult,OutboundMessage} from './channel-types.js';
 import {DiagnosticPersistenceError} from './diagnostics.js';
-import {collectTrending,generateTrendingDigest,fallbackTrendingDigest,type TrendingDigest,type TrendingSnapshot} from './trending-content.js';
+import {collectTrending,generateTrendingDigest,type TrendingDigest,type TrendingSnapshot,type TrendingGenerateDeps} from './trending-content.js';
 import {TrendingStore,TrendingPersistenceError,routeKey,type TrendingEdition,type TrendingCode} from './trending-store.js';
 
 const DAY=86_400_000,OFFSET=8*60*60_000;
@@ -11,7 +11,7 @@ const dueAt=(day:string)=>Date.parse(`${day}T09:00:00+08:00`);
 export interface TrendingDependencies {
   now?:()=>number;
   collector?:(config:PaConfig,signal:AbortSignal)=>Promise<TrendingSnapshot>;
-  generator?:(config:PaConfig,snapshot:TrendingSnapshot,signal:AbortSignal)=>Promise<TrendingDigest>;
+  generator?:(config:PaConfig,snapshot:TrendingSnapshot,signal:AbortSignal,deps?:TrendingGenerateDeps)=>Promise<TrendingDigest>;
 }
 export interface TrendingRunOptions {id:string;groupIds?:string[];preview?:boolean}
 class GenerationCleanupPending extends Error {}
@@ -80,7 +80,7 @@ export class TrendingService {
     return this.storage().update(id,e=>{e.state=state;e.updatedAt=this.now();if(code)e.code=code;else delete e.code;if(state==='delivered'&&e.recovery)e.recovery.status='completed';});
   }
   private async bounded<T>(operation:(signal:AbortSignal)=>Promise<T>,settleGeneration=false):Promise<T>{
-    const signal=AbortSignal.any([this.abort.signal,AbortSignal.timeout(Math.min(this.config.timeoutMs,120_000))]);
+    const signal=AbortSignal.any([this.abort.signal,AbortSignal.timeout(Math.min(this.config.timeoutMs*(settleGeneration?3:1),settleGeneration?360_000:120_000))]);
     signal.throwIfAborted();
     return new Promise<T>((resolve,reject)=>{
       let settled=false,cleanupTimer:ReturnType<typeof setTimeout>|undefined;
@@ -91,7 +91,7 @@ export class TrendingService {
       };
       const onClose=()=>finish(true,this.abort.signal.reason);
       const onAbort=()=>{
-        // Generation timeout must include diagnostic cleanup before fallback can be delivered.
+        // Generation timeout must include diagnostic cleanup before the generation failure is settled.
         // A nonsettling operation remains unknown; it must not block tomorrow's edition forever.
         if(settleGeneration&&!this.abort.signal.aborted)cleanupTimer=setTimeout(()=>finish(true,new GenerationCleanupPending()),1000);
         else finish(true,signal.reason);
@@ -110,10 +110,10 @@ export class TrendingService {
     if(this.now()<edition.nextAttemptAt)return;
     if(edition.routes.some(route=>!this.targets.some(r=>routeKey(r)===routeKey(route)))){this.setState(edition.id,'failed','route_unavailable');return;}
     if(edition.recovery?.status==='requested'){
-      const recovered=store.prepareRecovery(edition.id,fallbackTrendingDigest(edition.snapshot!,'operator_recovery'),this.now());
+      const recovered=store.prepareRecovery(edition.id,this.now());
       if(!recovered)return;edition=recovered;
     }
-    if(['pending','collect_failed'].includes(edition.state)){
+    if(['pending','collect_failed'].includes(edition.state)&&!edition.snapshot){
       if(edition.attempts>=3){this.setState(edition.id,'failed','collect_exhausted');return;}
       if(this.now()<edition.nextAttemptAt)return;
       const claimed=store.claimCollection(edition.id,this.now());if(!claimed)return;edition=claimed;
@@ -122,22 +122,31 @@ export class TrendingService {
       catch(error){if(this.persistenceFailure(error))throw error;store.update(edition.id,e=>{e.state=e.attempts>=3?'failed':'collect_failed';e.code=e.attempts>=3?'collect_exhausted':'collect_failed';e.nextAttemptAt=this.now()+60_000;e.updatedAt=this.now();});return;}
       if(!this.enabled()){this.setState(edition.id,'collect_failed','collect_failed');return;}
       edition=store.update(edition.id,e=>{e.snapshot=snapshot;e.state='generating';e.updatedAt=this.now();});
+    }
+    if(edition.snapshot&&['pending','generating'].includes(edition.state)){
+      const snapshot=edition.snapshot;
+      edition=store.update(edition.id,e=>{e.state='generating';e.generation??={attempts:0,limit:3,introductions:{}};e.updatedAt=this.now();});
       let digest:TrendingDigest;
-      try{digest=await this.bounded(signal=>this.generator(this.config,snapshot,signal),true);}
+      try{digest=await this.bounded(signal=>this.generator(this.config,snapshot,signal,{
+        progress:edition.generation!,
+        onProgress:progress=>{store.update(edition.id,e=>{e.generation=progress;e.updatedAt=this.now();});},
+      }),true);}
       catch(error){
         if(this.persistenceFailure(error))throw error;
         if(this.abort.signal.aborted||error instanceof GenerationCleanupPending){this.setState(edition.id,'uncertain','generation_unknown');return;}
-        digest=fallbackTrendingDigest(snapshot,'generation_failed');
+        this.setState(edition.id,'failed','digest_invalid');return;
       }
       if(!this.enabled()){this.setState(edition.id,'uncertain','generation_unknown');return;}
-      if(!digest.sections?.length||digest.sections.some(s=>typeof s.text!=='string'||!s.text.trim())){this.setState(edition.id,'failed','digest_invalid');return;}
+      if(digest.degraded?.length||!digest.sections?.length||digest.sections.some(s=>typeof s.text!=='string'||!s.text.trim())){this.setState(edition.id,'failed','digest_invalid');return;}
       edition=store.update(edition.id,e=>{e.digest=digest;e.state='ready';e.updatedAt=this.now();});
     }
     if(edition.state!=='ready'||preview||!this.enabled())return;
+    if(edition.digest?.degraded?.length){this.setState(edition.id,'failed','digest_invalid');return;}
+    if(edition.supplementOf&&dayAt(this.now())!==edition.date){this.setState(edition.id,'expired','expired');return;}
     if(!edition.manual){const due=dueAt(edition.date);if(this.now()<due)return;if(edition.recovery?dayAt(this.now())!==edition.date:this.now()>=due+60*60_000){this.setState(edition.id,'expired','expired');return;}}
     if(!edition.parts){
       const late=!edition.manual&&this.now()>=dueAt(edition.date)+60_000;
-      const title=`# GitHub Trending · ${edition.date}${edition.manual?' · 试运行':''}\n${late?'延迟补发：原定北京时间 09:00。\n':''}`;
+      const title=`# GitHub Trending · ${edition.date}${edition.supplementOf?' · AI总结补充':edition.manual?' · 试运行':''}\n${late?'延迟补发：原定北京时间 09:00。\n':''}`;
       const parts:string[]=[];
       // Generated sections use blank lines between complete project paragraphs.
       // Keep each name/introduction/link together, and never mix period groups.
@@ -165,6 +174,7 @@ export class TrendingService {
         for(const part of parts){
           if(part.status!=='pending')continue;
           if(!this.enabled())return;
+          if(edition.supplementOf&&dayAt(this.now())!==edition.date){this.setState(edition.id,'expired','expired');return;}
           if(!edition.manual&&(edition.recovery?dayAt(this.now())!==edition.date:this.now()>=dueAt(edition.date)+60*60_000)){this.setState(edition.id,'expired','expired');return;}
           if(!this.allowedRoutes().some(r=>routeKey(r)===routeKey(route))||!this.targets.some(r=>routeKey(r)===routeKey(route))){
             store.update(edition.id,e=>{e.code='route_unavailable';e.nextAttemptAt=this.now()+60_000;e.updatedAt=this.now();});return;

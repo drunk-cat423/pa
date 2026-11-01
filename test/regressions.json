@@ -4,8 +4,8 @@
   "tests": [
     {
       "file": "test/trending-service.test.mjs",
-      "name": "真实故障3条有效7条typo占位逐项降级，真实Pi/SQLite正式期恢复与投递幂等",
-      "evidence": "2026-11-01 production daily edition collected 10 projects but rejected a normal-stop response with three valid introductions and seven indroduction:placeholder items, so nothing was delivered. Local Pi/HTTP and SQLite regression checks partial fallback, harmless legacy format tolerance, no paid retry, canonical links, bounded Markdown, same-edition operator recovery and restart/delivery idempotency. Private evidence stays in .local."
+      "name": "真实故障3条有效7条错参经Pi校验仅修复缺项，全量AI总结与恢复补充投递幂等",
+      "evidence": "2026-11-01 production returned three valid introductions and seven misspelled placeholder items; the initial raw-description fallback was rejected because every project requires AI summarization. The existing incident regression now checks Pi schema tools, error feedback and selective repair, persisted bounded attempts/valid summaries, no raw fallback on exhaustion, same-edition recovery and idempotent same-day AI supplement without resetting original delivery records. Private evidence stays in .local."
     },
     {
       "file": "test/person-profile-policy.test.mjs",
@@ -79,8 +79,8 @@
     },
     {
       "file": "test/trending-content.test.mjs",
-      "name": "真实Pi最终请求单次JSON Object且关闭thinking，程序固定slug/数量/链接并独立记录诊断",
-      "evidence": "2026-10-30 paid preview repeated a source homepage domain and an overlong feature list, rejecting the whole digest. Regression checks source URL removal from model input with original snapshot retained, bounded introduction length, exact project mapping and program-built links."
+      "name": "真实Pi最终请求严格工具参数且关闭thinking，程序固定slug/数量/链接并独立记录诊断",
+      "evidence": "2026-10-30 paid preview repeated a source homepage domain and an overlong feature list, rejecting the whole digest. Regression checks source URL removal from model input with original snapshot retained, bounded introduction length, exact project mapping and program-built links. 2026-11-01 the same regression was updated to assert Pi strict tool schemas and explicit tool_choice, bounded repair with valid-output reuse, and no source-description substitution."
     },
     {
       "file": "test/trending-service.test.mjs",

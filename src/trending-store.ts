@@ -2,18 +2,26 @@ import {mkdirSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import type {ChannelRoute} from './channel-types.js';
-import type {TrendingSnapshot,TrendingDigest} from './trending-content.js';
+import type {TrendingSnapshot,TrendingDigest,TrendingGenerationProgress} from './trending-content.js';
 
 export type TrendingCode = 'collect_failed'|'collect_exhausted'|'generation_unknown'|'digest_invalid'|'delivery_uncertain'|'delivery_rejected'|'route_unavailable'|'expired'|'persistence_failed'|'internal_error';
 export interface TrendingEdition {
   id:string; date:string; manual:boolean; preview?:boolean; state:'pending'|'collecting'|'collect_failed'|'generating'|'ready'|'delivered'|'failed'|'uncertain'|'expired';
   routes:ChannelRoute[]; attempts:number; nextAttemptAt:number; createdAt:number; updatedAt:number;
   code?:TrendingCode; snapshot?:TrendingSnapshot; digest?:TrendingDigest; parts?:string[];
+  generation?:TrendingGenerationProgress; supplementOf?:string;
   recovery?:{requestedAt:number;previousState:TrendingEdition['state'];previousCode:TrendingCode;status:'requested'|'ready'|'completed'};
 }
 export interface TrendingPart {index:number; status:'pending'|'sending'|'sent'|'uncertain'|'rejected'; externalMessageId?:string}
 export class TrendingPersistenceError extends Error {
   constructor(cause:unknown){super('Trending 本地持久化失败。',{cause});this.name='TrendingPersistenceError';}
+}
+
+// This is only a completeness check for zero-call recovery; content validation remains in the generator.
+function hasSavedIntroductions(edition:TrendingEdition):boolean {
+  return Boolean(edition.snapshot&&edition.snapshot.sections.every(section=>section.projects.every(project=>{
+    const value=edition.generation?.introductions[project.slug];return typeof value==='string'&&Boolean(value.trim());
+  })));
 }
 
 /** Independent feature ledger. Report text never enters the conversation database. */
@@ -51,6 +59,31 @@ export class TrendingStore {
     if(JSON.stringify(edition.routes.map(routeKey).sort())!==JSON.stringify(targets.map(routeKey).sort()))throw new Error('同一手工日报编号不能变更群路由。');
     return edition;
   }
+  /** Correct an already delivered degraded formal edition without touching its receipts. */
+  requestAiSupplement(date:string,at=Date.now()):TrendingEdition {
+    const today=new Date(at+8*3_600_000).toISOString().slice(0,10);
+    if(date!==today)throw new Error('仅能补充北京时间今天的已投递降级日报。');
+    const result=this.transaction(()=>{
+      const original=this.get(date),id=`manual:ai-summary-${date}`;
+      if(!original||original.manual||original.date!==date||original.state!=='delivered'||!original.snapshot||!original.digest?.degraded?.length)return undefined;
+      const existing=this.get(id);
+      if(existing){
+        if(existing.supplementOf!==date)throw new Error('AI总结补充编号已被占用。');
+        if(['failed','uncertain'].includes(existing.state)&&['generation_unknown','digest_invalid'].includes(existing.code??'')
+          &&existing.generation&&(existing.generation.attempts<existing.generation.limit||hasSavedIntroductions(existing))&&!existing.parts
+          &&!this.db.prepare('SELECT 1 FROM parts WHERE edition_id=? LIMIT 1').get(id)){
+          existing.state='pending';existing.nextAttemptAt=0;existing.updatedAt=at;delete existing.code;
+          this.db.prepare('UPDATE editions SET body=? WHERE id=?').run(JSON.stringify(existing),id);
+        }
+        return existing;
+      }
+      const supplement:TrendingEdition={id,date,manual:true,supplementOf:date,state:'pending',snapshot:original.snapshot,
+        routes:original.routes,attempts:0,nextAttemptAt:0,createdAt:at,updatedAt:at};
+      this.db.prepare('INSERT INTO editions VALUES(?,?,?,?)').run(id,date,1,JSON.stringify(supplement));return supplement;
+    });
+    if(!result)throw new Error('AI总结补充需要当天已投递且明确含原文降级的正式日报。');
+    return result;
+  }
   /** Explicit recovery preserves the failed edition and its original frozen routes. Never retries delivery. */
   requestRecovery(date:string,at=Date.now()):TrendingEdition {
     const today=new Date(at+8*3_600_000).toISOString().slice(0,10);
@@ -58,9 +91,22 @@ export class TrendingStore {
     const result=this.transaction(()=>{
       const edition=this.get(date);
       if(!edition||edition.manual||edition.date!==date)return undefined;
-      if(edition.recovery)return edition; // Repeated operator requests are idempotent.
+      if(edition.recovery){
+        // A crashed recovery may resume its remaining allowance, never acquire another one.
+        if(edition.recovery.status==='ready'&&['failed','uncertain'].includes(edition.state)
+          &&['generation_unknown','digest_invalid'].includes(edition.code??'')&&edition.generation
+          &&(edition.generation.attempts<edition.generation.limit||hasSavedIntroductions(edition))&&!edition.parts
+          &&!this.db.prepare('SELECT 1 FROM parts WHERE edition_id=? LIMIT 1').get(date)){
+          edition.recovery.status='requested';edition.nextAttemptAt=0;edition.updatedAt=at;
+          this.db.prepare('UPDATE editions SET body=? WHERE id=?').run(JSON.stringify(edition),date);
+        }
+        return edition;
+      }
       if(!edition.snapshot||!['failed','uncertain'].includes(edition.state)||!['generation_unknown','digest_invalid'].includes(edition.code??'')
         ||edition.parts||this.db.prepare('SELECT 1 FROM parts WHERE edition_id=? LIMIT 1').get(date))return undefined;
+      // The legacy generator made one possibly unknown call; its old allowance is already closed.
+      edition.generation??={attempts:1,limit:1,introductions:{}};
+      edition.generation.limit+=3;
       edition.recovery={requestedAt:at,previousState:edition.state,previousCode:edition.code!,status:'requested'};
       edition.nextAttemptAt=0;edition.updatedAt=at;this.db.prepare('UPDATE editions SET body=? WHERE id=?').run(JSON.stringify(edition),date);
       return edition;
@@ -74,11 +120,11 @@ export class TrendingStore {
     return edition?.recovery&&edition.nextAttemptAt<=at&&((edition.recovery.status==='requested'&&['failed','uncertain'].includes(edition.state)
       &&['generation_unknown','digest_invalid'].includes(edition.code??''))||(edition.recovery.status==='ready'&&edition.state==='ready'))?edition:undefined;
   });}
-  prepareRecovery(id:string,digest:TrendingDigest,at:number):TrendingEdition|undefined {return this.transaction(()=>{
+  prepareRecovery(id:string,at:number):TrendingEdition|undefined {return this.transaction(()=>{
     const edition=this.get(id);
     if(!edition||edition.manual||edition.date!==new Date(at+8*3_600_000).toISOString().slice(0,10)||edition.recovery?.status!=='requested'
       ||!['failed','uncertain'].includes(edition.state)||!['generation_unknown','digest_invalid'].includes(edition.code??'')||edition.parts||this.db.prepare('SELECT 1 FROM parts WHERE edition_id=? LIMIT 1').get(id))return undefined;
-    edition.digest=digest;edition.state='ready';edition.recovery.status='ready';edition.updatedAt=at;delete edition.code;
+    delete edition.digest;edition.state='generating';edition.recovery.status='ready';edition.updatedAt=at;delete edition.code;
     this.db.prepare('UPDATE editions SET body=? WHERE id=?').run(JSON.stringify(edition),id);return edition;
   });}
   pendingManual(at:number):TrendingEdition|undefined {return this.safe(()=>{
@@ -118,6 +164,11 @@ export class TrendingStore {
   expire(at:number):void {
     const today=new Date(at+8*3_600_000).toISOString().slice(0,10);
     const cutoff=new Date(at+8*3_600_000-10*3_600_000).toISOString().slice(0,10);
+    for(const row of this.safe(()=>this.db.prepare(`SELECT body FROM editions WHERE manual=1 AND date<?
+      AND json_extract(body,'$.supplementOf') IS NOT NULL AND json_extract(body,'$.state') IN ('pending','collect_failed','ready')`).all(today))){
+      const edition=JSON.parse(String(row.body)) as TrendingEdition;
+      this.update(edition.id,e=>{e.state='expired';e.code='expired';e.updatedAt=at;});
+    }
     // Empty polls must not reserve the writer or scan completed editions.
     if(!this.safe(()=>this.db.prepare(`SELECT 1 FROM editions INDEXED BY editions_pending_expiry WHERE manual=0 AND date<=?
       AND json_extract(body,'$.state') IN ('pending','collect_failed','ready')
