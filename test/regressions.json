@@ -80,7 +80,7 @@
     {
       "file": "test/trending-content.test.mjs",
       "name": "真实Pi最终请求严格工具参数且关闭thinking，程序固定slug/数量/链接并独立记录诊断",
-      "evidence": "2026-10-30 paid preview repeated a source homepage domain and an overlong feature list, rejecting the whole digest. Regression checks source URL removal from model input with original snapshot retained, bounded introduction length, exact project mapping and program-built links. 2026-11-01 the same regression was updated to assert Pi strict tool schemas and explicit tool_choice, bounded repair with valid-output reuse, and no source-description substitution."
+      "evidence": "2026-10-30 paid preview repeated a source homepage domain and an overlong feature list, rejecting the whole digest. Regression checks source URL removal from model input with original snapshot retained, bounded introduction length, exact project mapping and program-built links. 2026-11-01 the same regression was updated to assert Pi strict tool schemas and explicit tool_choice, bounded repair with valid-output reuse, and no source-description substitution. 2026-11-01 confirmed the source collector never read README, so an empty About description produced no useful t3code summary. Existing source/HTTP tests now verify description-first selection, README retrieval only for empty descriptions, explicit source status and bounded excerpt, and the actual model payload; no new test item."
     },
     {
       "file": "test/trending-service.test.mjs",

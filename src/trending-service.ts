@@ -2,7 +2,7 @@ import {join} from 'node:path';
 import type {PaConfig} from './config.js';
 import type {ChannelRoute,DeliveryResult,OutboundMessage} from './channel-types.js';
 import {DiagnosticPersistenceError} from './diagnostics.js';
-import {collectTrending,generateTrendingDigest,type TrendingDigest,type TrendingSnapshot,type TrendingGenerateDeps} from './trending-content.js';
+import {collectTrending,generateTrendingDigest,formatTrendingParts,type TrendingDigest,type TrendingSnapshot,type TrendingGenerateDeps} from './trending-content.js';
 import {TrendingStore,TrendingPersistenceError,routeKey,type TrendingEdition,type TrendingCode} from './trending-store.js';
 
 const DAY=86_400_000,OFFSET=8*60*60_000;
@@ -146,22 +146,10 @@ export class TrendingService {
     if(!edition.manual){const due=dueAt(edition.date);if(this.now()<due)return;if(edition.recovery?dayAt(this.now())!==edition.date:this.now()>=due+60*60_000){this.setState(edition.id,'expired','expired');return;}}
     if(!edition.parts){
       const late=!edition.manual&&this.now()>=dueAt(edition.date)+60_000;
-      const title=`# GitHub Trending · ${edition.date}${edition.supplementOf?' · AI总结补充':edition.manual?' · 试运行':''}\n${late?'延迟补发：原定北京时间 09:00。\n':''}`;
-      const parts:string[]=[];
-      // Generated sections use blank lines between complete project paragraphs.
-      // Keep each name/introduction/link together, and never mix period groups.
-      for(const [index,section] of edition.digest!.sections.entries()){
-        const [heading,...projects]=section.text.split(/\n\s*\n/);
-        let current=(index===0?title:'')+heading;
-        for(const project of projects){
-          const candidate=current+'\n\n'+project;
-          if(Buffer.byteLength(candidate)>1500){parts.push(current);current=heading+'\n\n'+project;}
-          else current=candidate;
-        }
-        parts.push(current);
-      }
-      if(parts.some(part=>Buffer.byteLength(part)>1500)){this.setState(edition.id,'failed','digest_invalid');return;}
-      if(!parts.length||parts.length>5){this.setState(edition.id,'failed','digest_invalid');return;}
+      let parts:string[];
+      try{parts=formatTrendingParts(edition.digest!,{date:edition.date,manual:edition.manual,late,
+        ...(edition.supplementOf?{supplementOf:edition.supplementOf}:{})});}
+      catch{this.setState(edition.id,'failed','digest_invalid');return;}
       edition=store.prepareParts(edition.id,parts,this.now());
     }
     for(const route of edition.routes){

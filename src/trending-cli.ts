@@ -2,7 +2,7 @@ import {existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {readConfig} from './config.js';
 import {readQQSettings} from './qq-config.js';
-import {collectTrending,generateTrendingDigest,TrendingContentError} from './trending-content.js';
+import {collectTrending,generateTrendingDigest,formatTrendingParts,TrendingContentError} from './trending-content.js';
 import {TrendingStore} from './trending-store.js';
 
 async function main():Promise<void>{
@@ -13,7 +13,8 @@ async function main():Promise<void>{
   const config=readConfig();
   if(command==='preview'){
     const snapshot=await collectTrending(config),digest=await generateTrendingDigest(config,snapshot);
-    console.log(digest.sections.map(s=>s.text).join('\n\n'));return;
+    const date=new Date(Date.parse(snapshot.fetchedAt)+8*60*60_000).toISOString().slice(0,10);
+    console.log(JSON.stringify({parts:formatTrendingParts(digest,{date})},null,2));return;
   }
   const path=join(config.dataDir,'trending.sqlite');
   if(command==='status'&&!existsSync(path)){console.log(JSON.stringify({state:'not_initialized'}));return;}
