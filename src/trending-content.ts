@@ -5,6 +5,7 @@ import { DiagnosticLog, DiagnosticPersistenceError } from './diagnostics.js';
 import { applyModelPayload } from './model-capabilities.js';
 import { createConfiguredModel, estimateContext } from './runtime.js';
 import { fetchWebDocument, type WebFetchDeps } from './web-fetch.js';
+import { TRENDING_SEND_TIME } from './trending-schedule.js';
 
 export type TrendingPeriod = 'daily' | 'weekly' | 'monthly';
 export interface TrendingReadme {
@@ -249,7 +250,7 @@ export function formatTrendingParts(digest: TrendingDigest, options: { date: str
   if (digest.degraded?.length || !digest.sections?.length || digest.sections.some(section => typeof section.text !== 'string' || !section.text.trim())) {
     throw new TrendingContentError('model_contract', 'GitHub Trending 日报正文无效。');
   }
-  const title = `# GitHub Trending · ${options.date}${options.supplementOf ? ' · AI总结补充' : options.manual ? ' · 试运行' : ''}\n${options.late ? '延迟补发：原定北京时间 09:00。\n' : ''}`;
+  const title = `# GitHub Trending · ${options.date}${options.supplementOf ? ' · AI总结补充' : options.manual ? ' · 试运行' : ''}\n${options.late ? `延迟补发：原定北京时间 ${TRENDING_SEND_TIME}。\n` : ''}`;
   const parts: string[] = [];
   // Keep each name/introduction/link together, and never mix period groups.
   for (const [index, section] of digest.sections.entries()) {

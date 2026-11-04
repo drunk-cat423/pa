@@ -4,6 +4,11 @@
   "tests": [
     {
       "file": "test/trending-service.test.mjs",
+      "name": "代理公网DNS隧道超时耗尽采集，恢复后仅显式补发且保留原失败期",
+      "evidence": "2026-11-04 formal daily digest exhausted three collections; proxy logs showed three upstream TCP timeouts opening the public-DNS tunnel, before any snapshot, model call or delivery. Offline local CONNECT 504 reproduces the real fetch/collector failure path and verifies bounded attempts, no generation/send, restart fencing, explicit idempotent backfill and preservation of the failed edition. Private evidence stays in .local/ops/daily-20261104/."
+    },
+    {
+      "file": "test/trending-service.test.mjs",
       "name": "真实故障3条有效7条错参经Pi校验仅修复缺项，全量AI总结与恢复补充投递幂等",
       "evidence": "2026-11-01 production returned three valid introductions and seven misspelled placeholder items; the initial raw-description fallback was rejected because every project requires AI summarization. The existing incident regression now checks Pi schema tools, error feedback and selective repair, persisted bounded attempts/valid summaries, no raw fallback on exhaustion, same-edition recovery and idempotent same-day AI supplement without resetting original delivery records. Private evidence stays in .local."
     },

@@ -4,10 +4,10 @@ import type {ChannelRoute,DeliveryResult,OutboundMessage} from './channel-types.
 import {DiagnosticPersistenceError} from './diagnostics.js';
 import {collectTrending,generateTrendingDigest,formatTrendingParts,type TrendingDigest,type TrendingSnapshot,type TrendingGenerateDeps} from './trending-content.js';
 import {TrendingStore,TrendingPersistenceError,routeKey,type TrendingEdition,type TrendingCode} from './trending-store.js';
+import {trendingDueAt as dueAt,TRENDING_CATCHUP_MS} from './trending-schedule.js';
 
 const DAY=86_400_000,OFFSET=8*60*60_000;
 const dayAt=(at:number)=>new Date(at+OFFSET).toISOString().slice(0,10);
-const dueAt=(day:string)=>Date.parse(`${day}T09:00:00+08:00`);
 export interface TrendingDependencies {
   now?:()=>number;
   collector?:(config:PaConfig,signal:AbortSignal)=>Promise<TrendingSnapshot>;
@@ -55,7 +55,7 @@ export class TrendingService {
     this.launch(async()=>{
       const store=this.storage();
       store.expire(at);
-      if(at>=due-5*60_000&&at<due+60*60_000){
+      if(at>=due-5*60_000&&at<due+TRENDING_CATCHUP_MS){
         const edition=store.create({id:date,date,manual:false,state:'pending',routes:this.targets.map(r=>({...r})),attempts:0,nextAttemptAt:0,createdAt:at,updatedAt:at});
         await this.process(edition,false);
       }
@@ -143,7 +143,7 @@ export class TrendingService {
     if(edition.state!=='ready'||preview||!this.enabled())return;
     if(edition.digest?.degraded?.length){this.setState(edition.id,'failed','digest_invalid');return;}
     if(edition.supplementOf&&dayAt(this.now())!==edition.date){this.setState(edition.id,'expired','expired');return;}
-    if(!edition.manual){const due=dueAt(edition.date);if(this.now()<due)return;if(edition.recovery?dayAt(this.now())!==edition.date:this.now()>=due+60*60_000){this.setState(edition.id,'expired','expired');return;}}
+    if(!edition.manual){const due=dueAt(edition.date);if(this.now()<due)return;if(edition.recovery?dayAt(this.now())!==edition.date:this.now()>=due+TRENDING_CATCHUP_MS){this.setState(edition.id,'expired','expired');return;}}
     if(!edition.parts){
       const late=!edition.manual&&this.now()>=dueAt(edition.date)+60_000;
       let parts:string[];
@@ -218,8 +218,8 @@ export class TrendingService {
     try{edition=this.store?.latest();if(edition)status=this.status(edition);}catch(error){this.fail(error);}
     const terminal=edition?.date===today&&['delivered','failed','uncertain','expired'].includes(edition.state);
     const generated=edition?.date===today&&['generating','ready'].includes(edition.state);
-    const nextRun=terminal||generated||at>=due+3_600_000?tomorrow:Math.max(due-300_000,at,edition?.nextAttemptAt??0);
-    const nextSend=terminal||at>=due+3_600_000?tomorrow+300_000:Math.max(due,at,edition?.nextAttemptAt??0);
+    const nextRun=terminal||generated||at>=due+TRENDING_CATCHUP_MS?tomorrow:Math.max(due-300_000,at,edition?.nextAttemptAt??0);
+    const nextSend=terminal||at>=due+TRENDING_CATCHUP_MS?tomorrow+300_000:Math.max(due,at,edition?.nextAttemptAt??0);
     return {enabled:this.config.trending?.enabled===true,started:Boolean(this.timer),running:Boolean(this.pending),failed:this.fatal||Boolean(edition?.code??this.lastCode),
       ...(edition?{latestDate:edition.date,status,...(edition.digest?.degraded?{degraded:edition.digest.degraded}:{}),...(edition.recovery?{recovery:edition.recovery}:{})}:{}),...(this.lastCode??edition?.code?{errorCode:this.lastCode??edition?.code}:{}),
       nextDue:this.enabled()?new Date(Math.min(nextRun,nextSend)).toISOString():null,

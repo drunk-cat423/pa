@@ -3,6 +3,7 @@ import {dirname} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import type {ChannelRoute} from './channel-types.js';
 import type {TrendingSnapshot,TrendingDigest,TrendingGenerationProgress} from './trending-content.js';
+import {trendingDueAt,TRENDING_CATCHUP_MS} from './trending-schedule.js';
 
 export type TrendingCode = 'collect_failed'|'collect_exhausted'|'generation_unknown'|'digest_invalid'|'delivery_uncertain'|'delivery_rejected'|'route_unavailable'|'expired'|'persistence_failed'|'internal_error';
 export interface TrendingEdition {
@@ -163,7 +164,7 @@ export class TrendingStore {
   });}
   expire(at:number):void {
     const today=new Date(at+8*3_600_000).toISOString().slice(0,10);
-    const cutoff=new Date(at+8*3_600_000-10*3_600_000).toISOString().slice(0,10);
+    const cutoff=at>=trendingDueAt(today)+TRENDING_CATCHUP_MS?today:new Date(at+8*3_600_000-86_400_000).toISOString().slice(0,10);
     for(const row of this.safe(()=>this.db.prepare(`SELECT body FROM editions WHERE manual=1 AND date<?
       AND json_extract(body,'$.supplementOf') IS NOT NULL AND json_extract(body,'$.state') IN ('pending','collect_failed','ready')`).all(today))){
       const edition=JSON.parse(String(row.body)) as TrendingEdition;

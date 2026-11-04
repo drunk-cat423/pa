@@ -1,6 +1,6 @@
 # pa
 
-已支持[GitHub Trending 群日报](docs/trending.md)：每天北京时间09:00，按日/周/月榜最多5/3/2项组织，模型生成中文简介并附仓库链接；仅向显式配置的现有QQ群主动发送。默认关闭，配置与试发命令见专题文档。
+已支持[GitHub Trending 群日报](docs/trending.md)：每天北京时间08:50，按日/周/月榜最多5/3/2项组织，模型生成中文简介并附仓库链接；仅向显式配置的现有QQ群主动发送。默认关闭，配置与试发命令见专题文档。
 
 以 TypeScript 和 Pi SDK 构建的 Headless 长期个人伙伴。目标入口是 QQ / Telegram，记忆系统参考 Shiori 的思路，用 TypeScript 独立实现。
 
