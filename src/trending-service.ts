@@ -33,7 +33,7 @@ export class TrendingService {
     private readonly allowedRoutes:()=>readonly ChannelRoute[],
     private readonly enqueueOutput:(route:ChannelRoute,operation:()=>Promise<void>)=>Promise<void>,
     private readonly send:(message:OutboundMessage)=>Promise<DeliveryResult>,
-    private readonly onError:(error:unknown)=>void,deps:TrendingDependencies={}){
+    private readonly onError:(error:unknown)=>void,deps:TrendingDependencies={},private readonly mayRun:()=>boolean=()=>true){
     this.now=deps.now??Date.now;this.collector=deps.collector??collectTrending;this.generator=deps.generator??generateTrendingDigest;
     const ids=config.trending?.groupIds??[];
     if(config.trending?.enabled&&(!ids.length||ids.some(id=>!routes.some(r=>r.channel==='qq'&&r.roomType==='group'&&r.roomId===id))))
@@ -51,6 +51,7 @@ export class TrendingService {
     this.timer=setInterval(()=>this.poll(),1000);this.timer.unref();this.poll();
   }
   poll():void {
+    if (!this.mayRun()) return;
     if(!this.enabled()||this.pending)return;
     const at=this.now(),date=dayAt(at),due=dueAt(date);
     this.launch(async()=>{

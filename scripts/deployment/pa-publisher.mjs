@@ -2,7 +2,7 @@ import { createServer, request as httpRequest } from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { constants, chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync,
-  openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+  openSync, readSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -12,17 +12,39 @@ const terminal = new Set(['succeeded', 'rolled_back', 'failed']);
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const now = () => new Date().toISOString();
+class ObsoleteRelease extends Error {}
 
 function atomicJson(path, value) {
   writeFileSync(path + '.next', JSON.stringify(value), { mode: 0o600, flush: true });
   renameSync(path + '.next', path);
 }
 function regular(path, maximum) {
-  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.size > maximum) throw new Error('发布输入文件类型或大小无效。');
-    return readFileSync(fd);
+    const buffer = Buffer.alloc(stat.size);
+    let n=0;
+    while(n<buffer.length) {
+      const count=readSync(fd,buffer,n,buffer.length-n,null);
+      if(!count) throw new Error('发布输入文件在读取中改变。');
+      n+=count;
+    }
+    if(fstatSync(fd).size!==n) throw new Error('发布输入文件在读取中改变。');
+    return buffer;
+  } finally { closeSync(fd); }
+}
+function frozenEvidence(root, revisionDirectory) {
+  const directory = join(root, 'results', revisionDirectory);
+  if (process.platform !== 'linux') { realDirectory(directory); return regular(join(directory, 'diff.txt'),750_000); }
+  // Anchor every lookup to a pinned directory fd: the worker owns this tree.
+  let fd=openSync('/',constants.O_RDONLY | constants.O_DIRECTORY);
+  try {
+    for(const part of directory.split('/').filter(Boolean)){
+      const next=openSync('/proc/self/fd/'+fd+'/'+part,constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      closeSync(fd); fd=next;
+    }
+    return regular('/proc/self/fd/'+fd+'/diff.txt',750_000);
   } finally { closeSync(fd); }
 }
 function realDirectory(path) {
@@ -111,14 +133,12 @@ export async function startPublisher(config, execute = runScript) {
     const latest = await worker(config, '/tasks/' + request.taskId + suffix);
     const task = await worker(config, '/tasks/' + request.taskId + suffix + '&revision=' + request.revision);
     if (latest.revision !== request.revision || task.id !== request.taskId || task.revision !== request.revision
-      || task.owner !== config.owner || task.status !== 'completed' || task.mode !== 'fix') throw new Error('只能发布最新且已成功完成的修复版本。');
+      || task.owner !== config.owner || task.status !== 'completed' || task.mode !== 'fix') throw new ObsoleteRelease('只能发布最新且已成功完成的修复版本。');
     const source = current();
-    if (task.source !== source.source) throw new Error('线上版本已变化，需要基于当前版本重新核对修复。');
+    if (task.source !== source.source) throw new ObsoleteRelease('线上版本已变化，需要基于当前版本重新核对修复。');
     const patch = safePatch(task.diff);
-    const resultDir = join(config.workerDirectory, 'results', `${request.taskId}-${request.revision}`);
-    realDirectory(config.workerDirectory); realDirectory(join(config.workerDirectory, 'results')); realDirectory(resultDir);
-    const recorded = regular(join(resultDir, 'diff.txt'), 750_000);
-    if (!recorded.equals(patch)) throw new Error('保存的代码差异与执行器报告不一致。');
+    const recorded = frozenEvidence(config.workerDirectory,`${request.taskId}-${request.revision}`);
+    if (!recorded.equals(patch)) throw new ObsoleteRelease('保存的代码差异与执行器报告不一致。');
     return { ...source, patch, patchSha256: hash(patch) };
   }
   function view(job) { return { ...job }; }
@@ -181,8 +201,13 @@ export async function startPublisher(config, execute = runScript) {
     const promise = (async () => {
       if (job.status === 'prepared') {
         if (ledger.releases.some(other => ['queued', 'running'].includes(other.status))) throw new Error('已有发布正在执行，请等它结束。');
-        const frozen = await verified(job);
-        if (frozen.patchSha256 !== job.patchSha256 || frozen.sourceSha !== job.sourceSha) throw new Error('待发布版本已变化，请重新核对。');
+        try {
+          const frozen = await verified(job);
+          if (frozen.patchSha256 !== job.patchSha256 || frozen.sourceSha !== job.sourceSha) throw new ObsoleteRelease('待发布版本已变化，请重新核对。');
+        } catch (error) {
+          if (!(error instanceof ObsoleteRelease)) throw error;
+          Object.assign(job,{status:'failed',summary:error.message,updatedAt:now()}); save(); return view(job);
+        }
         if (ledger.releases.some(other => ['queued', 'running'].includes(other.status))) throw new Error('已有发布正在执行，请等它结束。');
         job.status = 'queued'; job.updatedAt = now(); save();
       }

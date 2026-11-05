@@ -39,7 +39,8 @@ export class ResearchService {
   private fatal?: unknown;
   private activeTask: string | undefined;
   constructor(private readonly config: PaConfig, private readonly routes: readonly ChannelRoute[],
-    private readonly send: (message: OutboundMessage, shouldSend?: () => boolean) => Promise<DeliveryResult>, private readonly onError: () => void) {
+    private readonly send: (message: OutboundMessage, shouldSend?: () => boolean) => Promise<DeliveryResult>, private readonly onError: () => void,
+    private readonly mayRun: () => boolean = () => true) {
     this.allowed = new Set(routes.map(routeKey));
   }
 
@@ -113,12 +114,13 @@ export class ResearchService {
   }
 
   private wake(): void {
+    if (!this.mayRun()) return;
     this.wakeNotifications();
     this.wakeRequested = true;
     if (this.closed || this.active || this.fatal || !this.store) return;
     this.wakeRequested = false;
     this.active = Promise.resolve().then(async () => {
-      while (!this.closed && !this.fatal) {
+      while (!this.closed && !this.fatal && this.mayRun()) {
         this.wakeRequested = false;
         const task = this.store!.research.claimNext(this.config.research!,this.routes);
         if (!task) break;
@@ -131,11 +133,12 @@ export class ResearchService {
   }
   /** One delivery at a time; durable task state remains the notification queue. */
   private wakeNotifications(): void {
+    if (!this.mayRun()) return;
     this.notificationWakeRequested = true;
     if (this.closed || this.notifications || this.fatal || !this.store) return;
     this.notificationWakeRequested = false;
     this.notifications = Promise.resolve().then(async () => {
-      while (!this.closed && !this.fatal) {
+      while (!this.closed && !this.fatal && this.mayRun()) {
         this.notificationWakeRequested = false;
         const task = this.store!.research.nextNotification(this.routes);
         if (!task) break;

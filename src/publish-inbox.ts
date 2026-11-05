@@ -5,14 +5,14 @@ import { DatabaseSync } from 'node:sqlite';
 import type { ChannelRoute, InboundMessage } from './channel-types.js';
 
 const routeKey = (r: ChannelRoute) => JSON.stringify([r.channel, r.accountId, r.roomType, r.roomId]);
-export function readPublicationGate(path?: string): 'hold' | 'activate' | undefined {
+export function readPublicationGate(path?: string): 'hold' | 'activate' | 'opening' | undefined {
   if (!path) return;
   try {
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 40) throw new Error('发布门禁文件无效。');
     const value = readFileSync(path, 'utf8').trim();
-    if (value !== 'hold' && value !== 'activate') throw new Error('发布门禁状态无效。');
-    return value;
+    if (!['hold', 'activate', 'opening'].includes(value)) throw new Error('发布门禁状态无效。');
+    return value as 'hold' | 'activate' | 'opening';
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 }
 

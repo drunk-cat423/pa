@@ -29,7 +29,7 @@ export class ReminderService {
     private readonly enqueueOutput:(route:ChannelRoute,operation:()=>Promise<void>)=>Promise<void>,
     private readonly send:(message:OutboundMessage)=>Promise<DeliveryResult>,
     private readonly onError:(error:unknown)=>void,
-    private readonly now:()=>number=Date.now) {}
+    private readonly now:()=>number=Date.now, private readonly mayRun:()=>boolean=()=>true) {}
 
   private storage():ConversationStore {
     if(this.closed)throw new MemoryError('提醒服务已经关闭。');
@@ -77,6 +77,7 @@ export class ReminderService {
 
   /** Bounded local work; the network operations proceed separately per room. */
   poll():void {
+    if (!this.mayRun()) return;
     if(this.closed||this.fatal||this.polling)return;
     this.polling=true;
     try {

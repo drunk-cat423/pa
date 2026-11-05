@@ -51,6 +51,7 @@ async function main(): Promise<void> {
   let accepting = false;
   let replay: Promise<void> | undefined;
   let activationReady = false;
+  let openReady = false;
   let preparedReady = false;
   let gatewayReady = false;
   function status(state: string): void {
@@ -103,7 +104,7 @@ async function main(): Promise<void> {
         if (['QQ Gateway READY', 'QQ Gateway 已恢复'].includes(state)) gatewayReady = true;
         else if (['connection_failed', 'QQ 正在重连'].includes(state)) gatewayReady = false;
         const held = gate();
-        status(held && preparedReady && gatewayReady ? (activationReady ? 'publish_activation_ready' : 'publish_standby_ready')
+        status(held && preparedReady && gatewayReady ? (openReady ? 'publish_open_ready' : activationReady ? 'publish_activation_ready' : 'publish_standby_ready')
           : held ? 'publish_standby_connecting' : state);
         if (state === 'connection_failed') { process.exitCode = 1; void stop(); }
       },
@@ -119,9 +120,13 @@ async function main(): Promise<void> {
         }).catch(() => { status('persistence_failed'); process.exitCode = 1; void stop(); });
       },
     });
-    harness = new ChannelHarness(config, qq.routes, channel, qq.maxCalls, policy, undefined, () => {
+    const transport = { send: async (message: import('./channel-types.js').OutboundMessage) => {
+      while (!stopping && gate()) await new Promise(resolve => setTimeout(resolve, 100));
+      return stopping ? { status: 'rejected' as const } : channel!.send(message);
+    } };
+    harness = new ChannelHarness(config, qq.routes, transport, qq.maxCalls, policy, undefined, () => {
       status('persistence_failed'); process.exitCode = 1; void stop();
-    },taskResult,{ standby: Boolean(inbox) });
+    },taskResult,{ standby: Boolean(inbox), mayRun: () => !gate() });
     await channel.start();
     if (inbox && !stopping) {
       await harness.prepare();
@@ -137,8 +142,10 @@ async function main(): Promise<void> {
         const phase = gate();
         if (phase !== last) {
           await harness.prepare(); check();
-          activationReady = phase === 'activate';
-          status(!gatewayReady ? 'publish_standby_connecting' : activationReady ? 'publish_activation_ready' : 'publish_standby_ready');
+          if (phase === 'opening') { await harness.start(); check(); }
+          activationReady = phase === 'activate' || phase === 'opening';
+          openReady = phase === 'opening';
+          status(!gatewayReady ? 'publish_standby_connecting' : openReady ? 'publish_open_ready' : activationReady ? 'publish_activation_ready' : 'publish_standby_ready');
           await statusQueue;
           last = phase;
         }

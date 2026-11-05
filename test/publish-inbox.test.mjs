@@ -15,7 +15,8 @@ test('publish standby holds business work and rollback-safe QQ inbox replays ord
     contextWindow: 1000000, maxOutputTokens: 1024, timeoutMs: 3000, research: { enabled: false, maxModelCalls: 2, maxToolCalls: 2, maxSearchCalls: 1 } };
   const create = standby => new ChannelHarness(config, [route], { send: async message => {
     sends.push(message); return { status: 'sent', externalMessageId: `out-${sends.length}` };
-  } }, 0, { version: 1, ownerBindings: [] }, undefined, undefined, undefined, { standby });
+  } }, 0, { version: 1, ownerBindings: [] }, undefined, undefined, undefined,
+  { standby, mayRun: () => !readPublicationGate(gatePath) });
   let harness, inbox, pausedMemory;
   try {
     await mkdir(dataDir, { recursive: true });
@@ -35,6 +36,10 @@ test('publish standby holds business work and rollback-safe QQ inbox replays ord
     await assert.rejects(harness.handle(message(1)), /发布检查/); assert.equal(sends.length, 0);
     await writeFile(gatePath, 'activate'); assert.equal(readPublicationGate(gatePath), 'activate');
     assert.equal(inbox.size(), 2); assert.equal(sends.length, 0);
+    await writeFile(gatePath, 'opening'); assert.equal(readPublicationGate(gatePath), 'opening');
+    await harness.start();
+    assert.equal(harness.info().reminders.started, true, 'normal service startup can finish while external execution remains gated');
+    await assert.rejects(harness.handle(message(1)), /发布检查/); assert.equal(sends.length, 0); assert.equal(inbox.size(), 2);
     await harness.close(); inbox.close();
     await rm(dataDir, { recursive: true, force: true }); // Simulate restoration of the old application's snapshot.
     await unlink(gatePath); assert.equal(readPublicationGate(gatePath), undefined);

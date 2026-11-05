@@ -152,7 +152,7 @@ async function rollback(reason) {
   const currentReal=fs.realpathSync(current);
   if(currentReal!==previous && currentReal!==path.join(releases,state.commit) &&
     (!state.revertCommit || currentReal!==path.join(releases,state.revertCommit))) throw Error('人工发布改变了当前版本，需要运维核对。');
-  if(state.phase!=='rollback') phase('rollback',{reason, restore: Boolean(state.snapshot && currentReal!==previous && state.phase!=='open')});
+  if(state.phase!=='rollback') phase('rollback',{reason, restore: Boolean(state.snapshot && currentReal!==previous)});
   if(!state.localRestored) {
     stop();
     if(state.restore) restoreData();
@@ -189,7 +189,7 @@ async function rollback(reason) {
 async function main() {
   if(fs.existsSync(resultPath)) return;
   if(state.phase==='rollback') { await rollback(state.reason); return; }
-  if(state.phase==='open') {await openAndFinish(); return;}
+  if(state.phase==='committed') {await finishCommitted(); return;}
   if(['stopping','switching'].includes(state.phase)) { await rollback('发布进程曾中断。'); return; }
   try {
     if(state.phase==='prepare') {
@@ -202,6 +202,7 @@ async function main() {
       run('systemctl',['stop',layout.worker]); const snapshot=backup();
       phase('switching',{snapshot}); setCurrent(path.join(releases,state.commit)); start(); await verify(path.join(releases,state.commit),'publish_standby_ready');
       gate('activate'); await verify(path.join(releases,state.commit),'publish_activation_ready');
+      gate('opening'); await verify(path.join(releases,state.commit),'publish_open_ready');
       phase('promoting');
     }
   } catch(error) {
@@ -211,7 +212,7 @@ async function main() {
     finish('failed',reason);return;
   }
   if(state.phase!=='promoting') throw Error('发布阶段无效。');
-  try {await verify(path.join(releases,state.commit),'publish_activation_ready');}
+  try {await verify(path.join(releases,state.commit),'publish_open_ready');}
   catch {await rollback('推送前重新核验运行状态失败。'); return;}
   // Reconcile before repeating a Git write. A lost response can mean GitHub already accepted the commit.
   let remote=remoteHead();
@@ -226,13 +227,20 @@ async function main() {
     let included=false;try{git(['merge-base','--is-ancestor',state.commit,'FETCH_HEAD']);included=true;}catch{}
     if(!included){await rollback('GitHub 未接受该候选提交，分支没有被强制覆盖。');return;}
   }
-  phase('open'); await openAndFinish();
+  try {await verify(path.join(releases,state.commit),'publish_open_ready');}
+  catch {await rollback('GitHub 确认期间候选失去就绪状态。');return;}
+  phase('committed'); await finishCommitted();
 }
-async function openAndFinish(){
+async function finishCommitted(){
   if(fs.realpathSync(current)!==path.join(releases,state.commit)) throw Error('当前版本已变化，需要核对。');
-  gate(null);
-  try {await verify(path.join(releases,state.commit));}
-  catch {await rollback('解除发布门禁后的健康检查失败。'); return;}
+  if(fs.existsSync(layout.gate)){
+    try {await verify(path.join(releases,state.commit),'publish_open_ready');}
+    catch {await rollback('最终放行业务前候选未就绪。');return;}
+    gate(null);
+  }
+  // Full startup and GitHub promotion are committed before admitting the first live user operation.
+  // After handover, never overwrite newly accepted business data to recover a lost result.
+  await verify(path.join(releases,state.commit));
   finish('succeeded',`已发布 ${state.commit.slice(0,8)}，GitHub 已收到对应提交，PA 和 QQ 已通过就绪检查。`);
   try {run('/opt/node-v24.15.0/bin/node',[layout.storage,'prune','--apply'],{timeout:300000});}
   catch {console.error('发布已完成，备份保留巡检需要复查。');}

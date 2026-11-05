@@ -47,10 +47,10 @@ test('publisher freezes exact repair, waits for sent acknowledgement, and resume
     assert.equal((await call('/releases', { ...input, revision: 2 })).code, 400);
     assert.equal((await call('/releases?owner=other')).code, 403);
     latestRevision = 2;
-    assert.equal((await call('/releases/' + prepared.value.id + '/start', { owner, requestId: input.requestId })).code, 400);
+    assert.equal((await call('/releases', { ...input, requestId:'changed-version' })).code, 400);
     assert.equal(attempts, 0); latestRevision = 1;
     await writeFile(join(result, 'diff.txt'), diff + '\nchanged after report');
-    assert.equal((await call('/releases/' + prepared.value.id + '/start', { owner, requestId: input.requestId })).code, 400);
+    assert.equal((await call('/releases', { ...input, requestId:'changed-patch' })).code, 400);
     await writeFile(join(result, 'diff.txt'), diff);
     const queued = await Promise.all([1, 2].map(() => call('/releases/' + prepared.value.id + '/start', { owner, requestId: input.requestId })));
     assert.ok(queued.every(response => response.code === 202));

@@ -14,7 +14,7 @@ PA 的 `codex-publication.sqlite` 保存已报告版本、来源请求、明确�
 
 ## 发布检查期间的 QQ 接入
 
-部署同时配置 `PA_PUBLISH_GATE_FILE` 和 `PA_PUBLISH_INBOX`。门禁文件由 root 写入，值为 `hold` 时，新版 PA 连接 QQ 并打开房间、核验 Pi 与数据库、初始化业务存储，成功后报告 `publish_standby_ready`。值为 `activate` 时再次核验并报告 `publish_activation_ready`。两种状态下均不启动业务调度和自动记忆，QQ 断连时只报告等待连接。
+部署同时配置 `PA_PUBLISH_GATE_FILE` 和 `PA_PUBLISH_INBOX`。门禁文件由 root 写入，值为 `hold` 时，新版 PA 连接 QQ 并打开房间、核验 Pi 与数据库、初始化业务存储，成功后报告 `publish_standby_ready`。值为 `activate` 时再次核验并报告 `publish_activation_ready`。值为 `opening` 时完成正常服务启动，调度器和自动记忆仍受独立运行门禁约束，成功后报告 `publish_open_ready`。任何门禁阶段均不发送 QQ 消息、不发起模型工作，QQ 断连时只报告等待连接。发布最终决定持久化且门禁删除后才允许执行和输入重放。
 
 所有已允许路由的真实 QQ 消息在启动及门禁期间，先同步写入 `PA_PUBLISH_INBOX/inbox.sqlite`。该目录由 pa 持有、权限 0700，位于应用快照目录之外，回滚恢复应用数据不会覆盖它。删除门禁后才启动业务服务，并按序把收件箱消息交给正常持久入队。只有入队、观察入库或确认重复后才删除收件箱条目；捕获或重放失败保留原文并停止服务等待处理。重放已入队消息利用原 QQ eventId 去重。
 
