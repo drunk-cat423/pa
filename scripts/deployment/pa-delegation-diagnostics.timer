@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh delegated PA diagnostics while the server runs
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

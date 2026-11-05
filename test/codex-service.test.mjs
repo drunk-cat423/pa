@@ -1,0 +1,156 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { CodexService, codexPrivateOwner, codexOwnerKey } from '../dist/codex-service.js';
+import { openConversation } from '../dist/runtime.js';
+import { preparationDelta } from './fixtures/turn-preparation.mjs';
+import { readRecordedTurns } from '../dist/transcript.js';
+
+test('owner private task delivers actual diff, continues same task, and preserves uncertain delivery across restart', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pa-codex-'));
+  const socketPath = process.platform === 'win32' ? `\\\\.\\pipe\\pa-codex-${randomUUID()}` : join(directory, 'worker.sock');
+  const route = { channel: 'qq', accountId: 'bot', roomType: 'private', roomId: 'owner' };
+  const binding = { route, senderId: 'owner' }, policy = { version: 1, ownerBindings: [binding] };
+  assert.equal(codexPrivateOwner(policy, [route]), binding);
+  assert.throws(() => codexPrivateOwner({ ...policy, ownerBindings: [binding, binding] }, [route]));
+  const revisions = [], requests = new Map(), deliveries = [];
+  let responseStatus = 'sent', service;
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (req.method === 'POST') {
+      const chunks = []; for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      assert.equal(body.owner, codexOwnerKey(binding));
+      let task = requests.get(body.requestId);
+      if (!task) {
+        if (revisions.length) assert.equal(body.taskId, 'C17');
+        task = { id: 'C17', revision: revisions.length + 1, status: 'queued', requestId: body.requestId };
+        revisions.push(task); requests.set(body.requestId, task);
+      }
+      res.end(JSON.stringify(task)); return;
+    }
+    assert.equal(url.searchParams.get('owner'), codexOwnerKey(binding));
+    if (url.pathname === '/tasks') {
+      const requestId = url.searchParams.get('requestId');
+      res.end(JSON.stringify({ tasks: requestId ? [requests.get(requestId)].filter(Boolean) : revisions.slice(-1) })); return;
+    }
+    res.end(JSON.stringify(revisions.at(-1)));
+  });
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  const create = () => new CodexService({ dataDir: directory, codex: { socketPath } }, binding, () => true, async message => {
+    deliveries.push(message); return responseStatus === 'sent' ? { status: 'sent', externalMessageId: 'qq-result' } : { status: responseStatus };
+  });
+  try {
+    service = create();
+    assert.equal(service.context(route, 'someone-else', 's1'), undefined);
+    assert.equal(service.context({ ...route, roomType: 'group' }, 'owner', 's1'), undefined);
+    const first = service.context(route, 'owner', 's1');
+    const receipt = await first.execute('delegate_task', { mode: 'fix', prompt: 'Fix the divider and run its test.' });
+    await first.execute('delegate_task', { mode: 'fix', prompt: 'Fix the divider and run its test.' });
+    assert.equal(receipt.id, 'C17'); assert.equal(revisions.length, 1);
+    Object.assign(revisions[0], { status: 'completed', summary: 'Fixed divider.', evidence: 'node --test divider.test.mjs\nexit_code=0', diff: '+ underscore divider' });
+    await service.wait(); await service.wait();
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0].deliveryMode, 'active');
+    assert.match(deliveries[0].file.data.toString(), /exit_code=0[\s\S]*\+ underscore divider/);
+    const second = await service.context(route, 'owner', 's2').execute('continue_coding_task', { id: 'C17', mode: 'fix', prompt: 'Keep the fix, undo the wording change.' });
+    assert.equal(second.revision, 2);
+    Object.assign(revisions[1], { status: 'completed', summary: 'Revised.', evidence: 'node --test divider.test.mjs\nexit_code=0', diff: '+ revised divider' });
+    responseStatus = 'uncertain'; await service.wait(); await service.close();
+    service = create(); await service.wait();
+    assert.equal(deliveries.length, 2, 'uncertain sends are not replayed after restart');
+    const status = await service.context(route, 'owner', 's3').execute('coding_status', { id: 'C17' });
+    assert.equal(status.revision, 2); assert.equal(status.summary, 'Revised.');
+    assert.equal(status.diff, undefined); // Large patches belong in the attachment, outside chat context.
+  } finally {
+    await service?.close(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Pi dispatches the saved coding task once and returns the durable acknowledgement without another model call', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'pa-codex-runtime-')), requests = [];
+  const confirmation = '已交给Codex，任务 C17（第1次）。完成后把执行结果和改动文件发回本私聊。';
+  let executions = 0;
+  const server = createServer(async (req, res) => {
+    let raw = ''; for await (const part of req) raw += part;
+    const body = JSON.parse(raw); requests.push(body);
+    const delta = requests.length === 1 ? preparationDelta('coding') : { role: 'assistant', tool_calls: [{
+      index: 0, id: 'dispatch', type: 'function', function: { name: 'delegate_task', arguments: JSON.stringify({ mode: 'fix', prompt: 'Fix divider.' }) },
+    }] };
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const [value, finish_reason] of [[delta, null], [{}, 'tool_calls']]) {
+      res.write(`data: ${JSON.stringify({ id: 'fixture', model: body.model, choices: [{ index: 0, delta: value, finish_reason }] })}\n\n`);
+    }
+    res.end('data: [DONE]\n\n');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const runtime = await openConversation({ cwd: directory, dataDir: join(directory, 'data'), provider: 'fixture', model: 'fixture', apiKey: 'fixture',
+    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, contextWindow: 131072, maxOutputTokens: 1024, timeoutMs: 5000,
+  }, 'owner-private', { enableSearch: true, enableCodex: true });
+  t.after(async () => { await runtime.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); });
+  const result = await runtime.prompt('Fix divider.', { runId: 'coding', companionTools: {
+    prepareTurn: plan => ({ prepared: true, mode: plan.mode, saved: [] }), readHistory: () => [],
+    codex: { async execute(name, params) { executions++; assert.equal(name, 'delegate_task'); assert.equal(params.mode, 'fix'); return { saved: true, id: 'C17', revision: 1, status: 'queued', confirmation }; } },
+  } });
+  assert.equal(result, confirmation); assert.equal(executions, 1); assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['prepare_turn']);
+  assert.ok(requests[1].tools.some(tool => tool.function.name === 'delegate_task'));
+  assert.equal(runtime.recordedTurns().at(-1).assistant.text, confirmation);
+  assert.equal((await readRecordedTurns(runtime.info().sessionFile)).at(-1).assistant.text, confirmation,
+    'saved Codex tool results must pass the strict disk reader used by task integrity verification');
+});
+
+test('rejected and unknown requests cannot starve later results or cross a changed owner policy', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pa-codex-recovery-'));
+  const socketPath = process.platform === 'win32' ? `\\\\.\\pipe\\pa-codex-${randomUUID()}` : join(directory, 'worker.sock');
+  const route = { channel: 'qq', accountId: 'bot', roomType: 'private', roomId: 'owner' };
+  const binding = { route, senderId: 'owner' }, owner = codexOwnerKey(binding);
+  const unknown = [], lookups = [], deliveries = [], tasks = new Map();
+  let posts = 0, service;
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (req.method === 'POST') {
+      posts++;
+      const chunks = []; for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      if (body.prompt === 'reject') { res.writeHead(400); res.end('{"error":"queue full"}'); return; }
+      if (body.prompt === 'unknown') { unknown.push(body.requestId); res.writeHead(500); res.end('{"error":"acceptance uncertain"}'); return; }
+      const task = { id: 'C17', revision: 1, status: 'completed', requestId: body.requestId, summary: 'Done.', diff: '+ verified', evidence: 'test exit=0' };
+      tasks.set(body.requestId, task); res.end(JSON.stringify(task)); return;
+    }
+    const requestId = url.searchParams.get('requestId');
+    lookups.push({ owner: url.searchParams.get('owner'), requestId });
+    if (requestId === unknown[0]) { res.writeHead(503); res.end('{"error":"temporary lookup failure"}'); return; }
+    res.end(JSON.stringify({ tasks: tasks.has(requestId) ? [tasks.get(requestId)] : [] }));
+  });
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  const create = selected => new CodexService({ dataDir: directory, codex: { socketPath } }, selected, () => true, async message => {
+    deliveries.push(message); return { status: 'sent', externalMessageId: 'result' };
+  });
+  try {
+    service = create(binding);
+    for (let n = 0; n < 21; n++) {
+      await assert.rejects(service.context(route, 'owner', `reject-${n}`).execute('delegate_task', { prompt: 'reject', mode: 'read' }), /queue full/);
+      await assert.rejects(service.context(route, 'owner', `unknown-${n}`).execute('delegate_task', { prompt: 'unknown', mode: 'read' }), /uncertain/);
+    }
+    await service.context(route, 'owner', 'accepted').execute('delegate_task', { prompt: 'accepted', mode: 'read' });
+    for (let pass = 0; pass < 4; pass++) await service.wait();
+    assert.equal(deliveries.length, 1, '21 stale unknowns and a failing lookup cannot hide the completed result');
+    assert.equal(posts, 43, 'recovery only queries; it never resubmits uncertain work');
+    assert.ok(lookups.every(item => item.owner === owner));
+    assert.equal(lookups.filter(item => item.requestId === unknown[1]).length, 3, 'three successful empty lookups retire unknown acceptance');
+    await service.close();
+    const changed = { route: { ...route, roomId: 'new-owner' }, senderId: 'new-owner' };
+    service = create(changed);
+    const before = lookups.length;
+    await service.wait();
+    assert.equal(lookups.length, before, 'new owner never polls pending source requests belonging to previous owner');
+    assert.equal(deliveries.length, 1);
+  } finally {
+    await service?.close(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true });
+  }
+});

@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const testDir = join(root, 'test');
 const scopeFiles = {
+  delegation: ['codex-service.test.mjs', 'codex-worker.test.mjs'],
   efficiency: ['search-concurrency.test.mjs', 'research-scheduling.test.mjs', 'storage-efficiency.test.mjs', 'context-efficiency.test.mjs'],
   trending: ['trending-content.test.mjs', 'trending-service.test.mjs'],
   ops: ['ops-status.test.mjs'],

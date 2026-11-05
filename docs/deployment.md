@@ -33,6 +33,12 @@ journalctl -u pa.service -n 30 --no-pager
 
 服务以 `Restart=on-failure` 有限重启，SIGTERM 会正常关闭后台任务及会话。异常结束后，启动前脚本只移除已证实进程不存在的服务/会话锁；活动进程、无效锁或不明路径会阻止启动，不能跳过这些检查。V8 堆限制256 MB，systemd MemoryHigh384 MB、MemoryMax512 MB；这些是资源限制，不代表实测常驻用量。
 
+## 本人私聊的 Codex 执行器
+
+主服务通过 Unix socket 调度单任务，Codex 在独立 systemd 单元内以专用账号运行。安装、订阅认证、模型设置和停用步骤见 [Codex 执行器](codex-worker.md)。开关只加在 PA 的服务环境中，执行器使用单独的环境文件。
+
+需要查看 PA 运行事件时，可安装 `scripts/deployment/pa-delegation-diagnostics.{service,timer}` 并启用 timer。它约每两分钟刷新 `/run/pa-delegation-diagnostics/events.log`，只包含最近 24 小时最多 300 条白名单网关事件及后台状态。执行器的 `PA_CODEX_LOG_FILE` 指向这个只读文件。日志不含原始聊天、用户 ID、模型请求和凭证；快照首行给出更新时间。
+
 ## Detective 停用与恢复
 
 保留 `/opt/detective-assistant` 的代码、venv、配置和 Chroma，以及 `/var/lib/mysql` 中的数据库。经确认 MySQL 没有其他业务库，且 Waline 使用独立 SQLite 后，可停用 Detective 后端和 MySQL：

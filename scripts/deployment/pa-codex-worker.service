@@ -1,0 +1,42 @@
+[Unit]
+Description=PA private Codex task executor
+After=network-online.target mihomo-pa.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=pa-codex-probe
+Group=pa
+WorkingDirectory=/var/lib/pa-codex-probe
+Environment=HOME=/var/lib/pa-codex-probe
+Environment=PATH=/opt/node-v24.15.0/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HTTPS_PROXY=http://127.0.0.1:17890
+Environment=HTTP_PROXY=http://127.0.0.1:17890
+Environment=NO_PROXY=localhost,127.0.0.1
+EnvironmentFile=/etc/pa-codex-worker.env
+ExecStart=/opt/node-v24.15.0/bin/node /opt/pa/current/dist/codex-worker.js
+RuntimeDirectory=pa-codex
+RuntimeDirectoryMode=0750
+UMask=0007
+MemoryMax=512M
+MemorySwapMax=0
+MemoryAccounting=true
+CPUQuota=100%
+TasksMax=100
+KillMode=control-group
+OOMPolicy=kill
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pa-codex-probe /run/pa-codex
+InaccessiblePaths=/var/lib/pa /etc/pa /root
+PrivateTmp=true
+AppArmorProfile=pa-codex-worker
+
+[Install]
+WantedBy=multi-user.target

@@ -25,6 +25,7 @@ import { WebFetchError, normalizeWebFetchUrl } from './web-fetch.js';
 import { RESEARCH_TOOL_SPECS, RESEARCH_USAGE_PROMPT, RESEARCH_WORKER_PROMPT, RESEARCH_STAGE_PROMPT,
   type ResearchToolContext, type ResearchToolName, type ResearchRuntimeOptions, type ResearchRuntimeEvent } from './research-tools.js';
 import { REMINDER_TOOL_SPECS, REMINDER_USAGE_PROMPT, type ReminderToolContext, type ReminderToolName } from './reminder-tools.js';
+import { CODEX_TOOL_SPECS, CODEX_USAGE_PROMPT, type CodexToolContext, type CodexToolName } from './codex-tools.js';
 import { outputLengthGuidance } from './output-length.js';
 import { compactResearchContext, researchContextReference, type ResearchContextReference } from './research-context.js';
 import { RESEARCH_MATERIAL_PREFIX, type MaterialReadParams } from './research-material-reader.js';
@@ -87,6 +88,7 @@ export interface CompanionToolContext {
   onProgress?(text: string): Promise<void>;
   research?: ResearchToolContext;
   reminders?: ReminderToolContext;
+  codex?: CodexToolContext | undefined;
 }
 
 export interface ContextEstimate {
@@ -191,7 +193,7 @@ async function loadSession(cwd: string, directory: string): Promise<SessionManag
 }
 
 export async function openConversation(config: PaConfig, conversationId: string,
-  options: { enableSearch?: boolean; contextCalibrationScope?: string; research?: ResearchRuntimeOptions } = {}): Promise<ConversationRuntime> {
+  options: { enableSearch?: boolean; enableCodex?: boolean; contextCalibrationScope?: string; research?: ResearchRuntimeOptions } = {}): Promise<ConversationRuntime> {
   const { directory, release: releaseLock } = await acquireConversationLock(config.dataDir, conversationId);
   let session: AgentSession | undefined;
   try {
@@ -204,11 +206,12 @@ export async function openConversation(config: PaConfig, conversationId: string,
     const systemPrompt = options.research ? options.research.systemPrompt
       ?? (options.research.phase ? RESEARCH_STAGE_PROMPT : RESEARCH_WORKER_PROMPT) : COMPANION_PROMPT;
     const channelReminderProtocol = options.enableSearch ? '\n' + REMINDER_USAGE_PROMPT : '';
+    const channelCodexProtocol = options.enableCodex ? '\n' + CODEX_USAGE_PROMPT : '';
     const channelPrepareProtocol = CHANNEL_CONTROL_PROTOCOL + '\nstage=prepare。\n'
       + PREPARE_TURN_PROMPT + '\n【以下grounding规则仅在groundingRequired=true时适用】\n' + ANSWER_GROUNDING_PROMPT + channelReminderProtocol
-      + (config.research?.enabled ? '\n用户明确要求加入研究清单或继续后台研究时，intent=research；本轮仅准备入队和简短确认，不先展开研究结论。' : '');
+      + (config.research?.enabled ? '\n用户明确要求加入研究清单或继续后台研究时，intent=research；本轮仅准备入队和简短确认，不先展开研究结论。' : '') + channelCodexProtocol;
     const channelAnswerProtocol = CHANNEL_CONTROL_PROTOCOL + '\nstage=answer；准备已完成，只按mode回答。\n'
-      + CHANNEL_ANSWER_PROTOCOL + (config.research?.enabled ? '\n' + RESEARCH_USAGE_PROMPT : '') + channelReminderProtocol;
+      + CHANNEL_ANSWER_PROTOCOL + (config.research?.enabled ? '\n' + RESEARCH_USAGE_PROMPT : '') + channelReminderProtocol + channelCodexProtocol;
     const configuredLoop = config.loop ?? { maxModelCalls: 6, maxToolCalls: 8 };
     const loop = options.research ? {
       maxModelCalls: researchSingleCall ? 1 : configuredLoop.maxModelCalls,
@@ -240,6 +243,8 @@ export async function openConversation(config: PaConfig, conversationId: string,
     let researchPartialFailure = false;
     let reminderAcknowledgements: string[] = [];
     let reminderAcknowledgementEnded = false;
+    let codexAcknowledgement: string | undefined;
+    let codexAcknowledgementEnded = false;
     const skippedAfterReminder = new Set<string>();
     const unresolvedResearchOperations = new Set<string>();
     const skippedAfterResearch = new Set<string>();
@@ -520,6 +525,24 @@ export async function openConversation(config: PaConfig, conversationId: string,
       },
     });
     if (!supportsImageInput(config)) customTools.splice(customTools.findIndex(tool => tool.name === 'read_image'),1);
+    if (options.enableCodex && !options.research) for (const spec of CODEX_TOOL_SPECS) customTools.push({
+      name: spec.name, label: spec.label, description: spec.description,
+      parameters: spec.parameters as ToolDefinition['parameters'], executionMode: 'sequential',
+      async execute(id, params, signal) {
+        startTool(signal, id);
+        try {
+          if (!companionTools?.codex) throw new MemoryError('此操作仅开放给已配置的本人QQ私聊。');
+          const receipt = await cancellable(() => companionTools!.codex!.execute(spec.name as CodexToolName, params), signal);
+          if (receipt && typeof receipt === 'object' && 'saved' in receipt && receipt.saved === true
+            && 'confirmation' in receipt && typeof receipt.confirmation === 'string') codexAcknowledgement = receipt.confirmation;
+          return result(receipt, '以下是Codex任务的真实回执或执行结果，只能按已完成操作确认：\n');
+        } catch (error) {
+          if (error instanceof MemoryError) return rejectArguments(id, error);
+          if (error instanceof RequestError) throw error;
+          return failPersistence(error);
+        }
+      },
+    });
     if (options.research) customTools.splice(0);
     if (options.research?.readMaterial && (researchCollects || researchPhase === 'review')) customTools.push({
       name: 'read_research_material', label: '读取已保存研究材料',
@@ -827,6 +850,9 @@ export async function openConversation(config: PaConfig, conversationId: string,
         reminderAcknowledgementEnded = true;
         return { action: 'end' };
       }
+      if (codexAcknowledgement) {
+        checkRun(signal); codexAcknowledgementEnded = true; return { action: 'end' };
+      }
       if (researchAcknowledgements.length) {
         checkRun(signal);
         const failed = turn.toolResults.filter(result => result.isError && !skippedAfterResearch.has(result.toolCallId));
@@ -881,6 +907,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
     agentSession.agent.toolExecution = 'sequential';
     agentSession.agent.beforeToolCall = async (context, signal) => {
       checkRun(signal);
+      if (codexAcknowledgement) return { block: true, terminate: true, reason: 'Codex任务已保存，本轮按实际回执确认。' };
       if (reminderAcknowledgements.length) {
         skippedAfterReminder.add(context.toolCall.id);
         return { block: true, terminate: true, reason: '提醒操作已保存，本轮只按实际回执确认；其他操作未执行。' };
@@ -1098,6 +1125,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
           researchAcknowledgementEnded = false; skippedAfterResearch.clear();
           researchPartialFailure = false;
           reminderAcknowledgements = []; reminderAcknowledgementEnded = false; skippedAfterReminder.clear();
+          codexAcknowledgement = undefined; codexAcknowledgementEnded = false;
           unresolvedResearchOperations.clear();
           collectionBudgetEnded = false; collectionToolFailed = false; linkReadAttempted = false;
           requestTimedOut = false;
@@ -1139,7 +1167,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
             }
             if (companionTools?.prepareTurn && (!prepared || preparationError)) throw new RequestError(preparationError ?? '本轮没有完成结构化准备，未放行回答。','error');
             if (collectionToolFailed) throw new RequestError('采集工具执行失败，已保存工具结果，未继续追加模型请求。', 'error');
-            if (assistant.stopReason === 'toolUse' && !collectionBudgetEnded && !researchAcknowledgementEnded && !reminderAcknowledgementEnded && !groundingFallback && !attributionReviewActive) throw new RequestError('本轮没有形成完整回答，未继续追加模型请求。', 'error');
+            if (assistant.stopReason === 'toolUse' && !collectionBudgetEnded && !researchAcknowledgementEnded && !reminderAcknowledgementEnded && !codexAcknowledgementEnded && !groundingFallback && !attributionReviewActive) throw new RequestError('本轮没有形成完整回答，未继续追加模型请求。', 'error');
             const assistantText = assistant.content.filter((part) => part.type === 'text').map((part) => part.text).join('');
             // Collection notes are small; full evidence is retained by record().
             let answer = assistantText;
@@ -1156,8 +1184,9 @@ export async function openConversation(config: PaConfig, conversationId: string,
               answer='已搜索相关资料，但来源日期与现况尚未独立核验；以下仅依据本次检索结果。\n\n'+answer;
               groundedReplacement=true;
             }
-            if (researchAcknowledgementEnded || reminderAcknowledgementEnded || saveClaimFallback || groundedReplacement) {
-              if (reminderAcknowledgementEnded) answer = reminderAcknowledgements.join('\n')
+            if (researchAcknowledgementEnded || reminderAcknowledgementEnded || codexAcknowledgementEnded || saveClaimFallback || groundedReplacement) {
+              if (codexAcknowledgementEnded) answer = codexAcknowledgement!;
+              else if (reminderAcknowledgementEnded) answer = reminderAcknowledgements.join('\n')
                 + (skippedAfterReminder.size ? '\n本轮其他操作未执行。' : '');
               else if(researchAcknowledgementEnded||saveClaimFallback)
               answer = saveClaimFallback ? ((preparationReceipt as TurnReceipt | undefined)?.saved.length || researchSaved
@@ -1184,7 +1213,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
               }
             }
             options.research?.onFinalResponse?.({ stopReason: assistant.stopReason });
-            if (companionTools?.verifyLink && !linkReadAttempted && !researchAcknowledgementEnded && !reminderAcknowledgementEnded && !groundingFallback) {
+            if (companionTools?.verifyLink && !linkReadAttempted && !researchAcknowledgementEnded && !reminderAcknowledgementEnded && !codexAcknowledgementEnded && !groundingFallback) {
               throw new RequestError('本轮尚未实际读取指定链接，不能确认网页内容可访问；未自动重试。', 'error');
             }
             if (preparationReceipt && hasUnconfirmedSaveClaim(answer)) {
@@ -1206,7 +1235,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
             });
             // Billing/audit persistence failures remain fatal even if cancellation raced them.
             if (fatal) throw fatal;
-            const confirmed = [...new Set([...researchAcknowledgements, ...reminderAcknowledgements])];
+            const confirmed = [...new Set([...researchAcknowledgements, ...reminderAcknowledgements, ...(codexAcknowledgement ? [codexAcknowledgement] : [])])];
             if (requestTimedOut) throw new RequestError('单个模型请求超时。', 'timeout', { cause: error }, confirmed);
             if (cancelRequested) throw new RequestError('本轮请求已取消。', 'cancelled', { cause: error }, confirmed);
             if (error instanceof RequestError && confirmed.length) throw new RequestError(error.message,error.kind,{cause:error},confirmed);

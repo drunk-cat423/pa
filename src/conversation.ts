@@ -20,6 +20,7 @@ import { ImageAssets, ImageAssetError } from './image-assets.js';
 import { DiagnosticLog } from './diagnostics.js';
 import type { ResearchToolContext } from './research-tools.js';
 import type {ReminderToolContext} from './reminder-tools.js';
+import type { CodexToolContext } from './codex-tools.js';
 import type { ResearchSender } from './research-service.js';
 import { researchUrls } from './research-target.js';
 import type { AnswerGroundingContext, GroundingSource } from './answer-grounding.js';
@@ -122,10 +123,11 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
   options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy;
     storeInitialization?:StoreInitializationScope;
     reminderContext?: (conversationId:string,sourceMessageId:string)=>ReminderToolContext;
+    codexContext?: (sourceMessageId: string, senderId: string) => CodexToolContext | undefined;
     onIntegrityFailure?: (error: Error) => void;
     researchContext?: (conversationId: string, sourceMessageId: string, send?: ResearchSender) => ResearchToolContext } = {}): Promise<RecordedConversation> {
   // Acquire the Pi conversation lock before inspecting or mutating its business records.
-  const runtime = await openConversation(config, conversationKey, { enableSearch: Boolean(route), contextCalibrationScope: conversationKey })
+  const runtime = await openConversation(config, conversationKey, { enableSearch: Boolean(route), enableCodex: Boolean(options.codexContext), contextCalibrationScope: conversationKey })
     .catch(error=>{
       if(error instanceof TranscriptIntegrityError) throw new SessionIntegrityError('该房间的主 Pi 会话文件损坏或不可读。',conversationKey,{cause:error});
       throw error;
@@ -359,7 +361,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
           persist(() => openedStore.refreshExpiredContext(conversation.id));
           applyContextReset();
           if (external) {
-            isolated = await openConversation(config, `${conversationKey}:task:${external.existingMessageId}`, { enableSearch: true, contextCalibrationScope: conversationKey });
+            isolated = await openConversation(config, `${conversationKey}:task:${external.existingMessageId}`, { enableSearch: true, enableCodex: Boolean(options.codexContext), contextCalibrationScope: conversationKey });
             taskRuntimes.add(isolated);
             const file = isolated.info().sessionFile;
             if (file) activeSessionFiles.add(file);
@@ -630,6 +632,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
                   && researchUrls(text).length === 1 ? { verifyLink: researchUrls(text)[0] } : {}),
                 ...(options.researchContext ? { research: options.researchContext(conversation.id, run.inputMessageId, sendResearch) } : {}),
                 ...(options.reminderContext ? {reminders:options.reminderContext(conversation.id,run.inputMessageId)} : {}),
+                ...(options.codexContext ? { codex: options.codexContext(run.inputMessageId, inputExternal.senderId) } : {}),
                 prepareTurn: (plan: import('./turn-plan.js').TurnPlan) => persist(()=>openedStore.prepareTurn(
                   conversation.id,run.inputMessageId,plan,policy,inputExternal.mentionedSenderIds,
                   selfProfileBudget(runtime.estimate('').contextWindow)),text),

@@ -17,6 +17,7 @@ import { ResearchService } from './research-service.js';
 import { SessionIntegrityError } from './session-integrity.js';
 import {ReminderService} from './reminder-service.js';
 import {TrendingService} from './trending-service.js';
+import { CodexService, codexPrivateOwner } from './codex-service.js';
 
 export interface ChannelTransport {
   send(message: OutboundMessage): Promise<DeliveryResult>;
@@ -58,6 +59,7 @@ export class ChannelHarness {
   private readonly research?: ResearchService;
   private readonly reminders: ReminderService;
   private readonly trending?: TrendingService;
+  private readonly codex?: CodexService;
 
   constructor(private readonly config: PaConfig, private readonly routes: ChannelRoute[],
     private readonly transport: ChannelTransport, private readonly maxCalls: number, policy: HarnessPolicy = NO_OWNER_POLICY,
@@ -70,6 +72,14 @@ export class ChannelHarness {
     this.allowed = new Set(routes.map(channelConversationKey));
     this.policy = validateHarnessPolicy(policy);
     this.imageAssets = new ImageAssets(config);
+    if (config.codex) {
+      const owner = codexPrivateOwner(this.policy, routes);
+      this.codex = new CodexService(config, owner, () => {
+        const key = channelConversationKey(owner.route);
+        return !this.closed && !this.fatal && !this.isolatedRooms.has(key)
+          && this.conversations.get(key)?.integrityStatus().status === 'healthy';
+      }, message => this.output(message.route, () => this.closed ? Promise.resolve({ status: 'rejected' as const }) : this.transport.send(message)));
+    }
     this.reminders=new ReminderService(config,
       ()=>this.routes.filter(route=>{
         const key=channelConversationKey(route),room=this.conversations.get(key);
@@ -96,6 +106,7 @@ export class ChannelHarness {
     ...(this.research ? { research: this.research.info() } : {}),
     reminders:this.reminders.info(),
     ...(this.trending?{trending:this.trending.info()}:{}),
+    ...(this.codex ? { codex: this.codex.info() } : {}),
     memory: [...this.conversations].map(([key, conversation]) => ({ conversation: key, ...conversation.memoryStatus() })) }; }
 
   async waitForMemory(): Promise<void> {
@@ -121,6 +132,7 @@ export class ChannelHarness {
       if (!this.closed) this.research?.start();
       if (!this.closed) this.reminders.start();
       if (!this.closed) this.trending?.start();
+      if (!this.closed) this.codex?.start();
     }
   }
 
@@ -135,6 +147,7 @@ export class ChannelHarness {
             else {this.fatal=error;this.onTaskError?.();}
           },
           reminderContext:(conversationId,sourceId)=>this.reminders.context(conversationId,sourceId),
+          ...(this.codex?.matches(route) ? { codexContext: (sourceId: string, senderId: string) => this.codex!.context(route, senderId, sourceId) } : {}),
           ...(this.research ? { researchContext: (conversationId, sourceId, send) => this.research!.context(conversationId, sourceId, send) } : {}) });
       this.opening.set(key, pending);
       pending.then(conversation => {
@@ -427,6 +440,7 @@ export class ChannelHarness {
     const researchClosing = this.research?.abort();
     const reminderClosing=this.reminders.close();
     const trendingClosing=this.trending?.close();
+    const codexClosing=this.codex?.close();
     for (const [id,waiting] of this.waiters) if(this.busyRooms.get(waiting.key)!==id) {
       waiting.resolve('ignored'); this.waiters.delete(id);
     }
@@ -440,6 +454,7 @@ export class ChannelHarness {
     await this.research?.close();
     await reminderClosing;
     await trendingClosing;
+    await codexClosing;
     await Promise.allSettled(this.outputs.values());
     // An open operation already in progress may have completed after the first close pass.
     await Promise.all([...this.conversations.values()].map(conversation => conversation.close()));

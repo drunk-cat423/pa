@@ -20,6 +20,7 @@ export interface PaConfig {
   fetch?: WebFetchConfig;
   research?: { enabled: boolean; maxModelCalls: number; maxToolCalls: number; maxSearchCalls: number };
   trending?: { enabled: boolean; groupIds: string[] };
+  codex?: { socketPath: string };
 }
 
 export interface AutoMemoryConfig {
@@ -89,6 +90,10 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
   }
   if (timeoutMs > 2147483647) throw new Error('PA_TIMEOUT_MS 超出 Node 定时器范围。');
   const baseUrl = env.PA_BASE_URL?.trim();
+  const codexSocket = env.PA_CODEX_SOCKET?.trim();
+  if (codexSocket && (!codexSocket.startsWith('/') || codexSocket.length > 100 || codexSocket.includes('\0'))) {
+    throw new Error('PA_CODEX_SOCKET 必须是长度不超过100的本机绝对Unix socket路径。');
+  }
   // Pi treats these Vertex values as ADC selectors, rather than explicit API keys.
   if (!baseUrl && provider === 'google-vertex'
     && (apiKey === 'gcp-vertex-credentials' || /^<[^>]+>$/.test(apiKey!))) {
@@ -115,6 +120,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     loop,
     research,
     trending: readTrendingConfig(env),
+    ...(codexSocket ? { codex: { socketPath: codexSocket } } : {}),
     memory: readAutoMemoryConfig(env),
     search: readWebSearchConfig(env, provider!, baseUrl),
     fetch: readWebFetchConfig(env),

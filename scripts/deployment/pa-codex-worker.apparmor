@@ -1,0 +1,8 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Ubuntu 24 userns allowance applies only to the dedicated systemd worker.
+# Codex enforces task filesystem/network policy; systemd protects production paths.
+profile pa-codex-worker flags=(unconfined) {
+  userns,
+}
