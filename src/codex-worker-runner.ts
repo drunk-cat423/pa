@@ -101,7 +101,7 @@ export async function runCodexTask(config: CodexWorkerConfig, task: CodexTask,
   const evidence: string[] = [];
   let final = '', errorText = '', outputBytes = 0, failed = false;
   const prompt = `你是 PA 委派的服务器任务执行者。当前工作目录就是 PA 已为本任务创建的独立 Git 副本。${task.mode === 'fix' ? '直接在当前根目录修改源码和测试；另建嵌套副本或在忽略目录中改代码，PA 将无法交付这些改动。' : '本轮只读检查。'}\n`
-    + '只能根据实际文件、命令输出与退出码报告结果。完成后用中文简述原因、改动、验证和未完成内容。'
+    + '最终回复会直接发给委派人。用两三句中文说清做了什么、实际验证到什么效果；如果只完成一部分、还没验证或遇到阻塞，明确说明。只读任务直接回答查到的结论。省略补丁、代码块、命令和日志。'
     + '不要部署、推送、发送QQ消息或修改服务，不读取凭证、其他任务和生产数据库。'
     + '仓库约定适用。修改时只做用户要求的小修复，选择一条针对性测试；测试失败可以修正后重跑，不扩大为全量测试。'
     + (config.logFile ? `\n可用的服务器诊断日志是 ${config.logFile}，这是经脱敏的只读材料。` : '')

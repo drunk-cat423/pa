@@ -10,7 +10,7 @@ import { openConversation } from '../dist/runtime.js';
 import { preparationDelta } from './fixtures/turn-preparation.mjs';
 import { readRecordedTurns } from '../dist/transcript.js';
 
-test('owner private task delivers actual diff, continues same task, and preserves uncertain delivery across restart', async () => {
+test('owner private task delivers a plain-language result, continues same task, and preserves uncertain delivery across restart', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'pa-codex-'));
   const socketPath = process.platform === 'win32' ? `\\\\.\\pipe\\pa-codex-${randomUUID()}` : join(directory, 'worker.sock');
   const route = { channel: 'qq', accountId: 'bot', roomType: 'private', roomId: 'owner' };
@@ -52,11 +52,13 @@ test('owner private task delivers actual diff, continues same task, and preserve
     const receipt = await first.execute('delegate_task', { mode: 'fix', prompt: 'Fix the divider and run its test.' });
     await first.execute('delegate_task', { mode: 'fix', prompt: 'Fix the divider and run its test.' });
     assert.equal(receipt.id, 'C17'); assert.equal(revisions.length, 1);
-    Object.assign(revisions[0], { status: 'completed', summary: 'Fixed divider.', evidence: 'node --test divider.test.mjs\nexit_code=0', diff: '+ underscore divider' });
+    Object.assign(revisions[0], { status: 'completed', summary: '分隔线已过滤，针对性测试通过。\n```diff\ndiff --git a/src b/src\n+ private patch\n```', evidence: 'node --test divider.test.mjs\nexit_code=0', diff: '+ underscore divider' });
     await service.wait(); await service.wait();
     assert.equal(deliveries.length, 1);
     assert.equal(deliveries[0].deliveryMode, 'active');
-    assert.match(deliveries[0].file.data.toString(), /exit_code=0[\s\S]*\+ underscore divider/);
+    assert.equal(deliveries[0].file, undefined);
+    assert.match(deliveries[0].text, /已完成[\s\S]*分隔线已过滤，针对性测试通过/);
+    assert.doesNotMatch(deliveries[0].text, /private patch|diff --git|exit_code/);
     const second = await service.context(route, 'owner', 's2').execute('continue_coding_task', { id: 'C17', mode: 'fix', prompt: 'Keep the fix, undo the wording change.' });
     assert.equal(second.revision, 2);
     Object.assign(revisions[1], { status: 'completed', summary: 'Revised.', evidence: 'node --test divider.test.mjs\nexit_code=0', diff: '+ revised divider' });
@@ -65,7 +67,7 @@ test('owner private task delivers actual diff, continues same task, and preserve
     assert.equal(deliveries.length, 2, 'uncertain sends are not replayed after restart');
     const status = await service.context(route, 'owner', 's3').execute('coding_status', { id: 'C17' });
     assert.equal(status.revision, 2); assert.equal(status.summary, 'Revised.');
-    assert.equal(status.diff, undefined); // Large patches belong in the attachment, outside chat context.
+    assert.equal(status.diff, undefined); // Patches stay in the worker's task directory.
   } finally {
     await service?.close(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true });
   }
@@ -73,7 +75,7 @@ test('owner private task delivers actual diff, continues same task, and preserve
 
 test('Pi dispatches the saved coding task once and returns the durable acknowledgement without another model call', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'pa-codex-runtime-')), requests = [];
-  const confirmation = '已交给Codex，任务 C17（第1次）。完成后把执行结果和改动文件发回本私聊。';
+  const confirmation = '已交给 Codex，任务 C17（第 1 次）。完成后我会在这里告诉你结果。';
   let executions = 0;
   const server = createServer(async (req, res) => {
     let raw = ''; for await (const part of req) raw += part;

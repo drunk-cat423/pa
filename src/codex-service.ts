@@ -41,6 +41,16 @@ function validTask(value: unknown): CodexTask {
 }
 const safeText = (text: string) => text.replace(/<(?=\/?(?:qqbot-|@))/gi, '〈');
 const textLimit = (text: string, limit: number) => [...safeText(text)].slice(0, limit).join('');
+function resultText(task: CodexTask): string {
+  // Older workers included fenced command output and patches in their final answer.
+  const prose = (task.summary ?? '').replace(/^`{3,}[^\n]*\n[\s\S]*?(?:^`{3,}[^\n]*(?:\n|$)|(?![\s\S]))/gm, '')
+    .split(/^(?:diff --git |--- (?:a\/|\/dev\/null)|@@ -)/m, 1)[0]!.trim();
+  const state: Record<string, string> = { completed: '已完成', failed: '未完成', partial: '部分完成', blocked: '遇到阻塞', interrupted: '执行中断' };
+  return [`任务 ${task.id} · 第 ${task.revision} 次 · ${state[task.status] ?? task.status}`,
+    textLimit(prose || '这次没有可用的文字结论。', 650),
+    ...(task.diff?.startsWith('diff --git ') ? ['改动保存在任务副本中，尚未部署。'] : []),
+  ].join('\n');
+}
 
 /** The worker owns execution; this service owns trusted QQ identity and durable delivery. */
 export class CodexService {
@@ -166,7 +176,7 @@ export class CodexService {
     }
     this.remember(requestId, task); this.wake();
     return { id: task.id, revision: task.revision, status: task.status, saved: true,
-      confirmation: `已交给Codex，任务 ${task.id}（第${task.revision}次）。完成后把执行结果和改动文件发回本私聊。` };
+      confirmation: `已交给 Codex，任务 ${task.id}（第 ${task.revision} 次）。完成后我会在这里告诉你结果。` };
   }
   private wake(): void {
     if (this.closed || this.polling || !this.available()) return;
@@ -211,11 +221,8 @@ export class CodexService {
     if (!reservation.changes) return String(db.prepare('SELECT status FROM notifications WHERE task_id=? AND revision=? AND purpose=?').get(task.id, task.revision, purpose)?.status);
     let outcome: DeliveryResult;
     try {
-      const text = `Codex任务 ${task.id}（第${task.revision}次）：${task.status}\n${textLimit(task.summary ?? '执行已结束，详情见文件。', 450)}`;
-      const diff = task.diff === undefined ? '未采集到 Git diff。' : task.diff || '本次没有代码改动。';
-      const report = `任务 ${task.id}\n版本 ${task.revision}\n状态 ${task.status}\n\n${task.summary ?? ''}\n\n实际执行记录\n${task.evidence ?? '没有可用的命令执行记录。'}\n\n改动 diff\n${diff}\n`;
       outcome = this.closed || !this.available() ? { status: 'rejected' } : await this.send({ route: this.binding.route, deliveryMode: 'active', plainText: true,
-        text, file: { name: `${task.id}-r${task.revision}-diff.txt`, data: Buffer.from(report, 'utf8') } });
+        text: resultText(task) });
     } catch { outcome = { status: 'uncertain' }; }
     db.prepare('UPDATE notifications SET status=? WHERE task_id=? AND revision=? AND purpose=?').run(outcome.status, task.id, task.revision, purpose);
     return outcome.status;
