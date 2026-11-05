@@ -98,7 +98,12 @@ function setCurrent(target) {
   const temp=path.join(layout.app,'.publish-'+randomUUID()); fs.symlinkSync(target,temp); fs.renameSync(temp,current);
 }
 function stop() { run('systemctl',['stop',layout.pa]); run('systemctl',['stop',layout.worker]); }
-function start() { run('systemctl',['reset-failed',layout.pa,layout.worker]); run('systemctl',['start',layout.worker,layout.pa]); }
+function start() {
+  for(const unit of [layout.worker, layout.pa]) {
+    if(run('systemctl',['show',unit,'-p','ActiveState','--value']).trim()==='failed') run('systemctl',['reset-failed',unit]);
+    run('systemctl',['start',unit]);
+  }
+}
 function gate(mode) {
   if(mode===null) { fs.rmSync(layout.gate,{force:true}); }
   else {
