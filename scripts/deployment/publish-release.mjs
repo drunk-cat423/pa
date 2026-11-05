@@ -77,7 +77,8 @@ function build(commit, names) {
   try {
     git(['archive','--format=tar','-o',archive,commit]);
     run('tar',['-xf',archive,'-C',stage]); fs.unlinkSync(archive);
-    if(!fs.readFileSync(path.join(stage,'package-lock.json')).equals(fs.readFileSync(path.join(previous,'package-lock.json')))) throw Error('依赖锁文件变化。');
+    const lockAt = root => fs.readFileSync(path.join(root,'package-lock.json'),'utf8').replace(/\r\n/g,'\n');
+    if(lockAt(stage)!==lockAt(previous)) throw Error('依赖锁文件变化。');
     run('cp',['-a','--reflink=auto',fs.realpathSync(path.join(previous,'node_modules')),path.join(stage,'node_modules')]);
     const dist=path.join(stage,'dist'); fs.mkdirSync(dist); run('chown',[layout.buildUser,dist]);
     // No candidate code runs as root. Tests cannot write the build output, release checkout, Git mirror or credentials.

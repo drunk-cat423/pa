@@ -132,7 +132,7 @@ async function main(): Promise<void> {
       await harness.prepare();
       const check = () => {
         const info = harness!.info();
-        if (info.isolatedRooms.length || info.integrity.length !== qq.routes.length
+        if (stopping || info.isolatedRooms.length || info.integrity.length !== qq.routes.length
           || info.integrity.some(room => room.status !== 'healthy')) throw new Error('发布候选未通过房间完整性检查。');
       };
       if (gate()) check();
