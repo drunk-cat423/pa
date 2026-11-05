@@ -80,16 +80,19 @@ function build(commit, names) {
     const lockAt = root => fs.readFileSync(path.join(root,'package-lock.json'),'utf8').replace(/\r\n/g,'\n');
     if(lockAt(stage)!==lockAt(previous)) throw Error('依赖锁文件变化。');
     run('cp',['-a','--reflink=auto',fs.realpathSync(path.join(previous,'node_modules')),path.join(stage,'node_modules')]);
-    const dist=path.join(stage,'dist'); fs.mkdirSync(dist); run('chown',[layout.buildUser,dist]);
+    const dist=path.join(stage,'dist'); fs.mkdirSync(dist); fs.chmodSync(dist,0o755); run('chown',[layout.buildUser,dist]);
     // No candidate code runs as root. Tests cannot write the build output, release checkout, Git mirror or credentials.
     const restricted=(args,writeDist=false)=>run('systemd-run',['--quiet','--pipe','--wait','--collect','-p','User='+layout.buildUser,
       '-p','WorkingDirectory='+stage,'-p','ProtectSystem=strict','-p','ProtectHome=true','-p','PrivateTmp=true','-p','PrivateNetwork=true',
       '-p','NoNewPrivileges=true','-p','KillMode=control-group','-p','MemoryMax=512M','-p','MemorySwapMax=0','-p','RuntimeMaxSec=150',
       ...(writeDist?['-p','ReadWritePaths='+dist]:[]),'--setenv=PATH=/opt/node-v24.15.0/bin:/usr/bin:/bin',...args],{timeout:170000});
     restricted(['/opt/node-v24.15.0/bin/node',path.join(stage,'node_modules/typescript/bin/tsc'),'-p','tsconfig.json'],true);
+    run('chown',['-hR','root:root',dist]);
+    run('runuser',['-u',layout.dataUser,'--','test','-r',path.join(dist,'qq-cli.js')]);
     const tests=names.filter(n=>n.startsWith('test/')&&n.endsWith('.test.mjs')&&fs.existsSync(path.join(stage,n)));
     if(tests.length) restricted(['/opt/node-v24.15.0/bin/node','--test','--test-concurrency=1',...tests]);
-    fs.writeFileSync(path.join(stage,'RELEASE_SHA'),commit+'\n'); fs.renameSync(stage,dest);
+    fs.writeFileSync(path.join(stage,'RELEASE_SHA'),commit+'\n'); fs.chmodSync(path.join(stage,'RELEASE_SHA'),0o644);
+    fs.renameSync(stage,dest);
   } finally {
     if(fs.existsSync(stage)) fs.rmSync(stage,{recursive:true,force:true});
   }

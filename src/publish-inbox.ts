@@ -32,7 +32,16 @@ export class PublishInbox {
     this.allowed = new Set(routes.map(routeKey));
     this.db = new DatabaseSync(path);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS inbox(sequence INTEGER PRIMARY KEY, event_key TEXT NOT NULL UNIQUE, payload TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS inbox(sequence INTEGER PRIMARY KEY, event_key TEXT NOT NULL UNIQUE, payload TEXT NOT NULL,
+        route_key TEXT NOT NULL DEFAULT '');
+      CREATE TABLE IF NOT EXISTS blocked_rooms(route_key TEXT PRIMARY KEY,retry_at INTEGER NOT NULL,reason TEXT NOT NULL);`);
+    if (!this.db.prepare('PRAGMA table_info(inbox)').all().some(column => column.name === 'route_key')) {
+      this.db.exec("ALTER TABLE inbox ADD COLUMN route_key TEXT NOT NULL DEFAULT ''");
+    }
+    for (const row of this.db.prepare("SELECT sequence,payload FROM inbox WHERE route_key=''").all()) {
+      const message = JSON.parse(String(row.payload)) as InboundMessage;
+      this.db.prepare('UPDATE inbox SET route_key=? WHERE sequence=?').run(routeKey(message.route), Number(row.sequence));
+    }
     if (this.db.prepare('PRAGMA quick_check').get()?.quick_check !== 'ok') throw new Error('发布收件箱完整性检查失败。');
   }
   capture(message: InboundMessage): boolean {
@@ -42,17 +51,25 @@ export class PublishInbox {
     const payload = JSON.stringify(message);
     if (Buffer.byteLength(payload) > 1_000_000) throw new Error('发布期间的 QQ 原始消息超过收件箱上限。');
     const key = createHash('sha256').update(routeKey(message.route) + ':' + message.eventId).digest('hex');
-    this.db.prepare('INSERT OR IGNORE INTO inbox(event_key,payload) VALUES (?,?)').run(key, payload);
+    this.db.prepare('INSERT OR IGNORE INTO inbox(event_key,payload,route_key) VALUES (?,?,?)').run(key, payload, routeKey(message.route));
     return true;
   }
-  next(): { sequence: number; message: InboundMessage } | undefined {
-    const row = this.db.prepare('SELECT sequence,payload FROM inbox ORDER BY sequence LIMIT 1').get();
+  next(now = Date.now()): { sequence: number; message: InboundMessage } | undefined {
+    const routes = [...this.allowed];
+    if (!routes.length) return;
+    const row = this.db.prepare(`SELECT i.sequence,i.payload FROM inbox i
+      LEFT JOIN blocked_rooms b ON b.route_key=i.route_key AND b.retry_at>?
+      WHERE b.route_key IS NULL AND i.route_key IN (${routes.map(() => '?').join(',')}) ORDER BY i.sequence LIMIT 1`).get(now, ...routes);
     if (!row) return;
     const message = JSON.parse(String(row.payload)) as InboundMessage;
     if (!this.allowed.has(routeKey(message.route))) throw new Error('发布收件箱中存在已撤销路由的消息，等待本机处理。');
     return { sequence: Number(row.sequence), message };
   }
   acknowledge(sequence: number): void { this.db.prepare('DELETE FROM inbox WHERE sequence=?').run(sequence); }
+  deferRoom(route: ChannelRoute, now = Date.now()): void {
+    this.db.prepare(`INSERT INTO blocked_rooms VALUES (?,?,'room_admission_failed')
+      ON CONFLICT(route_key) DO UPDATE SET retry_at=excluded.retry_at,reason=excluded.reason`).run(routeKey(route), now + 30_000);
+  }
   size(): number { return Number(this.db.prepare('SELECT count(*) AS n FROM inbox').get()!.n); }
   close(): void { this.db.close(); }
 }

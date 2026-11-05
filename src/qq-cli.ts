@@ -50,6 +50,7 @@ async function main(): Promise<void> {
   let statusQueue: Promise<unknown> = Promise.resolve();
   let accepting = false;
   let replay: Promise<void> | undefined;
+  let replayTimer: ReturnType<typeof setTimeout> | undefined;
   let activationReady = false;
   let openReady = false;
   let preparedReady = false;
@@ -65,6 +66,7 @@ async function main(): Promise<void> {
   function stop(): Promise<void> {
     if (stopping) return stopping;
     stopping = (async () => {
+      clearTimeout(replayTimer);
       channel?.close();
       await harness?.close();
       await replay;
@@ -76,16 +78,31 @@ async function main(): Promise<void> {
   function drain(): void {
     if (!inbox || replay || !accepting || stopping || gate()) return;
     replay = (async () => {
-      for (;;) {
+      for (let count = 0; count < 20; count++) {
         if (!accepting || stopping || gate()) return;
         const next = inbox.next();
         if (!next) return;
         const result = await harness!.handle(next.message, { waitForResult: false });
-        if (!['accepted', 'observed', 'duplicate', 'sent'].includes(result)) throw new Error('发布收件箱消息未被持久接纳。');
+        if (!['accepted', 'observed', 'duplicate', 'sent'].includes(result)) {
+          // Room isolation and failed attachment admission retain that room's originals,
+          // while unrelated rooms can continue through the same durable inbox.
+          if (stopping) return;
+          inbox.deferRoom(next.message.route);
+          status('publish_replay_deferred');
+          continue;
+        }
         inbox.acknowledge(next.sequence);
         if (result === 'accepted') status('accepted'); else taskResult(result);
       }
-    })().catch(() => { fail(); }).finally(() => { replay = undefined; });
+    })().catch(() => { fail(); }).finally(() => {
+      replay = undefined;
+      try {
+        if (!stopping && inbox.size() && !replayTimer) {
+          replayTimer = setTimeout(() => { replayTimer = undefined; try { drain(); } catch { fail(); } }, 1000);
+          replayTimer.unref();
+        }
+      } catch { fail(); }
+    });
   }
   const taskResult = (result: import('./channel-harness.js').HarnessResult): void => {
     if (result !== 'ignored' && result !== 'observed' && result !== 'duplicate') status(result);
@@ -110,9 +127,12 @@ async function main(): Promise<void> {
       },
       onMessage: message => {
         if (inbox) {
-          try { if (inbox.capture(message)) drain(); }
-          catch { fail(); }
-          return;
+          try {
+            if (!accepting || stopping || gate() || replay || inbox.size() > 0) {
+              if (inbox.capture(message)) drain();
+              return;
+            }
+          } catch { fail(); return; }
         }
         void harness!.handle(message,{waitForResult:false}).then(result => {
           if(result==='accepted') status('accepted');

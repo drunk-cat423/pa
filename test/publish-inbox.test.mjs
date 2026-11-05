@@ -53,6 +53,19 @@ test('publish standby holds business work and rollback-safe QQ inbox replays ord
     assert.equal(await harness.handle(second.message, { waitForResult: false }), 'accepted'); inbox.acknowledge(second.sequence);
     await harness.waitForTasks(); assert.equal(inbox.size(), 0); assert.equal(sends.length, 2);
     assert.deepEqual(sends.map(item => item.replyToMessageId), ['held-1', 'held-2']);
+    inbox.close();
+    const other = { ...route, roomId: 'healthy-owner' };
+    inbox = new PublishInbox(inboxDir, [route, other]);
+    inbox.capture(message(3)); inbox.capture(message(4));
+    inbox.capture({ ...message(5), route: other, senderId: other.roomId });
+    inbox.deferRoom(route, 1000);
+    const healthy = inbox.next(1001); assert.equal(healthy.message.eventId, 'held-5');
+    inbox.acknowledge(healthy.sequence);
+    assert.equal(inbox.next(1002), undefined); assert.equal(inbox.size(), 2, 'failed room originals are retained without blocking healthy rooms');
+    assert.equal(inbox.next(31001).message.eventId, 'held-3', 'the isolated room retries in its original order after a bounded delay');
+    inbox.close(); inbox = new PublishInbox(inboxDir, [other]);
+    assert.equal(inbox.next(31001), undefined, 'revoked route originals are retained rather than replayed or crashing other rooms');
+    assert.equal(inbox.size(), 2);
     await writeFile(gatePath, 'unexpected'); assert.throws(() => readPublicationGate(gatePath), /门禁状态/);
   } finally { await pausedMemory?.close(); await harness?.close(); inbox?.close(); await rm(directory, { recursive: true, force: true }); }
 });
