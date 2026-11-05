@@ -8,10 +8,13 @@ import type { ChannelRoute, DeliveryResult, OutboundMessage } from './channel-ty
 import type { HarnessPolicy } from './harness-policy.js';
 import type { CodexToolContext, CodexToolName } from './codex-tools.js';
 import { MemoryError } from './memory-types.js';
+import { CodexPublication, type PublicationConfirmation } from './codex-publication.js';
+import type { InboundMessage } from './channel-types.js';
 
 export interface CodexTask {
   id: string; revision: number; status: string; requestId?: string;
   summary?: string; evidence?: string; diff?: string;
+  mode?: 'read' | 'fix';
 }
 type Binding = HarnessPolicy['ownerBindings'][number];
 class CodexResponseError extends MemoryError {
@@ -60,9 +63,18 @@ export class CodexService {
   private polling: Promise<void> | undefined;
   private closed = false;
   private lastError: string | undefined;
+  private readonly publication?: CodexPublication;
   constructor(private readonly config: Pick<PaConfig, 'dataDir' | 'codex'>, private readonly binding: Binding,
     private readonly available: () => boolean,
-    private readonly send: (message: OutboundMessage) => Promise<DeliveryResult>) { this.owner = codexOwnerKey(binding); }
+    private readonly send: (message: OutboundMessage) => Promise<DeliveryResult>) {
+    this.owner = codexOwnerKey(binding);
+    if (config.codex?.publishSocketPath) this.publication = new CodexPublication(config.dataDir, config.codex.publishSocketPath,
+      this.owner, binding.route, binding.senderId, available, id => this.task(id), send);
+  }
+
+  confirmPublication(message: InboundMessage): Promise<PublicationConfirmation | undefined> {
+    return this.publication?.confirm(message) ?? Promise.resolve(undefined);
+  }
 
   private storage(): DatabaseSync {
     if (this.closed) throw new MemoryError('Codex委派服务已关闭。');
@@ -87,6 +99,7 @@ export class CodexService {
     return this.db;
   }
   start(): void { this.storage(); this.timer ??= setInterval(() => this.wake(), 2000); this.timer.unref(); this.wake(); }
+  prepare(): void { this.storage(); }
   info() { return { enabled: true, failed: Boolean(this.lastError), ...(this.lastError ? { error: this.lastError } : {}) }; }
   matches(route: ChannelRoute): boolean { return routeKey(route) === routeKey(this.binding.route); }
   context(route: ChannelRoute, senderId: string, sourceMessageId: string): CodexToolContext | undefined {
@@ -185,6 +198,7 @@ export class CodexService {
     }).finally(() => { this.polling = undefined; });
   }
   private async poll(): Promise<void> {
+    await this.publication?.poll();
     const db = this.storage();
     const requests = db.prepare('SELECT request_id,task_id,revision,misses FROM requests WHERE owner=? AND done=0 ORDER BY checked_at,rowid LIMIT 20').all(this.owner);
     if (!requests.length) return;
@@ -218,15 +232,20 @@ export class CodexService {
     const db = this.storage();
     purpose = `${this.owner}:${purpose}`;
     const reservation = db.prepare("INSERT OR IGNORE INTO notifications(task_id,revision,purpose,status) VALUES (?,?,?,'sending')").run(task.id, task.revision, purpose);
-    if (!reservation.changes) return String(db.prepare('SELECT status FROM notifications WHERE task_id=? AND revision=? AND purpose=?').get(task.id, task.revision, purpose)?.status);
+    if (!reservation.changes) {
+      const status = String(db.prepare('SELECT status FROM notifications WHERE task_id=? AND revision=? AND purpose=?').get(task.id, task.revision, purpose)?.status);
+      if (status === 'sent') this.publication?.recordReport(task);
+      return status;
+    }
     let outcome: DeliveryResult;
     try {
       outcome = this.closed || !this.available() ? { status: 'rejected' } : await this.send({ route: this.binding.route, deliveryMode: 'active', plainText: true,
         text: resultText(task) });
     } catch { outcome = { status: 'uncertain' }; }
     db.prepare('UPDATE notifications SET status=? WHERE task_id=? AND revision=? AND purpose=?').run(outcome.status, task.id, task.revision, purpose);
+    if (outcome.status === 'sent') this.publication?.recordReport(task);
     return outcome.status;
   }
   async wait(): Promise<void> { this.wake(); await this.polling; }
-  async close(): Promise<void> { this.closed = true; clearInterval(this.timer); await this.polling; this.db?.close(); this.db = undefined; }
+  async close(): Promise<void> { this.closed = true; clearInterval(this.timer); await this.polling; this.publication?.close(); this.db?.close(); this.db = undefined; }
 }

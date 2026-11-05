@@ -20,7 +20,7 @@ export interface PaConfig {
   fetch?: WebFetchConfig;
   research?: { enabled: boolean; maxModelCalls: number; maxToolCalls: number; maxSearchCalls: number };
   trending?: { enabled: boolean; groupIds: string[] };
-  codex?: { socketPath: string };
+  codex?: { socketPath: string; publishSocketPath?: string };
 }
 
 export interface AutoMemoryConfig {
@@ -91,8 +91,12 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
   if (timeoutMs > 2147483647) throw new Error('PA_TIMEOUT_MS 超出 Node 定时器范围。');
   const baseUrl = env.PA_BASE_URL?.trim();
   const codexSocket = env.PA_CODEX_SOCKET?.trim();
+  const publishSocket = env.PA_PUBLISH_SOCKET?.trim();
   if (codexSocket && (!codexSocket.startsWith('/') || codexSocket.length > 100 || codexSocket.includes('\0'))) {
     throw new Error('PA_CODEX_SOCKET 必须是长度不超过100的本机绝对Unix socket路径。');
+  }
+  if (publishSocket && (!codexSocket || !publishSocket.startsWith('/') || publishSocket.length > 100 || publishSocket.includes('\0'))) {
+    throw new Error('PA_PUBLISH_SOCKET 需要已启用的 Codex 和本机绝对 Unix socket 路径。');
   }
   // Pi treats these Vertex values as ADC selectors, rather than explicit API keys.
   if (!baseUrl && provider === 'google-vertex'
@@ -120,7 +124,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     loop,
     research,
     trending: readTrendingConfig(env),
-    ...(codexSocket ? { codex: { socketPath: codexSocket } } : {}),
+    ...(codexSocket ? { codex: { socketPath: codexSocket, ...(publishSocket ? { publishSocketPath: publishSocket } : {}) } } : {}),
     memory: readAutoMemoryConfig(env),
     search: readWebSearchConfig(env, provider!, baseUrl),
     fetch: readWebFetchConfig(env),

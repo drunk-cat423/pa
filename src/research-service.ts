@@ -44,10 +44,14 @@ export class ResearchService {
   }
 
   start(): void {
+    if (this.closed) return;
+    this.prepare();
+    this.wake();
+  }
+  prepare(): void {
     if (this.closed || this.store) return;
     this.store = new ConversationStore(join(this.config.dataDir, 'pa.sqlite'));
     this.store.research.recover();
-    this.wake();
   }
   /** Local operator entry: claim exactly one pre-authorized queued attempt.
    * No queue pump, memory worker, notification or automatic network retry. */

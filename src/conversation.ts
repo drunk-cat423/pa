@@ -34,6 +34,7 @@ export class PersistenceError extends Error {
 }
 
 export interface RecordedConversation {
+  startBackground(): void;
   prompt(text: string, external?: ExternalRunInput,
     onProgress?: (progress: { id: string; text: string; begin(mode: 'passive' | 'active', replySlot?: number): void }) => Promise<{ status: 'sent' | 'uncertain' | 'rejected'; externalMessageId?: string }>,
     canSendProgress?: () => boolean, sendResearch?: ResearchSender): Promise<{ text: string; runId: string; deliveryId: string; referenceUrls?: readonly string[] }>;
@@ -120,7 +121,7 @@ function memoryContext(memories: MemoryRecord[], channel = false): { content?: s
 }
 
 export async function openRecordedConversation(config: PaConfig, conversationKey: string, route?: ChannelRoute,
-  options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy;
+  options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy; backgroundAllowed?: () => boolean;
     storeInitialization?:StoreInitializationScope;
     reminderContext?: (conversationId:string,sourceMessageId:string)=>ReminderToolContext;
     codexContext?: (sourceMessageId: string, senderId: string) => CodexToolContext | undefined;
@@ -224,7 +225,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
       }
     }
     applyContextReset();
-    const background = new BackgroundMemory(config, openedStore.autoMemory, conversation.id, options.memoryProvider);
+    const background = new BackgroundMemory(config, openedStore.autoMemory, conversation.id, options.memoryProvider, undefined, options.backgroundAllowed);
     suspendBackground=()=>{void background.close();};
     const imageAssets = new ImageAssets(config);
     const diagnostics = new DiagnosticLog(config.dataDir, [config.apiKey]);
@@ -250,6 +251,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
       if (active) throw new Error('此会话正在处理上一条消息，请等待完成后管理记忆。');
     }
     return {
+      startBackground() { background.start(); },
       info: () => ({ ...runtime.info(), databasePath: openedStore.databasePath, memory: background.info() }),
       history(limit = 50) {
         usable();

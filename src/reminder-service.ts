@@ -17,6 +17,7 @@ const safeText=(text:string)=>text.replace(/<(?=\/?(?:qqbot-|@))/gi,'〈');
 
 /** The clock and transport are ordinary program work; no model/runtime is imported. */
 export class ReminderService {
+  prepare(): void { this.storage(); }
   private store:ConversationStore|undefined;
   private closed=false;
   private timer:ReturnType<typeof setInterval>|undefined;

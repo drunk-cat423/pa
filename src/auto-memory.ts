@@ -307,7 +307,8 @@ export class BackgroundMemory {
   private readonly timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly config: PaConfig, private readonly store: AutoMemoryStore,
-    private readonly conversationId: string, provider?: MemoryProvider, private readonly scope?: MemoryExecutionScope) {
+    private readonly conversationId: string, provider?: MemoryProvider, private readonly scope?: MemoryExecutionScope,
+    private readonly mayRun: () => boolean = () => true) {
     if (scope) {
       if (scope.pipeline !== 'materials' || !scope.jobIds.length || new Set(scope.jobIds).size !== scope.jobIds.length
         || scope.jobIds.some(id => typeof id !== 'string' || !id)) throw new Error('回填执行范围无效。');
@@ -343,7 +344,7 @@ export class BackgroundMemory {
   }
 
   start(reason?: 'count' | 'capacity', excludeMessageId?: string): void {
-    if (this.closed || this.diagnosticFailed || !this.config.memory?.enabled) return;
+    if (this.closed || this.diagnosticFailed || !this.config.memory?.enabled || !this.mayRun()) return;
     if (this.scope && (reason !== undefined || excludeMessageId !== undefined)) throw new Error('回填执行不能预约新的整理或压缩任务。');
     if (!this.scope) {
       this.store.reserveRecoveryJobs(this.conversationId);

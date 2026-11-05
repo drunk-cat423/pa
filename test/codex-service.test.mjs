@@ -4,11 +4,66 @@ import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { CodexService, codexPrivateOwner, codexOwnerKey } from '../dist/codex-service.js';
 import { openConversation } from '../dist/runtime.js';
 import { preparationDelta } from './fixtures/turn-preparation.mjs';
 import { readRecordedTurns } from '../dist/transcript.js';
+import { CodexPublication } from '../dist/codex-publication.js';
+
+test('publication requires exact original owner confirmation and sent acknowledgement; restart reports success or rollback once', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pa-publication-'));
+  const socket = process.platform === 'win32' ? `\\\\.\\pipe\\pa-publish-${randomUUID()}` : join(directory, 'publish.sock');
+  const route = { channel: 'qq', accountId: 'bot', roomType: 'private', roomId: 'owner' };
+  const owner = codexOwnerKey({ route, senderId: 'owner' }), releases = [], deliveries = [];
+  let starts = 0, publication;
+  const task = { id: 'C17', revision: 1, status: 'completed', mode: 'fix', diff: 'diff --git a/src/plain-text.ts b/src/plain-text.ts\n+ fix' };
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    assert.equal(req.method === 'GET' ? url.searchParams.get('owner') : true, req.method === 'GET' ? owner : true);
+    if (req.method === 'GET') { res.end(JSON.stringify({ releases: releases.filter(item => item.requestId === url.searchParams.get('requestId')) })); return; }
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks)); assert.equal(body.owner, owner);
+    if (url.pathname === '/releases') {
+      assert.equal(body.taskId, task.id); assert.equal(body.revision, task.revision);
+      assert.equal(body.patchSha256, createHash('sha256').update(task.diff).digest('hex'));
+      let release = releases.find(item => item.requestId === body.requestId);
+      if (!release) { release = { ...body, id: randomUUID(), status: 'prepared' }; releases.push(release); }
+      res.end(JSON.stringify(release)); return;
+    }
+    const release = releases.find(item => url.pathname === `/releases/${item.id}/start`);
+    assert.equal(body.requestId, release.requestId); release.status = 'queued'; starts++;
+    res.end(JSON.stringify(release));
+  });
+  await new Promise(resolve => server.listen(socket, resolve));
+  const create = () => new CodexPublication(directory, socket, owner, route, 'owner', () => true, async () => ({ ...task }), async message => {
+    deliveries.push(message); return { status: 'sent', externalMessageId: randomUUID() };
+  });
+  const message = (eventId, text = '把这版上线') => ({ route, senderId: 'owner', eventId, text, mentioned: false, sentAt: new Date().toISOString() });
+  try {
+    publication = create(); publication.recordReport(task);
+    assert.equal(await publication.confirm({ ...message('intruder'), senderId: 'someone' }), undefined);
+    assert.equal(await publication.confirm({ ...message('group'), route: { ...route, roomType: 'group' } }), undefined);
+    assert.equal(await publication.confirm(message('question', '你会如何处理“把这版上线”这句话？')), undefined);
+    const quoted = await publication.confirm({ ...message('quoted'), quote: { messageId: 'old' } });
+    assert.match(quoted.text, /引用/); assert.equal(releases.length, 0);
+    const unknown = await publication.confirm(message('uncertain-ack')); assert.equal(releases.length, 1); assert.equal(starts, 0);
+    await unknown.acknowledge(false); publication.close(); publication = create(); await publication.poll(); assert.equal(starts, 0);
+    const confirmed = await publication.confirm(message('confirmed')); assert.equal(starts, 0);
+    assert.equal(releases.length, 1, 'fresh confirmation reuses the prepared version whose old acknowledgement was uncertain');
+    await confirmed.acknowledge(true); assert.equal(starts, 1);
+    publication.close(); releases[0].status = 'succeeded'; releases[0].summary = '新版已连接 QQ。';
+    publication = create(); await publication.poll(); assert.equal(deliveries.length, 1); assert.match(deliveries[0].text, /已上线/);
+    publication.close(); publication = create(); await publication.poll(); assert.equal(deliveries.length, 1);
+    task.revision = 2;
+    const stale = await publication.confirm(message('stale')); assert.match(stale.text, /新版本/); assert.equal(releases.length, 1);
+    publication.recordReport(task);
+    const rollback = await publication.confirm(message('rollback', '可以，把这版上线。')); await rollback.acknowledge(true);
+    publication.close(); releases[1].status = 'rolled_back'; releases[1].summary = '健康检查失败，旧版已恢复。';
+    publication = create(); await publication.poll(); assert.equal(deliveries.length, 2); assert.match(deliveries[1].text, /已恢复旧版/);
+    const query = await publication.confirm(message('query', '查看发布结果')); assert.match(query.text, /已恢复旧版/); assert.equal(starts, 2);
+  } finally { publication?.close(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); }
+});
 
 test('owner private task delivers a plain-language result, continues same task, and preserves uncertain delivery across restart', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'pa-codex-'));

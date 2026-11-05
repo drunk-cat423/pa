@@ -39,6 +39,15 @@ journalctl -u pa.service -n 30 --no-pager
 
 需要查看 PA 运行事件时，可安装 `scripts/deployment/pa-delegation-diagnostics.{service,timer}` 并启用 timer。它约每两分钟刷新 `/run/pa-delegation-diagnostics/events.log`，只包含最近 24 小时最多 300 条白名单网关事件及后台状态。执行器的 `PA_CODEX_LOG_FILE` 指向这个只读文件。日志不含原始聊天、用户 ID、模型请求和凭证；快照首行给出更新时间。
 
+## 私聊确认后的发布与回滚
+
+[发布指令](codex-publish.md)只对已配置的本人私聊开放。发布程序单独安装在 `/opt/pa/maintenance/publisher`，由 `pa-publisher.service` 启动。安装 `scripts/deployment/pa-publisher.mjs`、`publish-release.mjs` 和可执行的 `publish.sh` 时使用 root 持有的固定版本。普通任务发布仅接受 src、test、docs 和 README.md 的普通文本改动；修改发布器、系统服务、依赖或凭证需另行维护。
+
+- 创建独立的 `pa-release-client` 组，仅给 `pa.service` 加上该补充组。配置 `PA_PUBLISH_SOCKET=/run/pa-publisher/publisher.sock`、`PA_PUBLISH_GATE_FILE=/var/lib/pa-publish-gate/hold`、`PA_PUBLISH_INBOX=/var/lib/pa-publish-inbox`；systemd 允许 PA 写入收件箱。gate 目录由 root 持有，收件箱由 pa 持有，权限 0700。收件箱在生产数据库快照之外。
+- 发布器的 `/etc/pa-publisher.env` 设定上述 socket、`PA_PUBLISH_DIR=/var/lib/pa-publisher/jobs`、`PA_PUBLISH_OWNER`（与执行器同一 owner）、`PA_PUBLISH_WORKER_SOCKET` 和 `PA_PUBLISH_WORKER_DIR`。任务账本、候选补丁和恢复记录仅 root 可读。GitHub 使用只授予 PA 仓库写权限的部署 key，私钥位于 `/etc/pa-publisher/github-deploy`，SSH 主机密钥固定在同目录的 `known_hosts`。
+- 独立账号 `pa-publish-build` 在无外网的 systemd 单元内编译候选、执行改动涉及的测试。发布器按已报告补丁的哈希冻结版本，核对 GitHub 和线上基线；候选就绪后，才正常快进推送 GitHub。基线变化会停止发布，不能覆盖别人的更新。
+- 切换和备份共用 storage 锁。待验证的新 PA 连接 QQ 并检查会话，门禁期间的消息写入独立收件箱。失败时重新启动原版本；候选可能修改过数据时按校验过的 SQLite 和 Pi 配套快照恢复，并把失败现场保留在发布记录目录。独立服务重启后按 `deploy.json` 和 GitHub 实际状态恢复。若网络中断导致推送结果未知，先查询远端，不强推。恢复期间排查 `journalctl -u pa-publisher` 和对应 job 的清单、状态及结果；不要手工清空账本或重新执行同一项发布。
+
 ## Detective 停用与恢复
 
 保留 `/opt/detective-assistant` 的代码、venv、配置和 Chroma，以及 `/var/lib/mysql` 中的数据库。经确认 MySQL 没有其他业务库，且 Waline 使用独立 SQLite 后，可停用 Detective 后端和 MySQL：

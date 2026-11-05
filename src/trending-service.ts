@@ -18,6 +18,7 @@ class GenerationCleanupPending extends Error {}
 
 /** A program-owned daily job. There is deliberately no chat tool or personal context. */
 export class TrendingService {
+  prepare(): void { if (this.enabled()) this.storage(); }
   private store:TrendingStore|undefined;
   private timer:ReturnType<typeof setInterval>|undefined;
   private closed=false;

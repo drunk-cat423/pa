@@ -1,0 +1,27 @@
+[Unit]
+Description=Independent PA release coordinator
+After=network-online.target pa-codex-worker.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Group=pa-release-client
+EnvironmentFile=/etc/pa-publisher.env
+WorkingDirectory=/opt/pa/maintenance/publisher
+ExecStart=/usr/bin/flock -n /run/lock/pa-publisher.lock /opt/node-v24.15.0/bin/node /opt/pa/maintenance/publisher/pa-publisher.mjs
+RuntimeDirectory=pa-publisher
+RuntimeDirectoryMode=0750
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+MemoryMax=512M
+MemorySwapMax=0
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

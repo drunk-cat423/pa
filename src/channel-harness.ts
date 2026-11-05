@@ -51,6 +51,7 @@ export class ChannelHarness {
   private fatal: unknown;
   private readonly opening = new Map<string, Promise<RecordedConversation>>();
   private closed = false;
+  private started: boolean;
   private calls = 0;
   private readonly policy: HarnessPolicy;
   private readonly imageAssets: ImageAssets;
@@ -64,7 +65,8 @@ export class ChannelHarness {
   constructor(private readonly config: PaConfig, private readonly routes: ChannelRoute[],
     private readonly transport: ChannelTransport, private readonly maxCalls: number, policy: HarnessPolicy = NO_OWNER_POLICY,
     private readonly memoryProvider?: MemoryProvider, private readonly onTaskError?: () => void,
-    private readonly onTaskResult?: (result: HarnessResult) => void) {
+    private readonly onTaskResult?: (result: HarnessResult) => void, startup: { standby?: boolean } = {}) {
+    this.started = !startup.standby;
     if (!Number.isSafeInteger(maxCalls) || maxCalls < 0) throw new Error('调用上限必须是非负整数，0 表示不限次数。');
     if (!routes.length) throw new Error('必须显式配置允许接入的房间。');
     const concurrency = config.tasks?.maxConcurrent ?? 2;
@@ -76,20 +78,20 @@ export class ChannelHarness {
       const owner = codexPrivateOwner(this.policy, routes);
       this.codex = new CodexService(config, owner, () => {
         const key = channelConversationKey(owner.route);
-        return !this.closed && !this.fatal && !this.isolatedRooms.has(key)
+        return this.started && !this.closed && !this.fatal && !this.isolatedRooms.has(key)
           && this.conversations.get(key)?.integrityStatus().status === 'healthy';
       }, message => this.output(message.route, () => this.closed ? Promise.resolve({ status: 'rejected' as const }) : this.transport.send(message)));
     }
     this.reminders=new ReminderService(config,
       ()=>this.routes.filter(route=>{
         const key=channelConversationKey(route),room=this.conversations.get(key);
-        return !this.closed&&!this.fatal&&!this.isolatedRooms.has(key)&&room?.integrityStatus().status==='healthy';
+        return this.started&&!this.closed&&!this.fatal&&!this.isolatedRooms.has(key)&&room?.integrityStatus().status==='healthy';
       }), (route,operation)=>this.output(route,operation),message=>this.transport.send(message),
       error=>{this.fatal=error;this.onTaskError?.();});
     if(config.trending?.enabled)this.trending=new TrendingService(config,routes,
       ()=>this.routes.filter(route=>{
         const key=channelConversationKey(route),room=this.conversations.get(key);
-        return !this.closed&&!this.fatal&&!this.isolatedRooms.has(key)&&room?.integrityStatus().status==='healthy';
+        return this.started&&!this.closed&&!this.fatal&&!this.isolatedRooms.has(key)&&room?.integrityStatus().status==='healthy';
       }),(route,operation)=>this.output(route,operation),message=>this.transport.send(message),
       error=>{this.fatal=error;this.onTaskError?.();});
     if (config.research?.enabled) this.research = new ResearchService(config, routes,
@@ -121,13 +123,25 @@ export class ChannelHarness {
 
   async waitForResearch(): Promise<void> { await this.research?.wait(); }
 
-  async start(): Promise<void> {
+  async prepare(): Promise<void> {
     if (!this.closed) {
       await Promise.all(this.routes.map(async route => {
         const key=channelConversationKey(route);
         try { await this.open(key,route); }
         catch(error) { if (!(error instanceof SessionIntegrityError)) throw error; this.isolate(key,error); }
       }));
+      this.research?.prepare();
+      this.reminders.prepare();
+      this.trending?.prepare();
+      this.codex?.prepare();
+    }
+  }
+
+  async start(): Promise<void> {
+    await this.prepare();
+    if (!this.closed) {
+      this.started = true;
+      for (const room of this.conversations.values()) room.startBackground();
       this.pump();
       if (!this.closed) this.research?.start();
       if (!this.closed) this.reminders.start();
@@ -141,6 +155,7 @@ export class ChannelHarness {
     if (!pending) {
       pending = openRecordedConversation(this.config, key, route,
         { persons: configuredPersons(this.policy), policy: this.policy, storeInitialization:this.storeInitialization,
+          backgroundAllowed: () => this.started && !this.closed,
           ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}),
           onIntegrityFailure:error=>{
             if(error instanceof SessionIntegrityError) this.isolate(key,error);
@@ -159,6 +174,7 @@ export class ChannelHarness {
   }
 
   handle(message: InboundMessage, options: { waitForResult?: boolean } = {}): Promise<HarnessResult> {
+    if (!this.started) return Promise.reject(new Error('发布检查期间不能直接接纳消息，必须保存在发布收件箱。'));
     const key = channelConversationKey(message.route);
     if (this.closed || !this.allowed.has(key) || !message.eventId || !message.senderId
       || (!message.text.trim() && !message.imageSources?.length && !message.images?.length) || message.text.length > 4000
@@ -235,7 +251,7 @@ export class ChannelHarness {
   }
 
   private pump(): void {
-    while (!this.closed && !this.fatal && this.computing < (this.config.tasks?.maxConcurrent ?? 2)) {
+    while (this.started && !this.closed && !this.fatal && this.computing < (this.config.tasks?.maxConcurrent ?? 2)) {
       let selected: {key: string; conversation: RecordedConversation; task: ReturnType<RecordedConversation['claimNextTask']>} | undefined;
       try {
         for(let checked=0;checked<this.routes.length;checked++) {
@@ -310,6 +326,15 @@ export class ChannelHarness {
     };
     const memoryRequest = parseMemoryRequest(message.text);
     const resultRequest = RESULT_COMMAND.exec(message.text);
+    const publication = await this.codex?.confirmPublication(message);
+    if (publication) {
+      const control = conversation.control(message.text, { ...sender, modelInputText: message.text }, () => publication.text);
+      conversation.finishTask(taskId, 'completed', control.deliveryId);
+      release();
+      const outcome = await this.deliver(conversation, message, control, 0, taskId);
+      await publication.acknowledge(outcome === 'sent');
+      return outcome;
+    }
     if (resultRequest) {
       const result = conversation.taskResult(message.senderId, resultRequest[1]);
       const control = conversation.control(message.text, { ...sender, modelInputText: message.text }, () => result?.text ?? '没有找到你在本会话中已完成的结果。');
