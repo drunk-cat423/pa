@@ -1,13 +1,15 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync, statfsSync, symlinkSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, statfsSync, symlinkSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { CodexTask } from './codex-worker-store.js';
+import { CODEX_WORKSPACE_BUDGET, codexStoredBytes } from './codex-worker-retention.js';
 
 export interface CodexWorkerConfig {
   directory: string; source: string; binary: string; modules: string; owner: string; socket: string; home: string; logFile?: string;
 }
 const OUTPUT_LIMIT = 180_000; // Leave room for the command log in QQ's 1 MiB text attachment.
+const SOURCE_INPUTS = ['src', 'test', 'docs', 'scripts', '.agents', 'AGENTS.md', 'README.md', 'package.json', 'package-lock.json', 'tsconfig.json'];
 function executionEnvironment(home?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home ?? process.env.HOME,
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', LANG: 'C.UTF-8' };
@@ -18,10 +20,30 @@ function clipped(text: string, limit = OUTPUT_LIMIT): string {
   return text.length <= limit ? text : text.slice(0, limit) + '\n[内容超过大小上限，已截断。]';
 }
 export function codexArguments(config: CodexWorkerConfig, task: CodexTask, workspace: string): string[] {
-  const filesystem: Record<string, string> = { ':root': 'read', [config.home]: 'deny', [config.directory]: 'deny',
-    '/var/lib/pa': 'deny', '/etc/pa': 'deny', '/root': 'deny', [config.socket]: 'deny',
-    [workspace]: task.mode === 'fix' ? 'write' : 'read', [join(workspace, '.git')]: 'read',
-    [join(workspace, '.codex')]: 'read', [join(workspace, '.agents')]: 'read', [config.modules]: 'read' };
+  const filesystem: Record<string, string> = { ':root': 'read', [config.home]: 'read', [config.directory]: 'deny',
+    '/var/lib/pa': 'deny', '/etc/pa': 'deny', '/root': 'deny', [config.socket]: 'deny', [config.modules]: 'read' };
+  // Codex also probes HOME/.codex during session setup outside a workspace.
+  // Expose the HOME directory itself, never any of its private children.
+  for (const name of existsSync(config.home) ? readdirSync(config.home) : []) filesystem[join(config.home, name)] = 'deny';
+  const belowHome = relative(config.home, workspace);
+  if (belowHome && !belowHome.startsWith('..' + sep) && belowHome !== '..' && !isAbsolute(belowHome)) {
+    // Bubblewrap cannot reconstruct a read-only child beneath a denied ancestor.
+    // Keep only the directory spine visible, masking every sibling at each level.
+    let directory = config.home;
+    for (const segment of belowHome.split(sep)) {
+      filesystem[directory] = 'read';
+      const next = join(directory, segment);
+      for (const name of existsSync(directory) ? readdirSync(directory) : []) {
+        if (join(directory, name) !== next) filesystem[join(directory, name)] = 'deny';
+      }
+      directory = next;
+    }
+  }
+  filesystem[join(config.home, '.codex')] = 'deny';
+  filesystem[workspace] = task.mode === 'fix' ? 'write' : 'read';
+  if (task.baseCommit || task.mode === 'fix') {
+    for (const name of ['.git', '.codex', '.agents']) filesystem[join(workspace, name)] = 'read';
+  }
   if (config.logFile) filesystem[config.logFile] = 'read';
   const toml = '{' + Object.entries(filesystem).map(([path, mode]) => `${JSON.stringify(path)}=${JSON.stringify(mode)}`).join(',') + '}';
   const args = ['exec', '--ignore-user-config', '--ignore-rules', '-m', 'gpt-6.1-sol',
@@ -29,6 +51,7 @@ export function codexArguments(config: CodexWorkerConfig, task: CodexTask, works
     '-c', `permissions.pa_task.filesystem=${toml}`, '-c', 'permissions.pa_task.network.enabled=false',
     '-c', 'approval_policy="never"', '--json'];
   if (task.threadId) args.push('resume', task.threadId);
+  if (task.mode === 'read' && !task.baseCommit) args.push('--skip-git-repo-check');
   args.push('-');
   return args;
 }
@@ -50,11 +73,17 @@ async function command(binary: string, args: string[], cwd: string, max = OUTPUT
 }
 export async function prepareCodexWorkspace(config: CodexWorkerConfig, task: CodexTask): Promise<string> {
   const workspace = join(config.directory, 'workspaces', task.id);
+  if (task.mode === 'read' && !task.baseCommit) {
+    if (!existsSync(task.source ?? config.source)) throw new Error('任务固定的源码版本已被发布保留规则回收，请新建任务检查当前版本。');
+    task.source = realpathSync(task.source ?? config.source);
+    return task.source;
+  }
   if (task.baseCommit) {
     if (!existsSync(workspace) || lstatSync(workspace).isSymbolicLink()) throw new Error('任务工作目录丢失或被重定向。');
     return workspace;
   }
-  const source = realpathSync(config.source);
+  if (!existsSync(task.source ?? config.source)) throw new Error('任务固定的源码版本已被发布保留规则回收，请新建修改任务。');
+  const source = realpathSync(task.source ?? config.source);
   if (!isAbsolute(source) || source === resolve(config.directory)) throw new Error('Codex 源码目录无效。');
   if (existsSync(workspace)) {
     if (lstatSync(workspace).isSymbolicLink()) throw new Error('任务工作目录被重定向。');
@@ -65,10 +94,14 @@ export async function prepareCodexWorkspace(config: CodexWorkerConfig, task: Cod
   }
   const disk = statfsSync(config.directory);
   if (disk.bavail * disk.bsize < 2 * 1024 ** 3) throw new Error('服务器磁盘余量不足2GiB，暂停新建Codex工作目录。');
+  const projected = SOURCE_INPUTS.reduce((total, name) => total + codexStoredBytes(join(source, name)), 0) * 2;
+  if (codexStoredBytes(join(config.directory, 'workspaces')) + projected > CODEX_WORKSPACE_BUDGET) {
+    throw new Error('Codex工作目录接近256MiB保留预算，未发布改动已保留。请先处理旧任务；只读诊断不受影响。');
+  }
   mkdirSync(join(config.directory, 'workspaces'), { recursive: true, mode: 0o700 });
   const staging = mkdtempSync(join(config.directory, 'workspaces', '.prepare-'));
   // Copy only versioned development inputs, never env, service data or deployment credentials.
-  for (const name of ['src', 'test', 'docs', 'scripts', '.agents', 'AGENTS.md', 'README.md', 'package.json', 'package-lock.json', 'tsconfig.json']) {
+  for (const name of SOURCE_INPUTS) {
     const input = join(source, name);
     if (!existsSync(input)) continue;
     cpSync(input, join(staging, name), { recursive: true, dereference: false,
@@ -100,7 +133,7 @@ export async function runCodexTask(config: CodexWorkerConfig, task: CodexTask,
   const outputPath = join(revisionDirectory, 'events.jsonl');
   const evidence: string[] = [];
   let final = '', errorText = '', outputBytes = 0, failed = false;
-  const prompt = `你是 PA 委派的服务器任务执行者。当前工作目录就是 PA 已为本任务创建的独立 Git 副本。${task.mode === 'fix' ? '直接在当前根目录修改源码和测试；另建嵌套副本或在忽略目录中改代码，PA 将无法交付这些改动。' : '本轮只读检查。'}\n`
+  const prompt = `你是 PA 委派的服务器任务执行者。${task.mode === 'fix' ? '当前工作目录是本任务的独立 Git 副本。直接在当前根目录修改源码和测试；另建嵌套副本或在忽略目录中改代码，PA 将无法交付这些改动。' : '当前工作目录是本任务固定版本的源码，本轮只读检查。'}\n`
     + '最终回复会直接发给委派人。用两三句中文说清做了什么、实际验证到什么效果；如果只完成一部分、还没验证或遇到阻塞，明确说明。只读任务直接回答查到的结论。省略补丁、代码块、命令和日志。'
     + '不要部署、推送、发送QQ消息或修改服务，不读取凭证、其他任务和生产数据库。'
     + '仓库约定适用。修改时只做用户要求的小修复，选择一条针对性测试；测试失败可以修正后重跑，不扩大为全量测试。'
@@ -154,8 +187,10 @@ export async function runCodexTask(config: CodexWorkerConfig, task: CodexTask,
   if (task.status === 'failed' && final) task.summary += '\n\n执行异常：' + clipped(errorText || `exit=${exit}`, 1500);
   writeFileSync(join(revisionDirectory, 'commands.txt'), task.evidence, { mode: 0o600 });
   try {
-    await command('git', ['add', '--intent-to-add', '--all'], workspace);
-    task.diff = await command('git', ['diff', '--no-ext-diff', '--no-textconv', task.baseCommit!, '--'], workspace);
+    if (task.baseCommit) {
+      await command('git', ['add', '--intent-to-add', '--all'], workspace);
+      task.diff = await command('git', ['diff', '--no-ext-diff', '--no-textconv', task.baseCommit, '--'], workspace);
+    } else task.diff = '';
   } catch (error) {
     task.status = 'failed';
     task.diff = '未能导出完整 diff：' + (error instanceof Error ? error.message : '未知错误');

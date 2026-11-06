@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import type { ChildProcess } from 'node:child_process';
 import { CodexWorkerStore, type CodexSubmission, type CodexTask } from './codex-worker-store.js';
 import { runCodexTask, type CodexWorkerConfig } from './codex-worker-runner.js';
+import { retainCodexTasks } from './codex-worker-retention.js';
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name]?.trim();
@@ -48,6 +49,11 @@ function submission(value: unknown, owner: string): CodexSubmission {
 
 export async function startCodexWorker(config: CodexWorkerConfig): Promise<{ close(): Promise<void> }> {
   const store = new CodexWorkerStore(config.directory);
+  const maintain = async (): Promise<void> => {
+    try { await retainCodexTasks(config, store); }
+    catch (error) { console.error('Codex任务回收未完成，已保留现场：', error instanceof Error ? error.message : 'unknown error'); }
+  };
+  await maintain();
   const report = (task: CodexTask): CodexTask => {
     const view = { ...task };
     const result = join(config.directory, 'results', `${task.id}-${task.revision}`);
@@ -74,6 +80,7 @@ export async function startCodexWorker(config: CodexWorkerConfig): Promise<{ clo
       task.summary = `Codex 执行失败：${error instanceof Error ? error.message : 'unknown error'}`;
       store.update(task);
     } finally {
+      await maintain();
       active = false;
       child = undefined;
       if (!stopping) setImmediate(() => { void tick(); });
@@ -99,7 +106,7 @@ export async function startCodexWorker(config: CodexWorkerConfig): Promise<{ clo
         const requestId = url.searchParams.get('requestId') ?? undefined;
         const tasks = store.list(config.owner, requestId);
         send(200, { tasks: requestId ? tasks.map(report) : tasks.slice(0, 50).map(task => ({ id: task.id, revision: task.revision,
-          requestId: task.requestId, status: task.status, summary: task.summary?.slice(0, 500) })) }); return;
+          requestId: task.requestId, status: task.status, archivedAt: task.archivedAt, summary: task.summary?.slice(0, 500) })) }); return;
       }
       const match = /^\/tasks\/([a-f0-9-]{36})$/.exec(url.pathname);
       const revision = url.searchParams.get('revision');

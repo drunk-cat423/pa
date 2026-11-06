@@ -21,6 +21,8 @@ export interface CodexTask {
   evidence?: string;
   diff?: string;
   memoryPeakBytes?: number;
+  archivedAt?: string;
+  reclaimedAt?: string;
 }
 export interface CodexSubmission { requestId: string; owner: string; mode: 'read' | 'fix'; prompt: string; taskId?: string }
 interface Ledger { version: 1; tasks: CodexTask[]; requests: Record<string, { id: string; revision: number; status: string; input: string }> }
@@ -82,6 +84,7 @@ export class CodexWorkerStore {
     if (input.taskId) {
       const found = this.get(input.taskId, input.owner);
       if (!found) throw new Error('没有属于你的该 Codex 任务。');
+      if (found.archivedAt) throw new Error('该任务的工作目录和会话已按保留规则归档，请新建任务；历史结论仍可查询。');
       if (found.status === 'queued' || found.status === 'running') throw new Error('该任务正在执行，请等本次结果后续办。');
       task = { ...found, requestId: input.requestId, revision: found.revision + 1,
         prompt: input.prompt, mode: input.mode, status: 'queued', updatedAt: now };
@@ -119,5 +122,13 @@ export class CodexWorkerStore {
       delete task.evidence;
       if (task.summary) task.summary = task.summary.slice(0, 2000);
     }
+  }
+  markArchived(id: string, at: string): void {
+    for (const task of this.ledger.tasks) if (task.id === id) task.archivedAt = at;
+    this.save();
+  }
+  markReclaimed(id: string, at: string): void {
+    for (const task of this.ledger.tasks) if (task.id === id) task.reclaimedAt = at;
+    this.save();
   }
 }

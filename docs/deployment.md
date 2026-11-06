@@ -37,7 +37,7 @@ journalctl -u pa.service -n 30 --no-pager
 
 主服务通过 Unix socket 调度单任务，Codex 在独立 systemd 单元内以专用账号运行。安装、订阅认证、模型设置和停用步骤见 [Codex 执行器](codex-worker.md)。开关只加在 PA 的服务环境中，执行器使用单独的环境文件。
 
-需要查看 PA 运行事件时，可安装 `scripts/deployment/pa-delegation-diagnostics.{service,timer}` 并启用 timer。它约每两分钟刷新 `/run/pa-delegation-diagnostics/events.log`，只包含最近 24 小时最多 300 条白名单网关事件及后台状态。执行器的 `PA_CODEX_LOG_FILE` 指向这个只读文件。日志不含原始聊天、用户 ID、模型请求和凭证；快照首行给出更新时间。
+需要查看 PA 运行事件时，可安装 `scripts/deployment/pa-delegation-diagnostics.{service,timer}` 并启用 timer。它约每两分钟刷新 `/run/pa-delegation-diagnostics/events.log`，包含最近 24 小时最多 300 条白名单网关事件、后台状态和有界模型错误投影，详见 [诊断范围](codex-worker.md)。执行器的 `PA_CODEX_LOG_FILE` 指向这个只读文件。日志不含原始聊天、用户 ID、模型请求和凭证；快照首行给出更新时间。
 
 ## 私聊确认后的发布与回滚
 

@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { collectModelErrors } from './delegation-error-metadata.mjs';
 
 // This projection is readable by the executor. Never pass raw journal output,
 // conversation records, route IDs, or free-form status strings through to it.
@@ -31,5 +32,6 @@ try {
     trendingError: knownErrors.includes(trending.errorCode) ? trending.errorCode : null,
     researchFailed: status.research?.failed === true, remindersFailed: status.reminders?.failed === true }));
 } catch { lines.push('PA runtime status unavailable'); }
+lines.push(JSON.stringify(collectModelErrors()));
 writeFileSync(directory + '/events.next', lines.join('\n') + '\n', { mode: 0o644 });
 renameSync(directory + '/events.next', directory + '/events.log');

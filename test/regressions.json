@@ -3,6 +3,16 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/delegation-diagnostics.test.mjs",
+      "name": "recorded vision 503 remains distinct from unknown outcome while private error text is excluded",
+      "evidence": "2026-11-06 production stored a vision queue 503 response under an unknown call outcome, but the delegated log projection exposed only generic failed events. Covers bounded field projection including large calibration records, response integrity and exclusion of private text. Real subscription replay independently recovered the recorded 503."
+    },
+    {
+      "file": "test/codex-worker.test.mjs",
+      "name": "Read tasks share immutable source, retire safely and keep unpublished fixes and delivery evidence",
+      "evidence": "2026-11-06 the real private read task failed during bubblewrap initialization beneath a denied home ancestor. Read tasks also copied source and Git unnecessarily. Covers zero-copy source selection and conservative retention of unpublished fixes and delivery evidence; actual Linux sandbox and full subscription replay are separately verified."
+    },
+    {
       "file": "test/trending-service.test.mjs",
       "name": "代理公网DNS隧道超时耗尽采集，恢复后仅显式补发且保留原失败期",
       "evidence": "2026-11-04 formal daily digest exhausted three collections; proxy logs showed three upstream TCP timeouts opening the public-DNS tunnel, before any snapshot, model call or delivery. Offline local CONNECT 504 reproduces the real fetch/collector failure path and verifies bounded attempts, no generation/send, restart fencing, explicit idempotent backfill and preservation of the failed edition. Private evidence stays in .local/ops/daily-20261104/."
