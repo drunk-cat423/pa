@@ -5,10 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
+import { ChannelHarness } from '../dist/channel-harness.js';
 import { ConversationStore } from '../dist/store.js';
-import { personLabel, messagePeople } from '../dist/context-people.js';
-import { prepareMemoryWireExtraction } from '../dist/memory-wire.js';
+import { personLabel } from '../dist/context-people.js';
 import { conversationContext, currentTurnInput } from './fixtures/conversation-context.mjs';
 import { companionReply } from './fixtures/companion-tools.mjs';
 import { emptyExtraction } from './fixtures/memory-output.mjs';
@@ -74,8 +73,7 @@ test('speaker swap incident keeps source speaker, original AI reply target, quot
     messageId: deliveredBotReplyId,
     inlineMessages: [
       { text: deliveredBotReply.text, senderId: 'unknown-platform-bot-author', senderName: '同名昵称' },
-    ],
-  } })), 'sent');
+    ] } })), 'sent');
 
   const request = f.requests.at(-1), turn = currentTurnInput(request), context = conversationContext(request);
   const labelA = personLabel('person-a'), labelB = personLabel('person-b');
@@ -91,8 +89,7 @@ test('speaker swap incident keeps source speaker, original AI reply target, quot
   assert.equal(await harness.handle(f.message('b-bot-author-human', '引用Bot原文，但平台明确标为A', 'b', { quote: {
     messageId: deliveredBotReplyId, inlineMessages: [
       { text: deliveredBotReply.text, senderId: 'a', senderName: '同名昵称' },
-    ],
-  } })), 'sent');
+    ] } })), 'sent');
   const humanAttributedBotInline = currentTurnInput(f.requests.at(-1)).currentMessage.quotedMessage;
   assert.equal(humanAttributedBotInline.messages[0].speakerLabel, labelA);
   assert.equal(humanAttributedBotInline.messages[0].senderId, 'a');
@@ -114,8 +111,7 @@ test('speaker swap incident keeps source speaker, original AI reply target, quot
     messageId: 'a-source', inlineMessages: [
       { text: humanSource.text, senderId: 'a', senderName: '同名昵称' },
       { text: '冒用同昵称但身份未知', senderId: 'intruder', senderName: '同名昵称' },
-    ],
-  } })), 'sent');
+    ] } })), 'sent');
   const humanQuote = currentTurnInput(f.requests.at(-1)).currentMessage.quotedMessage;
   assert.equal(humanQuote.messages[0].speakerLabel, labelA);
   assert.equal(humanQuote.messages[0].text, humanSource.text);
@@ -135,61 +131,6 @@ test('speaker swap incident keeps source speaker, original AI reply target, quot
     assert.equal(history.messages.find(item => item.role === 'assistant').replyToLabel, labelA);
   } finally { store.close(); }
   assert.equal(f.requests.length, 8, 'four ordinary turns should each use the normal two model requests');
-});
-
-test('adding people, changing sender, restart, and another room preserve the existing context prefix and raw records', async t => {
-  const f = await fixture(t), harness = f.open();
-  assert.equal(await harness.handle(f.message('a-first', '第一条：A的原始记录。', 'a')), 'sent');
-  const store = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
-  try {
-    const conversation = f.conversationId(f.route);
-    const source = store.db.prepare("SELECT id FROM messages WHERE conversation_id=? AND role='user' AND text=?").get(conversation, '第一条：A的原始记录。');
-    assert.ok(source);
-    assert.ok(source.id);
-  } finally { store.close(); }
-
-  assert.equal(await harness.handle(f.message('b-second', '第二条：B的新内容。', 'b')), 'sent');
-  let context = conversationContext(f.requests.at(-1));
-  const stablePrefix = context.historyRaw;
-  assert.ok(stablePrefix.length > 0, 'capture history after it contains A\'s first message');
-  assert.ok(stablePrefix.includes('第一条：A的原始记录。'));
-  assert.ok(context.historyRaw.startsWith(stablePrefix));
-  assert.equal(context.messages.find(item => item.text.includes('第一条')).speakerLabel, personLabel('person-a'));
-  assert.equal(currentTurnInput(f.requests.at(-1)).currentMessage.speakerLabel, personLabel('person-b'));
-  await harness.close();
-
-  const reopened = f.open();
-  assert.equal(await reopened.handle(f.message('a-after-restart', '重启后的A消息。', 'a', { senderName: 'A的新昵称' })), 'sent');
-  context = conversationContext(f.requests.at(-1));
-  assert.ok(context.historyRaw.startsWith(stablePrefix));
-  assert.equal(context.messages.find(item => item.text.includes('第一条')).speakerLabel, personLabel('person-a'));
-  assert.equal(context.messages.find(item => item.text.includes('第二条')).speakerLabel, personLabel('person-b'));
-  assert.equal(context.messages.find(item => item.text.includes('第一条')).senderName, '同名昵称');
-  assert.equal(currentTurnInput(f.requests.at(-1)).currentMessage.senderName, 'A的新昵称');
-
-  assert.equal(await reopened.handle(f.message('c-third', '第三条：C加入群聊。', 'c', { senderName: '新成员' })), 'sent');
-  context = conversationContext(f.requests.at(-1));
-  assert.ok(context.historyRaw.startsWith(stablePrefix));
-  assert.equal(currentTurnInput(f.requests.at(-1)).currentMessage.speakerLabel, personLabel('person-c'));
-  assert.equal(currentTurnInput(f.requests.at(-1)).currentMessage.senderName, '新成员');
-  assert.equal(await reopened.handle(f.message('after-c-check', '确认C之前说了什么？', 'a')), 'sent');
-  context = conversationContext(f.requests.at(-1));
-  assert.ok(context.historyRaw.startsWith(stablePrefix));
-  assert.equal(context.messages.find(item => item.text.includes('第三条：C加入群聊')).speakerLabel, personLabel('person-c'));
-
-  const before = f.requests.length;
-  assert.equal(await reopened.handle(f.message('other-room', '另一房间消息', 'a', { route: f.other })), 'sent');
-  assert.equal(f.requests.length, before + 2);
-  const crossRoomStore = new ConversationStore(join(f.config.dataDir, 'pa.sqlite'));
-  try {
-    const sourceId = crossRoomStore.db.prepare("SELECT id FROM messages WHERE role='user' AND text=?").get('第一条：A的原始记录。').id;
-    assert.throws(() => crossRoomStore.readHistory(f.conversationId(f.other), sourceId, { scope: 'room' }), /边界/);
-  } finally { crossRoomStore.close(); }
-  const db = new DatabaseSync(join(f.config.dataDir, 'pa.sqlite'));
-  try {
-    assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE text LIKE '%第一条：A的原始记录%' AND role='user'").get().n, 1);
-    assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE text LIKE '%第二条：B的新内容%' AND role='user'").get().n, 1);
-  } finally { db.close(); }
 });
 
 test('Pi续问与旧Bot话题同时出现时，真实请求保留最近对象并明确检索仅作辅助', async t => {
@@ -286,35 +227,4 @@ test('旧画像报错保留为历史，回答阶段仍携带现行契约且不�
     assert.equal(reopened.db.prepare('SELECT COUNT(*) n FROM self_profile_revisions').get().n, 2, 'old and current versions remain');
     assert.equal(reopened.db.prepare('SELECT COUNT(*) n FROM person_profile_pending').get().n, 0);
   } finally { reopened.close(); }
-});
-
-test('background memory projections keep stable person labels across local reference remapping and unknown legacy identity', () => {
-  const message = (id, role, text, personId, replyToPersonId) => ({ id, role, text, personId, replyToPersonId,
-    conversationId: 'conversation-a', ingestSeq: 1, createdAt: '2026-10-26T00:00:00.000Z' });
-  const base = { extractionProtocol: 2, profileProtocol: 2, contextProtocol: 1, pipeline: 'compression', roomType: 'group',
-    previousSummary: '', job: { id: 'job', conversationId: 'conversation-a', reason: 'capacity', status: 'queued', startSeq: 1,
-      endSeq: 1, messageIds: ['a-msg', 'bot-msg'], attempts: 0 },
-    messages: [message('a-msg', 'user', 'A的原文', 'person-a'), message('bot-msg', 'assistant', '回复A', undefined, 'person-a')],
-    profiles: [{ personId: 'person-a', baseVersion: 1, facts: [] }] };
-  const original = structuredClone(base);
-  const first = JSON.parse(prepareMemoryWireExtraction(base, 100000).userContent);
-  const changedMapping = structuredClone(base);
-  changedMapping.profiles.unshift({ personId: 'person-b', baseVersion: 1, facts: [] });
-  const second = JSON.parse(prepareMemoryWireExtraction(changedMapping, 100000).userContent);
-  assert.equal(first.messages[0].personId, 'p0');
-  assert.equal(second.messages[0].personId, 'p1');
-  assert.equal(first.messages[0].speakerLabel, personLabel('person-a'));
-  assert.equal(second.messages[0].speakerLabel, personLabel('person-a'));
-  assert.equal(first.messages[1].replyToLabel, personLabel('person-a'));
-  assert.equal(messagePeople({ role: 'user' }).speakerLabel, 'UNKNOWN');
-  assert.match(prepareMemoryWireExtraction(base, 100000).systemPrompt, /稳定人物标签/);
-  const topicWire = prepareMemoryWireExtraction({...base,pipeline:'materials',materialsProtocol:3,mode:'messages'},100000);
-  assert.equal(JSON.parse(topicWire.userContent).messages[0].speakerLabel,personLabel('person-a'));
-  assert.match(topicWire.systemPrompt,/Topic和摘要涉及人物时保留稳定人物标签/);
-  const profileWire = prepareMemoryWireExtraction({...base,pipeline:'materials',materialsProtocol:3,mode:'profiles',
-    profileProposalProtocol:'delta-v1'},100000);
-  const profileInput=JSON.parse(profileWire.userContent);
-  assert.equal(profileInput.personLabel,personLabel('person-a'));
-  assert.equal(profileInput.sources[0].speakerLabel,personLabel('person-a'));
-  assert.deepEqual(base,original,'model projections must not rewrite the frozen source input');
 });

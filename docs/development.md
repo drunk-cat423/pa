@@ -50,43 +50,16 @@ QQ 回答使用原生 Markdown；长回答按 UTF-8 字节限制自动切段并�
 
 ## 检查
 
+测试只保留具体产品故障、用户明确提出的问题，以及少量会造成越权、原文丢失、重复付费或重复发送的关键检查。测试在编写时曾失败、基础功能验收或已经退出运行的旧机制，不是独立保留理由。逐项依据见 [test/regressions.json](../test/regressions.json)，取舍规则见 [测试保留说明](testing.md)。
+
 ```powershell
 node scripts/repo-check.mjs --list
 node scripts/repo-check.mjs memory
-# 涉及多个范围时合并选择；综合改动用 all。
-node scripts/repo-check.mjs chat delivery
+node scripts/repo-check.mjs --changed src/文件.ts test/新增.test.mjs --list
+node scripts/repo-check.mjs all
 ```
 
-脚本先编译与类型检查，再以并发2运行已有离线回归；分组与执行文件通过 `--list` 查询。原npm入口保留，不修改依赖清单或CI。
-
-测试使用临时目录、SQLite 和本地 HTTP，不调用外部模型、不消费生产凭据。2026-10-23再次按用户要求清理：只保留有同名实际失败记录、明确改名的失败延续记录，或能对应已确认故障复现的现存用例。保留依据逐项列在 [test/regressions.json](../test/regressions.json)，私有故障日志不提交。按具体用例及参数化变体筛选，不因文件中某一项失败就保留整个文件；仅有文件导入失败不算其中全部用例失败。已经移除的旧功能测试不恢复。
-
-研究保留错误码丢失、长报告截断、未读取链接却声称可读、目标串话题、末轮工具关闭、材料漏选与分页、前缀缓存失配等已复现问题的回归；`material-proposal-recovery.test.mjs`只保留实际出现过的未知画像对象和错误人物归属两个分支。无故障依据的功能验收与预防性组合已删除，附属无用helper、import和代理测试证书一起清理。模型、网页与QQ接口仍使用本地模拟，真实模型质量和客户端展示需独立联调。研究的设计、预算和边界见 [research.md](research.md)。
-
-失败记录可能来自实现、测试样例或旧断言，不等于每次都发现了产品缺陷。未找到失败记录的用例及不再使用的辅助代码已移除，当前套件不代表所有功能和边界都有覆盖。保留的回归按以下范围查找：
-
-| 范围 | 主要测试文件 | 防止的故障 |
-|---|---|---|
-| 对话和工具循环 | `channel-async`、`cli-interaction` | 已记录的分段排队和终端交互失败 |
-| 上下文与用量校准 | `memory-context`、`runtime-token-calibration`、`calibrated-compression` | 已记录的历史注入、容量压缩和实测用量问题 |
-| 画像与后台整理 | `auto-memory*`、`self-profile*`、`memory-diagnostics` | 已记录的画像注入、整理恢复及诊断保存问题 |
-| 存储与消息投递 | `store`、`memory-store`、`channel-task-store`、`delivery-parts` | 旧数据库升级及投递状态 |
-| 搜索、网页和图片 | `runtime-search*`、`channel-web-tools`、`image-context` | 搜索工具衔接及图片传递 |
-| 后台研究 | `research-context`、`research-materials`、`research-e2e`、`research-target`、`research-thinking-runtime`、`research-archive` | 已复现的材料、缓存、循环、目标和归档问题 |
-| 旧任务处理 | `legacy-count-retirement` | 失败队列退役与原始资料保留 |
-
-表中的名称均对应 `test/<名称>.test.mjs`。只检查相关模块时，先构建，再指定文件，例如：
-
-```powershell
-npm run build
-node --test --test-concurrency=2 test/research-materials.test.mjs test/research-context.test.mjs
-```
-
-后续优先为实际故障补充回归用例，说明触发条件和错误结果；同一入口、同一输入和同一结果不重复覆盖。迁移测试也按失败记录筛选，不整组保留。
-
-Mock只验证程序契约。真实模型的人物归属、提取质量、关键词检索以及实际QQ @对象需独立联调。容量检查使用带余量的事前估算：成功usage校准只在收到响应后生效，未知新增文本仍保守计量，不等于对尚未发送请求进行供应商精确计数。
-
-模型及后台整理的诊断字段、存储边界和离线重放命令见 [统一日志](logging.md)。保留的诊断回归聚焦曾失败的后台保存和提交阶段。
+检查入口先编译，再运行对应的现存测试；共享fixture变化仍选择所有现存回归。Mock和本地HTTP只证明程序行为，实际模型语义、QQ展示和线上延迟仍需独立验证。没有配置模型或QQ也可完成这些离线检查。
 
 ## 当前完成与后续边界
 

@@ -57,7 +57,7 @@ QQ返回成功和外部消息编号后，在同一事务中保存work_delivery_r
 | QQ协议 | 捕获主动消息POST，确认无被动msg_id、群标签目标来自受控sender、正文不能注入@全体、私聊没有群@ |
 | 升级 | schema31/32升级33保留原文及已有提醒，旧库备份、外键与研究清理契约正常 |
 
-对应测试：test/reminder-runtime.test.mjs、test/reminder-service.test.mjs、test/work-ledger-store.test.mjs、test/work-ledger-migration.test.mjs。另选择3项channel-async中的慢投递、关闭竞态、房间隔离测试，验证新定时器与旧harness生命周期相容。另单跑channel-web-tools的一项工具目录兼容用例；不运行全量npm test。
+保留 test/reminder-runtime.test.mjs、test/reminder-service.test.mjs、test/work-ledger-store.test.mjs、test/work-ledger-migration.test.mjs 中针对错误承诺、补充时间、实际到期交付、本人权限、未知投递和当前升级的数据保护用例。基础成功路径、工具目录组合和参数矩阵已删除；逐项依据见 [测试登记](../test/regressions.json)。
 
 验证命令：
 

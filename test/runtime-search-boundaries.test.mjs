@@ -4,7 +4,7 @@ import { mkdtemp,  rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { openRecordedConversation,  } from '../dist/conversation.js';
+import { openRecordedConversation } from '../dist/conversation.js';
 import { estimateContext, openConversation } from '../dist/runtime.js';
 
 async function harness(t, { repeatedToolCall = false, truncatedSummary = false, includeSummary = false, contextWindow = 32768 } = {}) {
@@ -39,8 +39,7 @@ async function harness(t, { repeatedToolCall = false, truncatedSummary = false, 
     if (String(url) !== 'https://api.deepseek.com/anthropic/v1/messages') return originalFetch(url, options);
     nativeCalls.push(JSON.parse(options.body));
     const results = Array.from({ length: 5 }, (_, index) => ({
-      type: 'web_search_result', url: `https://example.test/${index}`, title: `Source ${index}`,
-    }));
+      type: 'web_search_result', url: `https://example.test/${index}`, title: `Source ${index}` }));
     const citations = results.map(item => ({ url: item.url, cited_text: 's'.repeat(1000) }));
     return new Response(JSON.stringify({ stop_reason: truncatedSummary ? 'max_tokens' : 'end_turn', content: [
       { type: 'web_search_tool_result', content: results },

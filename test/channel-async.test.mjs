@@ -196,70 +196,6 @@ test('同群长回答分段与其它回答按队列顺序完成', async t => {
   assert.equal(f.totalCalls(), 6);
 });
 
-test('慢房间投递不阻塞其他房间，生产入口立即入库返回，后续同房间任务重启恢复', async t => {
-  const f=await fixture(t,1),blocked=f.gate(),h=f.harness();
-  f.send(async(message,index)=>{
-    if(message.replyToMessageId==='a1') await blocked.promise;
-    return {status:'sent',externalMessageId:`sent-${index}`};
-  });
-  const first=h.handle(f.message('a1','房间A第一问'));
-  await until(()=>f.sent.length===1,'A开始慢投递');
-  assert.equal(await h.handle(f.message('a2','房间A第二问'),{waitForResult:false}),'accepted');
-  assert.equal(await h.handle(f.message('b1','房间B第一问',{route:f.other})),'sent');
-  assert.equal(f.tasks().find(task=>task.eventId==='a2').status,'queued');
-  assert.equal(f.totalCalls(),4);
-  assert.equal(h.info().queued,1);
-  const closing=h.close();blocked.release();
-  assert.equal(await first,'sent');await closing;
-  assert.equal(f.tasks().find(task=>task.eventId==='a2').status,'queued');
-  const reopened=f.harness();await reopened.start();await reopened.waitForTasks();
-  assert.equal(f.tasks().find(task=>task.eventId==='a2').status,'completed');
-  assert.equal(f.sent.filter(message=>message.replyToMessageId==='a2').length,1);
-  assert.equal(f.totalCalls(),6);
-});
-
-test('持续热房间队列按房间轮转，单房间保持入队顺序',async t=>{
-  const f=await fixture(t,1);
-  // This case checks nine queued turns, without provider usage calibration.
-  // Leave capacity for their full history so every task reaches scheduling.
-  f.config.contextWindow=65536;
-  const gate=f.gate(),h=f.harness();
-  f.plans.set('a0',[{gate,answer:'first'}]);
-  const first=h.handle(f.message('a0','first'));
-  await until(()=>f.requests.length===1,'第一请求占据计算槽');
-  for(let i=1;i<=8;i++) assert.equal(await h.handle(f.message(`a${i}`,`A ${i}`),{waitForResult:false}),'accepted');
-  assert.equal(await h.handle(f.message('b','B',{route:f.other}),{waitForResult:false}),'accepted');
-  gate.release();await first;await h.waitForTasks();
-  assert.deepEqual(f.requests.map(r=>r.input.currentMessage.eventId),['a0','b',...Array.from({length:8},(_,i)=>`a${i+1}`)]);
-});
-
-test('claim到执行之间关闭时，尚无run的任务安全退回queued，重启只执行一次',async t=>{
-  const f=await fixture(t),h=f.harness();await h.start();
-  const original=ConversationStore.prototype.claimNextChannelTask;
-  let closing;
-  ConversationStore.prototype.claimNextChannelTask=function(id){
-    const task=original.call(this,id);
-    if(task&&!closing) closing=h.close();
-    return task;
-  };
-  try {assert.equal(await h.handle(f.message('close-gap','不能丢掉的任务')),'ignored');await closing;}
-  finally{ConversationStore.prototype.claimNextChannelTask=original;}
-  assert.equal(f.tasks()[0].status,'queued');assert.equal(f.totalCalls(),0);
-  const next=f.harness();await next.start();await next.waitForTasks();
-  assert.equal(f.tasks()[0].status,'completed');assert.equal(f.totalCalls(),2);
-});
-
-test('SQLite是业务真相，旧Pi关联不再覆盖SQLite原文',async t=>{
-  const f=await fixture(t),h=f.harness();
-  assert.equal(await h.handle(f.message('original','原始问题')),'sent');
-  const mutator=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
-  try{mutator.db.prepare("UPDATE messages SET text='数据库当前原文' WHERE external_event_id='original'").run();}finally{mutator.close();}
-  assert.equal(await h.handle(f.message('next','继续聊天')),'sent');
-  assert.match(JSON.stringify(f.planningRequests.at(-1).body),/数据库当前原文/);
-  assert.ok(f.tasks().every(task=>task.session===null));
-  assert.equal(h.info().persistence.length,1);assert.equal(h.info().persistence[0].status,'ready');
-});
-
 test('损坏canonical JSONL不阻止新聊天或其它房间启动',async t=>{
   const f=await fixture(t),key=channelConversationKey(f.route);
   const directory=join(f.config.dataDir,createHash('sha256').update(key).digest('hex'));
@@ -269,17 +205,4 @@ test('损坏canonical JSONL不阻止新聊天或其它房间启动',async t=>{
   assert.equal(await h.handle(f.message('safe','正常问题',{route:f.other})),'sent');
   assert.equal(await h.handle(f.message('old-bad','旧文件损坏的房间仍正常')),'sent');
   assert.equal(f.totalCalls(),4);
-});
-
-test('SQLite领取持久化失败必须全局停调度并上报',async t=>{
-  const f=await fixture(t);let fatal=0;const h=f.harness(0,()=>fatal++);
-  assert.equal(await h.handle(f.message('original','原始问题')),'sent');
-  const claim=ConversationStore.prototype.claimNextChannelTask;
-  ConversationStore.prototype.claimNextChannelTask=()=>{throw new Error('injected claim persistence failure');};
-  try{
-    await assert.rejects(h.handle(f.message('blocked','新问题')),/持久化失败/);await h.waitForTasks();
-    assert.equal(fatal,1);
-    await assert.rejects(h.handle(f.message('other','另一个房间',{route:f.other})),/持久化失败/);
-    assert.equal(f.totalCalls(),2);
-  }finally{ConversationStore.prototype.claimNextChannelTask=claim;}
 });

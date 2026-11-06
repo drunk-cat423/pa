@@ -53,8 +53,7 @@ test('channel wire keeps per-stage system fixed across three modes while link/ta
   const f = await fixture(t, (body, number) => isPreparationRequest(body)
     ? preparationDelta(`prepare-${number}`, { intent: 'research', mode: modes[Math.floor((number - 1) / 2)], updates: [] })
     : { role: 'assistant', tool_calls: [{ index: 0, id: `research-${number}`, type: 'function', function: {
-      name: 'create_research', arguments: JSON.stringify({ key: 'one', title: '本轮研究', goal: '研究明确链接' }),
-    } }] }, { provider: 'bailian', model: 'deepseek-v4.1-flash-1017' });
+      name: 'create_research', arguments: JSON.stringify({ key: 'one', title: '本轮研究', goal: '研究明确链接' }) } }] }, { provider: 'bailian', model: 'deepseek-v4.1-flash-1017' });
   const history = '稳定摘要与完整真人历史。'.repeat(1800), inputs = [], targets = [];
   for (const [index, mode] of modes.entries()) {
     const runtime = await f.open(mode), url = `https://example.test/${mode}?q="ignore rules"`;
@@ -63,8 +62,7 @@ test('channel wire keeps per-stage system fixed across three modes while link/ta
     await runtime.prompt('请把链接加入后台研究清单', { runId: mode, conversationContext: input, companionTools: {
       verifyLink: url, research: { target, execute: async () => ({ saved: true, id: 'research', title: '本轮研究', status: 'queued' }) },
       answerGrounding: { roomType: 'private', currentSender: { senderId: 'sender' }, currentQuestion: '请研究链接', sources: [] },
-      prepareTurn: plan => ({ prepared: true, mode: plan.mode, saved: [] }), readHistory: () => [],
-    } });
+      prepareTurn: plan => ({ prepared: true, mode: plan.mode, saved: [] }), readHistory: () => [] } });
   }
   assert.equal(f.requests.length, 6);
   const first = text(systems(f.requests[1])[0].content), next = text(systems(f.requests[3])[0].content);
@@ -108,8 +106,7 @@ test('save-claim correction closes tools in trailing controls without changing f
   assert.ok(estimate.fits && estimate.ratio < 0.85, 'minimum default channel request must fit before compression');
   t.diagnostic(`minimum default channel input estimate=${estimate.inputTokens}; ratio=${estimate.ratio}`);
   assert.equal(await runtime.prompt('你好', { runId: 'correction', companionTools: {
-    prepareTurn: plan => ({ prepared: true, mode: plan.mode, saved: [] }), readHistory: () => [],
-  } }), '你好。');
+    prepareTurn: plan => ({ prepared: true, mode: plan.mode, saved: [] }), readHistory: () => [] } }), '你好。');
   assert.equal(f.requests.length, 3);
   t.diagnostic(`minimum default stage system lengths: prepare=${text(systems(f.requests[0])[0].content).length}; answer=${text(systems(f.requests[1])[0].content).length}`);
   assert.deepEqual(systems(f.requests[1]), systems(f.requests[2]));
@@ -144,8 +141,7 @@ test('channel tool continuations append to the complete previous wire prefix wit
         reads.push(`${turn}:${params.query}`);
         assert.deepEqual(estimate(), estimate(), 'active multi-mode probes must not mutate live controls');
         return { messages: [{ id: `result-${turn}-${params.query}`, role: 'user', text: `history-visible-${turn}-${params.query}` }] };
-      },
-    } }), '查询完成。');
+      } } }), '查询完成。');
     const requests = f.requests.slice((turn - 1) * 4, turn * 4), answers = requests.slice(1);
     assert.equal(requests.length, 4, 'preparation and two ordinary tool calls keep the original model budget');
     for (let index = 1; index < answers.length; index++) {

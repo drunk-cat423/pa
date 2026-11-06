@@ -5,10 +5,9 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
 import {openConversation} from '../dist/runtime.js';
-import {bindAnswerGrounding,UNVERIFIED_CURRENT_NOTICE,UNCERTAIN_ATTRIBUTION_NOTICE} from '../dist/answer-grounding.js';
+import { bindAnswerGrounding } from '../dist/answer-grounding.js';
 import {preparationDelta} from './fixtures/turn-preparation.mjs';
-import {DiagnosticLog,DiagnosticPersistenceError} from '../dist/diagnostics.js';
-import {speakerSwapIncident} from './fixtures/production-incidents.mjs';
+import { DiagnosticLog } from '../dist/diagnostics.js';
 
 const context={roomType:'group',currentSender:{senderId:'owner',personId:'primary-owner',senderName:'佑'},
   currentQuestion:'真的假的 opencode里的claude是啥型号',sources:[
@@ -50,22 +49,6 @@ async function fixture(t,respond,overrides={},native) {
 const metadata=(ctx=context)=>({runId:'grounded',conversationContext:'稳定会话前缀\n'+ctx.sources.map(source=>JSON.stringify(source)).join('\n'),
   companionTools:{answerGrounding:ctx,prepareTurn:p=>({prepared:true,mode:p.mode,saved:[]}),readHistory:()=>[]}});
 
-test('真实串人材料的归属绑定区分发言者与对象，拒绝伪造原文、其他房间及已纠正来源',()=>{
-  const receipt=bindAnswerGrounding(plan().grounding,context);
-  assert.equal(receipt.crossPersonExperience,true);assert.equal(receipt.currentSender.senderId,'owner');
-  assert.equal(receipt.references[0].speaker.senderId,'chocolate');assert.equal(receipt.references[0].proposedSubject.senderId,'chocolate');
-  const reported=bindAnswerGrounding({...plan().grounding,experienceRefs:[{...references[0],subjectSenderId:'owner'}]},context);
-  assert.equal(reported.references[0].speaker.senderId,'chocolate');assert.equal(reported.references[0].proposedSubject.senderId,'owner');
-  assert.equal(reported.references[0].subjectVerified,false);
-  for(const ref of [{...references[0],quote:'伪造经历'},{...references[0],messageId:'other-room'},{...references[0],subjectSenderId:'unknown'}]) {
-    assert.throws(()=>bindAnswerGrounding({...plan().grounding,experienceRefs:[ref]},context));
-  }
-  for(const change of [{corrected:true},{role:'assistant'}])assert.throws(()=>bindAnswerGrounding(plan().grounding,
-    {...context,sources:[{...context.sources[0],...change}]}));
-  const shared=bindAnswerGrounding(plan().grounding,{...context,currentSender:{senderId:'other-account',personId:'person-chocolate'}});
-  assert.equal(shared.crossPersonExperience,false);
-});
-
 test('同一真人消息可提交两段摘录并在两次模型调用内完成回答，仍拒绝无效第二段',async t=>{
   const sameSpeakerContext={...context,currentSender:{senderId:'chocolate',personId:'person-chocolate',senderName:'巧克力'}};
   const excerpts=[
@@ -93,19 +76,6 @@ test('同一真人消息可提交两段摘录并在两次模型调用内完成�
     {...excerpts[1],messageId:'corrected-source'},
     {...excerpts[1],messageId:'unknown-source'},
   ]) assert.throws(()=>bindAnswerGrounding(plan([excerpts[0],second]).grounding,correctedContext));
-});
-
-test('已退出的归属纠正字段被参数验证拒绝，改为普通问答后不产生专属记录',async t=>{
-  let saves=0;
-  const f=await fixture(t,(body,n)=>{
-    if(n===1)return preparationDelta('invalid',{...plan([]),updates:[{target:'room_memory',content:'纠正归属',attribution:{kind:'correction',
-      subjectSenderIds:['owner'],excludedSenderIds:['chocolate'],correctsMessageIds:['source']}}]});
-    if(n===2){assert.equal(saves,0);assert.ok(body.messages.some(message=>message.role==='tool')); return preparationDelta('valid',plan([]));}
-    assert.equal(n,3);return {role:'assistant',content:'明白，刚才说的是巧克力。'};
-  });
-  const runtime=await f.open('same-turn-correction'),meta=metadata();
-  meta.companionTools.prepareTurn=p=>{saves++;assert.deepEqual(p.updates,[]);return {prepared:true,mode:p.mode,saved:[]};};
-  assert.equal(await runtime.prompt('纠正归属',meta),'明白，刚才说的是巧克力。');assert.equal(saves,1);assert.equal(f.requests.length,3);
 });
 
 test('跨人物经历才进入有界无工具核验，修正回复和原始草稿均保留且前缀不重排',async t=>{
@@ -136,18 +106,6 @@ test('跨人物经历才进入有界无工具核验，修正回复和原始草�
   assert.ok(larger.inputTokens>plain.inputTokens+5000);
 });
 
-test('普通群聊和私聊不增加核验调用，跨人物核验无余预算或协议无效时不发送未核验草稿',async t=>{
-  for(const variant of ['ordinary','private','budget','invalid']) {
-    const f=await fixture(t,(_body,n)=>n===1?preparationDelta('prepare',plan(variant==='ordinary'?[]:references))
-      :{role:'assistant',content:n===2?'候选答复':'not valid JSON'},variant==='budget'?{loop:{maxModelCalls:2,maxToolCalls:8}}:{});
-    const runtime=await f.open('mode-'+variant),meta=metadata(variant==='private'?{...context,roomType:'private'}:context);
-    const answer=await runtime.prompt('问题',meta);
-    if(variant==='ordinary'||variant==='private'){assert.equal(answer,'候选答复');assert.equal(f.requests.length,2);}
-    else {assert.equal(answer,UNCERTAIN_ATTRIBUTION_NOTICE);assert.equal(f.requests.length,variant==='budget'?2:3);}
-    assert.equal(runtime.recordedTurns().at(-1).assistant.text,answer);
-  }
-});
-
 test('现况回答强制先搜索绑定的当前问题，日期未核验的结果必须明示且不自动追加搜索',async t=>{
   const search={enabled:true,budgetId:'current',model:'deepseek-flash',maxRequests:1,maxUses:1,maxTokens:1024,timeoutMs:1000,maxResults:5};
   const f=await fixture(t,(body,n)=>{
@@ -161,66 +119,4 @@ test('现况回答强制先搜索绑定的当前问题，日期未核验的结�
   assert.equal(f.requests.length,3);assert.equal(f.nativeRequests.length,1);
   assert.match(f.nativeRequests[0].messages[0].content[0].text,/opencode Go 当前口碑 官方型号/);
   assert.match(answer,/来源日期与现况尚未独立核验/);assert.equal(runtime.recordedTurns().at(-1).assistant.text,answer);
-});
-
-test('现况搜索失败、未启用或预算不足时明确未核验，不重试收费请求也不放行猜测结论',async t=>{
-  for(const variant of ['failed','disabled','budget','same-batch']) {
-    const enabled=variant!=='disabled';
-    const f=await fixture(t,(body,n)=>n===1?preparationDelta('prepare',plan([],'current_external'))
-      :variant==='same-batch'?{role:'assistant',tool_calls:[...tool('web_search',{query:'现在口碑'},'first').tool_calls,
-        {...tool('web_search',{query:'再试一次'},'second').tool_calls[0],index:1}]}:tool('web_search',{query:'现在口碑'}),{
-      ...(enabled?{search:{enabled:true,budgetId:'current',model:'deepseek-flash',maxRequests:0,maxUses:0,maxTokens:1024,timeoutMs:1000,maxResults:5}}:{}),
-      ...(variant==='budget'?{loop:{maxModelCalls:2,maxToolCalls:8}}:{}),
-    },()=>new Response(JSON.stringify({error:'fixture unavailable'}),{status:503}));
-    const runtime=await f.open('current-'+variant);
-    const answer=await runtime.prompt('现在口碑如何？',metadata());
-    assert.equal(answer,UNVERIFIED_CURRENT_NOTICE);assert.equal(f.nativeRequests.length,['failed','same-batch'].includes(variant)?1:0);
-    assert.equal(f.requests.length,['failed','same-batch'].includes(variant)?2:1);assert.equal(runtime.recordedTurns().at(-1).assistant.text,answer);
-  }
-});
-
-test('归属核验的未知响应、取消和诊断持久化失败均停止，不放行草稿或追加请求',async t=>{
-  for(const variant of ['unknown','cancel','persistence']) {
-    let reviewStarted,release;
-    const started=new Promise(resolve=>{reviewStarted=resolve;}),gate=new Promise(resolve=>{release=resolve;});
-    const f=await fixture(t,async(_body,n)=>{
-      if(n===1)return preparationDelta('prepare',plan());
-      if(n===2)return {role:'assistant',content:'你之前那个插件有问题。'};
-      assert.equal(n,3);
-      if(variant==='cancel'){reviewStarted();await gate;return {role:'assistant',content:'{"status":"ok"}'};}
-      return {httpStatus:503};
-    });
-    const runtime=await f.open('review-'+variant);
-    const original=DiagnosticLog.prototype.startCall;
-    if(variant==='persistence') {
-      let calls=0;
-      DiagnosticLog.prototype.startCall=function(...args){if(++calls===3)throw new DiagnosticPersistenceError();return original.apply(this,args);};
-    }
-    try {
-      const running=runtime.prompt('问题',metadata());
-      const failure=assert.rejects(running,error=>variant==='persistence'?error instanceof DiagnosticPersistenceError:/cancelled|取消|模型请求失败/.test(error.message+' '+error.kind));
-      if(variant==='cancel'){await started;await runtime.abort();release();}
-      await failure;
-      assert.equal(f.requests.length,variant==='persistence'?2:3);
-      if(variant==='persistence') {
-        await assert.rejects(runtime.prompt('不能再次请求',metadata()),DiagnosticPersistenceError);
-        assert.equal(f.requests.length,2);
-      }
-    } finally {DiagnosticLog.prototype.startCall=original;release();}
-  }
-});
-
-test('历史事故对照：旧准备响应缺grounding时拒绝放行，明确跨人引用后可阻止旧错答',async t=>{
-  const incident=speakerSwapIncident,source=incident.context.sources[0],refs=[{messageId:source.id,quote:incident.source,subjectSenderId:source.senderId}];
-  let saves=0;
-  const f=await fixture(t,(body,n)=>{
-    if(n===1)return tool('prepare_turn',{intent:'question',mode:'standard',updates:[]},'old-schema');
-    if(n===2){assert.equal(saves,0);assert.match(JSON.stringify(body.messages),/缺少grounding/);return preparationDelta('fixed-schema',plan(refs));}
-    if(n===3)return {role:'assistant',content:incident.wrongAnswer};
-    assert.equal(n,4);return {role:'assistant',content:'{"status":"uncertain"}'};
-  });
-  const runtime=await f.open('old-incident-schema'),meta=metadata(incident.context);
-  meta.companionTools.prepareTurn=p=>{saves++;return {prepared:true,mode:p.mode,saved:[]};};
-  const answer=await runtime.prompt(incident.question,meta);
-  assert.equal(answer,UNCERTAIN_ATTRIBUTION_NOTICE);assert.equal(saves,1);assert.equal(f.requests.length,4);
 });

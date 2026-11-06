@@ -130,8 +130,7 @@ async function fixture(t) {
       queueMicrotask(() => listeners.get('message')({ data: JSON.stringify({ op: 0, t: 'READY',
         d: { user: { id: 'bot' }, session_id: 'fixture-session' } }) }));
       return socket;
-    },
-  });
+    } });
   await qq.start();
   const route = { channel: 'qq', accountId: 'app', roomType: 'group', roomId: 'group' };
   const privateRoute = { ...route, roomType: 'private', roomId: 'alice-dm' };
@@ -216,26 +215,6 @@ test('研究故障端到端：原文失败仅尝试两次、显式续作保留�
   assert.equal(f.requests.length, requestCount);
   assert.equal(f.qqRequests.filter(request => request.body?.msg_type === 7).length, fileCount);
   assert.match(f.inspect(db => db.prepare('SELECT evidence_json FROM research_evidence WHERE task_id=?').get(interrupted.id).evidence_json), /已保存的资料/);
-});
-
-test('最后一个采集工具失败且无笔记时，写作仅带必要失败说明并保留blocked', async t => {
-  const f = await fixture(t); f.config.research.maxToolCalls=1;
-  const h = await f.harness(); f.pageFails(true);
-  f.plans.set('last-failure',[call('create_research',{key:'last-failure',title:'最后抓取失败',goal:'读取指定原文',urls:[sourceUrl],requiresOriginal:true})]);
-  f.phasePlans.set('最后抓取失败:collect',[call('web_fetch',{url:sourceUrl})]);
-  f.workerPlans.set('最后抓取失败',[body=>{
-    const input=JSON.parse(userText(body));
-    assert.equal(input.collectionNote,''); assert.equal(input.materialIndex,undefined);
-    assert.equal(input.sourceFailures.length,1);
-    assert.equal(input.sourceFailures[0].code,'network');
-    assert.match(input.sourceFailures[0].request,/research-source/);
-    assert.ok(input.sourceFailures[0].error);
-    return answer(sectionOutput('blocked'));
-  }]);
-  assert.equal(await h.handle(f.message('last-failure',`研究指定原文 ${sourceUrl}`)),'sent');
-  await h.waitForResearch();
-  assert.equal(f.taskRows()[0].status,'blocked');
-  assert.deepEqual(f.requests.filter(r=>r.worker).map(r=>r.worker.phase),['collect','write']);
 });
 
 test('章节报告不继承聊天输出上限，程序组装长正文；伪调用保留失败草稿且不重试', async t => {

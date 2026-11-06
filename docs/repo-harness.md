@@ -65,7 +65,7 @@ node scripts/repo-check.mjs all
 - **真实 @ 和文本伪 @**：`test/channel-async.test.mjs` 检查渠道入库、重启、旧元数据修复和权限差异。
 - **补齐不打乱时间**：`test/memory-recovery-e2e.test.mjs` 检查恢复来源、较新纠正和基线合并后的来源继承。
 
-保留依据见 [test/regressions.json](../test/regressions.json)。修复优先扩展匹配的故障回归，不公开私有聊天或故障日志，不为了引入 harness 批量新增测试。真实模型语义和 QQ 展示仍需单独验收。
+保留依据见 [test/regressions.json](../test/regressions.json)，标准见[测试保留说明](testing.md)。开发中断言失败或功能验收本身不算真实产品故障；仅保留有具体依据的当前用例。修复优先扩展匹配的故障回归，不公开私有聊天或故障日志，不为了引入 harness 批量新增测试。真实模型语义和 QQ 展示仍需单独验收。
 
 ## 修改与交接
 

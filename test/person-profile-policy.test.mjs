@@ -1,6 +1,6 @@
-import { downgradeSchema14 } from './fixtures/legacy-schema.mjs';
+import { memoryWords } from '../dist/memory-text.js';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
@@ -32,8 +32,7 @@ function fixture() {
     },
     inspect(fn) { const db = new DatabaseSync(path); try { return fn(db); } finally { db.close(); } },
     restart() { store.close(); store = new ConversationStore(path); },
-    close() { store.close(); rmSync(dir, { recursive: true, force: true }); },
-  };
+    close() { store.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
 function batch(f) {
@@ -123,8 +122,7 @@ test('给定正确计划时Bot名称落AI pending，下一轮注入并归档原�
       const body = JSON.parse(raw); requests.push(body);
       const preparing = isPreparationRequest(body);
       const delta = preparing ? preparationDelta(`ownership-${requests.length}`, {
-        intent: 'memory_update', mode: 'casual', updates: plans.get(currentMessage(body)?.text) ?? [],
-      }) : { role: 'assistant', content: '好。' };
+        intent: 'memory_update', mode: 'casual', updates: plans.get(currentMessage(body)?.text) ?? [] }) : { role: 'assistant', content: '好。' };
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       for (const [value, finish] of [[delta, null], [{}, preparing ? 'tool_calls' : 'stop']]) {
         response.write(`data: ${JSON.stringify({ id: 'ownership', object: 'chat.completion.chunk', created: 1,
@@ -171,8 +169,7 @@ test('给定正确计划时Bot名称落AI pending，下一轮注入并归档原�
     const step = { ...input, mode: 'self', profiles: [], messages: input.messages.filter(message => message.id === source.id) };
     assert.ok(prepareMemoryExtraction(step, 32768).systemPrompt.includes(SELF_PROFILE_POLICY));
     const organized = validateExtract(decodeMemoryWireResponse({ selfProfile: {
-      baseVersion: snapshot.baseVersion, content: botName, pendingIds: ['s0'], updates: [],
-    } }, step), step);
+      baseVersion: snapshot.baseVersion, content: botName, pendingIds: ['s0'], updates: [] } }, step), step);
     store.autoMemory.commit(job.id, job.leaseToken, organized, undefined, { key: 'self', messageIds: [] });
     assert.equal(store.autoMemory.selfProfile.snapshot().content, botName);
     assert.deepEqual(store.autoMemory.selfProfile.snapshot().pending, []);
@@ -225,8 +222,7 @@ test('本地审阅去除已确认任务问句污染，旧画像与原文保留�
     const text = '我喜欢读书，长期学习数学；我想问这个接口怎么调用';
     const source = f.inbound(text), personId = personFor(f), current = batch(f);
     const facts = ['喜欢读书', '询问接口如何调用', '长期学习数学'].map(content => ({
-      content, sourceType: 'self', messageIds: [source.existingMessageId],
-    }));
+      content, sourceType: 'self', messageIds: [source.existingMessageId] }));
     f.store.autoMemory.commit(current.job.id, current.job.leaseToken, extract(current.input, [{ personId, baseVersion: 0, facts }]));
     const before = f.store.autoMemory.profile(personId);
     const confirmation=f.inbound('我再次确认自己长期学习数学');
@@ -237,8 +233,7 @@ test('本地审阅去除已确认任务问句污染，旧画像与原文保留�
     assert.throws(() => f.store.autoMemory.reviewProfile(personId, before.baseVersion, [0], [{factIndex:1,content:'不能从移除项创建新事实'}]), /归纳条目/);
     const reworded={...before.facts[2],content:'长期学习数学，属于稳定学习背景'};
     assert.deepEqual(f.store.autoMemory.reviewProfile(personId, before.baseVersion, [2, 0], [{factIndex:2,content:reworded.content}]), {
-      beforeVersion: before.baseVersion, afterVersion: before.baseVersion + 1, beforeCount: 3, afterCount: 2,
-    });
+      beforeVersion: before.baseVersion, afterVersion: before.baseVersion + 1, beforeCount: 3, afterCount: 2 });
     assert.deepEqual(f.store.autoMemory.profile(personId).facts, [before.facts[0], reworded]);
     assert.deepEqual(JSON.parse(f.inspect(db => db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=?')
       .get(personId, before.baseVersion)).facts_json), facts);
@@ -258,36 +253,34 @@ test('本地审阅去除已确认任务问句污染，旧画像与原文保留�
   } finally { f.close(); }
 });
 
-test('v13 migration backup preserves archived legacy pending rows and current database advances to v23', () => {
+
+test('AI画像可归纳当前真人确认，归档不要求重复原话或AI关键词', () => {
   const f = fixture();
   try {
-    const source = f.inbound('我喜欢读书，也有旧版已归档提醒');
-    const personId = personFor(f);
-    let current = batch(f);
-    f.store.autoMemory.commit(current.job.id, current.job.leaseToken, extract(current.input, [{ personId, baseVersion: 0,
-      facts: [{ content: '喜欢读书', sourceType: 'self', messageIds: [source.existingMessageId] }] }]));
-    f.store.autoMemory.addProfilePending(personId, source.existingMessageId, '旧版已归档提醒', 'self');
-    const archived = f.store.autoMemory.profile(personId).pending[0];
-    f.inspect(db => db.prepare('UPDATE person_profile_pending SET archived_revision=1,archived_at=? WHERE id=?').run('2026-10-16T00:00:00Z', archived.id));
-    f.store.close();
+    const text = '可以，就按你说的来';
+    f.store.recordInbound(f.room.id, text, { eventId: 'confirmation', senderId: 'member', modelInputText: text });
+    const source = f.store.externalMessage(f.room.id, 'confirmation').id;
+    const content = '长期关注何为生命第一因';
+    const receipt = f.store.prepareTurn(f.room.id, source,
+      { intent: 'memory_update', mode: 'casual', updates: [{ target: 'ai_self', content }] },
+      { version: 1, ownerBindings: [] });
+    assert.deepEqual(receipt.saved, [{ target: 'ai_self', status: 'saved_pending' }]);
+    const snapshot = f.store.autoMemory.selfProfile.snapshot();
+    assert.equal(snapshot.pending[0].content, content);
+    assert.equal(snapshot.pending[0].sourceMessageId, source);
+    f.store.autoMemory.selfProfile.commit(snapshot, { protocol: 2, baseVersion: snapshot.baseVersion,
+      content, pendingIds: snapshot.pending.map(item => item.id), updates: [] }, []);
+    assert.equal(f.store.autoMemory.selfProfile.snapshot().content, content);
+    assert.deepEqual(f.store.autoMemory.selfProfile.snapshot().pending, []);
+    assert.equal(f.inspect(db => db.prepare('SELECT text FROM messages WHERE id=?').get(source)).text, text);
+    assert.equal(f.inspect(db => db.prepare('SELECT message_id,evidence_json FROM self_profile_update_sources WHERE message_id=?').get(source)).evidence_json, null);
+    assert.throws(() => f.store.autoMemory.selfProfile.addPending('missing', content), /原始真人/);
+    const fakeSource = 'assistant-only';
     f.inspect(db => {
-      downgradeSchema14(db);db.exec('DROP TABLE person_profile_pending_results; DROP TABLE person_profile_revision_sources; PRAGMA user_version=13;');
+      db.function('history_tokens', { deterministic: true }, value => memoryWords(String(value ?? '')).join(' '));
+      db.prepare("INSERT INTO messages(id,conversation_id,role,text,created_at,message_kind) VALUES(?,?,'assistant',?,?,'chat')")
+        .run(fakeSource, f.room.id, '我建议长期关注这个问题', '2026-01-01T00:00:00Z');
     });
-    f.restart();
-    assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),33);
-    assert.deepEqual({ ...f.inspect(db => db.prepare('SELECT id,person_id,source_message_id,archived_revision,archived_at FROM person_profile_pending WHERE id=?').get(archived.id)) }, {
-      id: archived.id, person_id: personId, source_message_id: source.existingMessageId, archived_revision: 1, archived_at: '2026-10-16T00:00:00Z',
-    });
-    const backups = readdirSync(f.dir).filter(name => name.includes('.v13.') && name.endsWith('.bak'));
-    assert.equal(backups.length, 1);
-    const backup = new DatabaseSync(join(f.dir, backups[0]), { readOnly: true });
-    try {
-      assert.equal(backup.prepare('PRAGMA user_version').get().user_version, 13);
-      assert.deepEqual({ ...backup.prepare('SELECT id,person_id,source_message_id,archived_revision,archived_at FROM person_profile_pending WHERE id=?').get(archived.id) }, {
-        id: archived.id, person_id: personId, source_message_id: source.existingMessageId, archived_revision: 1, archived_at: '2026-10-16T00:00:00Z',
-      });
-      assert.equal(backup.prepare("SELECT name FROM sqlite_master WHERE name='person_profile_pending_results'").get(), undefined);
-      assert.deepEqual(backup.prepare('PRAGMA foreign_key_check').all(), []);
-    } finally { backup.close(); }
+    assert.throws(() => f.store.autoMemory.selfProfile.addPending(fakeSource, content), /原始真人/);
   } finally { f.close(); }
 });

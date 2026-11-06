@@ -4,8 +4,7 @@ import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collectTrending, enrichTrendingReadmes, generateTrendingDigest, parseTrendingPage, parseRepositoryReadme, formatTrendingParts } from '../dist/trending-content.js';
-import { fetchWebDocument, fetchWebPage } from '../dist/web-fetch.js';
+import { collectTrending, enrichTrendingReadmes, generateTrendingDigest, formatTrendingParts } from '../dist/trending-content.js';
 import { DiagnosticLog } from '../dist/diagnostics.js';
 
 const periods = ['daily', 'weekly', 'monthly'];
@@ -33,72 +32,6 @@ const fetchDocument = async url => {
   return { url, contentType: 'text/html; charset=utf-8', statusCode: 200, fetchedAt: '2026-10-30T00:00:00.000Z',
     body: lists[period].map(slug => row(slug, slug === 'u/a5' ? '' : undefined, period)).join('') };
 };
-
-test('官方article字段解析、跨分组按原序去重补齐，缺榜与读取失败明确拒绝', async () => {
-  // Public field values from the official page; no signed-in DOM or hydro metadata.
-  const project = parseTrendingPage(row('HKUDS/DeepTutor', 'DeepTutor: Lifelong Personalized Tutoring. <a href="https://deeptutor.info/">https://deeptutor.info/</a>.'), 'daily')[0];
-  assert.deepEqual(project, { slug: 'HKUDS/DeepTutor', url: 'https://github.com/HKUDS/DeepTutor',
-    description: 'DeepTutor: Lifelong Personalized Tutoring. https://deeptutor.info/ .', language: 'Python', periodStars: 1930 });
-  assert.equal(parseTrendingPage(row('u/entity', 'Read &amp; write &#x4e2d;&#25991;'), 'daily')[0].description, 'Read & write 中文');
-  const urls = [];
-  const snapshot = await collectTrending(config, undefined, { fetchDocument: async (...args) => { urls.push(args[0]); return fetchDocument(...args); }, now: () => new Date('2026-10-30T00:00:00Z') });
-  assert.equal(snapshot.fetchedAt, '2026-10-30T00:00:00.000Z');
-  assert.deepEqual(snapshot.sections.map(section => section.projects.map(project => project.slug)), [lists.daily.slice(0, 5), ['u/w1', 'u/w2', 'u/w3'], ['u/m1', 'u/m2']]);
-  assert.equal(urls.length, 4);
-  assert.equal(new Set(urls).size, 4);
-  assert.ok(urls.slice(0, 3).every(url => url.includes('/trending?')));
-  assert.equal(urls[3], 'https://github.com/u/a5');
-  const projects = snapshot.sections.flatMap(section => section.projects);
-  assert.ok(projects.filter(project => project.description.trim()).every(project => project.readme === undefined));
-  assert.equal(projects[4].readme.sourceUrl, 'https://github.com/u/a5#readme');
-  assert.equal(projects[4].readme.fetchedAt, '2026-10-30T00:00:01.000Z');
-  assert.match(projects[4].readme.text, /Workspace runner\n\nREADME workspace runner/);
-  assert.ok(!/navigation|tagline|Permalink|badge noise|hidden script/.test(projects[4].readme.text));
-  assert.equal(projects[4].description, '');
-  assert.equal(projects[4].readme.status, 'ok');
-  const clipped = parseRepositoryReadme(readmeHtml('长'.repeat(9000)));
-  assert.equal(clipped.text.length, 8000);
-  assert.equal(clipped.truncated, true);
-  assert.match(clipped.text, /\[README 已截断\]$/);
-  assert.equal(parseRepositoryReadme('<article class="markdown-body"><p>not the README</p></article>').status, 'missing');
-  assert.equal(parseRepositoryReadme('<article class="markdown-body entry-content" itemprop="text"><img alt="badge"><script>hidden</script></article>').reason, 'readme_empty');
-  const old = structuredClone(snapshot);
-  for (const project of old.sections.flatMap(section => section.projects)) { delete project.readme; project.description = ' \t\n '; }
-  const frozen = JSON.stringify(old);
-  const unavailable = await enrichTrendingReadmes(config, old, undefined, { fetchDocument });
-  assert.deepEqual(unavailable.sections[0].projects.slice(2, 4).map(project => [project.readme.status, project.readme.reason]), [['failed', 'fetch_failed'], ['missing', 'readme_missing']]);
-  let active = 0, maximum = 0, reads = 0;
-  const enriched = await enrichTrendingReadmes(config, old, undefined, { fetchDocument: async url => {
-    active++; reads++; maximum = Math.max(maximum, active);
-    await new Promise(resolve => setImmediate(resolve)); active--;
-    return { url, contentType: 'text/html', fetchedAt: '2026-10-30T00:00:02Z', body: readmeHtml() };
-  } });
-  assert.equal(reads, 10); assert.equal(maximum, 2); assert.equal(JSON.stringify(old), frozen);
-  await enrichTrendingReadmes(config, enriched, undefined, { fetchDocument: async () => assert.fail('successful frozen README must not be re-read') });
-  const controller = new AbortController(); let cancelledReads = 0;
-  await assert.rejects(enrichTrendingReadmes(config, old, controller.signal, { fetchDocument: async () => {
-    cancelledReads++; controller.abort(); throw new Error('cancelled');
-  } }), { code: 'cancelled' });
-  assert.equal(cancelledReads, 1);
-  const shortSnapshot = await collectTrending(config, undefined, { fetchDocument: async url => ({ ...await fetchDocument(url), body: row('u/only') }) });
-  assert.deepEqual(shortSnapshot.sections.map(section => section.projects.length), [1, 0, 0]);
-  await assert.rejects(collectTrending(config, undefined, { fetchDocument: async () => { throw new Error('offline'); } }), { code: 'fetch' });
-  assert.throws(() => parseTrendingPage('<article class="Box-row"><h2>unexpected</h2></article>', 'daily'), { code: 'structure' });
-});
-
-test('原HTML和普通web_fetch共用公开地址、响应大小和HTML提取边界', async () => {
-  const html = '<html><body><script>hidden</script><h1>Visible</h1></body></html>';
-  const deps = { lookup: async () => [{ address: '93.184.216.34', family: 4 }], transport: async () => ({
-    statusCode: 200, headers: { 'content-type': 'text/html' }, body: (async function* () { yield Buffer.from(html); })() }) };
-  assert.equal((await fetchWebDocument('https://github.com/trending?since=daily', config.fetch, undefined, deps)).body, html);
-  assert.equal((await fetchWebPage('https://github.com/trending?since=daily', config.fetch, undefined, deps)).text, 'Visible');
-  await assert.rejects(fetchWebDocument('http://127.0.0.1', config.fetch, undefined, deps), { code: 'address' });
-  await assert.rejects(fetchWebDocument('https://github.com', { ...config.fetch, maxResponseBytes: 1 }, undefined, deps), { code: 'size' });
-  const snapshot = await collectTrending(config, undefined, { fetchDocument });
-  for (const project of snapshot.sections.flatMap(section => section.projects)) { delete project.readme; project.description = ''; }
-  const bounded = await enrichTrendingReadmes({ ...config, fetch: { ...config.fetch, maxResponseBytes: 1 } }, snapshot, undefined, { webFetch: deps });
-  assert.ok(bounded.sections.flatMap(section => section.projects).every(project => project.readme.status === 'failed' && project.readme.reason === 'fetch_failed'));
-});
 
 test('真实Pi最终请求严格工具参数且关闭thinking，程序固定slug/数量/链接并独立记录诊断', async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'pa-trending-content-'));

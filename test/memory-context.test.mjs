@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { openRecordedConversation,  } from '../dist/conversation.js';
+import { openRecordedConversation } from '../dist/conversation.js';
 import { openMemory } from '../dist/memory.js';
 import { requestText } from './fixtures/request-text.mjs';
 
@@ -36,8 +36,7 @@ async function fixture(t) {
   const config = {
     cwd, dataDir: join(directory, 'data'), provider: 'pa-memory-test', model: 'test-model',
     apiKey: 'local-test-key', baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
-    contextWindow: 32768, maxOutputTokens: 512, timeoutMs: 5000,
-  };
+    contextWindow: 32768, maxOutputTokens: 512, timeoutMs: 5000 };
   const track = value => { resources.push(value); return value; };
   t.after(async () => {
     await Promise.allSettled(resources.reverse().map(value => Promise.resolve().then(() => value.close())));
@@ -49,8 +48,7 @@ async function fixture(t) {
     config, requests,
     memory: async key => track(await openMemory(config.dataDir, key)),
     conversation: async key => track(await openRecordedConversation(config, key)),
-    database: () => track(new DatabaseSync(join(config.dataDir, 'pa.sqlite'))),
-  };
+    database: () => track(new DatabaseSync(join(config.dataDir, 'pa.sqlite'))) };
 }
 
 function memoryMessages(request) {

@@ -24,8 +24,7 @@ async function fixture(t, respond = () => ({}), overrides = {}) {
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const preparing = body.tool_choice?.function?.name === 'prepare_turn';
     const delta = preparing ? { role: 'assistant', tool_calls: [{ index: 0, id: 'prepare', type: 'function', function: {
-      name: 'prepare_turn', arguments: JSON.stringify({ intent: 'question', mode: 'standard', updates: [] }),
-    } }] } : { role: 'assistant', content: '回答' };
+      name: 'prepare_turn', arguments: JSON.stringify({ intent: 'question', mode: 'standard', updates: [] }) } }] } : { role: 'assistant', content: '回答' };
     for (const [part, reason] of [[delta, null], [{}, preparing ? 'tool_calls' : 'stop']]) {
       response.write(`data: ${JSON.stringify({ id: 'fixture', model: 'model', choices: [{ index: 0, delta: part, finish_reason: reason }] })}\n\n`);
     }
@@ -56,8 +55,7 @@ test('successful prepare usage is learned before answer payload is sent in the s
     prepareTurn: plan => {
       learnedInTool = runtime.estimate('next', undefined, { channel: true }).method === 'usage-calibrated';
       return { prepared: true, mode: plan.mode, saved: [], extra: 'receipt'.repeat(3000) };
-    }, readHistory: () => [],
-  } });
+    }, readHistory: () => [] } });
   assert.equal(learnedInTool, true);
   assert.equal(f.requests.length, 2);
   assert.equal(estimateContext(f.requests[1], 290000, 512).fits, false,

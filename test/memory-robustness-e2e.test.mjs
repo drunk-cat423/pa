@@ -24,8 +24,7 @@ function fixture(t) {
   t.after(async()=>{await Promise.all(workers.map(worker=>worker.close()));store.close();rmSync(dir,{recursive:true,force:true});});
   return {dir,path,store,a,b,route,config,inbound,
     worker(room,provider,override={}) { const worker=new BackgroundMemory({...config,...override},store.autoMemory,room.id,provider);workers.push(worker);return worker; },
-    inspect(callback){const db=new DatabaseSync(path);try{return callback(db);}finally{db.close();}},
-  };
+    inspect(callback){const db=new DatabaseSync(path);try{return callback(db);}finally{db.close();}} };
 }
 
 test('two rooms sharing one person serialize material snapshots, preserve compression and cancel queued workers', {timeout:15000},async t=>{

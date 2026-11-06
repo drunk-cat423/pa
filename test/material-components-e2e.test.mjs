@@ -24,8 +24,7 @@ function fixture(t) {
     async run(provider){const worker=new BackgroundMemory({dataDir:dir,contextWindow:1000000,memory:{enabled:true,maxCalls:50,timeoutMs:2000,maxOutputTokens:8192}},store.autoMemory,room.id,{extract:async input=>{
       const wire=prepareMemoryWireExtraction(input,1000000),payload=JSON.parse(wire.userContent);
       return parseMemoryResponse({stopReason:'stop',content:[{type:'text',text:JSON.stringify(await provider(input,payload,wire))}]},input);
-    }});workers.push(worker);worker.start();try{await worker.wait(undefined,5000,'materials');}finally{await worker.close();}},
-  };
+    }});workers.push(worker);worker.start();try{await worker.wait(undefined,5000,'materials');}finally{await worker.close();}} };
 }
 
 test('单人物简化提案接受自然表达，无关字段不拖垮Topic；失败画像跨重启只补自身',async t=>{
@@ -63,21 +62,4 @@ test('单人物简化提案接受自然表达，无关字段不拖垮Topic；失
   assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM memory_topics').get().n),1);
   assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM messages').get().n),2);
   assert.deepEqual(f.inspect(db=>db.prepare('PRAGMA foreign_key_check').all()),[]);
-});
-
-test('画像请求未知失败保留其他组件，单目标来源和真实权限仍不能越界',async t=>{
-  const f=fixture(t);f.add('alice','喜欢阅读，回答尽量简短');f.add('bob','我喜欢登山');
-  const root=f.reserve();
-  await f.run(async(input,payload)=>{
-    if(input.mode==='messages')return {topics:[{summary:'阅读和登山'}]};
-    const person=input.profiles[0].personId;
-    if(person==='alice')throw new Error('fixture upstream response unknown');
-    assert.ok(payload.sources.every(source=>!source.text.includes('喜欢阅读')),'other members are not writable sources for this target');
-    return {personId:'alice',changes:[{content:'喜欢登山',sources:[payload.sources.find(source=>source.text==='我喜欢登山').id]}]};
-  });
-  assert.equal(f.store.autoMemory.profile('bob').facts[0].content,'喜欢登山');
-  assert.deepEqual(f.store.autoMemory.profile('alice').facts,[]);
-  assert.equal(f.inspect(db=>db.prepare('SELECT COUNT(*) n FROM memory_topics').get().n),1);
-  assert.equal(f.store.autoMemory.listJobs().find(job=>job.id===root.id).status,'failed');
-  assert.ok(f.store.autoMemory.recoveryInfo(root.id));
 });

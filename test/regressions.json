@@ -1,938 +1,481 @@
 {
-  "policy": "Retain exact recorded failing tests or tests for independently confirmed incidents. Local failure logs are private and not committed.",
-  "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
+  "policy": "Keep only confirmed product incidents, concrete user-reported problems, or narrowly justified critical data/authorization/replay checks. A failed development assertion, generic feature acceptance, retired protocol, or hypothetical matrix is not sufficient.",
+  "baseCommit": "eae4ba71c21ecd01f7c283bb2d76c74449739c21",
   "tests": [
-    {
-      "file": "test/image-context.test.mjs",
-      "name": "read_image rejects cumulative inline-image overflow before loading the next original",
-      "evidence": "Independent review of this change confirmed that read_image loaded and Base64-encoded a fifth 10MiB image before checking the 64MiB cumulative request budget. A local HTTP/Pi/harness fixture with bounded virtual image content verifies rejection before the fifth original is loaded; no large memory allocation or paid provider is used."
-    },
-    {
-      "file": "test/session-integrity.test.mjs",
-      "name": "真实模型回复已返回但SQLite完成失败时，重启只恢复最终诊断答案并保持未知投递",
-      "evidence": "Local HTTP model and injected SQLite completion failure exercise the exact crash window: only final validated input/answer-bound diagnostic evidence can restore the reply, with delivery uncertain and no repeated model request. A large valid answer also confirms the 256KiB event bound does not become a new response limit."
-    },
-    {
-      "file": "test/session-integrity.test.mjs",
-      "name": "诊断证据缺失、不完整或脱敏改变答案均不恢复业务，也不重新执行模型",
-      "evidence": "The approved move from Pi JSONL to SQLite business truth retires transcript-based restart recovery. Locally injected missing, incomplete and redacted final evidence must keep the original run interrupted without paid replay or unknown delivery resend."
-    },
-    {
-      "file": "test/storage-efficiency.test.mjs",
-      "name": "批量历史读取保持1000条逐条查询结果并将SQL准备次数降为常数级",
-      "evidence": "Independent audit confirmed three synchronous statements per historical message. A real SQLite fixture compares 1000 mixed records against the prior implementation, preserving every projected field/order/duplicate while reducing 3000 prepares to 9."
-    },
-    {
-      "file": "test/publisher-controller.test.mjs",
-      "name": "source-only publication selects existing regressions and includes new tests in the same acceptance",
-      "evidence": "Independent audit reproduced zero selected regressions for source-only fixes. The release selector now reuses existing scopes and includes newly added tests; unsupported source modules select all existing regressions."
-    },
-    {
-      "file": "test/delegation-diagnostics.test.mjs",
-      "name": "recorded vision 503 remains distinct from unknown outcome while private error text is excluded",
-      "evidence": "2026-11-06 production stored a vision queue 503 response under an unknown call outcome, but the delegated log projection exposed only generic failed events. Covers bounded field projection including large calibration records, response integrity and exclusion of private text. Real subscription replay independently recovered the recorded 503."
-    },
-    {
-      "file": "test/codex-worker.test.mjs",
-      "name": "Read tasks share immutable source, retire safely and keep unpublished fixes and delivery evidence",
-      "evidence": "2026-11-06 the real private read task failed during bubblewrap initialization beneath a denied home ancestor. Read tasks also copied source and Git unnecessarily. Covers zero-copy source selection and conservative retention of unpublished fixes and delivery evidence; actual Linux sandbox and full subscription replay are separately verified."
-    },
-    {
-      "file": "test/trending-service.test.mjs",
-      "name": "代理公网DNS隧道超时耗尽采集，恢复后仅显式补发且保留原失败期",
-      "evidence": "2026-11-04 formal daily digest exhausted three collections; proxy logs showed three upstream TCP timeouts opening the public-DNS tunnel, before any snapshot, model call or delivery. Offline local CONNECT 504 reproduces the real fetch/collector failure path and verifies bounded attempts, no generation/send, restart fencing, explicit idempotent backfill and preservation of the failed edition. Private evidence stays in .local/ops/daily-20261104/."
-    },
-    {
-      "file": "test/trending-service.test.mjs",
-      "name": "真实故障3条有效7条错参经Pi校验仅修复缺项，全量AI总结与恢复补充投递幂等",
-      "evidence": "2026-11-01 production returned three valid introductions and seven misspelled placeholder items; the initial raw-description fallback was rejected because every project requires AI summarization. The existing incident regression now checks Pi schema tools, error feedback and selective repair, persisted bounded attempts/valid summaries, no raw fallback on exhaustion, same-edition recovery and idempotent same-day AI supplement without resetting original delivery records. Private evidence stays in .local."
-    },
-    {
-      "file": "test/person-profile-policy.test.mjs",
-      "name": "给定正确计划时Bot名称落AI pending，下一轮注入并归档原来源，个人称呼和偏好隔离",
-      "evidence": "2026-10-30 production inspection found a direct Bot-name correction routed to sender and later rejected by personal-profile consolidation. This isolated Pi/SQLite test verifies given correct ai_self versus sender plans, immediate pending injection, independent self archival and source preservation; model classification remains a separately evaluated semantic behavior."
-    },
-    {
-      "file": "test/search-concurrency.test.mjs",
-      "name": "共享无限预算允许四条请求并发，额外请求排队可取消且不占预算",
-      "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
-    },
-    {
-      "file": "test/search-concurrency.test.mjs",
-      "name": "不同进程同时预约共享预算仍不超额，重启后持久预算继续生效",
-      "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
-    },
-    {
-      "file": "test/search-concurrency.test.mjs",
-      "name": "旧JSONL与未知预约仍计数，请求失败不重发也不退还预算",
-      "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
-    },
-    {
-      "file": "test/search-concurrency.test.mjs",
-      "name": "等待跨进程预算短锁时可取消，取消不发送也不预约",
-      "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
-    },
-    {
-      "file": "test/research-scheduling.test.mjs",
-      "name": "SQL领取一项只读元信息，checkpoint及状态核验不展开旧证据，单材料读取保持原编号",
-      "evidence": "2026-10-30 offline reproduction: selecting one of 50 research jobs loaded all 50 evidence sets; a held notification also prevented the next research job from starting. Covers metadata-only selection/checkpoints, independent delivery and obsolete/unknown notification handling."
-    },
-    {
-      "file": "test/research-scheduling.test.mjs",
-      "name": "慢A房间通知不阻塞B研究；通知单并发且wait等待持久回执",
-      "evidence": "2026-10-30 offline reproduction: selecting one of 50 research jobs loaded all 50 evidence sets; a held notification also prevented the next research job from starting. Covers metadata-only selection/checkpoints, independent delivery and obsolete/unknown notification handling."
-    },
-    {
-      "file": "test/research-scheduling.test.mjs",
-      "name": "通知在房间实际发送前复核归档、续作及关闭；重启未知投递不重发",
-      "evidence": "2026-10-30 offline reproduction: selecting one of 50 research jobs loaded all 50 evidence sets; a held notification also prevented the next research job from starting. Covers metadata-only selection/checkpoints, independent delivery and obsolete/unknown notification handling."
-    },
-    {
-      "file": "test/storage-efficiency.test.mjs",
-      "name": "压缩后只读取增量和旧缺口，资料水位从已有位置推进且不越缺口",
-      "evidence": "2026-10-30 architecture audit: summarized context IDs and material coverage were scanned from the beginning, idle memory/Trending polls visited finished work, and room connections repeated full FK checks. Covers bounded incremental reads with gaps, idle indexes and scoped bootstrap without disabling corruption checks."
-    },
-    {
-      "file": "test/storage-efficiency.test.mjs",
-      "name": "空闲记忆轮询不汇总历史状态，pending查询不扫描done任务",
-      "evidence": "2026-10-30 architecture audit: summarized context IDs and material coverage were scanned from the beginning, idle memory/Trending polls visited finished work, and room connections repeated full FK checks. Covers bounded incremental reads with gaps, idle indexes and scoped bootstrap without disabling corruption checks."
-    },
-    {
-      "file": "test/storage-efficiency.test.mjs",
-      "name": "同一次harness初始化共用完整性核验，新scope和结构变化仍核验损坏",
-      "evidence": "2026-10-30 architecture audit: summarized context IDs and material coverage were scanned from the beginning, idle memory/Trending polls visited finished work, and room connections repeated full FK checks. Covers bounded incremental reads with gaps, idle indexes and scoped bootstrap without disabling corruption checks."
-    },
-    {
-      "file": "test/context-efficiency.test.mjs",
-      "name": "百炼只读一次且payload相同，旧大图可纠正并继续会话，损坏原图仍停止",
-      "evidence": "2026-10-30 call-chain audit: Bailian image projection read/hashed each original five times, four admission projections repeated exact chunk hashing, and cold calibration keys scanned diagnostic history. Covers identical payload/estimates, original corruption detection, indexed lookup and read-only diagnostics."
-    },
-    {
-      "file": "test/context-efficiency.test.mjs",
-      "name": "同次准备和三种回答估算复用分片hash，v1/v2上界与原分片完全相同",
-      "evidence": "2026-10-30 call-chain audit: Bailian image projection read/hashed each original five times, four admission projections repeated exact chunk hashing, and cold calibration keys scanned diagnostic history. Covers identical payload/estimates, original corruption detection, indexed lookup and read-only diagnostics."
-    },
-    {
-      "file": "test/context-efficiency.test.mjs",
-      "name": "旧v1诊断索引增补校准索引，冷key查询使用索引且不改历史正文",
-      "evidence": "2026-10-30 call-chain audit: Bailian image projection read/hashed each original five times, four admission projections repeated exact chunk hashing, and cold calibration keys scanned diagnostic history. Covers identical payload/estimates, original corruption detection, indexed lookup and read-only diagnostics."
-    },
-    {
-      "file": "test/trending-content.test.mjs",
-      "name": "真实Pi最终请求严格工具参数且关闭thinking，程序固定slug/数量/链接并独立记录诊断",
-      "evidence": "2026-10-30 paid preview repeated a source homepage domain and an overlong feature list, rejecting the whole digest. Regression checks source URL removal from model input with original snapshot retained, bounded introduction length, exact project mapping and program-built links. 2026-11-01 the same regression was updated to assert Pi strict tool schemas and explicit tool_choice, bounded repair with valid-output reuse, and no source-description substitution. 2026-11-01 confirmed the source collector never read README, so an empty About description produced no useful t3code summary. Existing source/HTTP tests now verify description-first selection, README retrieval only for empty descriptions, explicit source status and bounded excerpt, and the actual model payload; no new test item."
-    },
-    {
-      "file": "test/trending-service.test.mjs",
-      "name": "关闭中止模型等待，生成中崩溃/发送中崩溃恢复均保留未知结果",
-      "evidence": "2026-10-30 independent review reproduced a late DiagnosticPersistenceError being swallowed after the outer cancellation promise settled. Existing shutdown acceptance case verifies a late failure still notifies the harness exactly once."
-    },
-    {
-      "file": "test/runtime-cache-prefix.test.mjs",
-      "name": "channel tool continuations append to the complete previous wire prefix without persisting or leaking controls",
-      "evidence": "2026-10-29 production search continuation: old request had seven messages but only the first six survived; the wire-only control block disappeared before new tools and was regenerated at the end, with 0.81 to 1.64 percent cache read despite identical system/tools/history. Local Pi and HTTP regression checks full message-prefix retention, estimate isolation and per-prompt reset; no provider performance claim."
-    },
-    {
-      "file": "test/runtime-cache-prefix.test.mjs",
-      "name": "channel wire keeps per-stage system fixed across three modes while link/target controls follow long history",
-      "evidence": "2026-10-28 final SDK request audit: three same-room answer mode changes preserved all old history and the tool schema, but changed front-loaded system text and cache hit rate fell to 1.59-7.27 percent; local HTTP regression checks real Pi wire projection, not provider cache performance"
-    },
-    {
-      "file": "test/runtime-cache-prefix.test.mjs",
-      "name": "save-claim correction closes tools in trailing controls without changing fixed answer system at the default context window",
-      "evidence": "2026-10-28 prefix audit identified the existing save-claim correction as another variable system branch; the same local HTTP regression verifies fixed protocol with actual tool closure after an unbacked save claim"
-    },
-    {
-      "file": "test/ops-status.test.mjs",
-      "name": "缓存巡检按scope和stage发现命中骤降且不读取正文或修改诊断库",
-      "evidence": "2026-10-28 production cache audit found three high-to-low same-stage drops while the existing health collector only reported completed calls; metadata-only SQLite regression checks detection, attribution limits, phase isolation and no business writes"
-    },
-    {
-      "file": "test/reminder-service.test.mjs",
-      "name": "私聊补充时间继承原事项，第二轮两次模型请求后绑定本条来源并落库",
-      "evidence": "2026-10-28 private reminder clarification: user supplied only the selected time, but concatenating prior request and confirmation as requestQuote failed the current-message substring gate; anonymized local HTTP and real SQLite regression"
-    },
-    {
-      "file": "test/ops-status.test.mjs",
-      "name": "巡检不把sent和正常claim/input阶段报异常，隔离旧队列不掩盖当前活动且仅读元数据",
-      "evidence": "2026-10-28 live collector validation misclassified sent as not ready and omitted the real claim/input diagnostic stages; retired legacy rows must not displace current work"
-    },
-    {
-      "file": "test/ops-status.test.mjs",
-      "name": "自动搁置不能隐藏耗尽缺口，资源耗尽和新unknown调用必须报出",
-      "evidence": "2026-10-28 collector review reproduced zero memory/disk as healthy and found automatic deferrals masked terminal recovery gaps and failed/unknown diagnostic calls"
-    },
-    {
-      "file": "test/memory-recovery-e2e.test.mjs",
-      "name": "已登记旧失败的空闲巡检不读取大正文或重复写审计，重启不改变旧记录",
-      "evidence": "2026-10-27 production idle CPU about 46 percent: 116 registered failures repeatedly read and hashed 29.5 MB each second; SQLite authorizer checks real column access and duplicate writes while snapshots preserve bodies, hashes and recovery metadata"
-    },
-    {
-      "file": "test/memory-recovery-e2e.test.mjs",
-      "name": "旧失败缺登记或缺搁置审计只补缺项，持久化失败回滚并传播",
-      "evidence": "Compatibility boundary of the confirmed 2026-10-27 idle recovery incident: repair only missing registration or audit without resetting existing clocks, attempts, original hashes or progress"
-    },
-    {
-      "file": "test/context-people.test.mjs",
-      "name": "旧画像报错保留为历史，回答阶段仍携带现行契约且不重启写入",
-      "evidence": "2026-10-27 07:29 production profile query repeated an obsolete exact-quote restriction from old history and a Topic after prepare_turn description was removed; checks actual two-stage requests and preserved records, not mocked semantic correctness"
-    },
-    {
-      "file": "test/self-profile-store.test.mjs",
-      "name": "本地审阅AI画像执行CAS并保留历史来源与待整理建议",
-      "evidence": "2026-10-26 production AI profile mixed a sender's topical preference into global identity; operator review must preserve old sources and pending while normalizing the current view"
-    },
-    {
-      "file": "test/self-profile-store.test.mjs",
-      "name": "本地AI画像审阅拒绝在途与等待自动恢复的资料任务及超容量正文",
-      "evidence": "Review of the 2026-10-26 profile cleanup found queued/recoverable materials could reread old sources after cleanup; the local review is blocked until those attempts settle"
-    },
-    {
-      "file": "test/person-profile-policy.test.mjs",
-      "name": "即时画像接受归纳正文和当前确认，保留来源绑定而不复制原话证据",
-      "evidence": "2026-10-26 private-chat incident: normalized prepare_turn rejected by literal excerpt gate; current confirmation could not save or archive the agreed preference"
-    },
-    {
-      "file": "test/person-profile-policy.test.mjs",
-      "name": "第三方归纳仍须管理员与真实对象定位，仅保存对象token兼容旧协议",
-      "evidence": "Companion regression for the 2026-10-26 normalized-profile incident; preserve real mention, identity and owner boundaries while removing the excerpt requirement"
-    },
-    {
-      "file": "test/person-profile-policy.test.mjs",
-      "name": "本地审阅去除已确认任务问句污染，旧画像与原文保留且拒绝旧版本和在途资料任务",
-      "evidence": "2026-10-26 production profile review found task instructions, temporary events and AI focus incorrectly retained as personal traits"
-    },
-    {
-      "file": "test/self-profile-store.test.mjs",
-      "name": "AI画像可归纳当前真人确认，归档不要求重复原话或AI关键词",
-      "evidence": "2026-10-26 life-first-cause private-chat incident: normalized AI-self update rejected before an exact-quote retry"
-    },
-    {
-      "file": "test/context-people.test.mjs",
-      "name": "Pi续问与旧Bot话题同时出现时，真实请求保留最近对象并明确检索仅作辅助",
-      "evidence": "2026-10-26 private Pi Durable follow-up drifted to a retrieved DeepSeek-Bot topic despite the immediate Pi link remaining visible; checks actual request and unchanged call count, not model semantics"
-    },
-    {
-      "file": "test/research-materials.test.mjs",
-      "name": "材料正文分页不再切JSON外壳，按实际返回范围续读且不被工具字节上限截断",
-      "evidence": "2026-10-23 real research attempt 3: read_research_material paged serialized evidence instead of clean body; .local/research-followup3-20261023/offline-fixture.json"
-    },
-    {
-      "file": "test/research-materials.test.mjs",
-      "name": "重复材料读取返回准确已读范围，跳读保留缺口且可显式重读被省略正文",
-      "evidence": "2026-10-23 real research attempt 3: 18 reads included 4 identical repeated reads; .local/research-followup3-20261023/stable-cache-comparison.json"
-    },
-    {
-      "file": "test/research-context.test.mjs",
-      "name": "真实工具循环使用正文协议：重复回执、显式重读和预算接线",
-      "evidence": "Local HTTP replay of the attempt-3 repeated-read incident validates the corrected tool contract and recovery of compacted body without a paid model call"
-    },
-    {
-      "file": "test/answer-documents.test.mjs",
-      "name": "schema17只读保留旧页面正文与引用索引，不混入规范回答历史",
-      "evidence": ".local/identity-attribution-regression.log:9"
-    },
-    {
-      "file": "test/answer-documents.test.mjs",
-      "name": "schema16 migration keeps canonical history and creates an intact backup",
-      "evidence": ".local/identity-attribution-regression.log:10"
-    },
-    {
-      "file": "test/auto-memory-retrieval.test.mjs",
-      "name": "a captured third-party target is organized even when only its recorder spoke in this batch",
-      "evidence": ".local/memory-refactor-narrow.log:5"
-    },
-    {
-      "file": "test/auto-memory-retrieval.test.mjs",
-      "name": "deduplicated facts recalled through a Topic reveal only evidence from that Topic room",
-      "evidence": ".local/memory-refactor-narrow.log:9"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "capacity short batch and queued snapshot survive failures and process restart",
-      "evidence": ".local/memory-refactor-regression-initial.log:33"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "deferral preserves failed evidence and frozen input, releases later batches in order and retains the raw gap",
-      "evidence": "User-confirmed failed first consolidation batch blocked 12 later batches; explicit deferral repair"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "v12 migration backs up the consistent original database before adding deferrals",
-      "evidence": ".local/memory-split-regression.log:36"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "expired worker is failed without automatic recall; explicit retry fences the old lease",
-      "evidence": ".local/memory-refactor-regression-initial.log:37"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "chunk progress and input snapshot survive retry and reclaim; clearing rereads facts",
-      "evidence": ".local/profile-subject-integration-20261021.log:38"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "unbound actors are isolated and configured multiple people share only explicit bindings",
-      "evidence": ".local/profile-subject-integration-20261021.log:42"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "profile pending corrections captured after a batch stay pending for the next batch",
-      "evidence": ".local/memory-refactor-regression-initial.log:43"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "confirmed binding carries independent automatic profile and fences in-flight old identity results",
-      "evidence": ".local/memory-refactor-regression-initial.log:46"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "atomic Topic, person evidence, profile and room-scoped keyword search",
-      "evidence": ".local/memory-refactor-regression-initial.log:47"
-    },
-    {
-      "file": "test/auto-memory-store.test.mjs",
-      "name": "v5 incremental migration preserves original IDs, tombstones, primary identity and snapshots legacy watermark",
-      "evidence": ".local/profile-subject-integration-20261021.log:51"
-    },
-    {
-      "file": "test/auto-memory.test.mjs",
-      "name": "私聊完成50轮且容量较低时不按轮数自动压缩",
-      "evidence": ".local/memory-split-regression-bounded.log:57"
-    },
-    {
-      "file": "test/auto-memory.test.mjs",
-      "name": "最终上下文达到85%才整理；摘要与检查点后消息跨新轮和重启继续",
-      "evidence": ".local/memory-refactor-main-narrow.log:29"
-    },
-    {
-      "file": "test/auto-memory.test.mjs",
-      "name": "仅发送者及真实@对象画像，绑定人物私聊自述可在群使用",
-      "evidence": ".local/memory-loop-tests.txt:42"
-    },
-    {
-      "file": "test/auto-memory.test.mjs",
-      "name": "群容量压缩标记新协议、创建群摘要且数据库保留原文",
-      "evidence": ".local/memory-refactor-main-narrow.log:35"
-    },
-    {
-      "file": "test/auto-memory.test.mjs",
-      "name": "长批次拆分检查点在失败重试后续接，不重复已成功的子批次",
-      "evidence": ".local/memory-loop-tests.txt:49"
-    },
-    {
-      "file": "test/auto-memory.test.mjs",
-      "name": "关闭中断的后台批次保留失败，只有显式重试后才继续整理",
-      "evidence": ".local/memory-refactor-main-narrow.log:39"
-    },
-    {
-      "file": "test/auto-memory.test.mjs",
-      "name": "后台提供完整旧画像并整体替换收敛结果，不再补回未返回的旧事实",
-      "evidence": ".local/memory-refactor-main-narrow.log:40"
-    },
-    {
-      "file": "test/auto-memory.test.mjs",
-      "name": "等待截止时间独立于后台工作结束，超时后后台可以继续",
-      "evidence": ".local/memory-refactor-regression-initial.log:73"
-    },
-    {
-      "file": "test/calibrated-compression.test.mjs",
-      "name": "渠道按实测校准跨任务复用，字节超窗口不误压缩，接近实际85%后触发同一整理流程",
-      "evidence": ".local/memory-refactor-main-narrow2.log:44"
-    },
-    {
-      "file": "test/channel-async.test.mjs",
-      "name": "同群长回答分段与其它回答按队列顺序完成",
-      "evidence": ".local/memory-split-regression-bounded.log:78"
-    },
-    {
-      "file": "test/channel-task-store.test.mjs",
-      "name": "真实v9迁移先备份，保留原文、已确认分段和旧canonical运行",
-      "evidence": ".local/memory-loop-tests.txt:88"
-    },
-    {
-      "file": "test/channel-web-tools.test.mjs",
-      "name": "搜索及后续网页核验不附网址，单独读取网页仍保留来源，实际工具参数与投递落库",
-      "evidence": ".local/memory-split-regression-bounded.log:114"
-    },
-    {
-      "file": "test/cli-interaction.test.mjs",
-      "name": "实际 CLI 多轮输入、管理指令、退出及重启恢复",
-      "evidence": ".local/memory-loop-tests.txt:90"
-    },
-    {
-      "file": "test/delivery-parts.test.mjs",
-      "name": "last receipt and parent completion are atomic; cross-conversation child references fail",
-      "evidence": ".local/identity-attribution-regression.log:155"
-    },
-    {
-      "file": "test/delivery-parts.test.mjs",
-      "name": "v7 migration creates a consistent backup and preserves legacy replies and unrelated records",
-      "evidence": ".local/identity-attribution-regression.log:157"
-    },
-    {
-      "file": "test/image-context.test.mjs",
-      "name": "QQ引用原图只进入当前请求，历史与容量摘要保留引用并可按房间重新读取",
-      "evidence": ".local/memory-split-regression-final.log:191 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
-    },
-    {
-      "file": "test/legacy-count-retirement.test.mjs",
-      "name": "retiring the failed + queued + deferred count backlog preserves evidence and hands every original to rolling",
-      "evidence": ".local/memory-refactor-regression-initial.log:194"
-    },
-    {
-      "file": "test/legacy-count-retirement.test.mjs",
-      "name": "schema15 upgrade backs up original evidence and never retires or reserves work automatically",
-      "evidence": ".local/profile-subject-integration-20261021.log:223"
-    },
-    {
-      "file": "test/material-proposal-recovery.test.mjs",
-      "name": "materials wire_subject rejection preserves evidence and releases the next batch without covering its gap",
-      "evidence": ".local/server-audit-20261022/排查结果.md:50; saved group proposal referenced a person absent from the input baseline, blocking later batches"
-    },
-    {
-      "file": "test/material-proposal-recovery.test.mjs",
-      "name": "materials attribution rejection preserves evidence and releases the next batch without covering its gap",
-      "evidence": ".local/server-audit-20261022/排查结果.md:51; asking about a tool was misattributed as personal usage, blocking later batches"
-    },
-    {
-      "file": "test/memory-context.test.mjs",
-      "name": "真实请求追加受限完整记忆、固定system不变、SQL usage只记录实际引用",
-      "evidence": ".local/memory-loop-tests.txt:135"
-    },
-    {
-      "file": "test/memory-diagnostics.test.mjs",
-      "name": "worker commit failure keeps SDK response and associates the final phase with the call",
-      "evidence": ".local/memory-refactor-regression-initial.log:245"
-    },
-    {
-      "file": "test/memory-diagnostics.test.mjs",
-      "name": "paused background and injected fake providers preserve scheduling while only real SDK calls create call records",
-      "evidence": ".local/memory-refactor-regression-initial.log:246"
-    },
-    {
-      "file": "test/memory-diagnostics.test.mjs",
-      "name": "diagnostic persistence failure before commit halts the worker without another call",
-      "evidence": ".local/memory-refactor-regression-initial.log:248"
-    },
-    {
-      "file": "test/memory-diagnostics.test.mjs",
-      "name": "diagnostic persistence failure after commit halts the worker without another call",
-      "evidence": ".local/logging-targeted.txt:8"
-    },
-    {
-      "file": "test/memory-store.test.mjs",
-      "name": "真实V1布局迁移到V6，保留消息、运行与投递并可写入记忆",
-      "evidence": ".local/memory-loop-tests.txt:151"
-    },
-    {
-      "file": "test/memory-store.test.mjs",
-      "name": "真实V3增量迁移保留所有业务列、rowid及审计，旧群记忆不自动共享，DDL失败回滚",
-      "evidence": ".local/memory-loop-tests.txt:152"
-    },
-    {
-      "file": "test/memory-store.test.mjs",
-      "name": "真实V2迁移保留记忆版本、来源、使用审计与pending重置标记，失败整笔回滚",
-      "evidence": ".local/memory-loop-tests.txt:153"
-    },
-    {
-      "file": "test/memory-store.test.mjs",
-      "name": "真实V4增量迁移保留rowid/正文/修订/来源/使用与reset水位，V5 DDL冲突整笔回滚",
-      "evidence": ".local/memory-loop-tests.txt:172"
-    },
-    {
-      "file": "test/person-profile-policy.test.mjs",
-      "name": "v13 migration backup preserves archived legacy pending rows and current database advances to v23",
-      "evidence": "91791ad explicitly renamed v14 to v23; old exact name failed at .local/memory-refactor-regression-final.log:310"
-    },
-    {
-      "file": "test/profile-history-storage.test.mjs",
-      "name": "v8 migration backs up and preserves archived legacy field metadata, identities, queued snapshot and FTS backfill",
-      "evidence": ".local/memory-loop-tests.txt:190"
-    },
-    {
-      "file": "test/research-archive.test.mjs",
-      "name": "归档其他三项后清单只保留目标，报告草稿历史和文件不变，幂等且停止执行与通知",
-      "evidence": ".local/research-revision-regression-20261023.log:130"
-    },
-    {
-      "file": "test/research-context.test.mjs",
-      "name": "本地HTTP采集循环：轻量投影启用，完整思考与原始Pi记录保留",
-      "evidence": "b888659; saved six collect requests prefix changed at byte 2069; .local/research-followup-20261023/cache-analysis.json"
-    },
-    {
-      "file": "test/research-e2e.test.mjs",
-      "name": "研究故障端到端：原文失败仅尝试两次、显式续作保留证据，未知发送和崩溃运行不自动重放",
-      "evidence": "1584876; actual regression failed when error index omitted network code"
-    },
-    {
-      "file": "test/research-e2e.test.mjs",
-      "name": "最后一个采集工具失败且无笔记时，写作仅带必要失败说明并保留blocked",
-      "evidence": "b888659; stage cleanup removed last-batch fetch failure from write input; sourceFailures repair"
-    },
-    {
-      "file": "test/research-e2e.test.mjs",
-      "name": "章节报告不继承聊天输出上限，程序组装长正文；伪调用保留失败草稿且不重试",
-      "evidence": "50242f9; user-reported real research report truncation and DSML pseudo-tool result"
-    },
-    {
-      "file": "test/research-e2e.test.mjs",
-      "name": "明确检查链接必须真实读取，不能只凭URL文字回答能看到",
-      "evidence": ".local/server-audit-20261022/排查结果.md:24; bot claimed repository readable without web_fetch/web_search"
-    },
-    {
-      "file": "test/research-materials.test.mjs",
-      "name": "省略告警保留但不挤爆合法的30条缺口和单条字节上限",
-      "evidence": "1584876; 30 valid gaps plus omission warning rejected by saveSection limit"
-    },
-    {
-      "file": "test/research-materials.test.mjs",
-      "name": "新增要求直接涉及的早期文件不被最近材料挤掉，短文件完整展示",
-      "evidence": "1584876; saved DeepSeek-Bot request dropped e29/e32; local first material test failed"
-    },
-    {
-      "file": "test/research-materials.test.mjs",
-      "name": "没有新增要求时原始目标仍参与排序、保护和省略告警",
-      "evidence": "1584876; reviewer reproduced goal ignored by newline truthiness and e101 omitted"
-    },
-    {
-      "file": "test/research-materials.test.mjs",
-      "name": "同快照重叠分页按UTF-16去重，emoji不破坏解包和读取位置",
-      "evidence": "1584876; reviewer reproduced abc😀def envelope failing UTF-16 range validation"
-    },
-    {
-      "file": "test/research-materials.test.mjs",
-      "name": "相关词只在后续分页出现时，整个来源仍优先选入",
-      "evidence": "1584876; reviewer reproduced second-page apples omitted after 100 unrelated sources"
-    },
-    {
-      "file": "test/research-materials.test.mjs",
-      "name": "只有链接而没有摘要的搜索仍可发现，不静默截掉第六个来源",
-      "evidence": "1584876; reviewer reproduced valid sources-only response projected to zero entries"
-    },
-    {
-      "file": "test/research-target.test.mjs",
-      "name": "明确承接继承最近同actor链接，群友新链接不会覆盖",
-      "evidence": ".local/server-audit-20261022/排查结果.md:18; follow-up repository question incorrectly became another member's old research topic"
-    },
-    {
-      "file": "test/research-thinking-runtime.test.mjs",
-      "name": "collect最后一次请求保持auto并执行整批真实抓取与材料工具，只发送一次请求",
-      "evidence": "52a95f7; real research run failed at forced no-tools last collect request"
-    },
-    {
-      "file": "test/rolling-memory-store.test.mjs",
-      "name": "v14 migration backs up original jobs and preserves old done group Topic history without a summary",
-      "evidence": ".local/memory-refactor-narrow.log:47"
-    },
-    {
-      "file": "test/runtime-search-boundaries.test.mjs",
-      "name": "搜索结果使最终请求超过窗口时发送前硬检查仍拦截",
-      "evidence": ".local/profile-subject-integration-20261021.log:460"
-    },
-    {
-      "file": "test/runtime-search.test.mjs",
-      "name": "harness真实Pi自主工具循环、查询实参、普通聊天不自动调用、CLI禁工具、重启不重放搜索",
-      "evidence": ".local/logging-regression.txt:282"
-    },
-    {
-      "file": "test/runtime-token-calibration.test.mjs",
-      "name": "successful prepare usage is learned before answer payload is sent in the same tool loop",
-      "evidence": ".local/identity-attribution-regression.log:380"
-    },
-    {
-      "file": "test/self-profile-store.test.mjs",
-      "name": "v6 migration backs up original data and preserves frozen job input while isolating its old lease",
-      "evidence": "9e42f99 explicitly renamed old v6 test; old exact name failed at .local/memory-loop-tests.txt:256"
-    },
-    {
-      "file": "test/store.test.mjs",
-      "name": "schema启用WAL与外键，会话和消息重开后持久化并隔离",
-      "evidence": ".local/memory-loop-tests.txt:259"
-    },
-    {
-      "file": "test/store.test.mjs",
-      "name": "上下文SQL在LIMIT之前过滤管理、失败运行与其他成员AI交互，重置水位持久生效",
-      "evidence": ".local/simplification-tests.txt:289"
-    },
-    {
-      "file": "test/tool-recovery-e2e.test.mjs",
-      "name": "真实Pi循环：准备schema和跨目标字段被拒后可修正，未保存承诺仅重写一次且不扩大预算",
-      "evidence": "2026-10-23 production: prepare rejected ai_self attribution, unbacked save claim, research e56 offset 14000 over 8000; independent review confirmed partial-success and rejected-call budget cases."
-    },
-    {
-      "file": "test/tool-recovery-e2e.test.mjs",
-      "name": "真实Pi研究循环：越界材料给出真实范围并可续读，末轮失败有记录，存储故障仍硬停止",
-      "evidence": "2026-10-23 production: prepare rejected ai_self attribution, unbacked save claim, research e56 offset 14000 over 8000; independent review confirmed partial-success and rejected-call budget cases."
-    },
-    {
-      "file": "test/tool-recovery-e2e.test.mjs",
-      "name": "真实Pi研究创建：同批成功任务保留，失败项修正后不重跑成功项，预算耗尽明示部分失败",
-      "evidence": "2026-10-23 production: prepare rejected ai_self attribution, unbacked save claim, research e56 offset 14000 over 8000; independent review confirmed partial-success and rejected-call budget cases."
-    },
-    {
-      "file": "test/memory-robustness-e2e.test.mjs",
-      "name": "two rooms sharing one person serialize material snapshots, preserve compression and cancel queued workers",
-      "evidence": "2026-10-23 independent review: cross-room person CAS could block materials FIFO; any old correction permanently hid subsequent summaries; reproduced with persisted SQLite workers."
-    },
-    {
-      "file": "test/memory-robustness-e2e.test.mjs",
-      "name": "普通纠正不另建归属记录，压缩保留原文、最新摘要及旧版本",
-      "evidence": "2026-10-23 independent review: cross-room person CAS could block materials FIFO; any old correction permanently hid subsequent summaries; reproduced with persisted SQLite workers. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
-    },
-    {
-      "file": "test/channel-async.test.mjs",
-      "name": "请求失败真实发送短回执，预算前置拒绝和未知投递重启后不重发",
-      "evidence": "2026-10-23 production two failed questions had no QQ response; review confirmed all RequestError paths returned without a delivery receipt."
-    },
-    {
-      "file": "test/memory-recovery-e2e.test.mjs",
-      "name": "资料失败退出队列，重启后按原时间补旧事实且不能覆盖跨房间新画像",
-      "evidence": "2026-10-23 confirmed FIFO failed-head blockers and deferred compression exclusion; user requested durable recovery without raw-message gaps or chronological inversion."
-    },
-    {
-      "file": "test/memory-recovery-e2e.test.mjs",
-      "name": "压缩失败保留旧摘要和水位，新快照按可见顺序覆盖失败原文及后续消息",
-      "evidence": "2026-10-23 confirmed FIFO failed-head blockers and deferred compression exclusion; user requested durable recovery without raw-message gaps or chronological inversion."
-    },
-    {
-      "file": "test/memory-recovery-e2e.test.mjs",
-      "name": "重复失败的恢复次数与退避跨重启保留，耗尽不堵新资料且不伪造覆盖",
-      "evidence": "2026-10-23 confirmed FIFO failed-head blockers and deferred compression exclusion; user requested durable recovery without raw-message gaps or chronological inversion."
-    },
-    {
-      "file": "test/channel-async.test.mjs",
-      "name": "真实@从渠道首次入库保留到重启后的资料快照，文本伪@不获得权限",
-      "evidence": "2026-10-23 live saved-response replay: readonly evidence references, summaryExtra and redundant empty profiles rejected whole batches; channel ingress omitted actual mentionedSenderIds. User authorized simpler single-person proposals and durable partial success."
-    },
-    {
-      "file": "test/material-components-e2e.test.mjs",
-      "name": "单人物简化提案接受自然表达，无关字段不拖垮Topic；失败画像跨重启只补自身",
-      "evidence": "2026-10-23 live saved-response replay: readonly evidence references, summaryExtra and redundant empty profiles rejected whole batches; channel ingress omitted actual mentionedSenderIds. User authorized simpler single-person proposals and durable partial success."
-    },
-    {
-      "file": "test/material-components-e2e.test.mjs",
-      "name": "画像请求未知失败保留其他组件，单目标来源和真实权限仍不能越界",
-      "evidence": "2026-10-23 live saved-response replay: readonly evidence references, summaryExtra and redundant empty profiles rejected whole batches; channel ingress omitted actual mentionedSenderIds. User authorized simpler single-person proposals and durable partial success."
-    },
-    {
-      "file": "test/material-profile-delta.test.mjs",
-      "name": "delta-v1无变更继承全部46条旧画像，旧冻结完整协议仍拒绝遗漏",
-      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
-    },
-    {
-      "file": "test/material-profile-delta.test.mjs",
-      "name": "delta-v1只纠正一项仍保留其他45条，pending只按显式q引用合并",
-      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
-    },
-    {
-      "file": "test/material-profile-delta.test.mjs",
-      "name": "delta-v1拒绝重复替换、非法引用、越界来源及版本，容量和恢复时间边界继续有效",
-      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
-    },
-    {
-      "file": "test/material-profile-delta.test.mjs",
-      "name": "delta-v1容量提炼继承候选新增facts、原基线updates和pending，cN合并不混用fN",
-      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
-    },
-    {
-      "file": "test/material-profile-delta.test.mjs",
-      "name": "新捕获与检查点保存delta-v1，恢复拒绝将旧进度混入新增量任务",
-      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
-    },
-    {
-      "file": "test/material-profile-delta.test.mjs",
-      "name": "delta-v1工作器容量提炼仅消费一次共享预算，保留候选新增事实和pending审计",
-      "evidence": "2026-10-24/25 production: five complete-profile responses omitted f44/f24; .local/server-audit-20261026/failed-calls.json"
-    },
-    {
-      "file": "test/answer-grounding.test.mjs",
-      "name": "真实串人材料的归属绑定区分发言者与对象，拒绝伪造原文、其他房间及已纠正来源",
-      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
-    },
     {
       "file": "test/answer-grounding.test.mjs",
       "name": "同一真人消息可提交两段摘录并在两次模型调用内完成回答，仍拒绝无效第二段",
+      "basis": "incident",
+      "reason": "群友经历被认成提问者的经历、同一原文两段摘录被误拒，以及现况回答未实际搜索这几类已确认错误。",
       "evidence": "Confirmed production bug: answer-grounding rejected two distinct consecutive quotes from one real user message as duplicate messageId, causing repeated preparation and budget exhaustion. Local Pi/HTTP regression verifies both excerpts bind to the same real speaker in the normal two-call flow; forged, corrected, and unknown sources remain rejected."
     },
     {
       "file": "test/answer-grounding.test.mjs",
       "name": "跨人物经历才进入有界无工具核验，修正回复和原始草稿均保留且前缀不重排",
-      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
-    },
-    {
-      "file": "test/answer-grounding.test.mjs",
-      "name": "普通群聊和私聊不增加核验调用，跨人物核验无余预算或协议无效时不发送未核验草稿",
+      "basis": "incident",
+      "reason": "群友经历被认成提问者的经历、同一原文两段摘录被误拒，以及现况回答未实际搜索这几类已确认错误。",
       "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
     },
     {
       "file": "test/answer-grounding.test.mjs",
       "name": "现况回答强制先搜索绑定的当前问题，日期未核验的结果必须明示且不自动追加搜索",
+      "basis": "incident",
+      "reason": "群友经历被认成提问者的经历、同一原文两段摘录被误拒，以及现况回答未实际搜索这几类已确认错误。",
       "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
     },
     {
-      "file": "test/answer-grounding.test.mjs",
-      "name": "现况搜索失败、未启用或预算不足时明确未核验，不重试收费请求也不放行猜测结论",
-      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
+      "file": "test/auto-memory-retrieval.test.mjs",
+      "name": "deduplicated facts recalled through a Topic reveal only evidence from that Topic room",
+      "basis": "critical",
+      "reason": "Topic只能召回来源房间的证据，避免把其他房间聊天暴露给无权访问者；只留这一条隔离检查。"
     },
     {
-      "file": "test/answer-grounding.test.mjs",
-      "name": "归属核验的未知响应、取消和诊断持久化失败均停止，不放行草稿或追加请求",
-      "evidence": "2026-10-24 production: Chocolate plugin experience attributed to owner and current OpenCode opinion answered without search; .local/server-audit-20261026/findings.md"
+      "file": "test/auto-memory.test.mjs",
+      "name": "最终上下文达到85%才整理；摘要与检查点后消息跨新轮和重启继续",
+      "basis": "user_issue",
+      "reason": "用户明确要求只有85%容量才压缩并跨重启承接，以及只注入提问者和真实@对象画像。"
     },
     {
-      "file": "test/answer-grounding.test.mjs",
-      "name": "已退出的归属纠正字段被参数验证拒绝，改为普通问答后不产生专属记录",
-      "evidence": "2026-10-26 independent review reproduced correction-versus-grounding regression; .local/server-audit-20261026/findings.md 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
+      "file": "test/auto-memory.test.mjs",
+      "name": "仅发送者及真实@对象画像，绑定人物私聊自述可在群使用",
+      "basis": "user_issue",
+      "reason": "用户明确要求只有85%容量才压缩并跨重启承接，以及只注入提问者和真实@对象画像。"
     },
     {
-      "file": "test/material-profile-delta.test.mjs",
-      "name": "五次历史画像遗漏事故按旧契约拒绝，新任务仅提交真实修改仍继承遗漏条目",
-      "evidence": "Five saved 2026-10-24/25 failed profile responses: four omitted f44, one replaced f44 while omitting f24; anonymized reference structures in production-incidents.mjs. Exact raw-response replay and hashes remain in .local/incident-test-audit-20261026/."
-    },
-    {
-      "file": "test/answer-grounding.test.mjs",
-      "name": "历史事故对照：旧准备响应缺grounding时拒绝放行，明确跨人引用后可阻止旧错答",
-      "evidence": "Saved 2026-10-24 speaker-swap incident; old prepare response lacked grounding. Tests the schema boundary and controlled uncertain review, not real-model semantic accuracy."
-    },
-    {
-      "file": "test/context-people.test.mjs",
-      "name": "speaker swap incident keeps source speaker, original AI reply target, quote identities, and history labels",
-      "evidence": "2026-10-24 saved speaker-swap incident; 2026-10-26 review additionally reproduced user self-reply labels and known Bot inline quote attribution loss/conflict. Checks canonical attribution metadata, not scripted model semantic correctness."
-    },
-    {
-      "file": "test/context-people.test.mjs",
-      "name": "adding people, changing sender, restart, and another room preserve the existing context prefix and raw records",
-      "evidence": "2026-10-24 saved speaker-swap incident and 2026-10-26 approved stable-label design: nonempty history prefix must remain stable when sender, nickname or participants change; no extra model calls or cross-room access."
-    },
-    {
-      "file": "test/context-people.test.mjs",
-      "name": "background memory projections keep stable person labels across local reference remapping and unknown legacy identity",
-      "evidence": "2026-10-26 attribution investigation: batch-local pN identifiers cannot serve as persistent summary identities; compression/Topic/profile labels must agree without rewriting frozen input or guessing missing identity."
-    },
-    {
-      "file": "test/channel-admission-atomic.test.mjs",
-      "name": "admission rolls back raw event with failed task insert, then restart preserves one queued intent and observation boundaries",
-      "evidence": "2026-10-26 architecture audit reproduced a committed inbound message without a channel task after interruption; .local/architecture-audit-20261026/reproduction.json. SQL fault injection now requires atomic rollback and one durable queued task after replay."
+      "file": "test/calibrated-compression.test.mjs",
+      "name": "渠道按实测校准跨任务复用，字节超窗口不误压缩，接近实际85%后触发同一整理流程",
+      "basis": "incident",
+      "reason": "用户发现token估算偏差导致压缩时机不对，要求用模型实际usage校准85%阈值。"
     },
     {
       "file": "test/channel-admission-atomic.test.mjs",
       "name": "channel ingress uses the atomic transaction and a replay after rollback executes only once",
+      "basis": "critical",
+      "reason": "入站原文和待回复任务必须同事务；否则失败重发可能永久漏答或重复执行。只保留harness端到端入口。",
       "evidence": "2026-10-26 real ChannelHarness offline reproduction returned duplicate for a stranded inbound event. The integrated regression verifies rollback, restart and one model run/delivery, using a localhost provider only."
     },
     {
-      "file": "test/research-retention-schema.test.mjs",
-      "name": "schema30 preview/apply only clears eligible research; unsupported schema and stale plans fail closed",
-      "evidence": "2026-10-26 architecture audit reproduced schema30 rejection by the schema27-only cleanup entry point. The current-schema temporary database covers preview/apply, protected data and fail-closed version/plan checks; no production deletion."
-    },
-    {
-      "file": "test/session-integrity.test.mjs",
-      "name": "实际启动不再读取旧Pi历史或改写其核对状态；离线账本分页索引保留",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
-    },
-    {
-      "file": "test/session-integrity.test.mjs",
-      "name": "显式离线审计仍发现旧SQL/Pi关联改写并保留corrupt证据",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
-    },
-    {
-      "file": "test/session-integrity.test.mjs",
-      "name": "运行关联改路径同时标记OLD和NEW；CAS无法清除核对期间的新变更",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
-    },
-    {
-      "file": "test/session-integrity.test.mjs",
-      "name": "JSONL离线篡改由持久分页hash巡检发现，SQL无关更新不能洗掉已有hash",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
-    },
-    {
-      "file": "test/session-integrity.test.mjs",
-      "name": "JSONL语法/链接损坏不降级；真实文件与SQL回执逐项绑定",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
-    },
-    {
-      "file": "test/session-integrity.test.mjs",
-      "name": "已返回但无最终业务证据的旧Pi/模型运行保持interrupted，完整诊断答案只补SQL且不重发",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
-    },
-    {
-      "file": "test/session-integrity.test.mjs",
-      "name": "旧Pi损坏保留显式离线审计结果，不隔离房间；真实SQLite操作失败仍停止",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
+      "file": "test/channel-async.test.mjs",
+      "name": "真实@从渠道首次入库保留到重启后的资料快照，文本伪@不获得权限",
+      "basis": "incident",
+      "reason": "真实@丢失、错误请求没有QQ回执是已确认故障；另保留用户关心的分段不混发和坏旧Pi文件不再挡聊天。"
     },
     {
       "file": "test/channel-async.test.mjs",
-      "name": "慢房间投递不阻塞其他房间，生产入口立即入库返回，后续同房间任务重启恢复",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+      "name": "请求失败真实发送短回执，预算前置拒绝和未知投递重启后不重发",
+      "basis": "incident",
+      "reason": "真实@丢失、错误请求没有QQ回执是已确认故障；另保留用户关心的分段不混发和坏旧Pi文件不再挡聊天。",
+      "evidence": "2026-10-23 production two failed questions had no QQ response; review confirmed all RequestError paths returned without a delivery receipt."
     },
     {
       "file": "test/channel-async.test.mjs",
-      "name": "持续热房间队列按房间轮转，单房间保持入队顺序",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
-    },
-    {
-      "file": "test/channel-async.test.mjs",
-      "name": "claim到执行之间关闭时，尚无run的任务安全退回queued，重启只执行一次",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
-    },
-    {
-      "file": "test/channel-async.test.mjs",
-      "name": "SQLite是业务真相，旧Pi关联不再覆盖SQLite原文",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
+      "name": "同群长回答分段与其它回答按队列顺序完成",
+      "basis": "user_issue",
+      "reason": "用户明确提出普通回答也要进消息队列，并担心分段回答混在一起；保留同房间完整回答顺序。"
     },
     {
       "file": "test/channel-async.test.mjs",
       "name": "损坏canonical JSONL不阻止新聊天或其它房间启动",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
-    },
-    {
-      "file": "test/channel-async.test.mjs",
-      "name": "SQLite领取持久化失败必须全局停调度并上报",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
+      "basis": "user_issue",
+      "reason": "用户明确取消Pi文件作为聊天门槛；坏旧JSONL必须不挡新聊天，不再保留其他旧Pi审计矩阵。"
     },
     {
       "file": "test/channel-task-store.test.mjs",
       "name": "崩溃恢复仅重排没有run的领取，不重排已记录模型调用的任务",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+      "basis": "critical",
+      "reason": "崩溃后只能重排确定没有模型run的任务，已有run的未知执行不能再收费重跑。"
     },
     {
-      "file": "test/research-retention-schema.test.mjs",
-      "name": "unrelated future schema, tables and additive columns preserve a frozen v2 plan",
-      "evidence": "Confirmed schema compatibility incident extended to frozen-plan recovery and exact structural dependency validation; offline temp SQLite apply in .local/long-task-20261026/full-final.log."
+      "file": "test/channel-web-tools.test.mjs",
+      "name": "搜索及后续网页核验不附网址，单独读取网页仍保留来源，实际工具参数与投递落库",
+      "basis": "user_issue",
+      "reason": "用户明确要求web_search不在回复中附网址，但单独读取网页仍保留来源及真实工具过程。"
     },
     {
-      "file": "test/research-retention-schema.test.mjs",
-      "name": "committed legacy pending resumes across compatible upgrade; uncommitted legacy preview is refused",
-      "evidence": "Confirmed schema compatibility incident extended to frozen-plan recovery and exact structural dependency validation; offline temp SQLite apply in .local/long-task-20261026/full-final.log."
+      "file": "test/codex-service.test.mjs",
+      "name": "publication requires exact original owner confirmation and sent acknowledgement; restart reports success or rollback once",
+      "basis": "critical",
+      "reason": "GitHub推送和生产部署只能由本人原始私聊确认触发，不能被引用、模型输出或重复通知启动。"
     },
     {
-      "file": "test/research-retention-schema.test.mjs",
-      "name": "exact session-integrity ledger triggers are compatible; same-name altered SQL is refused",
-      "evidence": "Confirmed schema compatibility incident extended to frozen-plan recovery and exact structural dependency validation; offline temp SQLite apply in .local/long-task-20261026/full-final.log."
+      "file": "test/codex-service.test.mjs",
+      "name": "owner private task delivers a plain-language result, continues same task, and preserves uncertain delivery across restart",
+      "basis": "user_issue",
+      "reason": "用户要求本人原始私聊确认才能发布、结果用简短文字并可续办；曾实际遇到派单不执行及重复要授权。"
     },
     {
-      "file": "test/work-ledger-store.test.mjs",
-      "name": "提醒按真实人物授权，同人物跨场景查询但不迁移通知路由，幂等并拒绝冲突",
-      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+      "file": "test/codex-service.test.mjs",
+      "name": "Pi dispatches the saved coding task once and returns the durable acknowledgement without another model call",
+      "basis": "user_issue",
+      "reason": "用户要求本人原始私聊确认才能发布、结果用简短文字并可续办；曾实际遇到派单不执行及重复要授权。"
     },
     {
-      "file": "test/work-ledger-store.test.mjs",
-      "name": "身份重绑不把相同原始来源和幂等键转移给新人物",
-      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+      "file": "test/codex-worker.test.mjs",
+      "name": "Codex tasks preserve request identity, revisions and interrupted work without replay",
+      "basis": "incident",
+      "reason": "实际只读任务被沙箱挡住，以及用户指出源码/Git副本持续增长；保留同任务续办和未发布改动不丢失。"
     },
     {
-      "file": "test/work-ledger-store.test.mjs",
-      "name": "到期查询命中部分索引，双连接领取不重复且提交检查 lease/version/授权",
-      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+      "file": "test/codex-worker.test.mjs",
+      "name": "Read tasks share immutable source, retire safely and keep unpublished fixes and delivery evidence",
+      "basis": "incident",
+      "reason": "实际只读任务被沙箱挡住，以及用户指出源码/Git副本持续增长；保留同任务续办和未发布改动不丢失。"
     },
     {
-      "file": "test/work-ledger-store.test.mjs",
-      "name": "版本取消阻止迟到 worker；撤销来源绑定后不执行；重启未知通知不重发",
-      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+      "file": "test/context-people.test.mjs",
+      "name": "speaker swap incident keeps source speaker, original AI reply target, quote identities, and history labels",
+      "basis": "incident",
+      "reason": "群友项目被认成自己的项目、私聊Pi续问被旧Bot Topic带跑、旧原话限制再次出现在回答中，均有具体反馈。"
     },
     {
-      "file": "test/work-ledger-migration.test.mjs",
-      "name": "schema33升级保留schema31原文与schema32已有提醒，备份及清理契约兼容",
-      "evidence": "2026-10-26 work-ledger foundation: independent review reproduced private-to-group exposure and undiscoverable queued notification after crash; SQLite authorization/lease/transaction/migration acceptance in .local/work-ledger-20261026/."
+      "file": "test/context-people.test.mjs",
+      "name": "Pi续问与旧Bot话题同时出现时，真实请求保留最近对象并明确检索仅作辅助",
+      "basis": "incident",
+      "reason": "群友项目被认成自己的项目、私聊Pi续问被旧Bot Topic带跑、旧原话限制再次出现在回答中，均有具体反馈。"
     },
     {
-      "file": "test/reminder-service.test.mjs",
-      "name": "真实harness落库后确认，重开服务由1秒循环补提醒，群目标正确且不再请求模型",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "file": "test/context-people.test.mjs",
+      "name": "旧画像报错保留为历史，回答阶段仍携带现行契约且不重启写入",
+      "basis": "incident",
+      "reason": "群友项目被认成自己的项目、私聊Pi续问被旧Bot Topic带跑、旧原话限制再次出现在回答中，均有具体反馈。",
+      "evidence": "2026-10-27 07:29 production profile query repeated an obsolete exact-quote restriction from old history and a Topic after prepare_turn description was removed; checks actual two-stage requests and preserved records, not mocked semantic correctness"
     },
     {
-      "file": "test/reminder-service.test.mjs",
-      "name": "等待房间输出期间取消或撤销权限不发送；未知投递重开后不重发",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "file": "test/delegation-diagnostics.test.mjs",
+      "name": "recorded vision 503 remains distinct from unknown outcome while private error text is excluded",
+      "basis": "incident",
+      "reason": "实际视觉503只留下unknown外观，Codex无法查到真实错误；保留结构化错误投影与隐私排除。",
+      "evidence": "2026-11-06 production stored a vision queue 503 response under an unknown call outcome, but the delegated log projection exposed only generic failed events. Covers bounded field projection including large calibration records, response integrity and exclusion of private text. Real subscription replay independently recovered the recorded 503."
     },
     {
-      "file": "test/reminder-service.test.mjs",
-      "name": "实际工具列表在鉴权范围内分页，第100项后仍可查询取消，不把其他人任务混入",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "file": "test/image-context.test.mjs",
+      "name": "read_image rejects cumulative inline-image overflow before loading the next original",
+      "basis": "user_issue",
+      "reason": "用户明确要求当前/引用图才发原图、历史保留引用并按需读；审查实证工具追加第5张图晚于内存加载才拒绝。"
     },
     {
-      "file": "test/reminder-service.test.mjs",
-      "name": "QQ主动群提醒仅序列化受控发起人@，正文标签不能扩大收件人，私聊不携带@",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "file": "test/image-context.test.mjs",
+      "name": "QQ引用原图只进入当前请求，历史与容量摘要保留引用并可按房间重新读取",
+      "basis": "user_issue",
+      "reason": "用户明确要求当前/引用图才发原图、历史保留引用并按需读；审查实证工具追加第5张图晚于内存加载才拒绝。"
     },
     {
-      "file": "test/reminder-runtime.test.mjs",
-      "name": "提醒成功使用prepare和create两次本地SSE请求，程序确认并持久保留工具记录",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "file": "test/material-components-e2e.test.mjs",
+      "name": "单人物简化提案接受自然表达，无关字段不拖垮Topic；失败画像跨重启只补自身",
+      "basis": "incident",
+      "reason": "线上提案被多余字段或单个人物错误拒绝，整批整理随之受阻；验证其他组件提交且只补失败部分。"
+    },
+    {
+      "file": "test/material-profile-delta.test.mjs",
+      "name": "五次历史画像遗漏事故按旧契约拒绝，新任务仅提交真实修改仍继承遗漏条目",
+      "basis": "incident",
+      "reason": "五份真实旧画像出现遗漏而反复被拒，用户要求简化提案；保留已捕获事故的继承旧事实回放。",
+      "evidence": "Five saved 2026-10-24/25 failed profile responses: four omitted f44, one replaced f44 while omitting f24; anonymized reference structures in production-incidents.mjs. Exact raw-response replay and hashes remain in .local/incident-test-audit-20261026/."
+    },
+    {
+      "file": "test/memory-context.test.mjs",
+      "name": "真实请求追加受限完整记忆、固定system不变、SQL usage只记录实际引用",
+      "basis": "user_issue",
+      "reason": "用户要求记忆由SQLite保持并在重启后继续使用；Pi内存化后实际发现独立memory入口不兼容，防止已存记忆不可用。"
+    },
+    {
+      "file": "test/memory-recovery-e2e.test.mjs",
+      "name": "资料失败退出队列，重启后按原时间补旧事实且不能覆盖跨房间新画像",
+      "basis": "incident",
+      "reason": "用户反复报告一次整理失败阻塞后续，要求原文不跳过、时间顺序不乱、重启可补齐且重试不无限收费。"
+    },
+    {
+      "file": "test/memory-recovery-e2e.test.mjs",
+      "name": "压缩失败保留旧摘要和水位，新快照按可见顺序覆盖失败原文及后续消息",
+      "basis": "incident",
+      "reason": "用户反复报告一次整理失败阻塞后续，要求原文不跳过、时间顺序不乱、重启可补齐且重试不无限收费。"
+    },
+    {
+      "file": "test/memory-recovery-e2e.test.mjs",
+      "name": "重复失败的恢复次数与退避跨重启保留，耗尽不堵新资料且不伪造覆盖",
+      "basis": "incident",
+      "reason": "用户反复报告一次整理失败阻塞后续，要求原文不跳过、时间顺序不乱、重启可补齐且重试不无限收费。"
+    },
+    {
+      "file": "test/memory-robustness-e2e.test.mjs",
+      "name": "two rooms sharing one person serialize material snapshots, preserve compression and cancel queued workers",
+      "basis": "user_issue",
+      "reason": "跨群私聊同人物更新曾冲突堵塞；用户另明确取消专属纠正类别，压缩仍须保留原文与最新摘要。"
+    },
+    {
+      "file": "test/memory-robustness-e2e.test.mjs",
+      "name": "普通纠正不另建归属记录，压缩保留原文、最新摘要及旧版本",
+      "basis": "user_issue",
+      "reason": "跨群私聊同人物更新曾冲突堵塞；用户另明确取消专属纠正类别，压缩仍须保留原文与最新摘要。"
+    },
+    {
+      "file": "test/ops-status.test.mjs",
+      "name": "缓存巡检按scope和stage发现命中骤降且不读取正文或修改诊断库",
+      "basis": "incident",
+      "reason": "用户多次发现模式切换及工具续轮缓存命中骤降，要求repo harness及时识别；只保留对应缓存监测。",
+      "evidence": "2026-10-28 production cache audit found three high-to-low same-stage drops while the existing health collector only reported completed calls; metadata-only SQLite regression checks detection, attribution limits, phase isolation and no business writes"
+    },
+    {
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "即时画像接受归纳正文和当前确认，保留来源绑定而不复制原话证据",
+      "basis": "incident",
+      "reason": "私聊确认无法承接保存、AI设定落入用户画像、任务问句污染画像是已确认反馈；保留一条第三方修改权限边界。"
+    },
+    {
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "给定正确计划时Bot名称落AI pending，下一轮注入并归档原来源，个人称呼和偏好隔离",
+      "basis": "incident",
+      "reason": "私聊确认无法承接保存、AI设定落入用户画像、任务问句污染画像是已确认反馈；保留一条第三方修改权限边界。",
+      "evidence": "2026-10-30 production inspection found a direct Bot-name correction routed to sender and later rejected by personal-profile consolidation. This isolated Pi/SQLite test verifies given correct ai_self versus sender plans, immediate pending injection, independent self archival and source preservation; model classification remains a separately evaluated semantic behavior."
+    },
+    {
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "第三方归纳仍须管理员与真实对象定位，仅保存对象token兼容旧协议",
+      "basis": "critical",
+      "reason": "修改其他人的个人画像必须由真实授权及明确对象绑定，不能因移除原话校验顺便开放越权写入。"
+    },
+    {
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "本地审阅去除已确认任务问句污染，旧画像与原文保留且拒绝旧版本和在途资料任务",
+      "basis": "incident",
+      "reason": "私聊确认无法承接保存、AI设定落入用户画像、任务问句污染画像是已确认反馈；保留一条第三方修改权限边界。",
+      "evidence": "2026-10-26 production profile review found task instructions, temporary events and AI focus incorrectly retained as personal traits"
+    },
+    {
+      "file": "test/publish-inbox.test.mjs",
+      "name": "publish standby holds business work and rollback-safe QQ inbox replays ordered inputs only after durable acceptance",
+      "basis": "critical",
+      "reason": "发布停机/回滚期间的真实QQ输入不能丢失或重复接单，必须保留外部收件箱与持久入队交接。"
+    },
+    {
+      "file": "test/publisher-controller.test.mjs",
+      "name": "source-only publication selects existing regressions and includes new tests in the same acceptance",
+      "basis": "incident",
+      "reason": "实际审查复现只改源码或测试fixture时零回归；另保留发布必须冻结同一补丁、确认后启动且重启不重复。"
+    },
+    {
+      "file": "test/publisher-controller.test.mjs",
+      "name": "publisher freezes exact repair, waits for sent acknowledgement, and resumes a running release once",
+      "basis": "incident",
+      "reason": "实际审查复现只改源码或测试fixture时零回归；另保留发布必须冻结同一补丁、确认后启动且重启不重复。"
     },
     {
       "file": "test/reminder-runtime.test.mjs",
       "name": "提醒拒绝不确认成功，已保存画像也不能授权无回执的未来提醒承诺",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
-    },
-    {
-      "file": "test/reminder-runtime.test.mjs",
-      "name": "模糊时间按正常回答澄清，没有额外提醒规划请求或工具执行",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
-    },
-    {
-      "file": "test/reminder-runtime.test.mjs",
-      "name": "提醒成功后阻止同批后续工具并确认未执行项",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "basis": "critical",
+      "reason": "拒绝不能变成未来提醒承诺；提醒已落库后取消对话不能丢失真实成功确认。"
     },
     {
       "file": "test/reminder-runtime.test.mjs",
       "name": "提醒已保存后取消本轮请求，RequestError保留实际成功确认",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "basis": "critical",
+      "reason": "拒绝不能变成未来提醒承诺；提醒已落库后取消对话不能丢失真实成功确认。"
     },
     {
-      "file": "test/reminder-runtime.test.mjs",
-      "name": "取消只采用真实成功回执，sending等未知状态留给正常回答解释",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "file": "test/reminder-service.test.mjs",
+      "name": "真实harness落库后确认，重开服务由1秒循环补提醒，群目标正确且不再请求模型",
+      "basis": "user_issue",
+      "reason": "用户实际私聊补充提醒时间无法承接；保留定时交付的唯一端到端入口，以及取消/撤权/未知投递不重发。"
     },
     {
-      "file": "test/reminder-runtime.test.mjs",
-      "name": "CLI、后台研究、无提醒context与未启用渠道工具的运行时不展示提醒工具",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "file": "test/reminder-service.test.mjs",
+      "name": "私聊补充时间继承原事项，第二轮两次模型请求后绑定本条来源并落库",
+      "basis": "user_issue",
+      "reason": "用户实际私聊补充提醒时间无法承接；保留定时交付的唯一端到端入口，以及取消/撤权/未知投递不重发。"
     },
     {
-      "file": "test/reminder-runtime.test.mjs",
-      "name": "无回执提醒承诺的窄校验保留否定、引用和澄清",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "file": "test/reminder-service.test.mjs",
+      "name": "等待房间输出期间取消或撤销权限不发送；未知投递重开后不重发",
+      "basis": "user_issue",
+      "reason": "用户实际私聊补充提醒时间无法承接；保留定时交付的唯一端到端入口，以及取消/撤权/未知投递不重发。"
+    },
+    {
+      "file": "test/research-archive.test.mjs",
+      "name": "归档其他三项后清单只保留目标，报告草稿历史和文件不变，幂等且停止执行与通知",
+      "basis": "user_issue",
+      "reason": "用户要求清单移除指定任务同时保留资料；验证归档后不继续执行或通知。"
+    },
+    {
+      "file": "test/research-e2e.test.mjs",
+      "name": "研究故障端到端：原文失败仅尝试两次、显式续作保留证据，未知发送和崩溃运行不自动重放",
+      "basis": "incident",
+      "reason": "实际发生网络/工具失败、报告被聊天输出上限截断、模型未读链接却声称可读；分别保留故障端到端。"
+    },
+    {
+      "file": "test/research-e2e.test.mjs",
+      "name": "章节报告不继承聊天输出上限，程序组装长正文；伪调用保留失败草稿且不重试",
+      "basis": "incident",
+      "reason": "实际发生网络/工具失败、报告被聊天输出上限截断、模型未读链接却声称可读；分别保留故障端到端。"
+    },
+    {
+      "file": "test/research-e2e.test.mjs",
+      "name": "明确检查链接必须真实读取，不能只凭URL文字回答能看到",
+      "basis": "incident",
+      "reason": "实际发生网络/工具失败、报告被聊天输出上限截断、模型未读链接却声称可读；分别保留故障端到端。"
+    },
+    {
+      "file": "test/research-materials.test.mjs",
+      "name": "材料正文分页不再切JSON外壳，按实际返回范围续读且不被工具字节上限截断",
+      "basis": "incident",
+      "reason": "实际研究正文协议把JSON当正文切页、早期e29/e32资料被新材料挤掉；只留这两种材料丢失。"
+    },
+    {
+      "file": "test/research-materials.test.mjs",
+      "name": "新增要求直接涉及的早期文件不被最近材料挤掉，短文件完整展示",
+      "basis": "incident",
+      "reason": "实际研究正文协议把JSON当正文切页、早期e29/e32资料被新材料挤掉；只留这两种材料丢失。"
+    },
+    {
+      "file": "test/research-retention-schema.test.mjs",
+      "name": "current schema preview/apply protects unfinished research, ordinary chat and profiles; stale plans fail closed",
+      "basis": "critical",
+      "reason": "当前schema曾被旧清理器拒绝；保留这一真实入口故障，以及审计后结构变化必须停止unlink以免删用户资料。"
+    },
+    {
+      "file": "test/research-retention-schema.test.mjs",
+      "name": "structure drift between audit commit and unlink is refused, leaving files and pending audit",
+      "basis": "critical",
+      "reason": "当前schema曾被旧清理器拒绝；保留这一真实入口故障，以及审计后结构变化必须停止unlink以免删用户资料。"
+    },
+    {
+      "file": "test/research-target.test.mjs",
+      "name": "明确承接继承最近同actor链接，群友新链接不会覆盖",
+      "basis": "incident",
+      "reason": "用户研究要求承接上文时误用了群里另一人的链接；保留真实sender与原目标绑定。"
+    },
+    {
+      "file": "test/runtime-cache-prefix.test.mjs",
+      "name": "channel wire keeps per-stage system fixed across three modes while link/target controls follow long history",
+      "basis": "incident",
+      "reason": "实际缓存骤降分别来自模式前置system、保存承诺纠正分支，以及工具续轮移动控制块；三个独立触发路径。"
+    },
+    {
+      "file": "test/runtime-cache-prefix.test.mjs",
+      "name": "save-claim correction closes tools in trailing controls without changing fixed answer system at the default context window",
+      "basis": "incident",
+      "reason": "实际缓存骤降分别来自模式前置system、保存承诺纠正分支，以及工具续轮移动控制块；三个独立触发路径。"
+    },
+    {
+      "file": "test/runtime-cache-prefix.test.mjs",
+      "name": "channel tool continuations append to the complete previous wire prefix without persisting or leaking controls",
+      "basis": "incident",
+      "reason": "实际缓存骤降分别来自模式前置system、保存承诺纠正分支，以及工具续轮移动控制块；三个独立触发路径。",
+      "evidence": "2026-10-29 production search continuation: old request had seven messages but only the first six survived; the wire-only control block disappeared before new tools and was regenerated at the end, with 0.81 to 1.64 percent cache read despite identical system/tools/history. Local Pi and HTTP regression checks full message-prefix retention, estimate isolation and per-prompt reset; no provider performance claim."
+    },
+    {
+      "file": "test/runtime-search-boundaries.test.mjs",
+      "name": "搜索结果使最终请求超过窗口时发送前硬检查仍拦截",
+      "basis": "user_issue",
+      "reason": "用户明确指出上下文可能爆限；保留工具结果加入后、真正发送前的最后容量检查。"
+    },
+    {
+      "file": "test/runtime-search.test.mjs",
+      "name": "harness真实Pi自主工具循环、查询实参、普通聊天不自动调用、CLI禁工具、重启不重放搜索",
+      "basis": "user_issue",
+      "reason": "用户要求历史与画像接入Pi自主工具循环，避免程序匹配语义；验证实际工具调用、普通闲聊及重启不重放。"
+    },
+    {
+      "file": "test/runtime-token-calibration.test.mjs",
+      "name": "successful prepare usage is learned before answer payload is sent in the same tool loop",
+      "basis": "incident",
+      "reason": "同一轮准备阶段已返回usage但回答阶段仍按旧估计发送，属于用户指出的实际token校准问题。"
+    },
+    {
+      "file": "test/search-concurrency.test.mjs",
+      "name": "共享无限预算允许四条请求并发，额外请求排队可取消且不占预算",
+      "basis": "incident",
+      "reason": "实际架构审查复现搜索预算文件锁跨越网络等待，连无限预算并发也失败；只留最直接并发复现。",
+      "evidence": "2026-10-30 offline reproduction: the shared budget file lock spanned the network call, so an unlimited-budget concurrent search failed before fetch. Covers short-lock atomic reservation, cancellation, cross-process limits and retained unknown attempts."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "诊断证据缺失、不完整或脱敏改变答案均不恢复业务，也不重新执行模型",
+      "basis": "critical",
+      "reason": "Pi改内存后不能靠缺失/伪造的诊断恢复答复或重跑未知调用；保留缺证据拒绝和真实HTTP返回后SQL失败的恢复窗口。"
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "真实模型回复已返回但SQLite完成失败时，重启只恢复最终诊断答案并保持未知投递",
+      "basis": "critical",
+      "reason": "真实本地HTTP已返回最终答复但SQL提交失败时，只恢复该输入的最终证据，不重调模型、不自动重发QQ。"
+    },
+    {
+      "file": "test/storage-efficiency.test.mjs",
+      "name": "批量历史读取保持1000条逐条查询结果并将SQL准备次数降为常数级",
+      "basis": "user_issue",
+      "reason": "用户明确同意把历史逐条SQL改批量；保留1000条真实SQLite输出等价及3000到9次查询的比较。"
+    },
+    {
+      "file": "test/tool-recovery-e2e.test.mjs",
+      "name": "真实Pi循环：准备schema和跨目标字段被拒后可修正，未保存承诺仅重写一次且不扩大预算",
+      "basis": "incident",
+      "reason": "用户实际报告工具参数错误中断整轮、未保存却说记住了、部分研究成功被后续失败吞掉；只保留这三个端到端故障路径。",
+      "evidence": "2026-10-23 production: prepare rejected ai_self attribution, unbacked save claim, research e56 offset 14000 over 8000; independent review confirmed partial-success and rejected-call budget cases."
+    },
+    {
+      "file": "test/tool-recovery-e2e.test.mjs",
+      "name": "真实Pi研究循环：越界材料给出真实范围并可续读，末轮失败有记录，存储故障仍硬停止",
+      "basis": "incident",
+      "reason": "用户实际报告工具参数错误中断整轮、未保存却说记住了、部分研究成功被后续失败吞掉；只保留这三个端到端故障路径。",
+      "evidence": "2026-10-23 production: prepare rejected ai_self attribution, unbacked save claim, research e56 offset 14000 over 8000; independent review confirmed partial-success and rejected-call budget cases."
+    },
+    {
+      "file": "test/tool-recovery-e2e.test.mjs",
+      "name": "真实Pi研究创建：同批成功任务保留，失败项修正后不重跑成功项，预算耗尽明示部分失败",
+      "basis": "incident",
+      "reason": "用户实际报告工具参数错误中断整轮、未保存却说记住了、部分研究成功被后续失败吞掉；只保留这三个端到端故障路径。",
+      "evidence": "2026-10-23 production: prepare rejected ai_self attribution, unbacked save claim, research e56 offset 14000 over 8000; independent review confirmed partial-success and rejected-call budget cases."
+    },
+    {
+      "file": "test/trending-content.test.mjs",
+      "name": "真实Pi最终请求严格工具参数且关闭thinking，程序固定slug/数量/链接并独立记录诊断",
+      "basis": "incident",
+      "reason": "日报必须每项目都有AI总结，曾出现schema错参及资料来源不对；保留实际Pi工具/来源/slug/链接固定的集成检查。"
+    },
+    {
+      "file": "test/trending-service.test.mjs",
+      "name": "代理公网DNS隧道超时耗尽采集，恢复后仅显式补发且保留原失败期",
+      "basis": "incident",
+      "reason": "正式日报真实遇到代理DNS超时和3条有效7条错参导致整篇不发；只保留两条生产事故。"
+    },
+    {
+      "file": "test/trending-service.test.mjs",
+      "name": "真实故障3条有效7条错参经Pi校验仅修复缺项，全量AI总结与恢复补充投递幂等",
+      "basis": "incident",
+      "reason": "正式日报真实遇到代理DNS超时和3条有效7条错参导致整篇不发；只保留两条生产事故。",
+      "evidence": "2026-11-01 production returned three valid introductions and seven misspelled placeholder items; the initial raw-description fallback was rejected because every project requires AI summarization. The existing incident regression now checks Pi schema tools, error feedback and selective repair, persisted bounded attempts/valid summaries, no raw fallback on exhaustion, same-edition recovery and idempotent same-day AI supplement without resetting original delivery records. Private evidence stays in .local."
+    },
+    {
+      "file": "test/work-ledger-migration.test.mjs",
+      "name": "schema33升级保留schema31原文与schema32已有提醒，备份及清理契约兼容",
+      "basis": "critical",
+      "reason": "保留当前schema33升级对已有原文和提醒的唯一迁移检查；删除更早版本组合矩阵。"
     },
     {
       "file": "test/work-ledger-store.test.mjs",
-      "name": "送达事务失败保留 sending 和正文；成功仅留短期无正文回执并拒绝同来源重排",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "name": "提醒按真实人物授权，同人物跨场景查询但不迁移通知路由，幂等并拒绝冲突",
+      "basis": "critical",
+      "reason": "提醒只能由真实本人跨场景访问，发送前必须复核绑定；失败/未知时不能清正文或自动重发。"
     },
     {
       "file": "test/work-ledger-store.test.mjs",
       "name": "发送前复核真实绑定，失败和未知正文不清理；本地租约恢复及回执清理有界",
-      "evidence": "User-requested one-shot reminder acceptance: local SSE, SQLite and QQ payload fixtures; independent review reproduced hidden pagination and unknown delivery misreport. .local/reminder-20261026/; no paid model or actual QQ send."
+      "basis": "critical",
+      "reason": "提醒只能由真实本人跨场景访问，发送前必须复核绑定；失败/未知时不能清正文或自动重发。"
     },
     {
-      "file": "test/reminder-runtime.test.mjs",
-      "name": "时间schema拒绝自然语言和无时区参数，模型可在原预算内修正且只执行有效调用",
-      "evidence": "2026-10-26 reminder/research boundary acceptance; runtime reproduced a clarification question wrongly blocked as an unsaved reminder promise. .local/reminder-boundary-20261026/targeted.log; fixed-response protocol test, not live model classification."
+      "file": "test/memory-recovery-e2e.test.mjs",
+      "name": "已登记旧失败的空闲巡检不读取大正文或重复写审计，重启不改变旧记录",
+      "basis": "incident",
+      "reason": "已确认生产事故：116个旧失败每秒反复读取/哈希29.5MB，空闲CPU约46%；剩余恢复流程不检查空闲轮询的大正文访问。",
+      "evidence": "2026-10-27 production idle CPU about 46 percent: 116 registered failures repeatedly read and hashed 29.5 MB each second; SQLite authorizer checks real column access and duplicate writes while snapshots preserve bodies, hashes and recovery metadata"
     },
     {
-      "file": "test/reminder-runtime.test.mjs",
-      "name": "提醒与研究同时可用时按实际工具调用分流，普通待办和定时研究澄清无副作用",
-      "evidence": "2026-10-26 reminder/research boundary acceptance; runtime reproduced a clarification question wrongly blocked as an unsaved reminder promise. .local/reminder-boundary-20261026/targeted.log; fixed-response protocol test, not live model classification."
-    }
-  ],
-  "modelEvaluations": [
-    {
-      "fixture": "test/fixtures/production-incidents.mjs#speakerSwapIncident",
-      "purpose": "Compare attribution quality using real model outputs. If the plugin experience is mentioned, attribute it to its speaker, not the current questioner. The program is not required to override arbitrary wrong model outputs.",
-      "evidence": ".local/incident-test-audit-20261026/report.md; 2026-10-26 user approved improving context representation without additional semantic intervention."
-    },
-    {
-      "fixture": "test/fixtures/production-incidents.mjs#currentOpinionIncident",
-      "status": "accepted_model_boundary",
-      "purpose": "Freshness misclassification does not require an additional program-level search detector; user explicitly deferred this issue on 2026-10-26."
-    },
-    {
-      "fixture": "test/fixtures/production-incidents.mjs#speakerSwapIncident",
-      "status": "accepted_model_boundary",
-      "purpose": "A verifier deliberately returning ok for a wrong draft is a model fault injection, not an authorization failure; no independent semantic proof is required. Original replay and failure evidence remain in .local/incident-test-audit-20261026/."
+      "file": "test/person-profile-policy.test.mjs",
+      "name": "AI画像可归纳当前真人确认，归档不要求重复原话或AI关键词",
+      "basis": "incident",
+      "reason": "真实私聊生命第一因长期课题：无AI关键词的确认被AI画像独立门槛拒绝；sender确认和显式Bot改名不能替代。复用当前画像fixture，仅保留这条事故。",
+      "evidence": "2026-10-26 life-first-cause private-chat incident: normalized AI-self update rejected before an exact-quote retry"
     }
   ]
 }

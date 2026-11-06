@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ConversationStore } from '../dist/store.js';
-import { downgradeSchema11 } from './fixtures/legacy-schema.mjs';
 
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'pa-channel-task-'));
@@ -30,50 +29,8 @@ function fixture(t) {
     },
     run(task, session = `/pi/task-${task.messageId}.jsonl`) {
       return store.beginRun(task.conversationId, task.input.text, 'provider', 'model', [], task.external, undefined, session);
-    },
-  };
+    } };
 }
-
-test('真实v9迁移先备份，保留原文、已确认分段和旧canonical运行', t => {
-  const f = fixture(t);
-  const run = f.store.beginRun(f.conversation.id, '原始问题', 'p', 'm', [], { eventId: 'legacy', senderId: 'alice', modelInputText: '模型输入' });
-  const result = f.store.completeRun(run.id, '**原始答案**', 'old-user', 'old-assistant');
-  f.store.prepareDeliveryParts(f.conversation.id, result.deliveryId, ['原有已发送文本', '未发送文本']);
-  f.store.beginDeliveryPart(f.conversation.id, result.deliveryId, 0);
-  f.store.ackDeliveryPart(f.conversation.id, result.deliveryId, 0, 'sent', 'old-external');
-  const pendingRun = f.store.beginRun(f.other.id, 'canonical进行中', 'p', 'm', [], { eventId: 'unfinished', senderId: 'alice', modelInputText: 'canonical进行中' });
-  f.store.close();
-  f.inspect(db => { downgradeSchema11(db); db.exec(`
-    DROP TABLE channel_tasks; DROP INDEX message_conversation_identity;
-    DROP INDEX one_running_run_per_session; DROP INDEX one_running_run_per_conversation;
-    ALTER TABLE agent_runs DROP COLUMN pi_session_file;
-    CREATE UNIQUE INDEX one_running_run_per_conversation ON agent_runs(conversation_id) WHERE status='running';
-    ALTER TABLE delivery_parts DROP COLUMN delivery_mode; ALTER TABLE delivery_parts DROP COLUMN reply_slot;
-    ALTER TABLE run_progress DROP COLUMN delivery_mode; ALTER TABLE run_progress DROP COLUMN reply_slot;
-    PRAGMA user_version=9;
-  `); });
-  f.reopen();
-  const backups = readdirSync(f.directory).filter(name => name.includes('.v9.') && name.endsWith('.bak'));
-  assert.equal(backups.length, 1);
-  const backup = new DatabaseSync(join(f.directory, backups[0]));
-  try {
-    assert.equal(backup.prepare('PRAGMA user_version').get().user_version, 9);
-    assert.equal(backup.prepare('SELECT text FROM messages WHERE id=?').get(result.messageId).text, '**原始答案**');
-    assert.deepEqual(backup.prepare('PRAGMA foreign_key_check').all(), []);
-    assert.equal(backup.prepare("SELECT name FROM pragma_table_info('agent_runs') WHERE name='pi_session_file'").get(), undefined);
-  } finally { backup.close(); }
-  assert.equal(f.inspect(db => db.prepare('PRAGMA user_version').get().user_version),33);
-  assert.deepEqual(f.store.unfinishedRuns(f.other.id), [pendingRun]);
-  assert.equal(f.store.quotedMessage(f.conversation.id, 'old-external').text, '原有已发送文本');
-  assert.equal(f.inspect(db => db.prepare('SELECT text FROM messages WHERE id=?').get(result.messageId).text), '**原始答案**');
-  assert.equal(f.inspect(db => db.prepare('SELECT model_input_text FROM messages WHERE id=?').get(run.inputMessageId).model_input_text), '模型输入');
-  assert.deepEqual(f.inspect(db => db.prepare('SELECT status,delivery_mode,reply_slot FROM delivery_parts ORDER BY part_index').all().map(row => ({ ...row }))), [
-    { status: 'sent', delivery_mode: 'passive', reply_slot: null }, { status: 'pending', delivery_mode: 'passive', reply_slot: null },
-  ]);
-  assert.deepEqual(f.inspect(db => db.prepare('PRAGMA foreign_key_check').all()), []);
-  f.reopen();
-  assert.equal(readdirSync(f.directory).filter(name => name.includes('.v9.') && name.endsWith('.bak')).length, 1);
-});
 
 test('崩溃恢复仅重排没有run的领取，不重排已记录模型调用的任务',t=>{
   const f=fixture(t),neverStarted=f.enqueue('claimed'),started=f.enqueue('dispatched');

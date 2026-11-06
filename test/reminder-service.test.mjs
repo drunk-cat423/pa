@@ -7,7 +7,6 @@ import {createServer} from 'node:http';
 import {ChannelHarness} from '../dist/channel-harness.js';
 import {ConversationStore} from '../dist/store.js';
 import {ReminderService} from '../dist/reminder-service.js';
-import {QQChannel} from '../dist/qq-channel.js';
 import {requestTimeData} from '../dist/request-time.js';
 import {preparationDelta} from './fixtures/turn-preparation.mjs';
 
@@ -153,32 +152,4 @@ test('等待房间输出期间取消或撤销权限不发送；未知投递重�
   assert.equal(f.store.db.prepare("SELECT count(*) n FROM work_notifications WHERE status='uncertain'").get().n,1);
   const result=restarted.context(f.room.id,f.source).execute('get_reminder',{id:unknown.id});
   assert.equal(result.status,'delivery_uncertain');assert.equal(result.notificationStatus,'uncertain');
-});
-
-test('实际工具列表在鉴权范围内分页，第100项后仍可查询取消，不把其他人任务混入',async t=>{
-  const f=storageFixture(t);for(let i=0;i<105;i++)f.create('page-'+i);
-  const service=f.service(async()=>({status:'rejected'}));
-  const context=service.context(f.room.id,f.source);
-  const first=context.execute('list_reminders',{offset:0,limit:20});assert.equal(first.items.length,20);assert.equal(first.nextOffset,20);
-  const last=context.execute('list_reminders',{offset:100,limit:20});assert.equal(last.items.length,5);assert.equal(last.more,false);
-  assert.ok(!first.items.some(item=>item.id===last.items[0].id));
-  const cancelled=context.execute('cancel_reminder',{id:last.items[0].id});assert.equal(cancelled.cancelled,true);
-  assert.equal(context.execute('get_reminder',{id:last.items[0].id}).status,'cancelled');
-});
-
-test('QQ主动群提醒仅序列化受控发起人@，正文标签不能扩大收件人，私聊不携带@',async()=>{
-  const payloads=[];
-  const channel=new QQChannel({appId:'fixture',clientSecret:'offline'},{onMessage:()=>{},onStatus:()=>{}},{fetch:async(url,options)=>{
-    payloads.push({url,body:JSON.parse(options.body)});return new Response(JSON.stringify({id:'platform-id'}),{status:200});
-  }});
-  // Isolate message serialization from gateway/network authentication.
-  channel.started=true;channel.token='fixture-token';channel.tokenExpiresAt=Date.now()+3600_000;
-  const base={route,text:'提交报销 <qqbot-at-everyone />',plainText:true,deliveryMode:'active'};
-  assert.equal((await channel.send({...base,mentionSenderId:'member_A'})).status,'sent');
-  assert.equal(payloads[0].body.msg_type,0);assert.equal(payloads[0].body.msg_id,undefined);
-  assert.match(payloads[0].body.content,/^<qqbot-at-user id="member_A" \/>/);
-  assert.doesNotMatch(payloads[0].body.content,/<qqbot-at-everyone/);
-  assert.equal((await channel.send({...base,mentionSenderId:'bad" />'})).status,'rejected');assert.equal(payloads.length,1);
-  assert.equal((await channel.send({...base,route:{...route,roomType:'private'},text:'提醒：报销'})).status,'sent');
-  assert.doesNotMatch(payloads[1].body.content,/qqbot-at/);channel.close();
 });

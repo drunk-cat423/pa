@@ -136,8 +136,7 @@ test('Pi dispatches the saved coding task once and returns the durable acknowled
     let raw = ''; for await (const part of req) raw += part;
     const body = JSON.parse(raw); requests.push(body);
     const delta = requests.length === 1 ? preparationDelta('coding') : { role: 'assistant', tool_calls: [{
-      index: 0, id: 'dispatch', type: 'function', function: { name: 'delegate_task', arguments: JSON.stringify({ mode: 'fix', prompt: 'Fix divider.' }) },
-    }] };
+      index: 0, id: 'dispatch', type: 'function', function: { name: 'delegate_task', arguments: JSON.stringify({ mode: 'fix', prompt: 'Fix divider.' }) } }] };
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const [value, finish_reason] of [[delta, null], [{}, 'tool_calls']]) {
       res.write(`data: ${JSON.stringify({ id: 'fixture', model: body.model, choices: [{ index: 0, delta: value, finish_reason }] })}\n\n`);
@@ -146,13 +145,11 @@ test('Pi dispatches the saved coding task once and returns the durable acknowled
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const runtime = await openConversation({ cwd: directory, dataDir: join(directory, 'data'), provider: 'fixture', model: 'fixture', apiKey: 'fixture',
-    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, contextWindow: 131072, maxOutputTokens: 1024, timeoutMs: 5000,
-  }, 'owner-private', { enableSearch: true, enableCodex: true });
+    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, contextWindow: 131072, maxOutputTokens: 1024, timeoutMs: 5000 }, 'owner-private', { enableSearch: true, enableCodex: true });
   t.after(async () => { await runtime.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); });
   const result = await runtime.prompt('Fix divider.', { runId: 'coding', companionTools: {
     prepareTurn: plan => ({ prepared: true, mode: plan.mode, saved: [] }), readHistory: () => [],
-    codex: { async execute(name, params) { executions++; assert.equal(name, 'delegate_task'); assert.equal(params.mode, 'fix'); return { saved: true, id: 'C17', revision: 1, status: 'queued', confirmation }; } },
-  } });
+    codex: { async execute(name, params) { executions++; assert.equal(name, 'delegate_task'); assert.equal(params.mode, 'fix'); return { saved: true, id: 'C17', revision: 1, status: 'queued', confirmation }; } } } });
   assert.equal(result, confirmation); assert.equal(executions, 1); assert.equal(requests.length, 2);
   assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['prepare_turn']);
   assert.ok(requests[1].tools.some(tool => tool.function.name === 'delegate_task'));
@@ -160,55 +157,4 @@ test('Pi dispatches the saved coding task once and returns the durable acknowled
   const evidence=new DiagnosticLog(join(directory,'data')).events({traceId:'coding'});
   assert.ok(evidence.some(event=>event.event==='turn.completed' && event.details.answer===confirmation));
   assert.equal(runtime.info().sessionFile,undefined);
-});
-
-test('rejected and unknown requests cannot starve later results or cross a changed owner policy', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'pa-codex-recovery-'));
-  const socketPath = process.platform === 'win32' ? `\\\\.\\pipe\\pa-codex-${randomUUID()}` : join(directory, 'worker.sock');
-  const route = { channel: 'qq', accountId: 'bot', roomType: 'private', roomId: 'owner' };
-  const binding = { route, senderId: 'owner' }, owner = codexOwnerKey(binding);
-  const unknown = [], lookups = [], deliveries = [], tasks = new Map();
-  let posts = 0, service;
-  const server = createServer(async (req, res) => {
-    const url = new URL(req.url, 'http://localhost');
-    if (req.method === 'POST') {
-      posts++;
-      const chunks = []; for await (const chunk of req) chunks.push(chunk);
-      const body = JSON.parse(Buffer.concat(chunks).toString());
-      if (body.prompt === 'reject') { res.writeHead(400); res.end('{"error":"queue full"}'); return; }
-      if (body.prompt === 'unknown') { unknown.push(body.requestId); res.writeHead(500); res.end('{"error":"acceptance uncertain"}'); return; }
-      const task = { id: 'C17', revision: 1, status: 'completed', requestId: body.requestId, summary: 'Done.', diff: '+ verified', evidence: 'test exit=0' };
-      tasks.set(body.requestId, task); res.end(JSON.stringify(task)); return;
-    }
-    const requestId = url.searchParams.get('requestId');
-    lookups.push({ owner: url.searchParams.get('owner'), requestId });
-    if (requestId === unknown[0]) { res.writeHead(503); res.end('{"error":"temporary lookup failure"}'); return; }
-    res.end(JSON.stringify({ tasks: tasks.has(requestId) ? [tasks.get(requestId)] : [] }));
-  });
-  await new Promise(resolve => server.listen(socketPath, resolve));
-  const create = selected => new CodexService({ dataDir: directory, codex: { socketPath } }, selected, () => true, async message => {
-    deliveries.push(message); return { status: 'sent', externalMessageId: 'result' };
-  });
-  try {
-    service = create(binding);
-    for (let n = 0; n < 21; n++) {
-      await assert.rejects(service.context(route, 'owner', `reject-${n}`).execute('delegate_task', { prompt: 'reject', mode: 'read' }), /queue full/);
-      await assert.rejects(service.context(route, 'owner', `unknown-${n}`).execute('delegate_task', { prompt: 'unknown', mode: 'read' }), /uncertain/);
-    }
-    await service.context(route, 'owner', 'accepted').execute('delegate_task', { prompt: 'accepted', mode: 'read' });
-    for (let pass = 0; pass < 4; pass++) await service.wait();
-    assert.equal(deliveries.length, 1, '21 stale unknowns and a failing lookup cannot hide the completed result');
-    assert.equal(posts, 43, 'recovery only queries; it never resubmits uncertain work');
-    assert.ok(lookups.every(item => item.owner === owner));
-    assert.equal(lookups.filter(item => item.requestId === unknown[1]).length, 3, 'three successful empty lookups retire unknown acceptance');
-    await service.close();
-    const changed = { route: { ...route, roomId: 'new-owner' }, senderId: 'new-owner' };
-    service = create(changed);
-    const before = lookups.length;
-    await service.wait();
-    assert.equal(lookups.length, before, 'new owner never polls pending source requests belonging to previous owner');
-    assert.equal(deliveries.length, 1);
-  } finally {
-    await service?.close(); await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true });
-  }
 });

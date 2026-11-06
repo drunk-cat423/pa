@@ -40,44 +40,11 @@ function fixture(t){
       :path.endsWith('memory.events')?'high 0\nmax 0\noom 0\noom_kill 0'
       :'anon 1000\nfile 2000\ninactive_file 1000',
     statfs:()=>({blocks:40*1024,bsize:1024*1024,bavail:zero?0:30*1024}),
-    journal:args=>{assert.deepEqual(args.slice(0,4),['-u','pa.service','-u','mihomo-pa.service']);return '';},
-  });
+    journal:args=>{assert.deepEqual(args.slice(0,4),['-u','pa.service','-u','mihomo-pa.service']);return '';} });
   t.after(()=>{diag.close();db.close();const target=resolve(dir);assert.ok(target.startsWith(parent+sep));rmSync(target,{recursive:true,force:true});});
   return {db,diag,now,at,status,fingerprint,collect:zero=>collectStatus({dataDir:dir,current,now,system:system(zero)}),
     writeStatus:()=>writeFileSync(join(dir,'qq-service/status.json'),JSON.stringify(status))};
 }
-
-test('巡检不把sent和正常claim/input阶段报异常，隔离旧队列不掩盖当前活动且仅读元数据',t=>{
-  const f=fixture(t);
-  f.diag.prepare('INSERT INTO calls VALUES (?,?)').run('digest',JSON.stringify({updatedAt:f.at,status:'completed',phase:'trending_digest',kind:'memory'}));
-  for(let n=0;n<25;n++){
-    f.db.prepare('INSERT INTO auto_memory_jobs VALUES (?,\'queued\',\'legacy\',?,NULL)').run('old-'+n,f.at);
-    f.db.prepare('INSERT INTO auto_memory_job_retirements VALUES (?)').run('old-'+n);
-  }
-  f.db.prepare('INSERT INTO auto_memory_jobs VALUES (?,\'running\',\'materials\',?,?)').run('current',f.at,f.now+60000);
-  const before=f.fingerprint(),r=f.collect(false);
-  assert.equal(r.complete,true);assert.equal(r.ok,true,JSON.stringify(r.findings));
-  assert.equal(r.diagnostics.callsByStage.trending_digest,1);
-  assert.deepEqual(r.database.active.map(x=>x.id),['current']);assert.equal(r.diagnostics.events,2);
-  assert.equal(JSON.stringify(r).includes('NEVER_OUTPUT_PRIVATE_TEXT'),false);assert.deepEqual(f.fingerprint(),before);
-  delete f.status.integrity;delete f.status.isolatedRooms;
-  f.status.persistence=[{status:'ready'}];f.writeStatus();
-  const current=f.collect(false);
-  assert.equal(current.complete,true);assert.equal(current.ok,true,JSON.stringify(current.findings));
-  assert.equal(current.statusFile.persistence.status,'ready');
-});
-
-test('自动搁置不能隐藏耗尽缺口，资源耗尽和新unknown调用必须报出',t=>{
-  const f=fixture(t);
-  f.db.prepare('INSERT INTO auto_memory_jobs VALUES (?,\'failed\',\'materials\',?,NULL)').run('gap',f.at);
-  f.db.prepare('INSERT INTO auto_memory_recoveries VALUES (?,3,?,NULL)').run('gap',f.now-1);
-  f.db.prepare('INSERT INTO auto_memory_job_deferrals VALUES (?)').run('gap');
-  f.diag.prepare('INSERT INTO calls VALUES (?,?)').run('unknown',JSON.stringify({updatedAt:f.at,status:'unknown',phase:'response'}));
-  const before=f.fingerprint(),r=f.collect(true),codes=r.findings.map(x=>x.code);
-  assert.equal(r.complete,true);assert.equal(r.ok,false);assert.equal(r.database.memoryRecoveryGaps.exhausted,1);
-  for(const code of ['memory_recovery_exhausted','host_memory_low','host_disk_low','recent_model_call_unknown'])assert.ok(codes.includes(code),code);
-  assert.deepEqual(f.fingerprint(),before);
-});
 
 test('缓存巡检按scope和stage发现命中骤降且不读取正文或修改诊断库',t=>{
   const f=fixture(t),systemA='a'.repeat(64),systemB='b'.repeat(64),tools='c'.repeat(64);

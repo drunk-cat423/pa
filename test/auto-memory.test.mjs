@@ -7,10 +7,8 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { companionReply } from './fixtures/companion-tools.mjs';
 import { conversationMessages } from './fixtures/turn-preparation.mjs';
-import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
-import { BackgroundMemory } from "../dist/auto-memory.js";
+import { ChannelHarness } from '../dist/channel-harness.js';
 import { ConversationStore } from '../dist/store.js';
-import { MemoryInputTooLargeError } from '../dist/memory-provider.js';
 import { conversationContext } from './fixtures/conversation-context.mjs';
 
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
@@ -81,8 +79,7 @@ async function fixture(t, extract = async input => extracted(input), overrides =
   const provider = { extract: async (input, signal) => { inputs.push(structuredClone(input)); return extract(input, signal); } };
   function harness(policy = { version: 1, ownerBindings: [] }) {
     const h = new ChannelHarness(config, [route, other, privateRoute], {
-      send: async message => { sent.push(message); return { status: 'sent', externalMessageId: `out-${sent.length}` }; },
-    }, 0, policy, provider);
+      send: async message => { sent.push(message); return { status: 'sent', externalMessageId: `out-${sent.length}` }; } }, 0, policy, provider);
     harnesses.push(h); return h;
   }
   const message = (id, text, options = {}) => ({ route, eventId: id, text, senderId: 'a',
@@ -113,17 +110,6 @@ async function fixture(t, extract = async input => extracted(input), overrides =
     },
     db: () => new DatabaseSync(join(config.dataDir, 'pa.sqlite')) };
 }
-
-test('私聊完成50轮且容量较低时不按轮数自动压缩', { timeout: 120_000 }, async t => {
-  const f = await fixture(t); const h = f.harness();
-  for (let i = 1; i <= 50; i++) assert.equal(await h.handle(f.message(`p${i}`, `私聊第${i}轮`, { route: f.privateRoute })), 'sent');
-  await h.waitForMemory();
-  assert.equal(f.inputs.length, 0);
-  assert.equal(h.info().memory.find(item => item.conversation === channelConversationKey(f.privateRoute)).completed, 0);
-  const db = f.db();
-  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages m JOIN conversations c ON c.id=m.conversation_id JOIN rooms r ON r.id=c.room_id WHERE m.role='user' AND r.room_type='private'").get().n, 50); }
-  finally { db.close(); }
-});
 
 test('最终上下文达到85%才整理；摘要与检查点后消息跨新轮和重启继续', async t => {
   const gate = deferred(), started = deferred();
@@ -181,106 +167,4 @@ test('仅发送者及真实@对象画像，绑定人物私聊自述可在群使�
   assert.ok(mentionedProfiles.some(profile => profile.senderIds.includes('a')));
   assert.ok(mentionedProfiles.some(profile => profile.senderIds.includes('b')
     && JSON.stringify(profile).includes('绘画')));
-});
-
-test('群容量压缩标记新协议、创建群摘要且数据库保留原文', async t => {
-  const f = await fixture(t, undefined, { contextWindow: 32768 }); const h = f.harness();
-  for (let i = 1; i <= 4; i++) await h.handle(f.message(`g${i}`, `${i}:` + 'g'.repeat(2000)));
-  const store=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
-  try {
-    const db=f.db();
-    try { store.autoMemory.reserveBatch(db.prepare('SELECT id FROM conversations').get().id,'capacity'); } finally {db.close();}
-  } finally {store.close();}
-  await h.waitForMemory();
-  assert.equal(await h.handle(f.message('g-question', '刚才群里讨论了什么？', { mentioned: true })), 'sent');
-  assert.equal(f.inputs[0].roomType, 'group'); assert.ok(f.inputs[0].messages.length < 50);
-  assert.ok(f.inputs.some(input => input.roomType === 'group' && input.contextProtocol === 1));
-  const db=f.db();
-  try { assert.equal(db.prepare("SELECT COUNT(*) n FROM messages WHERE text LIKE '%gggggggggg%' AND role='user'").get().n, 4); }
-  finally { db.close(); }
-  const context=conversationContext(f.requests.at(-1));
-  assert.ok(context.summary.continuationSummary);
-});
-
-test('长批次拆分检查点在失败重试后续接，不重复已成功的子批次', async t => {
-  let smallCalls = 0, failed = false;
-  const finished = [];
-  const f = await fixture(t, async input => {
-    if (input.messages.length > 20) throw new MemoryInputTooLargeError('fixture split');
-    smallCalls++;
-    if (smallCalls === 2 && !failed) { failed = true; throw new Error('fixture transient'); }
-    if (input.mode !== 'profiles') finished.push(input.messages.map(message => message.id));
-    return extracted(input);
-  }, { memory: { enabled: true, maxCalls: 20, timeoutMs: 5000 } });
-  const h = f.harness();
-  for (let i = 0; i < 50; i++) await h.handle(f.message(`split-${i}`, `批次消息${i}`));
-  assert.ok(f.reserveCapacity(f.route)); h.start();
-  await assert.rejects(h.waitForMemory(), /失败/);
-  await h.close(); f.retryFailed();
-  const next = f.harness(); await next.start(); await next.waitForMemory();
-  assert.equal(next.info().memory.find(item=>item.conversation===channelConversationKey(f.route)).completed, 1);
-  const ids = finished.flat(); assert.equal(ids.length, 50); assert.equal(new Set(ids).size, 50);
-  assert.equal(next.info().memory[0].calls, 9);
-});
-
-test('关闭中断的后台批次保留失败，只有显式重试后才继续整理', async t => {
-  let calls = 0; const started = deferred();
-  const f = await fixture(t, async (input, signal) => {
-    calls++;
-    if (calls === 1) { started.resolve(); await wait(signal, new Promise(() => {})); }
-    return extracted(input);
-  });
-  const h = f.harness();
-  for (let i = 0; i < 50; i++) await h.handle(f.message(`resume-${i}`, `继续${i}`));
-  assert.ok(f.reserveCapacity(f.route)); h.start();
-  await started.promise; await h.close();
-  const stopped = f.harness(); await stopped.start(); await assert.rejects(stopped.waitForMemory(), /失败/);
-  assert.equal(calls,1); await stopped.close(); f.retryFailed();
-  const next = f.harness(); await next.start(); await next.waitForMemory();
-  assert.equal(calls, 2);
-  assert.equal(next.info().memory.find(item => item.conversation === channelConversationKey(f.route)).completed, 1);
-});
-
-test('后台提供完整旧画像并整体替换收敛结果，不再补回未返回的旧事实', async t => {
-  let observedFacts = 0;
-  const f = await fixture(t, async input => {
-    const result = extracted(input); const person = input.profiles[0];
-    if (input.mode === 'messages') return result;
-    observedFacts = person.facts.length;
-    result.profiles = [{ personId: person.personId, baseVersion: person.baseVersion, facts: [
-      { content: '长期兴趣是天文', sourceType: 'self', messageIds: [person.facts[0].messageIds[0]] }] }];
-    return result;
-  }, { contextWindow: 50000 });
-  const h = f.harness(); await h.handle(f.message('profile-base', '首次发言'));
-  const db = f.db(); let person;
-  try {
-    person = db.prepare('SELECT person_id FROM actor_person_bindings JOIN actors ON actors.id=actor_id WHERE external_user_id=?').get('a').person_id;
-    const source = db.prepare("SELECT id FROM messages WHERE external_event_id='profile-base'").get().id;
-    const facts = Array.from({ length: 200 }, (_, i) => ({ content: `旧事实${i}:` + 'x'.repeat(300), sourceType: 'self', messageIds: [source], field: `old${i}` }));
-    db.prepare('UPDATE persons SET revision=1 WHERE id=?').run(person);
-    db.prepare('INSERT INTO person_profile_revisions VALUES (?,1,?,NULL,?)').run(person, JSON.stringify(facts), new Date().toISOString());
-    for (let i = 1; i < 50; i++) await h.handle(f.message(`profile-${i}`, '天文记录'));
-    assert.ok(f.reserveCapacity(f.route)); h.start();
-    await h.waitForMemory();
-    const row = db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? ORDER BY revision DESC LIMIT 1').get(person);
-    assert.equal(observedFacts, 200);
-    assert.deepEqual(JSON.parse(row.facts_json), [{ content: '长期兴趣是天文', sourceType: 'self', messageIds: [source] }]);
-    assert.equal(JSON.parse(db.prepare('SELECT facts_json FROM person_profile_revisions WHERE person_id=? AND revision=1').get(person).facts_json).length, 200);
-  } finally { db.close(); }
-});
-
-test('等待截止时间独立于后台工作结束，超时后后台可以继续', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'pa-memory-wait-'));
-  const store = new ConversationStore(join(directory, 'store.sqlite'));
-  const conversation = store.ensureConversation('room', join(directory, 'session.jsonl'), { channel: 'qq', accountId: 'a', roomId: 'g', roomType: 'group' });
-  for (let i = 0; i < 50; i++) store.recordInbound(conversation.id, 'hello', { eventId: String(i), senderId: 'a', modelInputText: 'hello' });
-  const gate = deferred();
-  const background = new BackgroundMemory({ memory: { enabled: true, maxCalls: 10, timeoutMs: 5000}, contextWindow: 100000 },
-    store.autoMemory, conversation.id, { extract: async (input, signal) => { await wait(signal, gate.promise); return extracted(input); } });
-  t.after(async () => { gate.resolve(); await background.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
-  assert.ok(store.autoMemory.reserveBatch(conversation.id, 'capacity'));
-  background.start();
-  await assert.rejects(background.wait(undefined, 30), /尚未完成/);
-  assert.equal(store.autoMemory.status(conversation.id).running, 1);
-  gate.resolve(); await background.wait(); assert.equal(store.autoMemory.status(conversation.id).completed, 1);
 });

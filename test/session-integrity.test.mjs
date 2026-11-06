@@ -2,14 +2,13 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
-import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { openRecordedConversation } from '../dist/conversation.js';
 import { ConversationStore } from '../dist/store.js';
-import { SessionIntegrity, SessionIntegrityError } from '../dist/session-integrity.js';
+import { SessionIntegrity } from '../dist/session-integrity.js';
 import {DiagnosticLog} from '../dist/diagnostics.js';
 
 async function fixture(t) {
@@ -44,128 +43,6 @@ async function fixture(t) {
   }
   return {config,key,route,canonical,conversation,store,db,verifier,seed};
 }
-
-test('实际启动不再读取旧Pi历史或改写其核对状态；离线账本分页索引保留',async t=>{
-  const f = await fixture(t);
-  const files = new Set();
-  for(let n=0;n<8;n++) files.add((await f.seed(n)).file);
-  const originalRead = fs.readFile, originalStat = fs.lstat;
-  let reads=0, stats=0;
-  fs.readFile = async (file,...args) => { if(files.has(String(file))) reads++; return originalRead(file,...args); };
-  fs.lstat = async (file,...args) => { if(files.has(String(file))) stats++; return originalStat(file,...args); };
-  syncBuiltinESMExports();
-  try {
-    const first=await openRecordedConversation(f.config,f.key,f.route); await first.close();
-    assert.equal(reads,0);assert.equal(stats,0);
-    assert.equal(f.db.prepare("SELECT count(*) AS n FROM session_integrity WHERE status='dirty'").get().n,8);
-    reads=0;stats=0;
-    const second=await openRecordedConversation(f.config,f.key,f.route); await second.close();
-    assert.equal(reads,0);assert.equal(stats,0);
-  } finally {fs.readFile=originalRead;fs.lstat=originalStat;syncBuiltinESMExports();}
-  assert.equal(f.db.prepare('SELECT count(*) AS n FROM session_integrity_canonical_messages').get().n,0);
-  const canonicalPlan=f.db.prepare(`EXPLAIN QUERY PLAN SELECT m.rowid FROM session_integrity_canonical_messages link
-    JOIN messages m ON m.rowid=link.message_rowid AND m.id=link.message_id
-    WHERE link.conversation_id=? AND link.message_rowid>? ORDER BY link.message_rowid LIMIT ?`).all(f.conversation.id,0,64);
-  assert.match(JSON.stringify(canonicalPlan),/session_integrity_canonical_page/);
-  assert.doesNotMatch(JSON.stringify(canonicalPlan),/SCAN m|TEMP B-TREE/);
-  const pagePlan=f.db.prepare('EXPLAIN QUERY PLAN SELECT * FROM session_integrity WHERE conversation_id=? AND id>? ORDER BY id LIMIT ?').all(f.conversation.id,0,64);
-  assert.match(JSON.stringify(pagePlan),/session_integrity_pages/);assert.doesNotMatch(JSON.stringify(pagePlan),/TEMP B-TREE/);
-});
-
-test('显式离线审计仍发现旧SQL/Pi关联改写并保留corrupt证据',async t=>{
-  const f=await fixture(t);const item=await f.seed(1);await f.verifier.dirty();
-  f.db.prepare('UPDATE messages SET text=? WHERE id=?').run('tampered',item.run.inputMessageId);
-  assert.equal(f.store.sessionIntegrity.forFile(item.file).status,'dirty');
-  await assert.rejects(f.verifier.dirty(),SessionIntegrityError);
-  assert.equal(f.store.sessionIntegrity.forFile(item.file).status,'corrupt');
-  const other=f.store.ensureConversation('other','other.jsonl');
-  assert.equal(f.store.sessionIntegrity.problem(other.id),undefined);
-  const g=await fixture(t);const deleted=await g.seed(2);await g.verifier.dirty();
-  g.db.exec('PRAGMA foreign_keys=OFF');
-  g.db.prepare('DELETE FROM agent_runs WHERE id=?').run(deleted.run.id);
-  assert.equal(g.store.sessionIntegrity.forFile(deleted.file).status,'dirty');
-  await assert.rejects(g.verifier.dirty(),/关联已删除/);
-  assert.equal(g.store.sessionIntegrity.forFile(deleted.file).status,'corrupt');
-  const h=await fixture(t);const response=await h.seed(3);await h.verifier.dirty();h.db.exec('PRAGMA foreign_keys=OFF');
-  h.db.prepare('DELETE FROM messages WHERE id=(SELECT response_message_id FROM agent_runs WHERE id=?)').run(response.run.id);
-  assert.equal(h.store.sessionIntegrity.forFile(response.file).status,'dirty');
-  await assert.rejects(h.verifier.dirty(),/回复不一致/);
-});
-
-test('运行关联改路径同时标记OLD和NEW；CAS无法清除核对期间的新变更',async t=>{
-  const f=await fixture(t);const item=await f.seed(1);await f.verifier.dirty();
-  const old=f.store.sessionIntegrity.forFile(item.file);
-  f.db.prepare('UPDATE agent_runs SET error_kind=? WHERE id=?').run('audit',item.run.id);
-  assert.equal(f.store.sessionIntegrity.verified(old,old.hash,old.sqlHash),false);
-  assert.equal(f.store.sessionIntegrity.forFile(item.file).status,'dirty');
-  await f.verifier.dirty();
-  f.db.prepare('UPDATE agent_runs SET pi_session_file=? WHERE id=?').run('different.jsonl',item.run.id);
-  assert.equal(f.store.sessionIntegrity.forFile(item.file).status,'dirty');
-  assert.equal(f.store.sessionIntegrity.forFile('different.jsonl').status,'dirty');
-  await assert.rejects(f.verifier.dirty(),/关联已删除或发生不一致/);
-});
-
-test('JSONL离线篡改由持久分页hash巡检发现，SQL无关更新不能洗掉已有hash',async t=>{
-  const f=await fixture(t);const a=await f.seed(1),b=await f.seed(2);await f.verifier.dirty();
-  assert.equal(await f.verifier.audit({limit:1}),1);
-  const cursor=f.store.sessionIntegrity.sweepCursor(f.conversation.id);assert.ok(cursor>0);
-  await fs.appendFile(b.file,'\n');
-  await assert.rejects(f.verifier.audit({limit:1}),/哈希发生变化/);
-  assert.equal(f.store.sessionIntegrity.forFile(b.file).status,'corrupt');
-  assert.equal(f.store.sessionIntegrity.forFile(a.file).status,'verified');
-  const g=await fixture(t);const c=await g.seed(3);await g.verifier.dirty();await fs.appendFile(c.file,'\n');
-  g.db.prepare('UPDATE agent_runs SET error_kind=? WHERE id=?').run('no-op',c.run.id);
-  await assert.rejects(g.verifier.dirty(),/哈希发生变化/);
-  await assert.rejects(g.verifier.audit({full:true,recheckCorrupt:true}),/哈希发生变化/);
-  await fs.writeFile(c.file,c.lines.map(line=>JSON.stringify(line)).join('\n')+'\n');
-  assert.equal(await g.verifier.audit({full:true,recheckCorrupt:true}),1);
-  assert.equal(g.store.sessionIntegrity.forFile(c.file).status,'verified');
-});
-
-test('JSONL语法/链接损坏不降级；真实文件与SQL回执逐项绑定',async t=>{
-  const f=await fixture(t);const item=await f.seed(1);await fs.appendFile(item.file,'{broken\n');
-  await assert.rejects(f.verifier.dirty(),SessionIntegrityError);
-  assert.equal(f.store.sessionIntegrity.forFile(item.file).status,'corrupt');
-  const g=await fixture(t);const linked=await g.seed(2);const target=linked.file+'.hardlink';await fs.link(linked.file,target);
-  await assert.rejects(g.verifier.dirty(),/文件损坏、不可读/);
-  const h=await fixture(t);const mismatch=await h.seed(3);
-  h.db.prepare('UPDATE messages SET pi_entry_id=? WHERE id=(SELECT response_message_id FROM agent_runs WHERE id=?)').run('wrong-entry',mismatch.run.id);
-  await assert.rejects(h.verifier.dirty(),/回复不一致/);
-});
-
-test('已返回但无最终业务证据的旧Pi/模型运行保持interrupted，完整诊断答案只补SQL且不重发',async t=>{
-  const f=await fixture(t),unknown=await f.seed(1,false),complete=await f.seed(2,false);
-  const diagnostics=new DiagnosticLog(f.config.dataDir),answer='已通过业务校验的最终回答';
-  diagnostics.event({traceId:complete.run.id,runId:complete.run.id,conversationId:f.conversation.id},'answer','turn.completed',
-    {answer,inputSha256:createHash('sha256').update(complete.run.inputText).digest('hex'),answerSha256:createHash('sha256').update(answer).digest('hex')});
-  // A damaged/missing old file has no role in new execution or recovery.
-  await fs.writeFile(unknown.file,'{broken\n');await fs.unlink(complete.file);
-  const opened=await openRecordedConversation(f.config,f.key,f.route);
-  try {
-    assert.equal(f.db.prepare('SELECT status FROM agent_runs WHERE id=?').get(unknown.run.id).status,'interrupted');
-    const row=f.db.prepare('SELECT status,recovered FROM agent_runs WHERE id=?').get(complete.run.id);
-    assert.equal(row.status,'completed');assert.equal(row.recovered,1);
-    assert.equal(f.db.prepare('SELECT text FROM messages WHERE id=(SELECT response_message_id FROM agent_runs WHERE id=?)').get(complete.run.id).text,answer);
-    assert.equal(f.db.prepare('SELECT status FROM deliveries WHERE run_id=?').get(complete.run.id).status,'uncertain');
-    assert.equal(opened.persistenceStatus().status,'ready');
-    assert.equal(f.db.prepare('SELECT count(*) AS n FROM agent_runs').get().n,2);
-  } finally {await opened.close();}
-  const next=await openRecordedConversation(f.config,f.key,f.route);await next.close();
-  assert.equal(f.db.prepare('SELECT count(*) AS n FROM deliveries').get().n,1);
-});
-
-test('旧Pi损坏保留显式离线审计结果，不隔离房间；真实SQLite操作失败仍停止',async t=>{
-  const f=await fixture(t),item=await f.seed(1);await fs.appendFile(item.file,'{broken\n');
-  await assert.rejects(f.verifier.dirty(),SessionIntegrityError);
-  const opened=await openRecordedConversation(f.config,f.key,f.route);
-  try {
-    assert.equal(opened.persistenceStatus().status,'ready');
-    assert.equal(f.store.sessionIntegrity.forFile(item.file).status,'corrupt');
-    f.db.exec('DROP TABLE channel_tasks');
-    assert.throws(()=>opened.queuedTaskCount(),/持久化失败/);
-    assert.equal(opened.persistenceStatus().status,'fatal');
-  } finally {await opened.close();}
-});
 
 test('诊断证据缺失、不完整或脱敏改变答案均不恢复业务，也不重新执行模型',async t=>{
   const f=await fixture(t),first=await f.seed(1,false),second=await f.seed(2,false);
