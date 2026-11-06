@@ -3,6 +3,31 @@
   "baseCommit": "b888659d19180131e59884aa4dc280a1ee507b59",
   "tests": [
     {
+      "file": "test/image-context.test.mjs",
+      "name": "read_image rejects cumulative inline-image overflow before loading the next original",
+      "evidence": "Independent review of this change confirmed that read_image loaded and Base64-encoded a fifth 10MiB image before checking the 64MiB cumulative request budget. A local HTTP/Pi/harness fixture with bounded virtual image content verifies rejection before the fifth original is loaded; no large memory allocation or paid provider is used."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "真实模型回复已返回但SQLite完成失败时，重启只恢复最终诊断答案并保持未知投递",
+      "evidence": "Local HTTP model and injected SQLite completion failure exercise the exact crash window: only final validated input/answer-bound diagnostic evidence can restore the reply, with delivery uncertain and no repeated model request. A large valid answer also confirms the 256KiB event bound does not become a new response limit."
+    },
+    {
+      "file": "test/session-integrity.test.mjs",
+      "name": "诊断证据缺失、不完整或脱敏改变答案均不恢复业务，也不重新执行模型",
+      "evidence": "The approved move from Pi JSONL to SQLite business truth retires transcript-based restart recovery. Locally injected missing, incomplete and redacted final evidence must keep the original run interrupted without paid replay or unknown delivery resend."
+    },
+    {
+      "file": "test/storage-efficiency.test.mjs",
+      "name": "批量历史读取保持1000条逐条查询结果并将SQL准备次数降为常数级",
+      "evidence": "Independent audit confirmed three synchronous statements per historical message. A real SQLite fixture compares 1000 mixed records against the prior implementation, preserving every projected field/order/duplicate while reducing 3000 prepares to 9."
+    },
+    {
+      "file": "test/publisher-controller.test.mjs",
+      "name": "source-only publication selects existing regressions and includes new tests in the same acceptance",
+      "evidence": "Independent audit reproduced zero selected regressions for source-only fixes. The release selector now reuses existing scopes and includes newly added tests; unsupported source modules select all existing regressions."
+    },
+    {
       "file": "test/delegation-diagnostics.test.mjs",
       "name": "recorded vision 503 remains distinct from unknown outcome while private error text is excluded",
       "evidence": "2026-11-06 production stored a vision queue 503 response under an unknown call outcome, but the delegated log projection exposed only generic failed events. Covers bounded field projection including large calibration records, response integrity and exclusion of private text. Real subscription replay independently recovered the recorded 503."
@@ -349,8 +374,8 @@
     },
     {
       "file": "test/image-context.test.mjs",
-      "name": "QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、重启与容量摘要，按房间重新读取",
-      "evidence": ".local/memory-split-regression-final.log:191"
+      "name": "QQ引用原图只进入当前请求，历史与容量摘要保留引用并可按房间重新读取",
+      "evidence": ".local/memory-split-regression-final.log:191 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/legacy-count-retirement.test.mjs",
@@ -554,8 +579,8 @@
     },
     {
       "file": "test/memory-robustness-e2e.test.mjs",
-      "name": "compression incorporates correction lineage and only unmasks the exact captured version, retaining originals",
-      "evidence": "2026-10-23 independent review: cross-room person CAS could block materials FIFO; any old correction permanently hid subsequent summaries; reproduced with persisted SQLite workers."
+      "name": "普通纠正不另建归属记录，压缩保留原文、最新摘要及旧版本",
+      "evidence": "2026-10-23 independent review: cross-room person CAS could block materials FIFO; any old correction permanently hid subsequent summaries; reproduced with persisted SQLite workers. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/channel-async.test.mjs",
@@ -659,8 +684,8 @@
     },
     {
       "file": "test/answer-grounding.test.mjs",
-      "name": "同轮纠正不再引用已否定旧说法，拒绝发生在保存之前且核验保留已保存纠正",
-      "evidence": "2026-10-26 independent review reproduced correction-versus-grounding regression; .local/server-audit-20261026/findings.md"
+      "name": "已退出的归属纠正字段被参数验证拒绝，改为普通问答后不产生专属记录",
+      "evidence": "2026-10-26 independent review reproduced correction-versus-grounding regression; .local/server-audit-20261026/findings.md 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/material-profile-delta.test.mjs",
@@ -704,13 +729,13 @@
     },
     {
       "file": "test/session-integrity.test.mjs",
-      "name": "实际启动：首次核对历史任务，二次启动不stat/read已verified JSONL；分页SQL不扫描任务消息",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+      "name": "实际启动不再读取旧Pi历史或改写其核对状态；离线账本分页索引保留",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/session-integrity.test.mjs",
-      "name": "SQL输入/输出变更和删除留下dirty记录，核对失败留corrupt并隔离房间",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+      "name": "显式离线审计仍发现旧SQL/Pi关联改写并保留corrupt证据",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/session-integrity.test.mjs",
@@ -729,13 +754,13 @@
     },
     {
       "file": "test/session-integrity.test.mjs",
-      "name": "未完成成功JSONL恢复仅补SQL并保留unknown投递，不重发、不调用模型；普通请求前拒绝dirty损坏",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+      "name": "已返回但无最终业务证据的旧Pi/模型运行保持interrupted，完整诊断答案只补SQL且不重发",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/session-integrity.test.mjs",
-      "name": "巡检发现损坏立即关闭本房间后台；数据库错误立即上报服务",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+      "name": "旧Pi损坏保留显式离线审计结果，不隔离房间；真实SQLite操作失败仍停止",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/channel-async.test.mjs",
@@ -754,18 +779,18 @@
     },
     {
       "file": "test/channel-async.test.mjs",
-      "name": "旧SQL损坏隔离一间房并保留新任务，另一个房间继续回答",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+      "name": "SQLite是业务真相，旧Pi关联不再覆盖SQLite原文",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/channel-async.test.mjs",
-      "name": "损坏canonical JSONL只隔离所属房间，不阻止其他房间启动",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+      "name": "损坏canonical JSONL不阻止新聊天或其它房间启动",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/channel-async.test.mjs",
-      "name": "隔离时退回未执行任务遇到持久化失败必须全局停调度并上报",
-      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures."
+      "name": "SQLite领取持久化失败必须全局停调度并上报",
+      "evidence": "2026-10-26 independent architecture review and offline fault injection; .local/long-task-20261026/review-fixes.log; startup scans and unbounded delivery backlog reproduced with local fixtures. 2026-11-06: updated to the approved SQLite-only business state and ordinary-correction contract; legacy files and audit remain preserved."
     },
     {
       "file": "test/channel-task-store.test.mjs",

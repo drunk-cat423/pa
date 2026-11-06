@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +10,7 @@ import { ResearchMaterialReader } from '../dist/research-material-reader.js';
 
 const body = '保存的原文😀'.repeat(900);
 
-for (const bodyProtocol of [false,true]) test(bodyProtocol ? '真实工具循环使用正文协议：重复回执、显式重读和预算接线' : '本地HTTP采集循环：轻量投影启用，完整思考与原始Pi记录保留', async t => {
+for (const bodyProtocol of [false,true]) test(bodyProtocol ? '真实工具循环使用正文协议：重复回执、显式重读和预算接线' : '本地HTTP采集循环：轻量投影启用，完整思考与原始工具证据保留', async t => {
   const enabled=true;
   const directory = await mkdtemp(join(tmpdir(), 'pa-context-'));
   const requests = [], errors = [], recorded = [];
@@ -73,8 +73,8 @@ for (const bodyProtocol of [false,true]) test(bodyProtocol ? '真实工具循环
   assert.deepEqual(thirdTools.map(message => message.tool_call_id), ['read-1', 'read-2']);
   const files = await readdir(join(directory, 'data'), { recursive: true });
   const sessions = files.filter(file => file.endsWith('session.jsonl'));
-  assert.equal(sessions.length, 1);
-  const session = await readFile(join(directory, 'data', sessions[0]), 'utf8');
+  assert.equal(sessions.length, 0);
+  const session = JSON.stringify(recorded);
   // Pi already bounds tool output before saving; this projection must not alter
   // that original bounded output or the independently recorded full material.
   assert.ok(session.includes(body.slice(0, 900))); assert.equal(session.includes('saved_research_material'), false);

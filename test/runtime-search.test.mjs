@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { openConversation } from '../dist/runtime.js';
+import { DiagnosticLog } from '../dist/diagnostics.js';
 import { openRecordedConversation } from '../dist/conversation.js';
 
 test('harness真实Pi自主工具循环、查询实参、普通聊天不自动调用、CLI禁工具、重启不重放搜索', async t => {
@@ -75,7 +76,10 @@ test('harness真实Pi自主工具循环、查询实参、普通聊天不自动�
   const db = new DatabaseSync(join(dataDir, 'pa.sqlite'), { readOnly: true });
   const file = db.prepare('SELECT pi_session_file FROM agent_runs WHERE id=?').get(reply.runId).pi_session_file;
   db.close();
-  assert.match(await readFile(file, 'utf8'), /"role":"toolResult"/);
+  assert.equal(file,null);
+  const log=new DiagnosticLog(dataDir);
+  assert.ok(log.events({traceId:reply.runId}).some(event=>event.event==='tool.finished' && event.details.tool==='web_search'));
+  assert.ok(log.events({traceId:reply.runId}).some(event=>event.event==='turn.completed' && event.details.answer===reply.text));
   await conversation.close();
   const reopened = await openRecordedConversation(config, 'group-search', route); opened.push(reopened);
   const normal = await reopened.prompt('你好', { eventId: 'evt2', senderId: 'user', modelInputText: '你好' });

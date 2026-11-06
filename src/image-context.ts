@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { ImageAssets, StoredImage } from './image-assets.js';
+import { isBailianDeepSeek } from './model-capabilities.js';
 
 export interface MessageImage extends StoredImage {
   quoted?: boolean;
@@ -8,13 +9,60 @@ export interface MessageImage extends StoredImage {
 }
 export type ImageContent = { type: 'text'; text: string } | { type: 'file'; file_id: string; bytes?: number }
   | { type: 'image_url'; image_url: { url: string }; bytes?: number };
-export interface ImageProjection { text: string; content: ImageContent[] }
+export interface ImageProjection {
+  text: string; content: ImageContent[];
+  /** Trusted original metadata, kept off the provider wire for pre-load budgets. */
+  sourceImages?: readonly Pick<MessageImage, 'imageId' | 'bytes'>[];
+}
 export const IMAGE_TOKENS = 1024;
 export const MAX_REQUEST_IMAGES = 600;
 export const MAX_REQUEST_IMAGE_BYTES = 200 * 1024 * 1024;
 export const BAILIAN_MAX_REQUEST_BYTES = 64 * 1024 * 1024;
+export const IMAGE_MAX_PROVIDER_BYTES = 10 * 1024 * 1024;
+export const IMAGE_MAX_PLATFORM_BYTES = 32 * 1024 * 1024;
+export interface ImageMetadataPreflightOptions {
+  provider?: { provider: string; model: string };
+  /** Known non-image serialized request bytes before originals are loaded. */
+  knownRequestBytes?: number;
+  /** Allowance for JSON/provider framing and metadata not included above. */
+  requestHeadroomBytes?: number;
+}
+export interface ImageMetadataPreflight {
+  fits: boolean;
+  reason?: 'invalid_metadata' | 'too_many_images' | 'image_too_large' | 'total_image_bytes' | 'request_bytes';
+  imageCount: number;
+  originalBytes: number;
+  estimatedBase64Bytes: number;
+  estimatedRequestBytes: number;
+}
 const imageIdentity = (block: Exclude<ImageContent, { type: 'text' }>) => block.type === 'file' ? block.file_id
   : `data-${createHash('sha256').update(block.image_url.url).digest('hex')}`;
+
+/** Reject obviously oversized current-turn images using metadata, before reading originals. */
+export function preflightImageMetadata(images: readonly Pick<MessageImage, 'imageId' | 'bytes'>[], options: ImageMetadataPreflightOptions = {}): ImageMetadataPreflight {
+  const byId = new Map<string, number>();
+  for (const image of images) {
+    if (typeof image.imageId !== 'string' || !image.imageId || !Number.isSafeInteger(image.bytes) || image.bytes <= 0)
+      return { fits: false, reason: 'invalid_metadata', imageCount: byId.size, originalBytes: 0, estimatedBase64Bytes: 0, estimatedRequestBytes: 0 };
+    const old = byId.get(image.imageId);
+    if (old !== undefined && old !== image.bytes)
+      return { fits: false, reason: 'invalid_metadata', imageCount: byId.size, originalBytes: 0, estimatedBase64Bytes: 0, estimatedRequestBytes: 0 };
+    byId.set(image.imageId, image.bytes);
+  }
+  const imageCount = byId.size, originalBytes = [...byId.values()].reduce((sum, bytes) => sum + bytes, 0);
+  const estimatedBase64Bytes = [...byId.values()].reduce((sum, bytes) => sum + Math.ceil(bytes / 3) * 4, 0);
+  const knownRequestBytes = options.knownRequestBytes ?? 0, requestHeadroomBytes = options.requestHeadroomBytes ?? 256 * 1024;
+  if (!Number.isSafeInteger(knownRequestBytes) || knownRequestBytes < 0 || !Number.isSafeInteger(requestHeadroomBytes) || requestHeadroomBytes < 0)
+    return { fits: false, reason: 'invalid_metadata', imageCount, originalBytes, estimatedBase64Bytes, estimatedRequestBytes: 0 };
+  const estimatedRequestBytes = knownRequestBytes + estimatedBase64Bytes + requestHeadroomBytes;
+  let reason: ImageMetadataPreflight['reason'];
+  if (imageCount > MAX_REQUEST_IMAGES) reason = 'too_many_images';
+  else if ([...byId.values()].some(bytes => bytes > (options.provider && isBailianDeepSeek(options.provider)
+    ? IMAGE_MAX_PROVIDER_BYTES : IMAGE_MAX_PLATFORM_BYTES))) reason = 'image_too_large';
+  else if (originalBytes > MAX_REQUEST_IMAGE_BYTES) reason = 'total_image_bytes';
+  else if (options.provider && isBailianDeepSeek(options.provider) && estimatedRequestBytes > BAILIAN_MAX_REQUEST_BYTES) reason = 'request_bytes';
+  return { fits: reason === undefined, ...(reason ? { reason } : {}), imageCount, originalBytes, estimatedBase64Bytes, estimatedRequestBytes };
+}
 
 export function imageContent(assets: ImageAssets, image: MessageImage): ImageContent { return assets.content(image); }
 

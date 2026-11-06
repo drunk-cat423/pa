@@ -1,12 +1,12 @@
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
-import { openConversation } from '../dist/runtime.js';
 import { ConversationStore } from '../dist/store.js';
 import { downgradeSchema30 } from './fixtures/legacy-schema.mjs';
 import { conversationMessages, isPreparationRequest, preparationDelta, totalModelCalls } from './fixtures/turn-preparation.mjs';
@@ -249,43 +249,37 @@ test('claim到执行之间关闭时，尚无run的任务安全退回queued，重
   assert.equal(f.tasks()[0].status,'completed');assert.equal(f.totalCalls(),2);
 });
 
-test('旧SQL损坏隔离一间房并保留新任务，另一个房间继续回答',async t=>{
+test('SQLite是业务真相，旧Pi关联不再覆盖SQLite原文',async t=>{
   const f=await fixture(t),h=f.harness();
   assert.equal(await h.handle(f.message('original','原始问题')),'sent');
   const mutator=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
-  try{mutator.db.prepare("UPDATE messages SET text='篡改原文' WHERE external_event_id='original'").run();}
-  finally{mutator.close();}
-  assert.equal(await h.handle(f.message('blocked','原文异常时不可调用模型')),'failed');
-  await h.waitForTasks();
-  assert.equal(f.tasks().find(task=>task.eventId==='blocked').status,'queued');
-  assert.equal(f.totalCalls(),2);
-  assert.equal(h.info().isolatedRooms.length,1);
-  assert.equal(await h.handle(f.message('safe','另一个房间',{route:f.other})),'sent');
+  try{mutator.db.prepare("UPDATE messages SET text='数据库当前原文' WHERE external_event_id='original'").run();}finally{mutator.close();}
+  assert.equal(await h.handle(f.message('next','继续聊天')),'sent');
+  assert.match(JSON.stringify(f.planningRequests.at(-1).body),/数据库当前原文/);
+  assert.ok(f.tasks().every(task=>task.session===null));
+  assert.equal(h.info().persistence.length,1);assert.equal(h.info().persistence[0].status,'ready');
+});
+
+test('损坏canonical JSONL不阻止新聊天或其它房间启动',async t=>{
+  const f=await fixture(t),key=channelConversationKey(f.route);
+  const directory=join(f.config.dataDir,createHash('sha256').update(key).digest('hex'));
+  await mkdir(directory,{recursive:true});await writeFile(join(directory,'session.jsonl'),'{broken\n');
+  const h=f.harness();await h.start();
+  assert.equal(h.info().persistence.length,2);
+  assert.equal(await h.handle(f.message('safe','正常问题',{route:f.other})),'sent');
+  assert.equal(await h.handle(f.message('old-bad','旧文件损坏的房间仍正常')),'sent');
   assert.equal(f.totalCalls(),4);
 });
 
-test('损坏canonical JSONL只隔离所属房间，不阻止其他房间启动',async t=>{
-  const f=await fixture(t);
-  const rt=await openConversation(f.config,channelConversationKey(f.route));
-  const file=rt.info().sessionFile;await rt.close();await writeFile(file,'{broken\n');
-  const h=f.harness();await h.start();
-  assert.equal(h.info().isolatedRooms.length,1);
-  assert.equal(await h.handle(f.message('safe','正常问题',{route:f.other})),'sent');
-  assert.equal(await h.handle(f.message('bad','异常房间问题')),'failed');
-  assert.equal(f.totalCalls(),2);
-});
-
-test('隔离时退回未执行任务遇到持久化失败必须全局停调度并上报',async t=>{
+test('SQLite领取持久化失败必须全局停调度并上报',async t=>{
   const f=await fixture(t);let fatal=0;const h=f.harness(0,()=>fatal++);
   assert.equal(await h.handle(f.message('original','原始问题')),'sent');
-  const mutator=new ConversationStore(join(f.config.dataDir,'pa.sqlite'));
-  try{mutator.db.prepare("UPDATE messages SET text='篡改' WHERE external_event_id='original'").run();}finally{mutator.close();}
-  const release=ConversationStore.prototype.releaseUnstartedChannelTask;
-  ConversationStore.prototype.releaseUnstartedChannelTask=()=>{throw new Error('injected rollback persistence failure');};
+  const claim=ConversationStore.prototype.claimNextChannelTask;
+  ConversationStore.prototype.claimNextChannelTask=()=>{throw new Error('injected claim persistence failure');};
   try{
-    await h.handle(f.message('blocked','新问题')).catch(()=>{});await h.waitForTasks();
+    await assert.rejects(h.handle(f.message('blocked','新问题')),/持久化失败/);await h.waitForTasks();
     assert.equal(fatal,1);
     await assert.rejects(h.handle(f.message('other','另一个房间',{route:f.other})),/持久化失败/);
     assert.equal(f.totalCalls(),2);
-  }finally{ConversationStore.prototype.releaseUnstartedChannelTask=release;}
+  }finally{ConversationStore.prototype.claimNextChannelTask=claim;}
 });

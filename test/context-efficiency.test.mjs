@@ -10,7 +10,7 @@ import test from 'node:test';
 import { ImageAssets, ImageAssetError } from '../dist/image-assets.js';
 import { ContextTokenEstimator, contextFootprint } from '../dist/context-tokens.js';
 import { DiagnosticLog } from '../dist/diagnostics.js';
-import { openRecordedConversation, PersistenceError } from '../dist/conversation.js';
+import { openRecordedConversation } from '../dist/conversation.js';
 import { ConversationStore } from '../dist/store.js';
 import { validateExtract } from '../dist/auto-memory.js';
 import { currentMessage, isPreparationRequest, preparationDelta } from './fixtures/turn-preparation.mjs';
@@ -53,7 +53,7 @@ async function assertLegacyImageRejection(dataDir) {
     // accesses the retained original without adding it to every current payload.
     const store = new ConversationStore(join(dataDir, 'pa.sqlite'));
     try {
-      const room = store.ensureConversation('legacy-image', conversation.info().sessionFile, route);
+      const room = store.ensureConversation('legacy-image', '', route);
       store.autoMemory.reserveBatch(room.id, 'capacity');
       const job = store.autoMemory.claimNext(room.id, { owner: 'fixture', leaseMs: 60000 });
       const frozen = store.autoMemory.taskInput(job);
@@ -67,15 +67,16 @@ async function assertLegacyImageRejection(dataDir) {
     conversation.acknowledge(oversized.deliveryId, 'sent', 'reply-oversized');
     const rejection = requests[2].messages.find(message => message.role === 'tool' && message.tool_call_id === 'read-legacy');
     assert.match(rejection.content, /tool_request_rejected/);
-    assert.match(rejection.content, /图片超过大小或尺寸限制/);
+    assert.match(rejection.content, /本轮图片的单图、数量或总容量已达当前模型限制/);
     const next = await prompt('next', '继续普通问答');
     assert.equal(next.text, 'LOCAL_ANSWER');
     conversation.acknowledge(next.deliveryId, 'sent', 'reply-next');
     const corrupt = Buffer.from(original); corrupt[corrupt.length - 1] ^= 1; fs.writeFileSync(imagePath, corrupt);
-    await assert.rejects(prompt('corrupt', '取旧图（原图已损坏）'), error =>
-      error instanceof PersistenceError && /图片持久化或读取失败/.test(error.message));
-    assert.throws(() => conversation.history(), PersistenceError);
-    assert.equal(requests.length, 7, 'rejected image is recoverable; corrupt original halts without another provider call');
+    const beforeCorrupt=requests.length;
+    const corruptResult=await prompt('corrupt', '取旧图（原图已损坏）');
+    assert.equal(corruptResult.text,'LOCAL_ANSWER');conversation.acknowledge(corruptResult.deliveryId,'sent','reply-corrupt');
+    assert.doesNotThrow(() => conversation.history(), 'corrupt historical image bytes do not block text history');
+    assert.ok(requests.length>beforeCorrupt,'a corrupted historical image does not stop text answering');
   } finally {
     await conversation?.close(); server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));

@@ -78,50 +78,26 @@ test('two rooms sharing one person serialize material snapshots, preserve compre
   await blocked.close();assert.deepEqual(versions,[0,1]);
 });
 
-test('compression incorporates correction lineage and only unmasks the exact captured version, retaining originals',async t=>{
+test('普通纠正不另建归属记录，压缩保留原文、最新摘要及旧版本',async t=>{
   const f=fixture(t),original=f.inbound(f.a,'Alice 喜欢喝咖啡');
   const compress=async summary=>{
     assert.ok(f.store.autoMemory.reserveCompressionBatch(f.a.id));
     const worker=f.worker(f.a,{extract:async input=>{
-      const wire=prepareMemoryWireExtraction(input,1000000);
-      if(summary==='纠正后的摘要') {
-        const payload=JSON.parse(wire.userContent);
-        assert.equal(payload.summaryCorrections[0].correctedMessages[0].text,'Alice 喜欢喝咖啡');
-        assert.equal(payload.summaryCorrections[0].source.senderId,'alice');
-        assert.ok(wire.systemPrompt.includes('summaryCorrections'));
-      }
+      const wire=prepareMemoryWireExtraction(input,1000000),payload=JSON.parse(wire.userContent);
+      assert.ok(!payload.summaryCorrections?.length);
       return emptyExtraction(input,summary);
     }});
     worker.start();await worker.wait(undefined,3000,'compression');await worker.close();
   };
   await compress('Alice 喜欢咖啡');
-  const policy={version:1,ownerBindings:[{route:f.route('a'),senderId:'alice'}]};
-  const correct=(text,target)=>{
-    const source=f.inbound(f.a,text);
-    f.store.prepareTurn(f.a.id,source,{intent:'question',mode:'standard',updates:[{target:'room_memory',content:text,
-      attribution:{kind:'correction',subjectSenderIds:['alice'],excludedSenderIds:[],correctsMessageIds:[target]}}]},policy);
-    return source;
-  };
-  const correction=correct('Alice 不喜欢咖啡，之前说错了',original);
-  assert.equal(f.store.roomFactContext(f.a.id).summaryInvalidated,true);
-  await compress('纠正后的摘要');
-  assert.equal(f.store.roomFactContext(f.a.id).summaryInvalidated,false);
-  f.inbound(f.a,'无关的新聊天');
-  assert.equal(f.store.roomFactContext(f.a.id).summaryInvalidated,false);
-  assert.ok(f.store.autoMemory.reserveCompressionBatch(f.a.id));
-  const job=f.store.autoMemory.claimNext(f.a.id,{owner:'held',leaseMs:10000,pipeline:'compression'});
-  const frozen=f.store.autoMemory.taskInput(job);
-  correct('Alice 现在又开始喜欢咖啡了',correction);
-  f.store.autoMemory.commit(job.id,job.leaseToken,emptyExtraction(frozen,'旧快照整理'));
-  assert.equal(f.store.roomFactContext(f.a.id).summaryInvalidated,true,'late correction must not be acknowledged by an older snapshot');
-  await compress('最新纠正摘要');
-  assert.equal(f.store.roomFactContext(f.a.id).summaryInvalidated,false);
-  // Older frozen jobs have no proof that corrections were supplied to the model.
-  f.inbound(f.a,'再聊一句');f.store.autoMemory.reserveCompressionBatch(f.a.id);
-  const old=f.store.autoMemory.claimNext(f.a.id,{owner:'old',leaseMs:10000,pipeline:'compression'}),oldInput=f.store.autoMemory.taskInput(old);
-  delete oldInput.summaryCorrections;
-  f.inspect(db=>db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=?').run(JSON.stringify(oldInput),old.id));
-  f.store.autoMemory.commit(old.id,old.leaseToken,emptyExtraction(oldInput,'旧协议摘要'));
-  assert.equal(f.store.roomFactContext(f.a.id).summaryInvalidated,true);
+  const correction=f.inbound(f.a,'Alice 不喜欢咖啡，之前说错了');
+  f.store.prepareTurn(f.a.id,correction,{intent:'question',mode:'standard',updates:[]},{version:1,ownerBindings:[]});
+  assert.equal(f.inspect(db=>db.prepare('SELECT count(*) n FROM memory_fact_attributions').get().n),0);
+  assert.equal(f.store.autoMemory.conversationContext(f.a.id).summary,'Alice 喜欢咖啡');
+  await compress('Alice 不喜欢咖啡，先前说法已在聊天中纠正');
+  const current=f.store.autoMemory.conversationContext(f.a.id);
+  assert.equal(current.summary,'Alice 不喜欢咖啡，先前说法已在聊天中纠正');
   assert.equal(f.inspect(db=>db.prepare('SELECT text FROM messages WHERE id=?').get(original).text),'Alice 喜欢喝咖啡');
+  assert.equal(f.inspect(db=>db.prepare('SELECT text FROM messages WHERE id=?').get(correction).text),'Alice 不喜欢咖啡，之前说错了');
+  assert.equal(f.inspect(db=>db.prepare("SELECT count(*) n FROM auto_memory_jobs WHERE status='done'").get().n),2);
 });

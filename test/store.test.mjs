@@ -24,7 +24,7 @@ test('schema启用WAL与外键，会话和消息重开后持久化并隔离', ()
     const run = f.store.beginRun(first.id, '保留原始内容 🙂', 'provider', 'model');
     f.store.completeRun(run.id, '回复', 'pi-user-1', 'pi-assistant-1');
     assert.equal(f.store.ensureConversation('alpha', '/pi/alpha.jsonl').id, first.id);
-    assert.throws(() => f.store.ensureConversation('alpha', '/changed.jsonl'), /不同的 Pi session/);
+    assert.equal(f.store.ensureConversation('alpha', '/changed.jsonl').piSessionFile, '/pi/alpha.jsonl', 'legacy Pi path is retained for audit and cannot override SQLite conversation identity');
     assert.deepEqual(f.store.listMessages('beta', 10), []);
     f.store.close();
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -82,9 +82,12 @@ test('真实请求追加受限完整记忆、固定system不变、SQL usage只�
     .map(row => ({ ...row })), items.map(({ id, revision }) => ({ id, revision })).sort((a, b) => a.id.localeCompare(b.id)));
   assert.equal(conversation.history().length, 4, 'custom memory must not become a SQL user message');
   assert.equal(conversation.history()[2].text, '整句未命中，仍应取最近记忆');
-  const entries = (await readFile(conversation.info().sessionFile, 'utf8')).trim().split('\n').map(JSON.parse);
-  assert.equal(entries.filter(entry => entry.type === 'custom_message' && entry.customType === 'pa_memory').length, 1);
+  assert.equal(conversation.info().sessionFile,undefined);
+  assert.equal(db.prepare('SELECT pi_session_file FROM agent_runs WHERE id=?').get(response.runId).pi_session_file,null);
   await conversation.close();
+  const management = await f.memory('recall');
+  assert.equal(management.query().length,12, 'standalone memory management opens a SQLite-only conversation');
+  await management.close();
   const reopened = await f.conversation('recall');
-  assert.equal(reopened.history().length, 4, 'custom memory must not break Pi/SQL integrity');
+  assert.equal(reopened.history().length, 4, 'explicit memories and original SQL messages survive restart');
 });

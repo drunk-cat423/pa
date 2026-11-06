@@ -6,6 +6,27 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { startPublisher } from '../scripts/deployment/pa-publisher.mjs';
+import { selectChangedTests } from '../scripts/repo-check-scopes.mjs';
+
+test('source-only publication selects existing regressions and includes new tests in the same acceptance', async () => {
+  const root=await mkdtemp(join(tmpdir(),'pa-publish-tests-'));
+  try {
+    await mkdir(join(root,'test'));
+    for(const name of ['runtime-search.test.mjs','runtime-cache-prefix.test.mjs','new-incident.test.mjs']) await writeFile(join(root,'test',name),'');
+    const related=selectChangedTests(root,['src/web-search.ts','test/new-incident.test.mjs']);
+    assert.ok(related.files.includes('runtime-search.test.mjs'));
+    assert.ok(related.files.includes('new-incident.test.mjs'));
+    assert.ok(related.files.includes('runtime-cache-prefix.test.mjs'));
+    assert.equal(new Set(related.files).size,related.files.length);
+    assert.deepEqual(selectChangedTests(root,['src/unknown-new-module.ts']).files,
+      ['new-incident.test.mjs','runtime-cache-prefix.test.mjs','runtime-search.test.mjs']);
+    assert.deepEqual(selectChangedTests(root,['test/new-incident.test.mjs']).files,['new-incident.test.mjs']);
+    assert.deepEqual(selectChangedTests(root,['docs/usage.md']).files,[]);
+    assert.deepEqual(selectChangedTests(root,['test/fixtures/request-text.mjs']).files,
+      ['new-incident.test.mjs','runtime-cache-prefix.test.mjs','runtime-search.test.mjs']);
+    assert.ok(!selectChangedTests(root,['src/web-search.ts','test/deleted.test.mjs']).files.includes('deleted.test.mjs'));
+  }finally{await rm(root,{recursive:true,force:true});}
+});
 
 test('publisher freezes exact repair, waits for sent acknowledgement, and resumes a running release once', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pa-publisher-'));

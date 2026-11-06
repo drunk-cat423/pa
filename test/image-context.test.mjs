@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -10,6 +10,8 @@ import { normalizeQQMessage } from '../dist/qq-channel.js';
 import { ChannelHarness, channelConversationKey } from '../dist/channel-harness.js';
 import { ConversationStore } from '../dist/store.js';
 import { createMemoryProvider } from '../dist/memory-provider.js';
+import { preflightImageMetadata, BAILIAN_MAX_REQUEST_BYTES } from '../dist/image-context.js';
+import { ImageAssets } from '../dist/image-assets.js';
 import { validateExtract } from '../dist/auto-memory.js';
 import { messageText } from './fixtures/conversation-context.mjs';
 import { preparationDelta } from './fixtures/turn-preparation.mjs';
@@ -17,9 +19,50 @@ import { preparationDelta } from './fixtures/turn-preparation.mjs';
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=','base64');
 const imageId=createHash('sha256').update(png).digest('hex');
 const history=body=>body.messages.find(message=>messageText(message).startsWith('[最近一次会话压缩摘要]'));
+const historyText=body=>history(body)?.content.map(block=>block.type==='text'?block.text:'').join('')??'';
 const files=body=>body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='file'):[]);
 
-test('QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、重启与容量摘要，按房间重新读取',async t=>{
+test('read_image rejects cumulative inline-image overflow before loading the next original',async t=>{
+  const dir=await mkdtemp(join(tmpdir(),'pa-image-preload-')),loaded=[],requests=[],errors=[];
+  // Large trusted metadata exercises ordering without allocating large image buffers.
+  const images=Array.from({length:5},(_,i)=>({imageId:String(i+1).repeat(64),fileId:`local-${String(i+1).repeat(64)}`,
+    mimeType:'image/png',bytes:10*1024*1024,width:1,height:1,tokenEstimate:1024}));
+  t.mock.method(ImageAssets.prototype,'prepare',async source=>images[Number(source.url.split('/').at(-1))]);
+  t.mock.method(ImageAssets.prototype,'loadContent',function(id){
+    loaded.push(id);const image=images.find(item=>item.imageId===id);
+    return {image,content:{type:'image_url',image_url:{url:`data:image/png;base64,${png.toString('base64')}`},bytes:image.bytes}};
+  });
+  const server=createServer(async(req,res)=>{
+    try {
+      let raw='';for await(const part of req)raw+=part;const body=JSON.parse(raw);requests.push(body);
+      const n=requests.length;
+      const delta=n===1?preparationDelta('prepare-budget'):n===2?{role:'assistant',tool_calls:[{index:0,id:'read-overflow',type:'function',
+        function:{name:'read_image',arguments:JSON.stringify({imageId:images[4].imageId})}}]}:{role:'assistant',content:'本轮图片容量已满，先处理已经看到的图片。'};
+      if(n===3)assert.match(JSON.stringify(body.messages),/本轮图片的单图、数量或总容量/);
+      res.writeHead(200,{'content-type':'text/event-stream'});
+      res.write(`data: ${JSON.stringify({id:'budget',model:body.model,choices:[{index:0,delta,finish_reason:null}]})}\n\n`);
+      res.end(`data: ${JSON.stringify({id:'budget',model:body.model,choices:[{index:0,delta:{},finish_reason:n===1||n===2?'tool_calls':'stop'}]})}\n\ndata: [DONE]\n\n`);
+    }catch(error){errors.push(error);res.writeHead(500);res.end('fixture error');}
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const config={cwd:dir,dataDir:join(dir,'data'),provider:'bailian',model:'deepseek-v4.1-flash-1017',apiKey:'fixture',
+    baseUrl:`http://127.0.0.1:${server.address().port}/v1`,contextWindow:1000000,maxOutputTokens:512,timeoutMs:5000};
+  const route={channel:'qq',accountId:'budget',roomType:'group',roomId:'room'};
+  const h=new ChannelHarness(config,[route],{send:async()=>({status:'sent',externalMessageId:'sent'})},0);
+  try {
+    await h.prepare();
+    const store=new ConversationStore(join(config.dataDir,'pa.sqlite'));
+    try {const room=store.ensureConversation(channelConversationKey(route),'',route);
+      store.recordInbound(room.id,'旧图片',{eventId:'old-image',senderId:'owner',modelInputText:'旧图片',images:[images[4]]});
+    }finally{store.close();}
+    await h.start();
+    assert.equal(await h.handle({route,eventId:'current-images',senderId:'owner',text:'看看图片',mentioned:true,sentAt:new Date().toISOString(),
+      imageSources:images.slice(0,4).map((_,i)=>({url:`https://multimedia.nt.qq.com.cn/${i}`}))}),'sent');
+    assert.equal(requests.length,3);assert.equal(loaded.length,4);assert.ok(!loaded.includes(images[4].imageId));assert.deepEqual(errors,[]);
+  }finally{await h.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await rm(dir,{recursive:true,force:true});}
+});
+
+test('QQ引用原图只进入当前请求，历史与容量摘要保留引用并可按房间重新读取',async t=>{
   const dir=await mkdtemp(join(tmpdir(),'pa-vision-context-')),requests=[],memoryRequests=[],sent=[];
   let uploads=0,downloads=0,sendGate,sendStarted,downloadStarted;
   const server=createServer(async(req,res)=>{
@@ -32,7 +75,7 @@ test('QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、
       memoryRequests.push(body);const input=JSON.parse(raw);
       delta={role:'assistant',content:JSON.stringify({
         ...(input.extractionProtocol === 2 ? {} : {ignoredMessageIds:input.messages.filter(message=>message.role==='user').map(message=>message.id),fragments:[]}),
-        topics:[],profiles:[],continuationSummary:`图中为一张小图，原图imageId=${imageId}`,
+        topics:[],profiles:[],continuationSummary:`原图尚未重新查看，可通过imageId=${imageId}调用read_image回查。`,
         ...(input.selfProfile ? {selfProfile:{baseVersion:input.selfProfile.baseVersion,content:input.selfProfile.content,updates:[],pendingIds:[]}} : {})})};
     }else{
       requests.push(body);
@@ -70,12 +113,15 @@ test('QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、
   assert.doesNotMatch(JSON.stringify(requests),/PRIVATE_SIGNED|PRIVATE_AUTH|data:image|base64/);
   const message=(eventId,text,extra={})=>({route,eventId,text,senderId:'asker',sentAt:new Date().toISOString(),mentioned:true,...extra});
   assert.equal(await h.handle(message('followup','再解释一下',{quote:{messageId:'quote-1'}})),'sent');
-  assert.equal(files(requests.at(-1)).length,1);
-  const prior=history(requests.at(-1)).content;
+  assert.equal(files(requests.at(-1)).length,1,'当前消息明确引用附件时发送原图');
+  const prior=historyText(requests.at(-1));
   assert.equal(await h.handle(message('followup-2','继续解释')),'sent');
-  assert.deepEqual(history(requests.at(-1)).content.slice(0,prior.length),prior);
+  assert.equal(files(requests.at(-1)).length,0,'普通问答不展开历史原图');
+  assert.match(JSON.stringify(requests.at(-1)),new RegExp(imageId),'历史仍带可回查imageId');
+  assert.ok(historyText(requests.at(-1)).startsWith(prior.slice(0,80)),'previous history prefix remains intact');
   assert.equal(uploads,1);await h.close();
-  h=open();assert.equal(await h.handle(message('restart','继续看图')),'sent');assert.equal(files(requests.at(-1)).length,1);
+  h=open();assert.equal(await h.handle(message('restart','继续看图')),'sent');assert.equal(files(requests.at(-1)).length,0,'重启后普通问答不展开历史原图');
+  assert.match(JSON.stringify(requests.at(-1)),new RegExp(imageId));assert.match(JSON.stringify(requests.at(-1)),/图片回答/);
   assert.equal(uploads,1);assert.equal(downloads,1);
   const beforeObserved=requests.length;
   const observed=normalizeQQMessage({op:0,t:'GROUP_MESSAGE_CREATE',d:{id:'image-only',group_openid:'room',author:{member_openid:'photographer'},timestamp:new Date().toISOString(),attachments:[{content_type:'image/png',url:'https://multimedia.nt.qq.com.cn/image'}]}},'account','bot');
@@ -99,9 +145,23 @@ test('QQ引用原图经过持久资产、真实Pi准备/回答、稳定历史、
   assert.equal(frozen.messages.find(message=>message.id===quoteMessage.id).images[0].fileId,'file-api-fixture-1');
   assert.equal(frozen.messages.find(message=>message.text==='失败的原始问题').imageFailure,'download');
   assert.equal(frozen.messages.find(message=>message.text==='').images.length,1);
-  const extracted=await createMemoryProvider(config).extract(frozen,new AbortController().signal);
-  assert.equal(memoryRequests.length,1);assert.equal(files(memoryRequests[0]).length,1);
+  const metadata=frozen.messages.flatMap(message=>message.images??[]);
+  assert.ok(metadata.some(image=>image.imageId===imageId));
+  const preflight=preflightImageMetadata(metadata,{provider:{provider:'bailian',model:'deepseek-v4.1-flash-1017'}});
+  assert.equal(preflight.fits,true);assert.ok(preflight.imageCount<metadata.length,'repeated imageId is budgeted once');
+  const oversized=preflightImageMetadata([{imageId,bytes:10*1024*1024+1}],{provider:{provider:'bailian',model:'deepseek-v4.1-flash-1017'}});
+  assert.equal(oversized.fits,false);assert.equal(oversized.reason,'image_too_large');
+  assert.equal(preflightImageMetadata([{imageId,bytes:10*1024*1024+1}],{provider:{provider:'deepseek',model:'deepseek-flash'}}).fits,true);
+  assert.equal(preflightImageMetadata([{imageId,bytes:32*1024*1024+1}]).reason,'image_too_large');
+  assert.equal(preflightImageMetadata([{imageId,bytes:1}],{provider:{provider:'bailian',model:'deepseek-v4.1-flash-1017'},knownRequestBytes:BAILIAN_MAX_REQUEST_BYTES}).reason,'request_bytes');
+  const imagePath=join(config.dataDir,'images',`${imageId}.bin`),originalImage=await readFile(imagePath),corruptImage=Buffer.from(originalImage);corruptImage[corruptImage.length-1]^=1;
+  await writeFile(imagePath,corruptImage);
+  let extracted;
+  try { extracted=await createMemoryProvider(config).extract(frozen,new AbortController().signal); }
+  finally { await writeFile(imagePath,originalImage); }
+  assert.equal(memoryRequests.length,1);assert.equal(files(memoryRequests[0]).length,0,'后台整理不读取或发送历史原图');
   assert.match(JSON.stringify(memoryRequests[0]),new RegExp(imageId));
+  assert.match(JSON.stringify(memoryRequests[0]),/只使用消息文字和已经存在的识图回答/);
   store.autoMemory.commit(claimed.id,claimed.leaseToken,validateExtract(extracted,frozen));
   assert.equal(store.autoMemory.conversationContext(room.id).messages.length,0);
   assert.equal(store.listMessages(channelConversationKey(route),100,route).find(message=>message.id===quoteMessage.id).text,quoteMessage.text);

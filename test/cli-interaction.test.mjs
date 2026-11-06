@@ -18,7 +18,8 @@ test('实际 CLI 多轮输入、管理指令、退出及重启恢复', { timeout
     requests.push(body);
     const users = body.messages.filter(message => message.role === 'user')
       .map(message => typeof message.content === 'string' ? message.content : message.content.map(part => part.text ?? '').join(''));
-    const answer = users.map(requestText).join('|');
+    const history = users.filter(raw => raw.startsWith('[最近一次会话压缩摘要]')).flatMap(raw => raw.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line)).filter(item => item.role === 'user').map(item => item.text));
+    const answer = [...history, requestText(users.at(-1))].join('|');
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     response.write(`data: ${JSON.stringify({ id: 'cli-test', object: 'chat.completion.chunk', model: 'cli-model', choices: [{ index: 0, delta: { role: 'assistant', content: answer }, finish_reason: null }] })}\n\n`);
     response.write(`data: ${JSON.stringify({ id: 'cli-test', object: 'chat.completion.chunk', model: 'cli-model', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
@@ -75,7 +76,7 @@ test('实际 CLI 多轮输入、管理指令、退出及重启恢复', { timeout
   assert.match(first, /伙伴 > alpha\s/);
   assert.match(first, /伙伴 > alpha\|beta/);
   assert.match(first, /"tools": \[\]/);
-  assert.match(first, /"messageCount": 4/);
+  assert.match(first, /"messageCount": 2/);
   const admin = await run(['--conversation', 'admin'], '/memory remember room 群内约定\n/memory remember me 私人画像\n/memory query\n/exit\n');
   assert.match(admin, /群内约定/);
   assert.doesNotMatch(admin, /私人画像/);

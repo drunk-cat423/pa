@@ -17,7 +17,7 @@ export async function openMemory(dataDir: string, conversationKey: string): Prom
   try {
     const openedStore = new ConversationStore(join(dataDir, 'pa.sqlite'));
     store = openedStore;
-    const conversation = openedStore.ensureConversation(conversationKey, join(lock.directory, 'session.jsonl'));
+    const conversation = openedStore.ensureConversation(conversationKey, '');
     let closed = false;
     let broken = false;
     let closePromise: Promise<void> | undefined;

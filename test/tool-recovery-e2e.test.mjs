@@ -41,7 +41,7 @@ test('真实Pi循环：准备schema和跨目标字段被拒后可修正，未保
     if(n===1)return call('prepare_turn',{intent:'question',mode:'invalid',updates:[]},'schema');
     if(n===2){assert.equal(conversationMessages(body).at(-1).role,'tool');return preparationDelta('business',{
       intent:'question',mode:'standard',updates:[{target:'ai_self',content:'轻松一点',attribution:{kind:'statement',subjectSenderIds:[],excludedSenderIds:[],correctsMessageIds:[]}}]});}
-    if(n===3){assert.match(JSON.stringify(body.messages),/群事实归属信息无效/);return preparationDelta('valid');}
+    if(n===3){assert.equal(preparations,0);assert.equal(conversationMessages(body).at(-1).role,'tool');return preparationDelta('valid');}
     if(n===4)return {role:'assistant',content:'你可以在设置中修改。记下了。'};
     assert.equal(n,5);assert.equal(body.tool_choice,'none');
     const control=body.messages.at(-1).content;

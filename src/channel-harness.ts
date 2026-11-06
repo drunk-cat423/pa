@@ -14,7 +14,6 @@ import { appendReferenceUrls, splitReply, QQ_PASSIVE_REPLY_LIMIT } from './reply
 import { splitMarkdown } from './markdown-chunks.js';
 import { ImageAssets, ImageAssetError } from './image-assets.js';
 import { ResearchService } from './research-service.js';
-import { SessionIntegrityError } from './session-integrity.js';
 import {ReminderService} from './reminder-service.js';
 import {TrendingService} from './trending-service.js';
 import { CodexService, codexPrivateOwner } from './codex-service.js';
@@ -44,7 +43,6 @@ export class ChannelHarness {
   // retain only resolvers; the production ingress returns after admission.
   private readonly waiters = new Map<string, { key: string; resolve: (value: HarnessResult) => void; reject: (error: unknown) => void }>();
   private readonly busyRooms = new Map<string,string>();
-  private readonly isolatedRooms = new Map<string, string>();
   private nextRoom = 0;
   private readonly jobs = new Set<Promise<unknown>>();
   private computing = 0;
@@ -80,20 +78,20 @@ export class ChannelHarness {
       const owner = codexPrivateOwner(this.policy, routes);
       this.codex = new CodexService(config, owner, () => {
         const key = channelConversationKey(owner.route);
-        return this.started && this.runAllowed() && !this.closed && !this.fatal && !this.isolatedRooms.has(key)
-          && this.conversations.get(key)?.integrityStatus().status === 'healthy';
+        return this.started && this.runAllowed() && !this.closed && !this.fatal
+          && this.conversations.get(key)?.persistenceStatus().status === 'ready';
       }, message => this.output(message.route, () => this.closed ? Promise.resolve({ status: 'rejected' as const }) : this.transport.send(message)));
     }
     this.reminders=new ReminderService(config,
       ()=>this.routes.filter(route=>{
         const key=channelConversationKey(route),room=this.conversations.get(key);
-        return this.started&&this.runAllowed()&&!this.closed&&!this.fatal&&!this.isolatedRooms.has(key)&&room?.integrityStatus().status==='healthy';
+        return this.started&&this.runAllowed()&&!this.closed&&!this.fatal&&room?.persistenceStatus().status==='ready';
       }), (route,operation)=>this.output(route,operation),message=>this.transport.send(message),
       error=>{this.fatal=error;this.onTaskError?.();}, Date.now, () => this.started && this.runAllowed());
     if(config.trending?.enabled)this.trending=new TrendingService(config,routes,
       ()=>this.routes.filter(route=>{
         const key=channelConversationKey(route),room=this.conversations.get(key);
-        return this.started&&this.runAllowed()&&!this.closed&&!this.fatal&&!this.isolatedRooms.has(key)&&room?.integrityStatus().status==='healthy';
+        return this.started&&this.runAllowed()&&!this.closed&&!this.fatal&&room?.persistenceStatus().status==='ready';
       }),(route,operation)=>this.output(route,operation),message=>this.transport.send(message),
       error=>{this.fatal=error;this.onTaskError?.();}, {}, () => this.started && this.runAllowed());
     if (config.research?.enabled) this.research = new ResearchService(config, routes,
@@ -105,8 +103,7 @@ export class ChannelHarness {
   info() { return { calls: this.calls, maxCalls: this.maxCalls, computing: this.computing,
     queued: [...this.conversations.values()].reduce((n,c) => n+c.queuedTaskCount(),0),
     deliveringRooms: this.outputs.size, outstandingRooms: this.busyRooms.size,
-    isolatedRooms: [...this.isolatedRooms].map(([conversation,error]) => ({conversation,error})),
-    integrity: [...this.conversations].map(([conversation,c]) => ({conversation,...c.integrityStatus()})),
+    persistence: [...this.conversations].map(([conversation,c]) => ({conversation,...c.persistenceStatus()})),
     ...(this.research ? { research: this.research.info() } : {}),
     reminders:this.reminders.info(),
     ...(this.trending?{trending:this.trending.info()}:{}),
@@ -129,8 +126,7 @@ export class ChannelHarness {
     if (!this.closed) {
       await Promise.all(this.routes.map(async route => {
         const key=channelConversationKey(route);
-        try { await this.open(key,route); }
-        catch(error) { if (!(error instanceof SessionIntegrityError)) throw error; this.isolate(key,error); }
+        await this.open(key,route);
       }));
       this.research?.prepare();
       this.reminders.prepare();
@@ -159,10 +155,6 @@ export class ChannelHarness {
         { persons: configuredPersons(this.policy), policy: this.policy, storeInitialization:this.storeInitialization,
           backgroundAllowed: () => this.started && this.runAllowed() && !this.closed,
           ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}),
-          onIntegrityFailure:error=>{
-            if(error instanceof SessionIntegrityError) this.isolate(key,error);
-            else {this.fatal=error;this.onTaskError?.();}
-          },
           reminderContext:(conversationId,sourceId)=>this.reminders.context(conversationId,sourceId),
           ...(this.codex?.matches(route) ? { codexContext: (sourceId: string, senderId: string) => this.codex!.context(route, senderId, sourceId) } : {}),
           ...(this.research ? { researchContext: (conversationId, sourceId, send) => this.research!.context(conversationId, sourceId, send) } : {}) });
@@ -188,21 +180,14 @@ export class ChannelHarness {
       ...(message.quote ? { quote: { ...message.quote,
         ...(message.quote.inlineMessages ? { inlineMessages: message.quote.inlineMessages.map(item => ({ ...item })) } : {}) } } : {}) };
     // Serialize only admission/preparation; model and complete output queues remain independent.
-    const admitted = (this.admissions.get(key) ?? Promise.resolve()).then(() => this.accept(key, input,options.waitForResult!==false))
-      .catch(error=>{
-        if(!(error instanceof SessionIntegrityError)) throw error;
-        this.isolate(key,error);return 'failed' as const;
-      });
+    const admitted = (this.admissions.get(key) ?? Promise.resolve()).then(() => this.accept(key, input,options.waitForResult!==false));
     this.admissions.set(key, admitted.then(() => undefined, () => undefined));
     return admitted.then(result => this.closed ? 'ignored' : typeof result === 'function' ? result() : result);
   }
 
   private async accept(key: string, message: InboundMessage, waitForResult: boolean): Promise<HarnessResult | (() => Promise<HarnessResult>)> {
     if (this.fatal) throw this.fatal;
-    if (this.isolatedRooms.has(key)) return 'failed';
-    let conversation: RecordedConversation;
-    try { conversation=await this.open(key,message.route); }
-    catch(error) { if (!(error instanceof SessionIntegrityError)) throw error; this.isolate(key,error); return 'failed'; }
+    const conversation = await this.open(key,message.route);
     if (this.closed) return 'ignored';
     if (conversation.hasInbound(message.eventId)) return 'duplicate';
     if (message.imageSources?.length) {
@@ -244,14 +229,6 @@ export class ChannelHarness {
     };
   }
 
-  private isolate(key: string,error: SessionIntegrityError): void {
-    this.isolatedRooms.set(key,error.message);
-    // Queued tasks remain durable; callers must not wait forever for an isolated room.
-    for (const [id,waiting] of this.waiters) {
-      if(waiting.key===key) {waiting.resolve('failed'); this.waiters.delete(id);}
-    }
-  }
-
   private pump(): void {
     while (this.started && this.runAllowed() && !this.closed && !this.fatal && this.computing < (this.config.tasks?.maxConcurrent ?? 2)) {
       let selected: {key: string; conversation: RecordedConversation; task: ReturnType<RecordedConversation['claimNextTask']>} | undefined;
@@ -260,10 +237,8 @@ export class ChannelHarness {
           const index=(this.nextRoom+checked)%this.routes.length;
           const key=channelConversationKey(this.routes[index]!);
           const conversation=this.conversations.get(key);
-          if(!conversation||this.busyRooms.has(key)||this.outputs.has(key)||this.isolatedRooms.has(key)) continue;
-          let task: ReturnType<RecordedConversation['claimNextTask']>;
-          try {task=conversation.claimNextTask();}
-          catch(error) {if(!(error instanceof SessionIntegrityError)) throw error;this.isolate(key,error);continue;}
+          if(!conversation||this.busyRooms.has(key)||this.outputs.has(key)) continue;
+          const task=conversation.claimNextTask();
           if(!task) continue;
           this.nextRoom=(index+1)%this.routes.length;
           selected={key,conversation,task}; break;
@@ -284,14 +259,6 @@ export class ChannelHarness {
           this.waiters.get(task.id)?.resolve(result);
           this.onTaskResult?.(result);
         }).catch(error => {
-          if(error instanceof SessionIntegrityError) {
-            try {conversation.releaseUnstartedTask(task.id);}
-            catch(persistenceError) {error=persistenceError;}
-          }
-          if(error instanceof SessionIntegrityError) {
-            this.isolate(key,error);this.waiters.get(task.id)?.resolve('failed');this.onTaskResult?.('failed');
-            return;
-          }
           this.fatal=error;
           for(const waiting of this.waiters.values()) waiting.reject(error);
           this.waiters.clear(); this.onTaskError?.();

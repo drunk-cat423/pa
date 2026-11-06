@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdtemp,rm,readFile} from 'node:fs/promises';
+import {mkdtemp,rm} from 'node:fs/promises';
 import {createServer} from 'node:http';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -95,21 +95,17 @@ test('同一真人消息可提交两段摘录并在两次模型调用内完成�
   ]) assert.throws(()=>bindAnswerGrounding(plan([excerpts[0],second]).grounding,correctedContext));
 });
 
-test('同轮纠正不再引用已否定旧说法，拒绝发生在保存之前且核验保留已保存纠正',async t=>{
+test('已退出的归属纠正字段被参数验证拒绝，改为普通问答后不产生专属记录',async t=>{
   let saves=0;
-  const correction={memoryId:'correction',sourceMessageId:'now',speakerSenderId:'owner',subjectSenderIds:['owner'],excludedSenderIds:['chocolate'],correctsMessageIds:['other-old']};
   const f=await fixture(t,(body,n)=>{
-    if(n===1)return preparationDelta('invalid',{...plan(),updates:[{target:'room_memory',content:'纠正归属',attribution:{kind:'correction',
+    if(n===1)return preparationDelta('invalid',{...plan([]),updates:[{target:'room_memory',content:'纠正归属',attribution:{kind:'correction',
       subjectSenderIds:['owner'],excludedSenderIds:['chocolate'],correctsMessageIds:['source']}}]});
-    if(n===2){assert.equal(saves,0);assert.match(JSON.stringify(body.messages),/正在纠正的旧说法/);return preparationDelta('valid',plan());}
-    if(n===3)return {role:'assistant',content:'巧克力那款插件。'};
-    assert.equal(n,4);const content=body.messages.at(-1).content;
-    const packet=JSON.parse(typeof content==='string'?content:content.map(p=>p.text??'').join(''));
-    assert.deepEqual(packet.corrections,[correction]);return {role:'assistant',content:'{"status":"ok"}'};
+    if(n===2){assert.equal(saves,0);assert.ok(body.messages.some(message=>message.role==='tool')); return preparationDelta('valid',plan([]));}
+    assert.equal(n,3);return {role:'assistant',content:'明白，刚才说的是巧克力。'};
   });
   const runtime=await f.open('same-turn-correction'),meta=metadata();
-  meta.companionTools.prepareTurn=p=>{saves++;return {prepared:true,mode:p.mode,saved:[],attributionCorrections:[correction]};};
-  assert.equal(await runtime.prompt('纠正归属',meta),'巧克力那款插件。');assert.equal(saves,1);assert.equal(f.requests.length,4);
+  meta.companionTools.prepareTurn=p=>{saves++;assert.deepEqual(p.updates,[]);return {prepared:true,mode:p.mode,saved:[]};};
+  assert.equal(await runtime.prompt('纠正归属',meta),'明白，刚才说的是巧克力。');assert.equal(saves,1);assert.equal(f.requests.length,3);
 });
 
 test('跨人物经历才进入有界无工具核验，修正回复和原始草稿均保留且前缀不重排',async t=>{
@@ -131,7 +127,10 @@ test('跨人物经历才进入有界无工具核验，修正回复和原始草�
   const systems=f.requests.slice(0,2).map(r=>r.messages.find(m=>m.role==='system').content);
   assert.ok(systems[0].startsWith('你是用户的个人对话伙伴。'));assert.ok(systems[1].startsWith('你是用户的个人对话伙伴。'));
   assert.equal(runtime.recordedTurns().at(-1).assistant.text,answer);
-  const session=await readFile(runtime.info().sessionFile,'utf8');assert.match(session,/你之前那个8小时/);assert.match(session,/巧克力刚才/);
+  const log=new DiagnosticLog(join(f.directory,'data'));
+  const evidence=JSON.stringify(log.calls().map(call=>log.artifact(call.callId,'response')));
+  assert.match(evidence,/你之前那个8小时/);assert.match(evidence,/巧克力刚才/);
+  assert.equal(runtime.info().sessionFile,undefined);
   const plain=runtime.estimate('下一轮',undefined,{channel:true});
   const larger=runtime.estimate('下一轮',undefined,{channel:true,conversationContext:'新增背景'.repeat(2000)});
   assert.ok(larger.inputTokens>plain.inputTokens+5000);

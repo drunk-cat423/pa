@@ -242,12 +242,18 @@ function statusProjection(path, findings, expectedPid) {
     if(raw.research&&typeof raw.research==='object'&&typeof raw.research.failed==='boolean'){
       out.research={failed:raw.research.failed};if(raw.research.failed){findings.push(finding('research_worker_failed','attention','Research worker reports a failure.'));findings.push(finding('worker_failed','critical','The service status reports a worker failure.'));}
     } else findings.push(finding('status_research_unknown','attention','Research worker health is not present in the status file.'));
-    if(Array.isArray(raw.isolatedRooms)){out.isolatedRooms=raw.isolatedRooms.length;if(raw.isolatedRooms.length)findings.push(finding('rooms_isolated','attention','One or more rooms are isolated.',{count:raw.isolatedRooms.length}));}
-    else findings.push(finding('status_isolation_unknown','attention','Room isolation count is unavailable.'));
-    if(Array.isArray(raw.integrity))out.integrity={status:raw.integrity.some(x=>x?.status!=='healthy')?'attention':'healthy'};
-    else if(raw.integrity&&typeof raw.integrity==='object'&&typeof raw.integrity.status==='string')out.integrity={status:raw.integrity.status};
-    else findings.push(finding('status_integrity_unknown','attention','Session integrity status is unavailable.'));
-    if(out.integrity?.status!=='healthy')findings.push(finding('session_integrity_attention','attention','Session integrity reports an unhealthy or unknown state.'));
+    if(Array.isArray(raw.persistence)) {
+      out.persistence={status:raw.persistence.length&&raw.persistence.every(x=>x?.status==='ready')?'ready':'attention'};
+      if(out.persistence.status!=='ready')findings.push(finding('session_persistence_attention','attention','SQLite session persistence is not ready.'));
+    } else {
+      // Older releases expose Pi integrity; retain this read path during rollback.
+      if(Array.isArray(raw.isolatedRooms)){out.isolatedRooms=raw.isolatedRooms.length;if(raw.isolatedRooms.length)findings.push(finding('rooms_isolated','attention','One or more rooms are isolated.',{count:raw.isolatedRooms.length}));}
+      else findings.push(finding('status_isolation_unknown','attention','Room isolation count is unavailable.'));
+      if(Array.isArray(raw.integrity))out.integrity={status:raw.integrity.some(x=>x?.status!=='healthy')?'attention':'healthy'};
+      else if(raw.integrity&&typeof raw.integrity==='object'&&typeof raw.integrity.status==='string')out.integrity={status:raw.integrity.status};
+      else findings.push(finding('status_integrity_unknown','attention','Session persistence status is unavailable.'));
+      if(out.integrity?.status!=='healthy')findings.push(finding('session_integrity_attention','attention','Legacy session integrity reports an unhealthy or unknown state.'));
+    }
     return out;
   } catch { findings.push(finding('status_file_unavailable','attention','The service status file could not be read.'));return {status:'unknown'}; }
 }

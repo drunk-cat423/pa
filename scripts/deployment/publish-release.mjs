@@ -27,7 +27,15 @@ function atomic(p, value) {
   const fd = fs.openSync(path.dirname(p), 'r'); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 function phase(next, extra = {}) { Object.assign(state, extra, {phase:next}); atomic(checkpoint,state); }
-function finish(status, summary) { atomic(resultPath, {status,summary, ...(state.commit ? {commit:state.commit} : {})}); }
+function finish(status, summary) {
+  const proof=path.join(dir,'validation.json');
+  if(status==='succeeded'&&fs.existsSync(proof)) {
+    const validation=readJSON(proof);
+    if(validation.status==='passed'&&validation.commit===state.commit) summary+=validation.tests.length
+      ?` 对应补丁的 ${validation.tests.length} 个测试文件已通过验收。`:' 本次仅文档改动，构建检查通过。';
+  }
+  atomic(resultPath, {status,summary, ...(state.commit ? {commit:state.commit} : {})});
+}
 function run(cmd, args, options = {}) {
   return execFileSync(cmd, args, {encoding:'utf8', timeout:120000, maxBuffer:8*1024*1024,
     stdio:['ignore','pipe','pipe'], ...options});
@@ -71,7 +79,12 @@ function prepareCommit() {
 }
 function build(commit, names) {
   const dest=path.join(releases,commit);
-  if(fs.existsSync(dest) && fs.readFileSync(path.join(dest,'RELEASE_SHA'),'utf8').trim()===commit) return;
+  const validationPath=path.join(dir,'validation.json');
+  if(fs.existsSync(dest) && fs.readFileSync(path.join(dest,'RELEASE_SHA'),'utf8').trim()===commit) {
+    const saved=fs.existsSync(validationPath)?readJSON(validationPath):null;
+    if(saved?.status!=='passed'||saved.commit!==commit||saved.patchSha256!==manifest.patchSha256) throw Error('候选版本缺少对应补丁的测试验收记录。');
+    return;
+  }
   const stage=fs.mkdtempSync(path.join(releases,'.publish-')); fs.chmodSync(stage,0o755);
   const archive=path.join(dir,'candidate.tar');
   try {
@@ -82,15 +95,28 @@ function build(commit, names) {
     run('cp',['-a','--reflink=auto',fs.realpathSync(path.join(previous,'node_modules')),path.join(stage,'node_modules')]);
     const dist=path.join(stage,'dist'); fs.mkdirSync(dist); fs.chmodSync(dist,0o755); run('chown',[layout.buildUser,dist]);
     // No candidate code runs as root. Tests cannot write the build output, release checkout, Git mirror or credentials.
-    const restricted=(args,writeDist=false)=>run('systemd-run',['--quiet','--pipe','--wait','--collect','-p','User='+layout.buildUser,
+    const restricted=(args,writeDist=false,seconds=150)=>run('systemd-run',['--quiet','--pipe','--wait','--collect','-p','User='+layout.buildUser,
       '-p','WorkingDirectory='+stage,'-p','ProtectSystem=strict','-p','ProtectHome=true','-p','PrivateTmp=true','-p','PrivateNetwork=true',
-      '-p','NoNewPrivileges=true','-p','KillMode=control-group','-p','MemoryMax=512M','-p','MemorySwapMax=0','-p','RuntimeMaxSec=150',
-      ...(writeDist?['-p','ReadWritePaths='+dist]:[]),'--setenv=PATH=/opt/node-v24.15.0/bin:/usr/bin:/bin',...args],{timeout:170000});
+      '-p','NoNewPrivileges=true','-p','KillMode=control-group','-p','MemoryMax=512M','-p','MemorySwapMax=0','-p','RuntimeMaxSec='+seconds,
+      ...(writeDist?['-p','ReadWritePaths='+dist]:[]),'--setenv=PATH=/opt/node-v24.15.0/bin:/usr/bin:/bin',...args],{timeout:(seconds+20)*1000});
     restricted(['/opt/node-v24.15.0/bin/node',path.join(stage,'node_modules/typescript/bin/tsc'),'-p','tsconfig.json'],true);
     run('chown',['-hR','root:root',dist]);
     run('runuser',['-u',layout.dataUser,'--','test','-r',path.join(dist,'qq-cli.js')]);
-    const tests=names.filter(n=>n.startsWith('test/')&&n.endsWith('.test.mjs')&&fs.existsSync(path.join(stage,n)));
-    if(tests.length) restricted(['/opt/node-v24.15.0/bin/node','--test','--test-concurrency=1',...tests]);
+    // Selection runs as the unprivileged builder too: candidate scripts never run as root.
+    const plan=JSON.parse(restricted(['/opt/node-v24.15.0/bin/node',path.join(stage,'scripts/repo-check.mjs'),'--changed',...names,'--json']));
+    if(!Array.isArray(plan.files)||plan.files.length>500||plan.files.some(name=>
+      typeof name!=='string'||!/^[A-Za-z0-9_.-]+\.test\.mjs$/.test(name)||!fs.existsSync(path.join(stage,'test',name)))) throw Error('相关回归测试清单无效。');
+    const tests=[...new Set(plan.files)].map(name=>'test/'+name);
+    if(names.some(name=>name.startsWith('src/')||name.startsWith('test/'))&&!tests.length) throw Error('源码或测试改动没有选中相关回归测试，禁止发布。');
+    const command=['/opt/node-v24.15.0/bin/node','--test','--test-concurrency=2',...tests];
+    atomic(validationPath,{status:'running',commit,patchSha256:manifest.patchSha256,tests,command:tests.length?command:null});
+    try {
+      if(tests.length) restricted(command,false,600);
+    } catch(error) {
+      atomic(validationPath,{status:'failed',commit,patchSha256:manifest.patchSha256,tests,command,exitCode:Number.isInteger(error.status)?error.status:null});
+      throw error;
+    }
+    atomic(validationPath,{status:'passed',commit,patchSha256:manifest.patchSha256,tests,command:tests.length?command:null,exitCode:tests.length?0:null,buildExitCode:0});
     fs.writeFileSync(path.join(stage,'RELEASE_SHA'),commit+'\n'); fs.chmodSync(path.join(stage,'RELEASE_SHA'),0o644);
     fs.renameSync(stage,dest);
   } finally {
@@ -122,7 +148,8 @@ async function verify(target, expectedState) {
       const s=readJSON(path.join(layout.data,'qq-service/status.json'));
       if(fs.realpathSync(current)===target && pid>0 && s.pid===pid && s.codex?.enabled && !s.codex.failed &&
         (expectedState?s.state===expectedState:['ready_waiting_for_mention','QQ Gateway 已恢复','accepted','sent'].includes(s.state)) &&
-        s.integrity?.length && s.integrity.every(r=>r.status==='healthy') && s.isolatedRooms?.length===0 &&
+        (Array.isArray(s.persistence)?s.persistence.length>0&&s.persistence.every(r=>r.status==='ready')
+          :s.integrity?.length&&s.integrity.every(r=>r.status==='healthy')&&s.isolatedRooms?.length===0) &&
         run('systemctl',['is-active',layout.worker]).trim()==='active') return;
     } catch { /* During startup the status file can still belong to the previous PID. */ }
     await sleep(1000);

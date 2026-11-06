@@ -8,7 +8,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { CodexService, codexPrivateOwner, codexOwnerKey } from '../dist/codex-service.js';
 import { openConversation } from '../dist/runtime.js';
 import { preparationDelta } from './fixtures/turn-preparation.mjs';
-import { readRecordedTurns } from '../dist/transcript.js';
+import { DiagnosticLog } from '../dist/diagnostics.js';
 import { CodexPublication } from '../dist/codex-publication.js';
 
 test('publication requires exact original owner confirmation and sent acknowledgement; restart reports success or rollback once', async () => {
@@ -157,8 +157,9 @@ test('Pi dispatches the saved coding task once and returns the durable acknowled
   assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ['prepare_turn']);
   assert.ok(requests[1].tools.some(tool => tool.function.name === 'delegate_task'));
   assert.equal(runtime.recordedTurns().at(-1).assistant.text, confirmation);
-  assert.equal((await readRecordedTurns(runtime.info().sessionFile)).at(-1).assistant.text, confirmation,
-    'saved Codex tool results must pass the strict disk reader used by task integrity verification');
+  const evidence=new DiagnosticLog(join(directory,'data')).events({traceId:'coding'});
+  assert.ok(evidence.some(event=>event.event==='turn.completed' && event.details.answer===confirmation));
+  assert.equal(runtime.info().sessionFile,undefined);
 });
 
 test('rejected and unknown requests cannot starve later results or cross a changed owner policy', async () => {

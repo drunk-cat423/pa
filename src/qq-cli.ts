@@ -152,8 +152,8 @@ async function main(): Promise<void> {
       await harness.prepare();
       const check = () => {
         const info = harness!.info();
-        if (stopping || info.isolatedRooms.length || info.integrity.length !== qq.routes.length
-          || info.integrity.some(room => room.status !== 'healthy')) throw new Error('发布候选未通过房间完整性检查。');
+        if (stopping || info.persistence.length !== qq.routes.length
+          || info.persistence.some(room => room.status !== 'ready')) throw new Error('发布候选未通过SQLite会话可用性检查。');
       };
       if (gate()) check();
       preparedReady = true;

@@ -7,7 +7,7 @@ import { WorkLedgerStore, migrateWorkLedger, migrateReminderDelivery } from './w
 import { isDeepStrictEqual } from 'node:util';
 import { MemoryError } from './memory-types.js';
 import type { MemoryChange, MemoryInput, MemoryKind, MemoryRecord, MemoryRef, PrimaryPerson,
-  FactPerson, SharedFactContext, SharedFactAttributionInput } from './memory-types.js';
+  FactPerson, SharedFactContext } from './memory-types.js';
 import type { ChannelRoute, ExternalRunInput, InboundMessage } from './channel-types.js';
 import { AutoMemoryStore, migrateAutoMemory, migrateMemoryRetrieval, migrateRollingContext, migrateMemoryPipelines, migrateMaterialBackfill, migrateProfileAttribution } from './auto-memory-store.js';
 import { migrateSelfProfile, migrateSelfProfileUpdates } from './self-profile-store.js';
@@ -85,7 +85,6 @@ export interface HistoryMessage {
   id: string; senderId?: string; senderName?: string; personId?: string; replyToSenderId?: string; replyToMessageId?: string;
   speakerLabel?: string; replyToLabel?: string;
   role: 'user' | 'assistant'; text: string; sentAt?: string;
-  correctedBy?: string[];
 }
 
 
@@ -741,7 +740,6 @@ export class ConversationStore {
     `).get(selected.channel, selected.accountId, selected.roomType, selected.roomId) as Record<string, unknown> | undefined;
     if (existing) {
       const conversation = asConversation({ ...existing, key });
-      if (conversation.piSessionFile !== piSessionFile) throw new Error('会话已绑定到不同的 Pi session 文件。');
       return conversation;
     }
     const roomId = randomUUID();
@@ -874,11 +872,11 @@ export class ConversationStore {
   }
 
   roomFactContext(conversationId: string, beforeMessageId?: string, includeBoundary = false): {
-    facts: SharedFactContext[]; corrections: SharedFactContext[]; correctedMessages: Record<string,string[]>; summaryInvalidated: boolean;
+    facts: SharedFactContext[];
   } {
     this.requireMemoryConversation(conversationId);
     const room = this.db.prepare('SELECT r.room_type FROM conversations c JOIN rooms r ON r.id=c.room_id WHERE c.id=?').get(conversationId);
-    if (room?.room_type !== 'group') return {facts:[],corrections:[],correctedMessages:{},summaryInvalidated:false};
+    if (room?.room_type !== 'group') return {facts:[]};
     const boundary = beforeMessageId === undefined ? undefined : this.db.prepare('SELECT ingest_seq FROM messages WHERE id=? AND conversation_id=?')
       .get(beforeMessageId,conversationId);
     if (beforeMessageId !== undefined && !boundary) throw new MemoryError('共享事实边界不属于当前房间。');
@@ -892,38 +890,10 @@ export class ConversationStore {
       AND (m.expires_at IS NULL OR m.expires_at>?) AND (? IS NULL OR s.ingest_seq<?)
       ORDER BY COALESCE(s.ingest_seq,0) DESC,m.updated_at DESC,m.rowid DESC`)
       .all(conversationId,now(),beforeSeq,beforeSeq);
-    const result: ReturnType<ConversationStore['roomFactContext']> = {facts:[],corrections:[],correctedMessages:{},summaryInvalidated:false};
-    // Retain the invalidation lineage through later revisions, corrections and
-    // expiry. Expiring a corrective note must not make its old error true again.
-    const lineage = this.db.prepare(`SELECT v.source_message_id,s.ingest_seq,a.corrected_message_ids_json
-      FROM memory_fact_attributions a JOIN memory_revisions v ON v.memory_id=a.memory_id AND v.revision=a.revision
-      JOIN memories m ON m.id=v.memory_id JOIN messages s ON s.id=v.source_message_id AND s.conversation_id=m.conversation_id
-      WHERE m.conversation_id=? AND m.status='active' AND a.kind='correction'
-      AND (? IS NULL OR s.ingest_seq<?) ORDER BY s.ingest_seq DESC,v.revision DESC`)
-      .all(conversationId,beforeSeq,beforeSeq);
-    const edges = new Map<string,Set<string>>();
-    for (const row of lineage) {
-      const id=String(row.source_message_id),targets=edges.get(id)??new Set<string>();
-      for (const target of JSON.parse(String(row.corrected_message_ids_json)) as string[]) targets.add(target);
-      edges.set(id,targets);
-    }
-    for (const row of lineage) {
-      const source=String(row.source_message_id);
-      if (result.correctedMessages[source]) continue;
-      const pending=[...(edges.get(source)??[])],visited=new Set<string>();
-      while (pending.length) {
-        const target=pending.pop()!;
-        if (visited.has(target)) continue;
-        visited.add(target);
-        const sources=result.correctedMessages[target]??=[];
-        if (!sources.includes(source)) sources.push(source);
-        pending.push(...(edges.get(target)??[]));
-      }
-    }
+    const result: ReturnType<ConversationStore['roomFactContext']> = {facts:[]};
     for (const row of rows) {
-      // A newer explicit correction can supersede the source of an older fact or
-      // correction, without modifying either original message or memory version.
-      if (row.source_message_id != null && result.correctedMessages[String(row.source_message_id)]) continue;
+      // Retired correction records remain in SQLite for audit only.
+      if (row.attribution_kind === 'correction') continue;
       const people = (value: unknown): FactPerson[] => (value == null ? [] : JSON.parse(String(value)) as string[])
         .flatMap(id => { const person=this.factPerson(conversationId,id); return person?[person]:[]; });
       const item: SharedFactContext = {id:String(row.id),revision:Number(row.revision),kind:row.kind as MemoryKind,
@@ -933,45 +903,11 @@ export class ConversationStore {
         attribution:row.attribution_kind==='correction'?'correction':'statement',
         subjects:people(row.subject_actor_ids_json),excludedSubjects:people(row.excluded_actor_ids_json),
         correctsMessageIds:row.corrected_message_ids_json==null?[]:JSON.parse(String(row.corrected_message_ids_json)) as string[]};
-      if (item.attribution === 'correction') {
-        result.corrections.push(item);
-      } else result.facts.push(item);
-    }
-    const state=this.db.prepare('SELECT cursor,summary_correction_hash FROM conversation_context_state WHERE conversation_id=?').get(conversationId);
-    const contextBoundary=beforeMessageId===undefined?undefined:this.db.prepare('SELECT seq FROM conversation_context_messages WHERE conversation_id=? AND message_id=?')
-      .get(conversationId,beforeMessageId);
-    if (Number(state?.cursor??0)>0 && (contextBoundary===undefined || Number(state!.cursor)<Number(contextBoundary.seq))) {
-      const inSummary=this.db.prepare('SELECT 1 FROM conversation_context_messages WHERE conversation_id=? AND message_id=? AND seq<=?');
-      const touchesSummary=Object.keys(result.correctedMessages).some(id=>Boolean(inSummary.get(conversationId,id,Number(state!.cursor))));
-      result.summaryInvalidated=touchesSummary && state!.summary_correction_hash !== this.autoMemory.summaryCorrections(conversationId,
-        contextBoundary===undefined?Number.MAX_SAFE_INTEGER:Number(contextBoundary.seq)-(includeBoundary?0:1)).hash;
+      result.facts.push(item);
     }
     return result;
   }
 
-  private saveFactAttribution(conversationId: string, sourceMessageId: string, memory: MemoryRecord,
-    attribution: SharedFactAttributionInput, mentionedSenderIds: readonly string[]): void {
-    const source = this.db.prepare(`SELECT m.actor_id,m.text,m.ingest_seq,a.external_user_id FROM messages m
-      JOIN actors a ON a.id=m.actor_id WHERE m.id=? AND m.conversation_id=? AND m.role='user'`)
-      .get(sourceMessageId,conversationId);
-    if (!source) throw new MemoryError('共享事实缺少本房间真人来源。');
-    const resolveActor = (senderId: string): string => {
-      if (senderId !== source.external_user_id && !mentionedSenderIds.includes(senderId)
-        && !String(source.text).includes(`<@${senderId}>`) && !String(source.text).includes(`<@!${senderId}>`)
-        && !String(source.text).includes(senderId)) throw new MemoryError('涉及人物须由本条真实 @ 或明确身份ID指定，不能按昵称猜测。');
-      const actor = this.db.prepare('SELECT a.id FROM actors a JOIN conversations c ON c.room_id=a.room_id WHERE c.id=? AND a.external_user_id=?')
-        .get(conversationId,senderId);
-      if (!actor) throw new MemoryError('共享事实涉及的人物不属于当前房间。');
-      return String(actor.id);
-    };
-    const subjects=attribution.subjectSenderIds.map(resolveActor),excluded=attribution.excludedSenderIds.map(resolveActor);
-    for (const id of attribution.correctsMessageIds) {
-      if (!this.db.prepare('SELECT id FROM messages WHERE id=? AND conversation_id=? AND ingest_seq<?')
-        .get(id,conversationId,Number(source.ingest_seq))) throw new MemoryError('只能纠正本房间当前消息之前的明确来源，不能引用他群、当前或未来消息。');
-    }
-    this.db.prepare('INSERT INTO memory_fact_attributions VALUES (?,?,?,?,?,?)').run(memory.id,memory.revision,attribution.kind,
-      JSON.stringify(subjects),JSON.stringify(excluded),JSON.stringify(attribution.correctsMessageIds));
-  }
 
   correctMemory(conversationId: string, id: string, input: MemoryInput, expectedRevision?: number): MemoryChange {
     validateMemoryInput(input);
@@ -979,9 +915,6 @@ export class ConversationStore {
     return this.memoryTransaction(() => {
       const actorId=this.validateMemorySource(conversationId,input.sourceMessageId);
       const existing=this.requireCurrentMemory(conversationId,id,expectedRevision);
-      const attribution=this.db.prepare('SELECT * FROM memory_fact_attributions WHERE memory_id=? AND revision=?').get(id,Number(existing.revision));
-      if (attribution && (attribution.kind==='correction' || String(attribution.subject_actor_ids_json)!=='[]')
-        && input.content!==existing.content) throw new MemoryError('此共享事实带有人物归属，请用明确的自然语言归属纠正更新；不能用无结构修订丢失或猜测人物归属。');
       if(input.sourceMessageId!==undefined && existing.source_message_id!=null) {
         const incoming=this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(input.sourceMessageId);
         const previous=this.db.prepare('SELECT ingest_seq FROM messages WHERE id=?').get(String(existing.source_message_id));
@@ -997,8 +930,6 @@ export class ConversationStore {
         VALUES (?,?,?,'active',?,?,?,?,?)`).run(id,revision,input.content,eventId,input.sourceMessageId??null,updatedAt,occurredAt,expiresAt);
       this.db.prepare(`UPDATE memories SET kind=?,content=?,revision=?,source_event_id=?,source_message_id=?,updated_at=?,occurred_at=?,expires_at=? WHERE id=?`)
         .run(input.kind??String(existing.kind),input.content,revision,eventId,input.sourceMessageId??null,updatedAt,occurredAt,expiresAt,id);
-      if (attribution) this.db.prepare('INSERT INTO memory_fact_attributions VALUES (?,?,?,?,?,?)')
-        .run(id,revision,attribution.kind!,attribution.subject_actor_ids_json!,attribution.excluded_actor_ids_json!,attribution.corrected_message_ids_json!);
       this.requireContextReset(conversationId);
       return {memory:asMemory(this.findMemory(conversationId,id)),contextResetRequired:true};
     });
@@ -1075,7 +1006,7 @@ export class ConversationStore {
         ...(plan.progressText === undefined ? {} : {progressText:plan.progressText}),updates:plan.updates.map(u=>({target:u.target,
         content:u.content,sourceType:u.sourceType??'third_party',senderId:u.senderId??null,key:u.key??null,
         ...(u.subject===undefined?{}:{subject:u.subject}),
-        ...(u.attribution === undefined ? {} : {attribution:u.attribution})})) });
+})) });
       const previous = this.db.prepare('SELECT plan_json,receipt_json FROM turn_preparations WHERE source_message_id=?').get(sourceMessageId);
       if (previous) {
         if (previous.plan_json !== canonical) throw new MemoryError('本条消息已经完成准备，不能重复更改保存内容。');
@@ -1118,16 +1049,9 @@ export class ConversationStore {
           // Same wording from different speakers is not the same sourced fact.
           // Replay of this exact preparation is handled by the receipt above.
           const memory=this.rememberMemory(conversationId,{content:update.content,kind:'fact',sourceMessageId}).memory;
-          const attribution=update.attribution??{kind:'statement' as const,subjectSenderIds:[],excludedSenderIds:[],correctsMessageIds:[]};
-          this.saveFactAttribution(conversationId,sourceMessageId,memory,attribution,mentionedSenderIds);
-          if (attribution.kind === 'correction') (receipt.attributionCorrections??=[]).push({memoryId:memory.id,
-            sourceMessageId,speakerSenderId:String(source.external_user_id),subjectSenderIds:attribution.subjectSenderIds,
-            excludedSenderIds:attribution.excludedSenderIds,correctsMessageIds:attribution.correctsMessageIds});
           receipt.saved.push({target:update.target,status:'saved'});
         }
       }
-      if (receipt.attributionCorrections && Buffer.byteLength(JSON.stringify(receipt.attributionCorrections),'utf8') > 3000)
-        throw new MemoryError('本轮归属纠正元数据过多，请减少涉及人物或旧消息数量；本批均未保存。');
       this.db.prepare('INSERT INTO turn_preparations VALUES (?,?,?,?)').run(sourceMessageId,canonical,JSON.stringify(receipt),now());
       return receipt;
     });
@@ -1174,7 +1098,6 @@ export class ConversationStore {
           AND (? IS NULL OR COALESCE(m.sent_at,m.created_at)<?)
           AND (? IS NULL OR COALESCE(m.sent_at,m.created_at)>?)`;
       const parameters = [conversationId,Number(current.ingest_seq),Number(current.ingest_seq),actorId,actorId,before,before,after,after];
-      const correctedMessages = this.roomFactContext(conversationId,currentMessageId,true).correctedMessages;
       const ranked = this.db.prepare(filtered + (match ? ' AND message_history_fts MATCH ? ORDER BY score,m.ingest_seq DESC LIMIT ?' : ' ORDER BY m.ingest_seq DESC LIMIT ?'))
         .all(...parameters,...(match ? [match] : []),limit);
       const selected = new Map<string, (typeof ranked)[number]>();
@@ -1196,7 +1119,6 @@ export class ConversationStore {
       if (!match) for (const row of ranked) selected.set(String(row.id),row);
       return { scope, messages: [...selected.values()].sort((a,b) => Number(a.ingest_seq)-Number(b.ingest_seq)).map(row => ({
         id: String(row.id), role: row.role as 'user'|'assistant', text: String(row.text),
-        ...(correctedMessages[String(row.id)] ? {correctedBy:correctedMessages[String(row.id)]} : {}),
         ...(row.sender_id == null ? {} : { senderId: String(row.sender_id) }),
         ...(row.sender_name == null ? {} : { senderName: String(row.sender_name) }),
         ...(row.person_id == null ? {} : { personId: String(row.person_id) }),

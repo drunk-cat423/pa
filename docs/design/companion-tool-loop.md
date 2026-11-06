@@ -32,7 +32,7 @@
 
 ### 回答依据、归属核验与现况搜索（2026-10-26）
 
-渠道准备额外返回`grounding={freshness,experienceRefs,searchQuery?}`。`experienceRefs`最多6条，每条只接受本轮可见真人消息ID、最多400码点的连续原文和可选描述对象senderId；不接受模型指定发言者或personId。程序按本房间固定快照绑定真实发言者、统一人物及已知对象，拒绝AI自述、伪造摘录、越房间、已被纠正或未展示的来源。引用带前后各最多80码点的原文，帮助判断引语/转述。人物画像仍是软参考；摘要无精确原文时不作为本人经历证明。新回执追加在prepare工具结果中，不重排固定核心、摘要或历史前缀，不复制整段历史。
+渠道准备额外返回`grounding={freshness,experienceRefs,searchQuery?}`。`experienceRefs`最多6条，每条只接受本轮可见真人消息ID、最多400码点的连续原文和可选描述对象senderId；不接受模型指定发言者或personId。程序按本房间固定快照绑定真实发言者、统一人物及已知对象，拒绝AI自述、伪造摘录、越房间或未展示的来源。引用带前后各最多80码点的原文，帮助判断引语/转述。人物画像仍是软参考；摘要无精确原文时不作为本人经历证明。新回执追加在prepare工具结果中，不重排固定核心、摘要或历史前缀，不复制整段历史。
 
 `speaker`仅表示谁说的，`proposedSubject`是模型提出的描述对象，`subjectVerified=false`明确程序没有证明语义。群聊引用其他人物的经历，或当前用户描述其他已知人物时，答复先作为未发送草稿，再触发至多一次无工具归属核验。核验只接收当前问题、有界归属回执和候选正文，输出ok/corrected/uncertain；正确则保留，明确归错则改称呼，无法核验或无剩余额度则发送未核实归属的短说明，不发送原草稿。核验计入原模型总预算，并为此提前保留一次调用；普通群聊、无经历引用及私聊不进入该核验。取消、未知请求和诊断持久化失败继续硬停止，不自动重试；核验原始响应、候选与最终正文分别保留，实际投递正文写入Pi/SQLite。准备阶段漏判引用仍是模型语义边界，离线协议通过不代表自然语言零串人。
 
@@ -47,7 +47,7 @@
 | QQ 适配与服务启动 | [qq-channel.ts](../../src/qq-channel.ts)、[qq-cli.ts](../../src/qq-cli.ts) | 规范化真实发送者、@ 与引用，维护连接并执行 REST 投递；READY 后恢复任务。 |
 | 调度与投递 | [channel-harness.ts](../../src/channel-harness.ts) | 白名单、去重、持久任务、并发计算、本地命令和每房间发送队列；计算完成与发送完成是不同状态。 |
 | 上下文与业务记录 | [conversation.ts](../../src/conversation.ts)、[store.ts](../../src/store.ts) | SQLite 保存消息、actor/person 关联、模型输入、运行、工具回执、任务和投递；画像按人物共享，房间历史仍按来源限定。 |
-| Pi 模型循环 | [runtime.ts](../../src/runtime.ts) | 每个渠道模型任务使用独立 Pi JSONL 与锁；SQLite 通过 run marker、entry ID 和 session 路径核对转录，不能混用不同任务的条目。 |
+| Pi 模型循环 | [runtime.ts](../../src/runtime.ts) | 每轮使用内存Pi会话及原有独占锁；SQLite保存业务历史，诊断保存模型/工具/最终答复证据，新运行不登记JSONL路径或entry ID。 |
 | 后台记忆 | [auto-memory.ts](../../src/auto-memory.ts)、[auto-memory-store.ts](../../src/auto-memory-store.ts)、[self-profile-store.ts](../../src/self-profile-store.ts) | SQLite 保存固定批次、租约、分块进度、人物与 AI 画像、Topic 和整理检查点；群聊与私聊都保存滚动continuationSummary与可见消息检查点。 |
 
 队列只保证本机器人各回答的分段不互相插入，群友自己的消息仍可能出现。同房间发送队列覆盖进度与最终答案；默认并发2只限制前台任务，不把后台记忆整理塞进同一队列。

@@ -22,7 +22,7 @@ test('publish standby holds business work and rollback-safe QQ inbox replays ord
     await mkdir(dataDir, { recursive: true });
     await writeFile(gatePath, 'hold'); assert.equal(readPublicationGate(gatePath), 'hold');
     harness = create(true); inbox = new PublishInbox(inboxDir, [route]);
-    await harness.prepare(); assert.ok(harness.info().integrity.every(room => room.status === 'healthy'));
+    await harness.prepare(); assert.ok(harness.info().persistence.every(room => room.status === 'ready'));
     let allowed = false;
     pausedMemory = new BackgroundMemory({ ...config, memory: { enabled: true, maxCalls: 1, timeoutMs: 1000 } },
       { reserveRecoveryJobs() { throw new Error('activated memory reservation'); } }, 'room', { extract: async () => { throw Error('unexpected model'); } }, undefined, () => allowed);

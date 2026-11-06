@@ -1,3 +1,5 @@
+当前数据与自动行为的完整说明见 [运行机制清单](runtime-state.md)。
+
 # 开发说明
 
 首次接手、按任务找模块、范围检查及交接见 [开发入口](repo-harness.md)。当前有效约定见根目录 [AGENTS.md](../AGENTS.md)，各主题文档说明实现边界；旧设计只作背景，不覆盖后续已确认的变更。运行模型、QQ 与后台任务需按实际配置及本次授权执行，离线检查不需要生产凭据。
@@ -17,7 +19,7 @@ AI设定与个人偏好的纳入范围、模式与性格的关系及隔离回放
 | src/context-tokens.ts | 成功SDK输入用量校准、字段与正文细分指纹、旧样本核验升级、缓存统计校验及新增内容保守估算 |
 | src/store.ts | schema v33、原文/run/投递、独立失败回执、长回答文档与页面引用、显式记忆、迁移备份、去重和上下文水位 |
 | src/context-people.ts / src/answer-grounding.ts | 稳定人物展示标签、真人经历来源与有界归属核验，标签不用于鉴权 |
-| src/session-integrity.ts / src/session-integrity-store.ts | Pi完整性账本、dirty会话核对、损坏隔离与启动巡检 |
+| src/session-integrity.ts / src/session-integrity-store.ts | 已退出产品启动与调度的旧 Pi 离线审计工具，保留历史表和文件 |
 | src/reminder-tools.ts / src/reminder-service.ts / src/work-ledger-store.ts | 本人一次性提醒工具、持久到期台账、原会话主动通知、取消与未知投递隔离 |
 | src/research-tools.ts / src/research-service.ts | 模型研究工具、独立后台Pi循环、次数预算、受阻/恢复和正式报告投递 |
 | src/research-store.ts / src/research-types.ts | 研究台账、北京时间统计、报告FTS、不可变版本文件、批次证据与投递幂等 |
@@ -42,7 +44,7 @@ AI设定与个人偏好的纳入范围、模式与性格的关系及隔离回放
 
 渠道只提供身份、@、消息和传输；记忆、调度、权限与模型调用属于 harness。身份共享不授予管理权限。聊天和整理不共用活动 Pi Session；SQLite 写事务不跨模型等待。同一人物的后台提案使用 CAS 和证据时序检查，不能覆盖较新的明确纠正。
 
-Pi 的默认自动压缩仍关闭。应用把版本化摘要和消息投影通过公开 API 接入 Pi，原文保持独立。不能直接替换 agent.state.messages，也不能忽略 SQLite / Pi 关联不一致。聊天重启不自动重发未知结果；后台整理依据持久批次和检查点重试。
+Pi 的默认自动压缩仍关闭。应用把版本化摘要和消息投影通过公开 API 接入 Pi，原文保持独立。SQLite 是业务状态的唯一真相，Pi 使用内存会话，不再要求旧 JSONL 与业务数据双重核对。聊天重启不自动重发未知结果；后台整理依据持久批次和检查点重试。
 
 QQ 回答使用原生 Markdown；长回答按 UTF-8 字节限制自动切段并连续发送。同房间投递串行，逐段确认；不确定或拒绝回执会停止余下部分，重启不自动重发。`/result` 显式领取完整结果，不调用模型。确认的分段保留消息 ID 与引用索引，引用按准确的房间和来源映射解析。旧分页文档与页面回执仍可读取，但当前 harness 不生成分页数据，也不响应 `/page`。
 
@@ -88,7 +90,7 @@ Mock只验证程序契约。真实模型的人物归属、提取质量、关键�
 
 ## 当前完成与后续边界
 
-当前包含统一对话准备、两条记忆流水线、单人物增量提案与独立组件恢复，以及schema31完整性账本和渠道调度，参考 [记忆](memory.md)、[存储](storage.md)、[循环协议](design/companion-tool-loop.md) 与 [启动和调度](startup-and-scheduling.md)。迁移保持原文、旧版本、冻结任务和审计；旧冻结协议与新任务分开处理。生产积压属于运行状态，应按诊断和任务库核对，不将某次维护的批次数写成当前系统事实。
+当前包含统一对话准备、两条记忆流水线、单人物增量提案与独立组件恢复，以及 SQLite 驱动的渠道调度，参考 [记忆](memory.md)、[存储](storage.md)、[循环协议](design/companion-tool-loop.md) 与 [启动和调度](startup-and-scheduling.md)。迁移保持原文、旧版本、冻结任务和审计；旧冻结协议与新任务分开处理。生产积压属于运行状态，应按诊断和任务库核对，不将某次维护的批次数写成当前系统事实。
 
 src/turn-plan.ts集中管理intent/mode/updates协议及三种回答提示；channel harness传可信policy启用prepare_turn，画像作为软参考不反复复述。一般渠道对话含准备和回答两次模型请求，网络/历史续轮计入相同上限。真实模型的意图、自然表达与语义检索质量尚需按授权联调，当前不宣称已经改善线上聊天质量。
 
@@ -96,4 +98,4 @@ src/turn-plan.ts集中管理intent/mode/updates协议及三种回答提示；cha
 
 [v0.2 基线](design/pi_evolving_companion_technical_design_v0.2.md)、[记忆 v1 设计](design/companion_memory_v1.md) 与 [Shiori 参考](shiori-memory-reference.md) 保留设计来源；当前规则见根目录AGENTS和主题文档，用户最新决定优先。不要按旧设计重新引入已取消的向量或个人事件记忆功能。
 
-图片链路由 `image-assets.ts` 下载/验证/去重/保存原图，`message_images`负责房间与消息关联。DeepSeek原平台上传Files，百炼V4.1从原图生成稳定Base64 `image_url`，不会上传到不支持该模型视觉的Files接口或发送旧平台句柄。`image-context.ts`只依据harness可信metadata投影真正的多模态块，同一投影用于估算和发送，图片字节不作为文本估算，不改Pi内部。`image-context.test.mjs`用QQ真实字段fixture、CDN下载stub和本地HTTP模型验证准备/回答、完整图片历史、重启、后台冻结压缩、摘要切换、原图工具、跨群权限与关闭中的admission取消。后台画像专用任务不额外注入图片。供应商参数、能力及边界见[模型供应商](model-providers.md)。
+当前默认仅本轮消息或本轮引用附件发送原图，历史和压缩仅保留元数据与已有识图回答；需要复看使用 `read_image`。图片链路由 `image-assets.ts` 下载/验证/去重/保存原图，`message_images`负责房间与消息关联。DeepSeek原平台上传Files，百炼V4.1从原图生成稳定Base64 `image_url`，不会上传到不支持该模型视觉的Files接口或发送旧平台句柄。`image-context.ts`只依据harness可信metadata投影真正的多模态块，同一投影用于估算和发送，图片字节不作为文本估算，不改Pi内部。`image-context.test.mjs`用QQ真实字段fixture、CDN下载stub和本地HTTP模型验证准备/回答、完整图片历史、重启、后台冻结压缩、摘要切换、原图工具、跨群权限与关闭中的admission取消。后台画像专用任务不额外注入图片。供应商参数、能力及边界见[模型供应商](model-providers.md)。

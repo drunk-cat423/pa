@@ -776,8 +776,11 @@ export class AutoMemoryStore {
     if(!row) throw new Error('整理租约已失效。'); return row;
   }
   private messages(ids: readonly string[]): AutoMemoryMessage[] {
-    return ids.map(id=>{
-      const r=this.db.prepare(`SELECT m.*,p.person_id,coalesce(r.status,CASE WHEN cf.status='sent' THEN 'failed' WHEN rd.status='sent' THEN 'completed' END) AS run_status,coalesce(d.status,rd.status,cf.status) AS delivery_status,input.ingest_seq AS turn_input_seq,
+    // Stay below SQLite builds that retain the historical 999-variable limit.
+    const chunkSize=400, uniqueIds=[...new Set(ids)], rowsById=new Map<string,Record<string,unknown>>();
+    const imagesById=new Map<string,import('./image-context.js').MessageImage[]>();
+    const contextById=new Map<string,string>();
+    const baseSql=`SELECT m.*,p.person_id,coalesce(r.status,CASE WHEN cf.status='sent' THEN 'failed' WHEN rd.status='sent' THEN 'completed' END) AS run_status,coalesce(d.status,rd.status,cf.status) AS delivery_status,input.ingest_seq AS turn_input_seq,
         context.seq AS context_seq,a.external_user_id AS sender_id,inputa.external_user_id AS reply_sender_id,inputp.person_id AS reply_person_id,coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) AS input_message_id FROM messages m
         LEFT JOIN actor_person_bindings p ON p.actor_id=m.actor_id LEFT JOIN agent_runs r ON r.input_message_id=m.id OR r.response_message_id=m.id
         LEFT JOIN research_deliveries rd ON rd.message_id=m.id
@@ -785,13 +788,28 @@ export class AutoMemoryStore {
         LEFT JOIN messages input ON input.id=coalesce(r.input_message_id,rd.source_message_id,failed_task.message_id) LEFT JOIN deliveries d ON d.message_id=m.id
         LEFT JOIN actors a ON a.id=m.actor_id LEFT JOIN actors inputa ON inputa.id=input.actor_id
         LEFT JOIN actor_person_bindings inputp ON inputp.actor_id=input.actor_id
-        LEFT JOIN conversation_context_messages context ON context.message_id=m.id WHERE m.id=?`).get(id)!;
-      const images=this.db.prepare('SELECT metadata_json FROM message_images WHERE message_id=? ORDER BY ordinal').all(id)
-        .map(row=>parse<import('./image-context.js').MessageImage>(row.metadata_json));
-      const context=this.db.prepare('SELECT mentioned_sender_ids_json FROM message_profile_context WHERE message_id=?').get(id);
+        LEFT JOIN conversation_context_messages context ON context.message_id=m.id WHERE m.id IN (`;
+    for(let offset=0;offset<uniqueIds.length;offset+=chunkSize){
+      const chunk=uniqueIds.slice(offset,offset+chunkSize),marks=chunk.map(()=>'?').join(',');
+      for(const row of this.db.prepare(baseSql+marks+')').all(...chunk)){
+        const key=String(row.id);
+        // The old get() returned one row for a join with multiple matches.
+        if(!rowsById.has(key))rowsById.set(key,row);
+      }
+      for(const row of this.db.prepare(`SELECT message_id,metadata_json FROM message_images WHERE message_id IN (${marks}) ORDER BY message_id,ordinal`).all(...chunk)){
+        const key=String(row.message_id),images=imagesById.get(key)??[];
+        images.push(parse<import('./image-context.js').MessageImage>(row.metadata_json));imagesById.set(key,images);
+      }
+      for(const row of this.db.prepare(`SELECT message_id,mentioned_sender_ids_json FROM message_profile_context WHERE message_id IN (${marks})`).all(...chunk))
+        contextById.set(String(row.message_id),String(row.mentioned_sender_ids_json));
+    }
+    return ids.map(id=>{
+      const r=rowsById.get(id)!;
+      const images=imagesById.get(id)??[];
+      const context=contextById.get(id);
       return {id:String(r.id),conversationId:String(r.conversation_id),role:r.role as 'user'|'assistant',text:String(r.text),ingestSeq:Number(r.ingest_seq),createdAt:String(r.created_at),
         ...(images.length?{images}:{}),
-        ...(context?{mentionedSenderIds:parse<string[]>(context.mentioned_sender_ids_json)}:{}),
+        ...(context===undefined?{}:{mentionedSenderIds:parse<string[]>(context)}),
         ...(r.image_failure==null?{}:{imageFailure:String(r.image_failure)}),
         ...(r.turn_input_seq==null?{}:{turnInputSeq:Number(r.turn_input_seq)}),
         ...(r.context_seq==null?{}:{contextSeq:Number(r.context_seq)}),
@@ -878,7 +896,6 @@ export class AutoMemoryStore {
     if(canonical.pipeline==='compression') {
       const input:AutoMemoryTaskInput={pipeline:'compression',contextProtocol:1,extractionProtocol:2,profileProtocol:2,
         job:canonical,roomType:this.roomType(canonical.conversationId),messages,profiles:[],
-        summaryCorrections:this.summaryCorrections(canonical.conversationId,Number(contextJob!.end_cursor)),
         ...(previousSummary==null?{}:{previousSummary:String(previousSummary)})};
       this.db.prepare('UPDATE auto_memory_jobs SET input_json=? WHERE id=? AND lease_token=?').run(JSON.stringify(input),job.id,job.leaseToken);
       return input;

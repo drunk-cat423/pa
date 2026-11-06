@@ -9,6 +9,7 @@ import { MemoryError } from '../dist/memory-types.js';
 import { REMINDER_TOOL_SPECS } from '../dist/reminder-tools.js';
 import { hasUnbackedReminderClaim } from '../dist/turn-plan.js';
 import { preparationDelta } from './fixtures/turn-preparation.mjs';
+import { DiagnosticLog } from '../dist/diagnostics.js';
 
 const call = (name, args) => ({ role: 'assistant', tool_calls: [{ index: 0, id: `call-${name}`, type: 'function',
   function: { name, arguments: JSON.stringify(args) } }] });
@@ -42,7 +43,7 @@ async function fixture(t, respond, overrides = {}) {
     await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true });
     assert.deepEqual(errors, []);
   });
-  return { requests, async open(id, options = { enableSearch: true }) {
+  return { requests, dataDir:config.dataDir, async open(id, options = { enableSearch: true }) {
     const runtime = await openConversation(config, id, options); runtimes.push(runtime); return runtime;
   } };
 }
@@ -61,7 +62,9 @@ test('提醒成功使用prepare和create两次本地SSE请求，程序确认并�
   assert.equal(runtime.recordedTurns().at(-1).assistant.text, confirmation);
   await runtime.close();
   const reopened = await f.open('create');
-  assert.equal(reopened.recordedTurns().at(-1).assistant.text, confirmation);
+  assert.equal(reopened.recordedTurns().length,0,'Pi only retains the active in-memory turn');
+  const completed=new DiagnosticLog(f.dataDir,['fixture']).events({traceId:'run-create',limit:100});
+  assert.equal(completed.find(event=>event.event==='turn.completed').details.answer,confirmation);
 });
 
 test('提醒拒绝不确认成功，已保存画像也不能授权无回执的未来提醒承诺', async t => {

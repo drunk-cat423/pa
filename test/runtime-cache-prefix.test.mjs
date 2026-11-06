@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -117,7 +117,7 @@ test('save-claim correction closes tools in trailing controls without changing f
   assert.equal(control(f.requests[2]).saveClaimCorrection, true);
   assert.equal(control(f.requests[2]).toolsClosed, true);
   assert.deepEqual(f.requests[2].tools, []); assert.equal(f.requests[2].tool_choice, 'none');
-  assert.doesNotMatch(await readFile(runtime.info().sessionFile, 'utf8'), /\[PA本轮控制｜应用生成\]/,
+  assert.doesNotMatch(JSON.stringify(runtime.recordedTurns()), /\[PA本轮控制｜应用生成\]/,
     'wire-only controls must not accumulate in saved conversation history');
 });
 
@@ -169,6 +169,6 @@ test('channel tool continuations append to the complete previous wire prefix wit
   assert.deepEqual(reads, ['1:part-1', '1:part-2', '2:part-1', '2:part-2']);
   assert.deepEqual(f.log.events().filter(event => event.event === 'turn.completed')
     .map(event => [event.details.modelCalls, event.details.toolCalls]), [[4, 3], [4, 3]]);
-  assert.doesNotMatch(await readFile(runtime.info().sessionFile, 'utf8'), /\[PA本轮控制｜应用生成\]/,
+  assert.doesNotMatch(JSON.stringify(runtime.recordedTurns()), /\[PA本轮控制｜应用生成\]/,
     'controls must remain wire-only rather than enter Pi JSONL');
 });

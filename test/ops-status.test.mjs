@@ -60,6 +60,11 @@ test('巡检不把sent和正常claim/input阶段报异常，隔离旧队列不�
   assert.equal(r.diagnostics.callsByStage.trending_digest,1);
   assert.deepEqual(r.database.active.map(x=>x.id),['current']);assert.equal(r.diagnostics.events,2);
   assert.equal(JSON.stringify(r).includes('NEVER_OUTPUT_PRIVATE_TEXT'),false);assert.deepEqual(f.fingerprint(),before);
+  delete f.status.integrity;delete f.status.isolatedRooms;
+  f.status.persistence=[{status:'ready'}];f.writeStatus();
+  const current=f.collect(false);
+  assert.equal(current.complete,true);assert.equal(current.ok,true,JSON.stringify(current.findings));
+  assert.equal(current.statusFile.persistence.status,'ready');
 });
 
 test('自动搁置不能隐藏耗尽缺口，资源耗尽和新unknown调用必须报出',t=>{
