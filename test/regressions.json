@@ -249,6 +249,13 @@
     },
     {
       "file": "test/publisher-controller.test.mjs",
+      "name": "publisher strictly applies CRLF task patches to LF indexes and rejects changed context without mutating the index",
+      "basis": "incident",
+      "reason": "真实QQ发布演练中，任务副本沿用CRLF而GitHub基线为LF，内容规范化后相同，冻结补丁仍在git apply阶段失败；只规范化换行并继续严格核验上下文。",
+      "evidence": "2026-11-14 task 85d36528-7c55-4c03-bb8b-728d0356b35f: src/codex-service.ts and test/codex-service.test.mjs had CRLF in the task/release and LF in GitHub blobs with identical normalized SHA; cached patch application failed before stopping PA. Private evidence stays in .local/self-iteration-20261114."
+    },
+    {
+      "file": "test/publisher-controller.test.mjs",
       "name": "source-only publication selects existing regressions and includes new tests in the same acceptance",
       "basis": "incident",
       "reason": "实际审查复现只改源码或测试fixture时零回归；另保留发布必须冻结同一补丁、确认后启动且重启不重复。"

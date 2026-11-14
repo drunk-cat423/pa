@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { applyReleasePatch } from './apply-release-patch.mjs';
 
 // Optional layout is supplied by the operator's systemd environment for a separate acceptance instance.
 const layout = { app: '/opt/pa', state: '/var/lib/pa-publisher', data: '/var/lib/pa', snapshots: '/var/backups/pa/snapshots',
@@ -61,7 +62,7 @@ function prepareCommit() {
   if(!bytes.length || createHash('sha256').update(bytes).digest('hex')!==manifest.patchSha256) throw Error('冻结补丁校验失败。');
   if(/^(?:Binary files |GIT binary patch)/m.test(bytes.toString())) throw Error('自动发布只支持文本补丁。');
   const env={GIT_INDEX_FILE:path.join(dir,'candidate.index')};
-  git(['read-tree',source],env); git(['apply','--cached','--whitespace=nowarn',patch],env);
+  git(['read-tree',source],env); applyReleasePatch(git,patch,env);
   const names=git(['diff','--cached','--no-renames','--name-only','-z',source,'--'],env).split('\0').filter(Boolean);
   if(!names.length || names.some(n=>!/^((src|test|docs)\/(?!\.)([A-Za-z0-9_-]+\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*|README\.md)$/.test(n))) {
     throw Error('自动发布只允许 src、test、docs 内的普通文件及 README.md。依赖、部署设置和敏感路径须单独维护。');

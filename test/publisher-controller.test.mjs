@@ -4,9 +4,42 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import test from 'node:test';
 import { startPublisher } from '../scripts/deployment/pa-publisher.mjs';
 import { selectChangedTests } from '../scripts/repo-check-scopes.mjs';
+import { applyReleasePatch } from '../scripts/deployment/apply-release-patch.mjs';
+
+test('publisher strictly applies CRLF task patches to LF indexes and rejects changed context without mutating the index', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pa-publish-eol-'));
+  const repository = join(root, 'repository'), patchPath = join(root, 'patch.diff');
+  const git = (args, extra = {}) => execFileSync('git', ['-C', repository, '-c', 'core.autocrlf=false',
+    '-c', 'core.safecrlf=false', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...extra } });
+  try {
+    await mkdir(repository); git(['init', '--quiet']);
+    const file = join(repository, 'example.txt');
+    await writeFile(file, 'heading\nbefore\ntrailer\n'); git(['add', 'example.txt']);
+    const lfTree = git(['write-tree']).trim();
+    await writeFile(file, 'heading\r\nbefore\r\ntrailer\r\n'); git(['add', 'example.txt']);
+    await writeFile(file, 'heading\r\nafter\r\ntrailer\r\n');
+    const patch = git(['diff', '--no-ext-diff', '--no-textconv', '--', 'example.txt']);
+    assert.ok(patch.includes('\r\n')); await writeFile(patchPath, patch);
+    const env = { GIT_INDEX_FILE: join(root, 'candidate.index') };
+    git(['read-tree', lfTree], env);
+    assert.throws(() => git(['apply', '--check', '--cached', patchPath], env));
+    applyReleasePatch(git, patchPath, env);
+    assert.equal(git(['show', ':example.txt'], env), 'heading\nafter\ntrailer\n');
+    assert.equal(await readFile(patchPath, 'utf8'), patch, 'the frozen patch stays byte-for-byte unchanged');
+    assert.equal(await readFile(patchPath + '.lf', 'utf8'), patch.replace(/\r\n/g, '\n'));
+
+    await writeFile(file, 'heading\ndifferent\ntrailer\n'); git(['add', 'example.txt']);
+    git(['read-tree', git(['write-tree']).trim()], env);
+    const unchanged = await readFile(env.GIT_INDEX_FILE);
+    assert.throws(() => applyReleasePatch(git, patchPath, env));
+    assert.deepEqual(await readFile(env.GIT_INDEX_FILE), unchanged);
+    assert.equal(await readFile(patchPath, 'utf8'), patch);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('source-only publication selects existing regressions and includes new tests in the same acceptance', async () => {
   const root=await mkdtemp(join(tmpdir(),'pa-publish-tests-'));

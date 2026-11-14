@@ -41,7 +41,7 @@ journalctl -u pa.service -n 30 --no-pager
 
 ## 私聊确认后的发布与回滚
 
-[发布指令](codex-publish.md)只对已配置的本人私聊开放。发布程序单独安装在 `/opt/pa/maintenance/publisher`，由 `pa-publisher.service` 启动。安装 `scripts/deployment/pa-publisher.mjs`、`publish-release.mjs` 和可执行的 `publish.sh` 时使用 root 持有的固定版本。普通任务发布仅接受 src、test、docs 和 README.md 的普通文本改动；修改发布器、系统服务、依赖或凭证需另行维护。
+[发布指令](codex-publish.md)只对已配置的本人私聊开放。发布程序单独安装在 `/opt/pa/maintenance/publisher`，由 `pa-publisher.service` 启动。安装 `scripts/deployment/pa-publisher.mjs`、`publish-release.mjs`、`apply-release-patch.mjs` 和可执行的 `publish.sh` 时使用 root 持有的固定版本。普通任务发布仅接受 src、test、docs 和 README.md 的普通文本改动；修改发布器、系统服务、依赖或凭证需另行维护。
 
 - 创建独立的 `pa-release-client` 组，仅给 `pa.service` 加上该补充组。配置 `PA_PUBLISH_SOCKET=/run/pa-publisher/publisher.sock`、`PA_PUBLISH_GATE_FILE=/var/lib/pa-publish-gate/hold`、`PA_PUBLISH_INBOX=/var/lib/pa-publish-inbox`；systemd 允许 PA 写入收件箱。gate 目录由 root 持有，收件箱由 pa 持有，权限 0700。收件箱在生产数据库快照之外。
 - 发布器的 `/etc/pa-publisher.env` 设定上述 socket、`PA_PUBLISH_DIR=/var/lib/pa-publisher/jobs`、`PA_PUBLISH_OWNER`（与执行器同一 owner）、`PA_PUBLISH_WORKER_SOCKET` 和 `PA_PUBLISH_WORKER_DIR`。任务账本、候选补丁和恢复记录仅 root 可读。GitHub 使用只授予 PA 仓库写权限的部署 key，私钥位于 `/etc/pa-publisher/github-deploy`，SSH 主机密钥固定在同目录的 `known_hosts`。
