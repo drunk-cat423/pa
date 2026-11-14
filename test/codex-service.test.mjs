@@ -112,7 +112,7 @@ test('owner private task delivers a plain-language result, continues same task, 
     assert.equal(deliveries.length, 1);
     assert.equal(deliveries[0].deliveryMode, 'active');
     assert.equal(deliveries[0].file, undefined);
-    assert.match(deliveries[0].text, /已完成[\s\S]*分隔线已过滤，针对性测试通过/);
+    assert.match(deliveries[0].text, /^任务 C17 · 第 1 版 · 已完成[\s\S]*分隔线已过滤，针对性测试通过/);
     assert.doesNotMatch(deliveries[0].text, /private patch|diff --git|exit_code/);
     const second = await service.context(route, 'owner', 's2').execute('continue_coding_task', { id: 'C17', mode: 'fix', prompt: 'Keep the fix, undo the wording change.' });
     assert.equal(second.revision, 2);

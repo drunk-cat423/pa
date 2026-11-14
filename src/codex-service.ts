@@ -49,7 +49,7 @@ function resultText(task: CodexTask): string {
   const prose = (task.summary ?? '').replace(/^`{3,}[^\n]*\n[\s\S]*?(?:^`{3,}[^\n]*(?:\n|$)|(?![\s\S]))/gm, '')
     .split(/^(?:diff --git |--- (?:a\/|\/dev\/null)|@@ -)/m, 1)[0]!.trim();
   const state: Record<string, string> = { completed: '已完成', failed: '未完成', partial: '部分完成', blocked: '遇到阻塞', interrupted: '执行中断' };
-  return [`任务 ${task.id} · 第 ${task.revision} 次 · ${state[task.status] ?? task.status}`,
+  return [`任务 ${task.id} · 第 ${task.revision} 版 · ${state[task.status] ?? task.status}`,
     textLimit(prose || '这次没有可用的文字结论。', 650),
     ...(task.diff?.startsWith('diff --git ') ? ['改动保存在任务副本中，尚未部署。'] : []),
   ].join('\n');
