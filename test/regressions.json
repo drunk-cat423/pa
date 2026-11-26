@@ -489,6 +489,18 @@
       "name": "P1: authenticated acceptance and atomic revision closure survive restart",
       "basis": "critical",
       "reason": "防止重复派单、其他身份读取材料，以及结案后缺少通知或同一旧版产生两次续办。"
+    },
+    {
+      "file": "test/task-coordinator-p2.test.mjs",
+      "name": "V03 selects a new compatible worker and fences start and authenticated reports",
+      "basis": "critical",
+      "reason": "避免错配协议、材料、权限，以及另一执行者交回伪属的结果。"
+    },
+    {
+      "file": "test/task-coordinator-p2.test.mjs",
+      "name": "a silent adapter times out with unknown effects and no second start",
+      "basis": "critical",
+      "reason": "接单响应丢失不能导致重复发起一次可能已收费的任务。"
     }
   ]
 }

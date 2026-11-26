@@ -18,3 +18,5 @@ description: 查看 PA 任务协调器的阶段标准，通过隔离的本机服
 ## Evidence and cleanup
 
 命令输出证据目录，包含源码摘要、命令、退出码和 TAP 日志。临时数据库和 socket 由用例关闭，编译副本由 CLI 清理；核对 run.json 中的 outcome 与 scratchRemoved。plan 只展示验收条件。
+
+使用 `node scripts/verify-pa-tasks.mjs run P2` 验证适配器选择、回报身份和不明确接单。本阶段使用受控适配器和内存尝试记录，持久调度另行验收。
