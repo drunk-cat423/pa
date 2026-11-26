@@ -13,6 +13,12 @@ const compiler = join(repo, 'node_modules', 'typescript', 'bin', 'tsc');
 const planFile = 'docs/design/task-coordinator-verification.json';
 const usage = '用法 node scripts/verify-pa-tasks.mjs doctor | list | run <feature> | list-stage | plan [stage]';
 const features = {
+  P2: {
+    test: 'test/task-coordinator-p2.test.mjs',
+    name: 'V03 selects a new compatible worker and fences start and authenticated reports',
+    additional: ['a silent adapter times out with unknown effects and no second start'],
+    fixtures: [],
+  },
   P1: {
     test: 'test/task-coordinator-p1.test.mjs',
     name: 'P1: authenticated acceptance and atomic revision closure survive restart',
@@ -135,14 +141,15 @@ function run(featureId, feature) {
       return executed;
     };
     execute('build', [compiler, '-p', 'tsconfig.json'], 120_000);
-    const pattern = `^${RegExp.escape(feature.name)}$`;
+    const names = [feature.name, ...(feature.additional ?? [])];
+    const pattern = `^(?:${names.map(name => RegExp.escape(name)).join('|')})$`;
     const executed = execute('test', [
       '--test', '--test-isolation=none', '--test-reporter=tap', '--test-timeout=90000',
       `--test-name-pattern=${pattern}`, feature.test,
     ], 100_000);
     const tap = readFileSync(join(evidence, executed.stdout), 'utf8');
-    const namedPass = new RegExp(`^ok \\d+ - ${RegExp.escape(feature.name)}$`, 'm');
-    if (!namedPass.test(tap) || !/^# pass 1\r?$/m.test(tap) || !/^# fail 0\r?$/m.test(tap)) {
+    const allNamed = names.every(name => new RegExp(`^ok \\d+ - ${RegExp.escape(name)}$`, 'm').test(tap));
+    if (!allNamed || !new RegExp(`^# pass ${names.length}\\r?$`, 'm').test(tap) || !/^# fail 0\r?$/m.test(tap)) {
       throw new Error('所选测试没有实际通过。请检查测试名和 TAP 日志。');
     }
     manifest.outcome = 'passed';
