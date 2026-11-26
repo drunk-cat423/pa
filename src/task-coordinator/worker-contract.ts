@@ -46,6 +46,12 @@ export interface WorkerStart extends WorkerAttemptFence {
   readonly materials: readonly string[];
   readonly deadlineAt: number;
   readonly budget: number;
+  readonly workspaceKey?: string;
+  readonly resumeFrom?: {
+    readonly attemptKey: string;
+    readonly revision: number;
+    readonly externalId?: string;
+  };
 }
 
 export type WorkerStartReceipt =

@@ -4,7 +4,7 @@ export const TASK_PHASES = ['waiting_input', 'waiting_dependency', 'queued', 'ru
 export const OUTCOME_STATUSES = ['succeeded', 'partial', 'failed', 'cancelled', 'timed_out', 'dependency_failed', 'outcome_unknown'] as const;
 
 const APPLICATION_ID = 0x50415443;
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
   CREATE TABLE tasks (
@@ -67,6 +67,97 @@ const SCHEMA = `
   ) STRICT;
 `;
 
+const SCHEDULING_SCHEMA = `
+  ALTER TABLE task_revisions ADD COLUMN dispatch_json TEXT CHECK (dispatch_json IS NULL OR json_valid(dispatch_json));
+  ALTER TABLE task_revisions ADD COLUMN dependencies_locked INTEGER NOT NULL DEFAULT 0 CHECK (dependencies_locked IN (0, 1));
+
+  CREATE TABLE task_dependencies (
+    task_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    prerequisite_id TEXT NOT NULL,
+    prerequisite_revision INTEGER NOT NULL,
+    allow_partial INTEGER CHECK (allow_partial IN (0, 1)),
+    PRIMARY KEY (task_id, revision, prerequisite_id, prerequisite_revision),
+    FOREIGN KEY (task_id, revision) REFERENCES task_revisions(task_id, revision),
+    FOREIGN KEY (prerequisite_id, prerequisite_revision) REFERENCES task_revisions(task_id, revision)
+  ) STRICT;
+
+  CREATE TABLE task_dispatch_queue (
+    queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    UNIQUE (task_id, revision),
+    FOREIGN KEY (task_id, owner) REFERENCES tasks(task_id, owner),
+    FOREIGN KEY (task_id, revision) REFERENCES task_revisions(task_id, revision)
+  ) STRICT;
+  CREATE INDEX task_dispatch_queue_owner ON task_dispatch_queue(owner, queue_id);
+  INSERT INTO task_dispatch_queue (owner, task_id, revision)
+    SELECT t.owner, r.task_id, r.revision FROM task_revisions r JOIN tasks t USING (task_id)
+    WHERE r.phase IN ('queued', 'waiting_dependency') ORDER BY r.created_at, r.rowid;
+
+  CREATE TABLE task_scheduler_policy (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    limits_json TEXT NOT NULL CHECK (json_valid(limits_json)),
+    last_owner TEXT NOT NULL DEFAULT ''
+  ) STRICT;
+  CREATE TABLE task_scheduler_cursors (
+    owner TEXT PRIMARY KEY,
+    queue_id INTEGER NOT NULL,
+    scan_end_id INTEGER NOT NULL CHECK (scan_end_id >= queue_id)
+  ) STRICT;
+  CREATE TABLE task_scheduler_workers (
+    worker_id TEXT PRIMARY KEY,
+    capacity_json TEXT NOT NULL CHECK (json_valid(capacity_json))
+  ) STRICT;
+
+  CREATE TABLE task_attempts (
+    attempt_key TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    worker_id TEXT NOT NULL REFERENCES task_scheduler_workers(worker_id),
+    lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
+    attempt_token TEXT NOT NULL,
+    can_resume INTEGER NOT NULL CHECK (can_resume IN (0, 1)),
+    permissions_json TEXT NOT NULL CHECK (json_type(permissions_json) = 'array'),
+    dispatch_state TEXT NOT NULL CHECK (dispatch_state IN ('unsent', 'possibly_sent', 'accepted', 'rejected')),
+    external_id TEXT,
+    last_event_seq INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    UNIQUE (task_id, revision, lease_generation),
+    FOREIGN KEY (task_id, revision) REFERENCES task_revisions(task_id, revision)
+  ) STRICT;
+  CREATE UNIQUE INDEX task_attempts_active ON task_attempts(task_id, revision) WHERE ended_at IS NULL;
+  CREATE INDEX task_attempts_continuation ON task_attempts(task_id, revision DESC, lease_generation DESC)
+    WHERE dispatch_state IN ('possibly_sent', 'accepted');
+  ALTER TABLE task_revisions ADD COLUMN resume_attempt_key TEXT REFERENCES task_attempts(attempt_key);
+
+  CREATE TABLE task_reservations (
+    attempt_key TEXT NOT NULL REFERENCES task_attempts(attempt_key),
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('global', 'owner', 'worker', 'pool', 'workspace')),
+    resource_key TEXT NOT NULL,
+    units INTEGER NOT NULL CHECK (units > 0),
+    acquired_at INTEGER NOT NULL,
+    released_at INTEGER,
+    release_reason TEXT,
+    PRIMARY KEY (attempt_key, resource_kind, resource_key),
+    CHECK ((released_at IS NULL) = (release_reason IS NULL))
+  ) STRICT;
+  CREATE INDEX task_live_reservations ON task_reservations(resource_kind, resource_key, units) WHERE released_at IS NULL;
+  CREATE UNIQUE INDEX task_workspace_writer ON task_reservations(resource_key)
+    WHERE resource_kind = 'workspace' AND released_at IS NULL;
+
+  CREATE TABLE task_attempt_events (
+    attempt_key TEXT NOT NULL REFERENCES task_attempts(attempt_key),
+    event_seq INTEGER NOT NULL CHECK (event_seq > 0),
+    event_json TEXT NOT NULL CHECK (json_valid(event_json)),
+    late INTEGER NOT NULL CHECK (late IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (attempt_key, event_seq)
+  ) STRICT;
+`;
+
 export function inImmediateTransaction<T>(db: DatabaseSync, operation: () => T): T {
   db.exec('BEGIN IMMEDIATE');
   try {
@@ -88,11 +179,17 @@ export function initializeTaskCoordinatorSchema(db: DatabaseSync): void {
     const applicationId = db.prepare('PRAGMA application_id').get()?.application_id;
     const schemaVersion = db.prepare('PRAGMA user_version').get()?.user_version;
     if (applicationId === APPLICATION_ID && schemaVersion === SCHEMA_VERSION) return;
+    if (applicationId === APPLICATION_ID && schemaVersion === 1) {
+      db.exec(SCHEDULING_SCHEMA);
+      db.exec(`PRAGMA user_version=${SCHEMA_VERSION};`);
+      return;
+    }
     const empty = !db.prepare("SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' LIMIT 1").get();
     if (applicationId !== 0 || schemaVersion !== 0 || !empty) {
       throw new Error(`Incompatible task coordinator database (application ID ${applicationId}, schema ${schemaVersion}).`);
     }
     db.exec(SCHEMA);
+    db.exec(SCHEDULING_SCHEMA);
     db.exec(`PRAGMA application_id=${APPLICATION_ID}; PRAGMA user_version=${SCHEMA_VERSION};`);
   });
 }
