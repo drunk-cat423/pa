@@ -483,6 +483,12 @@
       "basis": "incident",
       "reason": "真实私聊生命第一因长期课题：无AI关键词的确认被AI画像独立门槛拒绝；sender确认和显式Bot改名不能替代。复用当前画像fixture，仅保留这条事故。",
       "evidence": "2026-10-26 life-first-cause private-chat incident: normalized AI-self update rejected before an exact-quote retry"
+    },
+    {
+      "file": "test/task-coordinator-p1.test.mjs",
+      "name": "P1: authenticated acceptance and atomic revision closure survive restart",
+      "basis": "critical",
+      "reason": "防止重复派单、其他身份读取材料，以及结案后缺少通知或同一旧版产生两次续办。"
     }
   ]
 }

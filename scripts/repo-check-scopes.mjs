@@ -2,6 +2,7 @@ import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const scopeFiles = {
+  coordinator: ['task-coordinator-p1.test.mjs'],
   delegation: ['codex-service.test.mjs', 'codex-worker.test.mjs', 'delegation-diagnostics.test.mjs', 'publish-inbox.test.mjs', 'publisher-controller.test.mjs'],
   efficiency: ['search-concurrency.test.mjs', 'storage-efficiency.test.mjs'],
   trending: ['trending-content.test.mjs', 'trending-service.test.mjs'],
@@ -82,6 +83,7 @@ export const scopeFiles = {
 // Reuse the same scopes as local checks. An unknown source module fails closed
 // to all existing regressions; changed/new test files are always included.
 const sourceScopes = [
+  [/^task-coordinator\//, ['coordinator']],
   [/^(runtime|conversation|turn-plan|answer-grounding|context-|config|model)/, ['chat', 'context', 'cache', 'research']],
   [/^(image-|web-|plain-text|markdown-chunks)/, ['web', 'delivery', 'cache']],
   [/^(auto-memory|memory|material-|person-|profile-|self-profile)/, ['memory', 'context', 'storage']],
