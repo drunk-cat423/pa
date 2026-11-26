@@ -113,25 +113,35 @@ async function fixture(t, extract = async input => extracted(input), overrides =
 
 test('最终上下文达到85%才整理；摘要与检查点后消息跨新轮和重启继续', async t => {
   const gate = deferred(), started = deferred();
-  let extractionStarted = false;
-  // Leave room for the expanded preparation protocol after compaction, while
-  // the growing 3500-character messages still cross the actual 85% boundary.
-  const f = await fixture(t, async (input, signal) => { extractionStarted = true; started.resolve(); await wait(signal, gate.promise); return extracted(input); }, { contextWindow: 32768 });
+  const f = await fixture(t, async (input, signal) => {
+    started.resolve(input);
+    await wait(signal, gate.promise);
+    return extracted(input);
+  }, { contextWindow: 42000 });
   const h = f.harness();
-  let pending;
-  for (let i = 1; i <= 10 && !extractionStarted; i++) {
-    pending = h.handle(f.message(`capacity${i}`, `${i}:` + 'x'.repeat(3500), { route: f.privateRoute }));
-    const state = await Promise.race([pending.then(result => ({ result })), started.promise.then(() => ({ started: true }))]);
-    if (state.started) break;
-    assert.equal(state.result, 'sent');
+  for (const i of [1, 2]) {
+    assert.equal(await h.handle(f.message(`capacity-history-${i}`, `${i}:` + '史'.repeat(1666), { route: f.privateRoute })), 'sent');
   }
-  assert.ok(extractionStarted, 'the measured final request should cross the 85% threshold');
-  await started.promise;
-  let finished = false; void pending.then(() => { finished = true; });
-  await new Promise(resolve => setTimeout(resolve, 50));
-  assert.equal(finished, false);
-  const before = f.requests.filter(request=>request.messages.at(-2)?.role==='tool').length; gate.resolve();
-  assert.equal(await pending, 'sent'); assert.equal(f.requests.filter(request=>request.messages.at(-2)?.role==='tool').length, before + 1);
+  assert.equal(f.inputs.length, 0, 'history turns should stay below the 85% threshold');
+
+  // Multibyte text stays within the channel's character limit and fills the context with history.
+  const before = f.requests.length;
+  let finished = false;
+  const pending = h.handle(f.message('capacity-crossing', '测'.repeat(3200), { route: f.privateRoute }))
+    .finally(() => { finished = true; });
+  try {
+    const input = await Promise.race([started.promise, pending.then(() => undefined)]);
+    assert.equal(input?.pipeline, 'compression');
+    assert.equal(finished, false);
+    assert.equal(f.requests.length, before);
+    const db = f.db();
+    try {
+      assert.equal(db.prepare('SELECT count(*) AS total FROM agent_runs').get().total, 2,
+        'the foreground turn must wait before reserving a model run');
+    } finally { db.close(); }
+  } finally { gate.resolve(); }
+  assert.equal(await pending, 'sent');
+  assert.equal(f.requests.slice(before).filter(request => request.messages.at(-2)?.role === 'tool').length, 1);
   await h.waitForMemory(); assert.equal(f.inputs[0].contextProtocol, 1);
   assert.equal(await h.handle(f.message('capacity-follow-up', 'CAPACITY_FOLLOW_UP', { route: f.privateRoute })), 'sent');
   let context = conversationContext(f.requests.at(-1));
