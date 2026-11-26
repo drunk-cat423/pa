@@ -15,6 +15,8 @@ PA 使用 Node.js 24.15.0、Pi SDK 和本地 SQLite，不需要 MySQL、Web 端�
 
 ## 首次发布与数据迁移
 
+GitHub Actions 交付包的领取、提交号与校验和核对见[CI 与持续交付](ci-cd.md)。
+
 发布包由已提交的 Git 版本生成，不包含 `.env`、`.local` 或 node_modules。在发布目录使用固定 lockfile 执行 `npm ci`、`npm run check` 和 `npm run build`；Node 下载包校验官方 SHA-256。服务器测试用 `node --test --test-concurrency=2 test/*.test.mjs`，不加载生产 `.env`，不请求真实模型。
 
 先准备并验证代码，再正常停止本机 QQ 服务，防止两台机器同时连接同一机器人。停机后备份并复制整个 PA_DATA_DIR，包含 SQLite 和所有会话的 Pi JSONL；不能只迁移数据库。迁移副本中的 `conversations.pi_session_file` 从 Windows 路径改为 `/var/lib/pa/<原会话哈希>/session.jsonl`，原会话 ID、消息和 Pi entry ID 不变。保留迁移前副本，核对数据库完整性、外键和每个有关联消息的会话文件。

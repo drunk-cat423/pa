@@ -84,6 +84,7 @@ export const scopeFiles = {
 // to all existing regressions; changed/new test files are always included.
 const sourceScopes = [
   [/^task-coordinator\//, ['coordinator']],
+  [/^runtime\.ts$/, ['chat', 'context', 'cache', 'research', 'web', 'delegation']],
   [/^(runtime|conversation|turn-plan|answer-grounding|context-|config|model)/, ['chat', 'context', 'cache', 'research']],
   [/^(image-|web-|plain-text|markdown-chunks)/, ['web', 'delivery', 'cache']],
   [/^(auto-memory|memory|material-|person-|profile-|self-profile)/, ['memory', 'context', 'storage']],
