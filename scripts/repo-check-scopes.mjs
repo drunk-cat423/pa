@@ -82,6 +82,7 @@ export const scopeFiles = {
 // Reuse the same scopes as local checks. An unknown source module fails closed
 // to all existing regressions; changed/new test files are always included.
 const sourceScopes = [
+  [/^runtime\.ts$/, ['chat', 'context', 'cache', 'research', 'web', 'delegation']],
   [/^(runtime|conversation|turn-plan|answer-grounding|context-|config|model)/, ['chat', 'context', 'cache', 'research']],
   [/^(image-|web-|plain-text|markdown-chunks)/, ['web', 'delivery', 'cache']],
   [/^(auto-memory|memory|material-|person-|profile-|self-profile)/, ['memory', 'context', 'storage']],

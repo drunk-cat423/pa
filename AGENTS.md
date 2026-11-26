@@ -5,6 +5,7 @@ PA 是 TypeScript / Node.js 的 Headless 长期个人伙伴，使用 Pi SDK，�
 ## 从这里开始
 
 - 安装、任务路由、检查与交接：[docs/repo-harness.md](docs/repo-harness.md)。只读取当前任务对应的资料。
+- PA 的 PR 标题和正文使用中文，写明原有行为、本次改动、前后差别及验收标准与结果。默认不指定人工审查人，具体格式与阶段审查规则见[提交 PR](docs/repo-harness.md#提交-pr)。
 - 拉取仓库或同步代码时，默认同时做既有 PA 服务器只读巡检，入口见[同步与巡检](docs/operations.md)。这是用户已确认的长期工作范围；不自动提交、部署、重启、重试任务或清理生产数据。
 - 模块职责：[docs/development.md](docs/development.md)。通用能力属于应用 harness，渠道适配层负责规范化事件和收发协议。
 - 使用与配置：[README.md](README.md)、[.env.example](.env.example)。运行参数以配置和代码为准，不能把某次生产状态当作默认值。
