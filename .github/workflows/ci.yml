@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pr-description:
+    name: PR 标题与说明
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+      - run: node scripts/ci/check-pr-description.mjs "$GITHUB_EVENT_PATH"
+
+  check:
+    # 跳过时使用独立名称，避免覆盖同一提交已有的代码检查结果。
+    name: >-
+      ${{ github.event_name == 'pull_request' && github.event.action == 'edited' &&
+      github.event.changes.base == null && '代码检查（仅编辑 PR 说明）' ||
+      github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' &&
+      '代码检查（非 main 手动触发）' || '代码检查' }}
+    if: >-
+      (github.event_name == 'pull_request' &&
+      (github.event.action != 'edited' || github.event.changes.base != null)) ||
+      (github.event_name != 'pull_request' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+      - name: 安装锁定依赖
+        run: npm ci --registry=https://registry.npmjs.org/ --replace-registry-host=registry.npmmirror.com --no-audit --no-fund
+      - name: 检查 PR 变更范围
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/ci/check-pr.mjs "$PR_BASE_SHA" "$PR_HEAD_SHA"
+      - name: 运行全量回归
+        if: github.event_name != 'pull_request'
+        run: node scripts/repo-check.mjs all
+      - name: 打包通过检查的 main 版本
+        if: github.event_name != 'pull_request'
+        run: node scripts/ci/package-release.mjs "$RUNNER_TEMP/pa-release"
+      - name: 上传发布包
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pa-${{ github.sha }}
+          path: ${{ runner.temp }}/pa-release/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
