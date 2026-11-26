@@ -176,7 +176,8 @@ function useWorkers(f, workers, schedulerOptions) {
       },
       async start(attempt) {
         active.set(attempt.attemptKey, attempt);
-        events.push({ type: 'started', taskId: attempt.taskId, revision: attempt.revision, workerId });
+        const { taskId, revision, attemptKey, resumeFrom } = attempt;
+        events.push({ type: 'started', taskId, revision, workerId, attemptKey, resumeFrom });
         return { disposition: 'accepted', externalId: 'local-fixture' };
       },
     });
@@ -381,6 +382,9 @@ test('V05 dependencies are pinned to revisions and cycles are refused', async t 
   const usesSecond = f.submit('Read second input revision', 'transform', { dependencies: [revised] });
   const byTaskId = (a, b) => a.taskId.localeCompare(b.taskId);
   assert.deepEqual((await round()).started.sort(byTaskId), [usesFirst, revised].sort(byTaskId));
+  const previous = events.find(event => event.type === 'started' && event.taskId === input.taskId && event.revision === 1);
+  const continuation = events.find(event => event.type === 'started' && event.taskId === input.taskId && event.revision === 2);
+  assert.deepEqual(continuation.resumeFrom, { attemptKey: previous.attemptKey, revision: 1, externalId: 'local-fixture' });
   assert.equal(f.phase(usesFirst), 'running');
   assert.equal(f.phase(usesSecond), 'waiting_dependency');
   finish(usesFirst);
