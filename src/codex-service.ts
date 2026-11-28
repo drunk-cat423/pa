@@ -81,6 +81,7 @@ export class CodexService {
   }
 
   private storage(): DatabaseSync {
+    if (this.readOnly) throw new MemoryError('旧 Codex 任务库已切换为只读。');
     if (this.closed) throw new MemoryError('Codex委派服务已关闭。');
     if (!this.db) {
       mkdirSync(this.config.dataDir, { recursive: true });
@@ -150,7 +151,7 @@ export class CodexService {
     return validTask(await this.call(`/tasks/${encodeURIComponent(id)}?owner=${encodeURIComponent(this.owner)}`));
   }
   async legacyStatus(route: ChannelRoute, senderId: string, id?: string): Promise<string> {
-    if (!this.readOnly || !this.matches(route) || senderId !== this.binding.senderId || !this.available()) {
+    if (this.closed || !this.readOnly || !this.matches(route) || senderId !== this.binding.senderId || !this.available()) {
       throw new MemoryError('旧任务查询仅对已配置的本人 QQ 私聊开放。');
     }
     if (id !== undefined && !/^[A-Za-z0-9_-]{1,100}$/.test(id)) throw new MemoryError('旧任务编号无效。');
@@ -218,7 +219,7 @@ export class CodexService {
       confirmation: `已交给 Codex，任务 ${task.id}（第 ${task.revision} 次）。完成后我会在这里告诉你结果。` };
   }
   private wake(): void {
-    if (this.closed || this.polling || !this.available()) return;
+    if (this.readOnly || this.closed || this.polling || !this.available()) return;
     this.polling = this.poll().then(() => { this.lastError = undefined; }, error => {
       this.lastError = error instanceof Error ? textLimit(error.message, 300) : 'Codex通知暂不可用。';
     }).finally(() => { this.polling = undefined; });
