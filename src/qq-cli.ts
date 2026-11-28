@@ -140,13 +140,13 @@ async function main(): Promise<void> {
         }).catch(() => { status('persistence_failed'); process.exitCode = 1; void stop(); });
       },
     });
-    const transport = { send: async (message: import('./channel-types.js').OutboundMessage) => {
-      while (!stopping && gate()) await new Promise(resolve => setTimeout(resolve, 100));
-      return stopping ? { status: 'rejected' as const } : channel!.send(message);
+    const transport = { send: async (message: import('./channel-types.js').OutboundMessage, signal?: AbortSignal) => {
+      while (!stopping && !signal?.aborted && gate()) await new Promise(resolve => setTimeout(resolve, 100));
+      return stopping || signal?.aborted ? { status: 'rejected' as const } : channel!.send(message, signal);
     } };
     harness = new ChannelHarness(config, qq.routes, transport, qq.maxCalls, policy, undefined, () => {
       status('persistence_failed'); process.exitCode = 1; void stop();
-    },taskResult,{ standby: Boolean(inbox), mayRun: () => !gate() });
+    },taskResult,{ standby: Boolean(inbox), mayRun: () => !gate(), taskDeliveryAvailable: () => gatewayReady });
     await channel.start();
     if (inbox && !stopping) {
       await harness.prepare();

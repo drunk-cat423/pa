@@ -555,6 +555,18 @@
       "name": "V10 uncertain delivery stops remaining parts and authorized reclaim reuses the original result",
       "basis": "critical",
       "reason": "发送回执未知不得自动重发，单房间后续通知不能被永久阻塞，本人重复重领不得再次执行任务。"
+    },
+    {
+      "file": "test/task-coordinator-p6.test.mjs",
+      "name": "V11 QQ task entry preserves authorized versioned delivery across cutover and restart",
+      "basis": "critical",
+      "reason": "切换后同一条本人私聊只能派单一次，旧任务不重跑，重领只能交付本人指定版本。"
+    },
+    {
+      "file": "test/task-coordinator-operations.test.mjs",
+      "name": "V12 offline operations stay bounded and read-only with 10000 closed revisions",
+      "basis": "critical",
+      "reason": "历史累积后应能定位排队和未送达的任务，管理查询不能读取历史正文或改变运行状态。"
     }
   ]
 }

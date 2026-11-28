@@ -24,12 +24,16 @@ const routeKey = (route: ChannelRoute) => JSON.stringify([route.channel, route.a
 export const codexOwnerKey = (binding: Binding) => createHash('sha256').update(JSON.stringify([
   binding.route.channel, binding.route.accountId, binding.route.roomType, binding.route.roomId, binding.senderId,
 ])).digest('hex');
-export function codexPrivateOwner(policy: HarnessPolicy, routes: readonly ChannelRoute[]): Binding {
+export function findTaskPrivateOwner(policy: HarnessPolicy, routes: readonly ChannelRoute[]): Binding | undefined {
   const allowed = new Set(routes.map(routeKey));
   const candidates = policy.ownerBindings.filter(binding => binding.route.channel === 'qq'
     && binding.route.roomType === 'private' && binding.senderId === binding.route.roomId && allowed.has(routeKey(binding.route)));
-  if (candidates.length !== 1) throw new Error('Codex需要唯一已授权且已接入的本人QQ私聊绑定。');
-  return candidates[0]!;
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+export function codexPrivateOwner(policy: HarnessPolicy, routes: readonly ChannelRoute[]): Binding {
+  const owner = findTaskPrivateOwner(policy, routes);
+  if (!owner) throw new Error('后台委派需要唯一已授权且已接入的本人 QQ 私聊绑定。');
+  return owner;
 }
 const terminal = (task: CodexTask) => ['completed', 'failed', 'interrupted', 'blocked', 'partial'].includes(task.status);
 function validTask(value: unknown): CodexTask {
@@ -66,9 +70,9 @@ export class CodexService {
   private readonly publication?: CodexPublication;
   constructor(private readonly config: Pick<PaConfig, 'dataDir' | 'codex'>, private readonly binding: Binding,
     private readonly available: () => boolean,
-    private readonly send: (message: OutboundMessage) => Promise<DeliveryResult>) {
+    private readonly send: (message: OutboundMessage) => Promise<DeliveryResult>, private readonly readOnly = false) {
     this.owner = codexOwnerKey(binding);
-    if (config.codex?.publishSocketPath) this.publication = new CodexPublication(config.dataDir, config.codex.publishSocketPath,
+    if (!readOnly && config.codex?.publishSocketPath) this.publication = new CodexPublication(config.dataDir, config.codex.publishSocketPath,
       this.owner, binding.route, binding.senderId, available, id => this.task(id), send);
   }
 
@@ -98,12 +102,17 @@ export class CodexService {
     }
     return this.db;
   }
-  start(): void { this.storage(); this.timer ??= setInterval(() => this.wake(), 2000); this.timer.unref(); this.wake(); }
-  prepare(): void { this.storage(); }
-  info() { return { enabled: true, failed: Boolean(this.lastError), ...(this.lastError ? { error: this.lastError } : {}) }; }
+  start(): void {
+    if (!this.readOnly) {
+      this.storage(); this.timer ??= setInterval(() => this.wake(), 2000); this.timer.unref(); this.wake();
+    }
+  }
+  prepare(): void { if (!this.readOnly) this.storage(); }
+  info() { return { enabled: !this.readOnly, readOnly: this.readOnly, failed: Boolean(this.lastError),
+    ...(this.lastError ? { error: this.lastError } : {}) }; }
   matches(route: ChannelRoute): boolean { return routeKey(route) === routeKey(this.binding.route); }
   context(route: ChannelRoute, senderId: string, sourceMessageId: string): CodexToolContext | undefined {
-    if (!this.matches(route) || senderId !== this.binding.senderId || !this.available()) return undefined;
+    if (this.readOnly || !this.matches(route) || senderId !== this.binding.senderId || !this.available()) return undefined;
     return { execute: (name, params) => this.execute(route, senderId, sourceMessageId, name, params) };
   }
   private async call(path: string, body?: unknown): Promise<unknown> {
@@ -140,12 +149,29 @@ export class CodexService {
   private async task(id: string): Promise<CodexTask> {
     return validTask(await this.call(`/tasks/${encodeURIComponent(id)}?owner=${encodeURIComponent(this.owner)}`));
   }
+  async legacyStatus(route: ChannelRoute, senderId: string, id?: string): Promise<string> {
+    if (!this.readOnly || !this.matches(route) || senderId !== this.binding.senderId || !this.available()) {
+      throw new MemoryError('旧任务查询仅对已配置的本人 QQ 私聊开放。');
+    }
+    if (id !== undefined && !/^[A-Za-z0-9_-]{1,100}$/.test(id)) throw new MemoryError('旧任务编号无效。');
+    try {
+      if (id) return resultText(await this.task(id));
+      const tasks = await this.tasks();
+      if (!tasks.length) return '这条私聊没有可查询的旧 Codex 任务。';
+      return '旧 Codex 任务（只读）\n' + tasks.slice(0, 10).map(task =>
+        resultText(task).split('\n', 1)[0]).join('\n');
+    } catch (error) {
+      if (!(error instanceof MemoryError)) throw error;
+      if (error instanceof CodexResponseError && error.statusCode === 404) return '这条私聊下没有找到该旧任务。';
+      return '暂时无法查询旧任务。旧记录仍保留。';
+    }
+  }
   private remember(requestId: string, task: CodexTask): void {
     this.storage().prepare("UPDATE requests SET task_id=?,revision=?,done=0,misses=0,resolution='accepted' WHERE request_id=? AND owner=?")
       .run(task.id, task.revision, requestId, this.owner);
   }
   private async execute(route: ChannelRoute, senderId: string, sourceId: string, name: CodexToolName, params: unknown): Promise<unknown> {
-    if (!this.matches(route) || senderId !== this.binding.senderId || !this.available()) throw new MemoryError('此操作仅开放给已配置的本人QQ私聊。');
+    if (this.readOnly || !this.matches(route) || senderId !== this.binding.senderId || !this.available()) throw new MemoryError('此操作仅开放给已配置的本人QQ私聊。');
     if (!params || typeof params !== 'object' || Array.isArray(params)) throw new MemoryError('Codex参数必须是对象。');
     const p = params as Record<string, unknown>;
     const allowed = { delegate_task: ['prompt', 'mode'], continue_coding_task: ['prompt', 'mode', 'id'], coding_status: ['id'], send_coding_result: ['id'] }[name];

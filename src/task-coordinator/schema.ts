@@ -4,8 +4,15 @@ import { DELIVERY_SCHEMA } from './delivery-schema.js';
 export const TASK_PHASES = ['waiting_input', 'waiting_dependency', 'queued', 'running', 'reconciling', 'closed'] as const;
 export const OUTCOME_STATUSES = ['succeeded', 'partial', 'failed', 'cancelled', 'timed_out', 'dependency_failed', 'outcome_unknown'] as const;
 
-const APPLICATION_ID = 0x50415443;
-const SCHEMA_VERSION = 4;
+export const APPLICATION_ID = 0x50415443;
+export const SCHEMA_VERSION = 5;
+
+export function requireTaskCoordinatorSchema(db: DatabaseSync): void {
+  if (db.prepare('PRAGMA application_id').get()?.application_id !== APPLICATION_ID
+    || db.prepare('PRAGMA user_version').get()?.user_version !== SCHEMA_VERSION) {
+    throw new Error('任务库版本不匹配。');
+  }
+}
 
 const SCHEMA = `
   CREATE TABLE tasks (
@@ -182,6 +189,11 @@ const RECOVERY_SCHEMA = `
   CREATE INDEX task_reservations_attempt_live ON task_reservations(attempt_key) WHERE released_at IS NULL;
 `;
 
+const OPERATIONS_SCHEMA = `
+  CREATE INDEX task_undelivered ON task_notifications(notification_id) WHERE status <> 'sent';
+  CREATE INDEX task_waiting_input_age ON task_revisions(created_at,task_id,revision) WHERE phase = 'waiting_input';
+`;
+
 export function inImmediateTransaction<T>(db: DatabaseSync, operation: () => T): T {
   db.exec('BEGIN IMMEDIATE');
   try {
@@ -203,10 +215,11 @@ export function initializeTaskCoordinatorSchema(db: DatabaseSync): void {
     const applicationId = db.prepare('PRAGMA application_id').get()?.application_id;
     const schemaVersion = db.prepare('PRAGMA user_version').get()?.user_version;
     if (applicationId === APPLICATION_ID && schemaVersion === SCHEMA_VERSION) return;
-    if (applicationId === APPLICATION_ID && (schemaVersion === 1 || schemaVersion === 2 || schemaVersion === 3)) {
+    if (applicationId === APPLICATION_ID && (schemaVersion === 1 || schemaVersion === 2 || schemaVersion === 3 || schemaVersion === 4)) {
       if (schemaVersion === 1) db.exec(SCHEDULING_SCHEMA);
       if (schemaVersion <= 2) db.exec(RECOVERY_SCHEMA);
-      db.exec(DELIVERY_SCHEMA);
+      if (schemaVersion <= 3) db.exec(DELIVERY_SCHEMA);
+      db.exec(OPERATIONS_SCHEMA);
       db.exec(`PRAGMA user_version=${SCHEMA_VERSION};`);
       return;
     }
@@ -218,6 +231,7 @@ export function initializeTaskCoordinatorSchema(db: DatabaseSync): void {
     db.exec(SCHEDULING_SCHEMA);
     db.exec(RECOVERY_SCHEMA);
     db.exec(DELIVERY_SCHEMA);
+    db.exec(OPERATIONS_SCHEMA);
     db.exec(`PRAGMA application_id=${APPLICATION_ID}; PRAGMA user_version=${SCHEMA_VERSION};`);
   });
 }

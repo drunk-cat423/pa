@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { splitMarkdown } from '../markdown-chunks.js';
 import { ArtifactUnavailableError, listFrozenArtifacts, readFrozenArtifact } from './artifacts.js';
 import type { ArtifactMetadata, TaskArtifact } from './artifacts.js';
-import { initializeTaskCoordinatorSchema, inImmediateTransaction } from './schema.js';
+import { initializeTaskCoordinatorSchema, inImmediateTransaction, requireTaskCoordinatorSchema } from './schema.js';
 import { TaskCoordinatorError } from './store.js';
 import type { TaskOutcome, TaskReceipt } from './store.js';
 
@@ -89,9 +89,9 @@ function assertArtifact(db: DatabaseSync, owner: string, receipt: TaskReceipt, r
 export class TaskDeliveryStore {
   private readonly db: DatabaseSync;
 
-  constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
-    try { initializeTaskCoordinatorSchema(this.db); }
+  constructor(dbPath: string, { readOnly = false }: { readOnly?: boolean } = {}) {
+    this.db = new DatabaseSync(dbPath, { readOnly });
+    try { (readOnly ? requireTaskCoordinatorSchema : initializeTaskCoordinatorSchema)(this.db); }
     catch (error) { this.db.close(); throw error; }
   }
 

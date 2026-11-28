@@ -13,6 +13,13 @@ const compiler = join(repo, 'node_modules', 'typescript', 'bin', 'tsc');
 const planFile = 'docs/design/task-coordinator-verification.json';
 const usage = '用法 node scripts/verify-pa-tasks.mjs doctor | list | run <feature> | list-stage | plan [stage]';
 const features = {
+  P6: {
+    test: 'test/task-coordinator-p6.test.mjs',
+    testFiles: ['test/task-coordinator-operations.test.mjs'],
+    name: 'V11 QQ task entry preserves authorized versioned delivery across cutover and restart',
+    additional: ['V12 offline operations stay bounded and read-only with 10000 closed revisions'],
+    fixtures: ['test/fixtures/turn-preparation.mjs'],
+  },
   P5: {
     test: 'test/task-coordinator-p5.test.mjs',
     name: 'V09 artifacts and delivery intent freeze atomically and survive restart',
@@ -92,8 +99,8 @@ function readiness(selected) {
   for (const path of dependencies) {
     if (!existsSync(join(repo, path))) throw new Error(`${path} 不存在。请在 PA 仓库按锁文件运行 npm ci。`);
   }
-  for (const { test, fixtures } of selected) {
-    for (const path of [test, ...fixtures]) readFileSync(join(repo, path));
+  for (const { test, testFiles = [], fixtures } of selected) {
+    for (const path of [test, ...testFiles, ...fixtures]) readFileSync(join(repo, path));
   }
   return {
     node: process.version,
@@ -106,7 +113,7 @@ function snapshot(scratch, feature) {
   const paths = [
     'package.json', 'package-lock.json', 'tsconfig.json',
     ...globSync('src/**/*.ts', { cwd: repo }).map(path => path.replaceAll('\\', '/')).sort(),
-    feature.test, ...feature.fixtures,
+    feature.test, ...(feature.testFiles ?? []), ...feature.fixtures,
   ];
   return Object.fromEntries(paths.map(path => {
     const content = readFileSync(join(repo, path));
@@ -170,7 +177,7 @@ function run(featureId, feature) {
     const pattern = `^(?:${names.map(name => RegExp.escape(name)).join('|')})$`;
     const executed = execute('test', [
       '--test', '--test-isolation=none', '--test-reporter=tap', '--test-timeout=90000',
-      `--test-name-pattern=${pattern}`, feature.test,
+      `--test-name-pattern=${pattern}`, feature.test, ...(feature.testFiles ?? []),
     ], 100_000);
     const tap = readFileSync(join(evidence, executed.stdout), 'utf8');
     const allNamed = names.every(name => new RegExp(`^ok \\d+ - ${RegExp.escape(name)}$`, 'm').test(tap));
