@@ -2,7 +2,7 @@ import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const scopeFiles = {
-  coordinator: ['task-coordinator-p1.test.mjs', 'task-coordinator-p2.test.mjs', 'task-coordinator-p3.test.mjs', 'task-coordinator-p4.test.mjs', 'task-coordinator-p5.test.mjs'],
+  coordinator: ['task-coordinator-p1.test.mjs', 'task-coordinator-p2.test.mjs', 'task-coordinator-p3.test.mjs', 'task-coordinator-p4.test.mjs', 'task-coordinator-p5.test.mjs', 'task-coordinator-p6.test.mjs', 'task-coordinator-operations.test.mjs', 'task-coordinator-upgrade.test.mjs'],
   delegation: ['codex-service.test.mjs', 'codex-worker.test.mjs', 'delegation-diagnostics.test.mjs', 'publish-inbox.test.mjs', 'publisher-controller.test.mjs'],
   efficiency: ['search-concurrency.test.mjs', 'storage-efficiency.test.mjs'],
   trending: ['trending-content.test.mjs', 'trending-service.test.mjs'],

@@ -50,3 +50,5 @@ node scripts/ops/sync-and-check.mjs --hours 48
 新增运行状态、schema或服务布局时同步维护采集器与本页，避免新增同义检查脚本。普通同步不要求安装依赖或运行全套测试；只有依赖变化、修改或异常需要时才按[开发导航](repo-harness.md)选择检查。
 
 修改流程脚本后检查语法、help、真实Git快进与本地改动保护，并对实际服务器做一次只读采集；核对返回的版本、字段和异常分类。`node scripts/repo-check.mjs ops`运行最少的已确认巡检误报/漏报回归，不访问真实服务器；脚本本身的直接入口为`node --test test/ops-status.test.mjs`。检查成功只说明这些结构和状态，没有证明模型回答质量、QQ展示或端到端业务完全正常。
+
+后台任务协调器停止调度时，即使 QQ 仍在线、没有新消息，巡检也会报告严重故障 `task_coordinator_stopped`。通过 `statusFile.taskCoordinator` 查看是否启用及是否故障。关闭功能或巡检旧版实例不会触发这条告警。

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { isSupportedArtifactFormat } from './artifacts.js';
-import { initializeTaskCoordinatorSchema, inImmediateTransaction, OUTCOME_STATUSES, TASK_PHASES } from './schema.js';
+import { initializeTaskCoordinatorSchema, inImmediateTransaction, OUTCOME_STATUSES, requireTaskCoordinatorSchema, TASK_PHASES } from './schema.js';
 import { closeTaskRevision, TaskSchedulingStore } from './scheduler-store.js';
 import { validWorkerFormat, validWorkerName } from './worker-contract.js';
 
@@ -191,9 +191,9 @@ export class TaskCoordinatorStore {
   private readonly db: DatabaseSync;
   readonly scheduling: TaskSchedulingStore;
 
-  constructor(dbPath: string) {
-    const db = new DatabaseSync(dbPath);
-    try { initializeTaskCoordinatorSchema(db); }
+  constructor(dbPath: string, { readOnly = false }: { readOnly?: boolean } = {}) {
+    const db = new DatabaseSync(dbPath, { readOnly });
+    try { (readOnly ? requireTaskCoordinatorSchema : initializeTaskCoordinatorSchema)(db); }
     catch (error) { db.close(); throw error; }
     this.db = db;
     this.scheduling = new TaskSchedulingStore(db);

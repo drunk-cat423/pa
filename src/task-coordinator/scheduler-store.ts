@@ -122,6 +122,11 @@ export function closeTaskRevision(db: DatabaseSync, owner: string, { taskId, rev
 }
 
 /** All state transitions run on the same SQLite connection as task admission. */
+export const overdueRevisionsQuery = `SELECT r.task_id, r.revision, r.phase, t.owner
+      FROM task_revisions r JOIN tasks t USING (task_id)
+      WHERE r.phase IN ('waiting_input', 'waiting_dependency', 'queued') AND r.deadline_at <= ?
+      ORDER BY r.deadline_at, r.task_id, r.revision LIMIT ?`;
+
 export class TaskSchedulingStore {
   constructor(private readonly db: DatabaseSync) {}
 
@@ -348,10 +353,7 @@ export class TaskSchedulingStore {
   }
 
   private closeOverdueRevisions(now: number, limit: number): void {
-    const queued = this.db.prepare(`SELECT r.task_id, r.revision, r.phase, t.owner
-      FROM task_revisions r JOIN tasks t USING (task_id)
-      WHERE r.phase IN ('waiting_input', 'waiting_dependency', 'queued') AND r.deadline_at <= ?
-      ORDER BY r.deadline_at, r.task_id, r.revision LIMIT ?`).all(now, limit);
+    const queued = this.db.prepare(overdueRevisionsQuery).all(now, limit);
     for (const row of queued) {
       closeTaskRevision(this.db, String(row.owner), { taskId: String(row.task_id), revision: Number(row.revision) },
         { status: 'timed_out', summary: '任务在等待期间超过期限。' }, row.phase as TaskPhase, now);

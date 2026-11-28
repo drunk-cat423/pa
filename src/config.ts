@@ -21,6 +21,7 @@ export interface PaConfig {
   research?: { enabled: boolean; maxModelCalls: number; maxToolCalls: number; maxSearchCalls: number };
   trending?: { enabled: boolean; groupIds: string[] };
   codex?: { socketPath: string; publishSocketPath?: string };
+  taskCoordinator?: { enabled: boolean };
 }
 
 export interface AutoMemoryConfig {
@@ -91,6 +92,8 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
   if (timeoutMs > 2147483647) throw new Error('PA_TIMEOUT_MS 超出 Node 定时器范围。');
   const baseUrl = env.PA_BASE_URL?.trim();
   const codexSocket = env.PA_CODEX_SOCKET?.trim();
+  const taskCoordinatorFlag = env.PA_TASK_COORDINATOR_ENABLED?.trim() || 'false';
+  if (!['true', 'false'].includes(taskCoordinatorFlag)) throw new Error('PA_TASK_COORDINATOR_ENABLED 必须为 true 或 false。');
   const publishSocket = env.PA_PUBLISH_SOCKET?.trim();
   if (codexSocket && (!codexSocket.startsWith('/') || codexSocket.length > 100 || codexSocket.includes('\0'))) {
     throw new Error('PA_CODEX_SOCKET 必须是长度不超过100的本机绝对Unix socket路径。');
@@ -125,6 +128,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     research,
     trending: readTrendingConfig(env),
     ...(codexSocket ? { codex: { socketPath: codexSocket, ...(publishSocket ? { publishSocketPath: publishSocket } : {}) } } : {}),
+    ...(taskCoordinatorFlag === 'true' ? { taskCoordinator: { enabled: true } } : {}),
     memory: readAutoMemoryConfig(env),
     search: readWebSearchConfig(env, provider!, baseUrl),
     fetch: readWebFetchConfig(env),

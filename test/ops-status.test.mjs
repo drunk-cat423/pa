@@ -104,3 +104,18 @@ test('缓存巡检按scope和stage发现命中骤降且不读取正文或修改�
   assert.equal(JSON.stringify(r).includes('NEVER_OUTPUT_CACHE_BODY'),false);
   assert.deepEqual(f.fingerprint(),before);
 });
+
+test('QQ 仍在线时巡检能识别后台任务协调器已停止调度', t => {
+  const f = fixture(t);
+  assert.equal(f.collect(false).ok, true, '兼容尚未接入协调器的旧版服务');
+  f.status.taskCoordinator = { enabled: true, failed: true };
+  f.writeStatus();
+  const report = f.collect(false);
+  assert.equal(report.ok, false);
+  assert.equal(report.complete, true);
+  assert.equal(report.findings.find(item => item.code === 'task_coordinator_stopped')?.severity, 'critical');
+  assert.deepEqual(report.statusFile.taskCoordinator, { enabled: true, failed: true });
+  f.status.taskCoordinator = { enabled: false, failed: false };
+  f.writeStatus();
+  assert.equal(f.collect(false).ok, true);
+});

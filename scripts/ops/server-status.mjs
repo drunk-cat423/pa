@@ -231,6 +231,15 @@ function statusProjection(path, findings, expectedPid) {
     if(expectedPid==null||safeInt(raw.pid)==null)findings.push(finding('worker_pid_unknown','attention','The worker PID could not be confirmed.'));
     else if(safeInt(raw.pid)!==expectedPid)findings.push(finding('worker_pid_mismatch','attention','The worker PID does not match the systemd main process.'));
     if(raw.failed===true||raw.state==='persistence_failed'||raw.state==='connection_failed')findings.push(finding('worker_failed','critical','The service status reports a worker failure.'));
+    if (raw.taskCoordinator !== undefined) {
+      const coordinator = raw.taskCoordinator;
+      if (typeof coordinator?.enabled !== 'boolean' || typeof coordinator.failed !== 'boolean') {
+        findings.push(finding('status_coordinator_unknown','attention','Task coordinator health fields are incomplete.'));
+      } else {
+        out.taskCoordinator = { enabled: coordinator.enabled, failed: coordinator.failed };
+        if (coordinator.failed) findings.push(finding('task_coordinator_stopped','critical','后台任务协调器已停止调度，请检查任务队列和服务日志。'));
+      }
+    }
     const reminders=raw.reminders;
     if(reminders&&typeof reminders==='object'){
       const projected={};for(const key of ['started','failed'])if(typeof reminders[key]==='boolean')projected[key]=reminders[key];
@@ -505,7 +514,7 @@ export function collectStatus({dataDir='/var/lib/pa',current='/opt/pa/current',h
   report.findings=findings;report.ok=findings.length===0;
   report.complete=!findings.some(x=>['database_read_failed','schema_table_missing','schema_table_unsupported','schema_version_unexpected','diagnostics_unsupported','diagnostics_summary_truncated','diagnostics_malformed_rows','diagnostics_unclassified','memory_pipeline_unsupported','memory_job_lease_unknown','service_memory_unknown',
     'systemd_status_unavailable','service_status_incomplete','timer_status_unavailable','status_file_unavailable','host_memory_unavailable','host_disk_unavailable',
-    'status_file_incomplete','status_state_unrecognized','status_reminders_unknown','worker_pid_unknown','status_research_unknown','status_isolation_unknown','status_integrity_unknown',
+    'status_file_incomplete','status_coordinator_unknown','status_state_unrecognized','status_reminders_unknown','worker_pid_unknown','status_research_unknown','status_isolation_unknown','status_integrity_unknown',
     'cgroup_memory_events_unavailable','cgroup_memory_events_incomplete','cgroup_memory_stat_unavailable','cgroup_memory_stat_incomplete','release_unavailable','diagnostics_unavailable','journal_output_incomplete','journal_output_limit','journal_unavailable'].includes(x.code));
   report.status=!report.complete?'incomplete':report.ok?'ok':'attention';
   return report;

@@ -16,10 +16,12 @@ import { ImageAssets, ImageAssetError } from './image-assets.js';
 import { ResearchService } from './research-service.js';
 import {ReminderService} from './reminder-service.js';
 import {TrendingService} from './trending-service.js';
-import { CodexService, codexPrivateOwner } from './codex-service.js';
+import { CodexService, codexPrivateOwner, findTaskPrivateOwner } from './codex-service.js';
+import { hasQQCoordinatorCutover, QQTaskRouter } from './task-coordinator/qq-router.js';
+import type { TaskTextGenerator } from './task-coordinator/execution-host.js';
 
 export interface ChannelTransport {
-  send(message: OutboundMessage): Promise<DeliveryResult>;
+  send(message: OutboundMessage, signal?: AbortSignal): Promise<DeliveryResult>;
 }
 
 export function channelConversationKey(route: ChannelRoute): string {
@@ -60,11 +62,13 @@ export class ChannelHarness {
   private readonly reminders: ReminderService;
   private readonly trending?: TrendingService;
   private readonly codex?: CodexService;
+  private readonly coordinator?: QQTaskRouter;
 
   constructor(private readonly config: PaConfig, private readonly routes: ChannelRoute[],
     private readonly transport: ChannelTransport, private readonly maxCalls: number, policy: HarnessPolicy = NO_OWNER_POLICY,
     private readonly memoryProvider?: MemoryProvider, private readonly onTaskError?: () => void,
-    private readonly onTaskResult?: (result: HarnessResult) => void, startup: { standby?: boolean; mayRun?: () => boolean } = {}) {
+    private readonly onTaskResult?: (result: HarnessResult) => void,
+    startup: { standby?: boolean; mayRun?: () => boolean; taskGenerator?: TaskTextGenerator; taskDeliveryAvailable?: () => boolean; onCoordinatorFailure?: () => void } = {}) {
     this.started = !startup.standby;
     this.runAllowed = startup.mayRun ?? (() => true);
     if (!Number.isSafeInteger(maxCalls) || maxCalls < 0) throw new Error('调用上限必须是非负整数，0 表示不限次数。');
@@ -74,13 +78,22 @@ export class ChannelHarness {
     this.allowed = new Set(routes.map(channelConversationKey));
     this.policy = validateHarnessPolicy(policy);
     this.imageAssets = new ImageAssets(config);
-    if (config.codex) {
-      const owner = codexPrivateOwner(this.policy, routes);
-      this.codex = new CodexService(config, owner, () => {
-        const key = channelConversationKey(owner.route);
+    const coordinatorEnabled = config.taskCoordinator?.enabled === true;
+    const coordinatorMode = coordinatorEnabled || hasQQCoordinatorCutover(config.dataDir);
+    const owner = coordinatorEnabled || (config.codex && !coordinatorMode)
+      ? codexPrivateOwner(this.policy, routes) : coordinatorMode ? findTaskPrivateOwner(this.policy, routes) : undefined;
+    if (owner) {
+      const key = channelConversationKey(owner.route);
+      const available = () => {
         return this.started && this.runAllowed() && !this.closed && !this.fatal
           && this.conversations.get(key)?.persistenceStatus().status === 'ready';
-      }, message => this.output(message.route, () => this.closed ? Promise.resolve({ status: 'rejected' as const }) : this.transport.send(message)));
+      };
+      if (config.codex) this.codex = new CodexService(config, owner, available,
+        message => this.output(message.route, () => this.closed ? Promise.resolve({ status: 'rejected' as const }) : this.transport.send(message)),
+        coordinatorMode);
+      if (coordinatorMode) this.coordinator = new QQTaskRouter(config, owner, available, (message, signal) => this.transport.send(message, signal),
+        operation => this.output(owner.route, operation), startup.taskDeliveryAvailable ?? (() => true), startup.taskGenerator,
+        this.codex ? id => this.codex!.legacyStatus(owner.route, owner.senderId, id) : undefined, startup.onCoordinatorFailure);
     }
     this.reminders=new ReminderService(config,
       ()=>this.routes.filter(route=>{
@@ -108,6 +121,7 @@ export class ChannelHarness {
     reminders:this.reminders.info(),
     ...(this.trending?{trending:this.trending.info()}:{}),
     ...(this.codex ? { codex: this.codex.info() } : {}),
+    ...(this.coordinator ? { taskCoordinator: this.coordinator.info() } : {}),
     memory: [...this.conversations].map(([key, conversation]) => ({ conversation: key, ...conversation.memoryStatus() })) }; }
 
   async waitForMemory(): Promise<void> {
@@ -139,6 +153,7 @@ export class ChannelHarness {
     await this.prepare();
     if (!this.closed) {
       this.started = true;
+      this.coordinator?.start();
       for (const room of this.conversations.values()) room.startBackground();
       this.pump();
       if (!this.closed) this.research?.start();
@@ -156,7 +171,12 @@ export class ChannelHarness {
           backgroundAllowed: () => this.started && this.runAllowed() && !this.closed,
           ...(this.memoryProvider ? { memoryProvider: this.memoryProvider } : {}),
           reminderContext:(conversationId,sourceId)=>this.reminders.context(conversationId,sourceId),
-          ...(this.codex?.matches(route) ? { codexContext: (sourceId: string, senderId: string) => this.codex!.context(route, senderId, sourceId) } : {}),
+          ...(this.coordinator?.enabled && this.coordinator.matches(route) ? {
+            codexContext: (sourceId: string, senderId: string, text: string, hasImages: boolean) =>
+              this.coordinator!.context(route, senderId, sourceId, text, hasImages),
+          } : !this.coordinator && this.codex?.matches(route) ? {
+            codexContext: (sourceId: string, senderId: string) => this.codex!.context(route, senderId, sourceId),
+          } : {}),
           ...(this.research ? { researchContext: (conversationId, sourceId, send) => this.research!.context(conversationId, sourceId, send) } : {}) });
       this.opening.set(key, pending);
       pending.then(conversation => {
@@ -263,6 +283,7 @@ export class ChannelHarness {
           for(const waiting of this.waiters.values()) waiting.reject(error);
           this.waiters.clear(); this.onTaskError?.();
         }).finally(() => {
+          this.coordinator?.finishReply(task.messageId);
           this.waiters.delete(task.id); release(); this.busyRooms.delete(key); this.jobs.delete(running); this.pump();
         });
       this.jobs.add(running);
@@ -295,6 +316,13 @@ export class ChannelHarness {
     };
     const memoryRequest = parseMemoryRequest(message.text);
     const resultRequest = RESULT_COMMAND.exec(message.text);
+    const taskReply = await this.coordinator?.command(message, source.id);
+    if (taskReply !== undefined) {
+      const control = conversation.control(message.text, { ...sender, modelInputText: message.text }, () => taskReply);
+      conversation.finishTask(taskId, 'completed', control.deliveryId);
+      release();
+      return this.deliver(conversation, message, control, 0, taskId);
+    }
     const publication = await this.codex?.confirmPublication(message);
     if (publication) {
       const control = conversation.control(message.text, { ...sender, modelInputText: message.text }, () => publication.text);
@@ -444,6 +472,7 @@ export class ChannelHarness {
     await Promise.allSettled(this.admissions.values());
     await Promise.all([...this.conversations.values()].map(conversation => conversation.abort()));
     await Promise.allSettled(this.jobs);
+    await this.coordinator?.close();
     await researchClosing;
     await this.research?.close();
     await reminderClosing;

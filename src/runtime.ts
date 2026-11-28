@@ -24,7 +24,8 @@ import { WebFetchError, normalizeWebFetchUrl } from './web-fetch.js';
 import { RESEARCH_TOOL_SPECS, RESEARCH_USAGE_PROMPT, RESEARCH_WORKER_PROMPT, RESEARCH_STAGE_PROMPT,
   type ResearchToolContext, type ResearchToolName, type ResearchRuntimeOptions, type ResearchRuntimeEvent } from './research-tools.js';
 import { REMINDER_TOOL_SPECS, REMINDER_USAGE_PROMPT, type ReminderToolContext, type ReminderToolName } from './reminder-tools.js';
-import { CODEX_TOOL_SPECS, CODEX_USAGE_PROMPT, type CodexToolContext, type CodexToolName } from './codex-tools.js';
+import { CODEX_TOOL_SPECS, CODEX_USAGE_PROMPT, COORDINATOR_TOOL_SPECS, COORDINATOR_USAGE_PROMPT,
+  type CodexToolContext, type CodexToolName } from './codex-tools.js';
 import { outputLengthGuidance } from './output-length.js';
 import { compactResearchContext, researchContextReference, type ResearchContextReference } from './research-context.js';
 import { RESEARCH_MATERIAL_PREFIX, type MaterialReadParams } from './research-material-reader.js';
@@ -199,7 +200,8 @@ export async function openConversation(config: PaConfig, conversationId: string,
     const systemPrompt = options.research ? options.research.systemPrompt
       ?? (options.research.phase ? RESEARCH_STAGE_PROMPT : RESEARCH_WORKER_PROMPT) : COMPANION_PROMPT;
     const channelReminderProtocol = options.enableSearch ? '\n' + REMINDER_USAGE_PROMPT : '';
-    const channelCodexProtocol = options.enableCodex ? '\n' + CODEX_USAGE_PROMPT : '';
+    const coordinatorMode = config.taskCoordinator?.enabled === true;
+    const channelCodexProtocol = options.enableCodex ? '\n' + (coordinatorMode ? COORDINATOR_USAGE_PROMPT : CODEX_USAGE_PROMPT) : '';
     const channelPrepareProtocol = CHANNEL_CONTROL_PROTOCOL + '\nstage=prepare。\n'
       + PREPARE_TURN_PROMPT + '\n【以下grounding规则仅在groundingRequired=true时适用】\n' + ANSWER_GROUNDING_PROMPT + channelReminderProtocol
       + (config.research?.enabled ? '\n用户明确要求加入研究清单或继续后台研究时，intent=research；本轮仅准备入队和简短确认，不先展开研究结论。' : '') + channelCodexProtocol;
@@ -507,7 +509,7 @@ export async function openConversation(config: PaConfig, conversationId: string,
       },
     });
     if (!supportsImageInput(config)) customTools.splice(customTools.findIndex(tool => tool.name === 'read_image'),1);
-    if (options.enableCodex && !options.research) for (const spec of CODEX_TOOL_SPECS) customTools.push({
+    if (options.enableCodex && !options.research) for (const spec of coordinatorMode ? COORDINATOR_TOOL_SPECS : CODEX_TOOL_SPECS) customTools.push({
       name: spec.name, label: spec.label, description: spec.description,
       parameters: spec.parameters as ToolDefinition['parameters'], executionMode: 'sequential',
       async execute(id, params, signal) {
@@ -517,7 +519,8 @@ export async function openConversation(config: PaConfig, conversationId: string,
           const receipt = await cancellable(() => companionTools!.codex!.execute(spec.name as CodexToolName, params), signal);
           if (receipt && typeof receipt === 'object' && 'saved' in receipt && receipt.saved === true
             && 'confirmation' in receipt && typeof receipt.confirmation === 'string') codexAcknowledgement = receipt.confirmation;
-          return result(receipt, '以下是Codex任务的真实回执或执行结果，只能按已完成操作确认：\n');
+          return result(receipt, coordinatorMode ? '以下是后台任务的真实回执或执行结果：\n'
+            : '以下是Codex任务的真实回执或执行结果，只能按已完成操作确认：\n');
         } catch (error) {
           if (error instanceof MemoryError) return rejectArguments(id, error);
           if (error instanceof RequestError) throw error;

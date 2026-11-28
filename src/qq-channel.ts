@@ -8,6 +8,10 @@ const MAX_RECONNECTS = 5;
 const RECONNECT_DELAYS = [500, 1_000, 2_000, 4_000, 8_000] as const;
 const DEFINITE_HTTP_FAILURES = new Set([400, 401, 403, 404, 405, 429]);
 const MAX_REPORT_FILE_BYTES = 1024 * 1024;
+function qqRequestSignal(parent?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(10_000);
+  return parent ? AbortSignal.any([parent, timeout]) : timeout;
+}
 
 type JsonObject = Record<string, unknown>;
 
@@ -289,9 +293,9 @@ export class QQChannel {
     return this.startPromise;
   }
 
-  async send(message: OutboundMessage): Promise<DeliveryResult> {
+  async send(message: OutboundMessage, signal?: AbortSignal): Promise<DeliveryResult> {
     const deliveryMode = message.deliveryMode ?? 'passive';
-    if (this.closed || !this.started || message.route.channel !== 'qq' || message.route.accountId !== this.config.appId
+    if (signal?.aborted || this.closed || !this.started || message.route.channel !== 'qq' || message.route.accountId !== this.config.appId
       || !['group', 'private'].includes(message.route.roomType)
       || !nonEmptyString(message.route.roomId) || !['passive', 'active'].includes(deliveryMode)) return { status: 'rejected' };
     if (deliveryMode === 'passive' && !referenceId(message.replyToMessageId)) return { status: 'rejected' };
@@ -323,7 +327,7 @@ export class QQChannel {
     } catch (error) {
       return (error as Partial<QQApiFailure>).definitelyRejected ? { status: 'rejected' } : { status: 'uncertain' };
     }
-    if (this.closed) return { status: 'rejected' };
+    if (signal?.aborted || this.closed) return { status: 'rejected' };
     const scope = message.route.roomType === 'private' ? 'users' : 'groups';
     const endpoint = `${API}/v2/${scope}/${encodeURIComponent(message.route.roomId)}`;
     let fileInfo: string | undefined;
@@ -331,7 +335,7 @@ export class QQChannel {
       try {
         const uploaded = await this.request(`${endpoint}/files`, token, {
           file_type: 4, file_name: fileName, file_data: fileData, srv_send_msg: false,
-        });
+        }, signal);
         if (!nonEmptyString(uploaded.file_info)) return { status: 'rejected' };
         fileInfo = uploaded.file_info;
       } catch (error) {
@@ -340,7 +344,7 @@ export class QQChannel {
         return (error as Partial<QQApiFailure>).definitelyRejected ? { status: 'rejected' } : { status: 'uncertain' };
       }
     }
-    if (this.closed) return { status: 'rejected' };
+    if (signal?.aborted || this.closed) return { status: 'rejected' };
     let response: Response;
     try {
       const payload = {
@@ -352,7 +356,7 @@ export class QQChannel {
         method: 'POST', redirect: 'error',
         headers: { 'Content-Type': 'application/json', Authorization: `QQBot ${token}` },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(10_000),
+        signal: qqRequestSignal(signal),
       });
     } catch {
       return { status: 'uncertain' };
@@ -551,12 +555,12 @@ export class QQChannel {
     return this.token;
   }
 
-  private async request(url: string, token?: string, body?: JsonObject): Promise<JsonObject> {
+  private async request(url: string, token?: string, body?: JsonObject, signal?: AbortSignal): Promise<JsonObject> {
     const response = await this.fetchImpl(url, {
       method: body ? 'POST' : 'GET', redirect: 'error',
       headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `QQBot ${token}` } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: AbortSignal.timeout(10_000),
+      signal: qqRequestSignal(signal),
     });
     let parsed: unknown;
     try { parsed = await response.json(); } catch { throw apiFailure(response.status); }

@@ -115,7 +115,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
   options: { persons?: readonly PrimaryPerson[]; memoryProvider?: MemoryProvider; policy?: HarnessPolicy; backgroundAllowed?: () => boolean;
     storeInitialization?:StoreInitializationScope;
     reminderContext?: (conversationId:string,sourceMessageId:string)=>ReminderToolContext;
-    codexContext?: (sourceMessageId: string, senderId: string) => CodexToolContext | undefined;
+    codexContext?: (sourceMessageId: string, senderId: string, text: string, hasImages: boolean) => CodexToolContext | undefined;
     researchContext?: (conversationId: string, sourceMessageId: string, send?: ResearchSender) => ResearchToolContext } = {}): Promise<RecordedConversation> {
   // The lock serializes this conversation; Pi itself is an ephemeral executor.
   const runtime = await openConversation(config, conversationKey, { enableSearch: Boolean(route), enableCodex: Boolean(options.codexContext), contextCalibrationScope: conversationKey });
@@ -544,7 +544,7 @@ export async function openRecordedConversation(config: PaConfig, conversationKey
                   && researchUrls(text).length === 1 ? { verifyLink: researchUrls(text)[0] } : {}),
                 ...(options.researchContext ? { research: options.researchContext(conversation.id, run.inputMessageId, sendResearch) } : {}),
                 ...(options.reminderContext ? {reminders:options.reminderContext(conversation.id,run.inputMessageId)} : {}),
-                ...(options.codexContext ? { codex: options.codexContext(run.inputMessageId, inputExternal.senderId) } : {}),
+                ...(options.codexContext ? { codex: options.codexContext(run.inputMessageId, inputExternal.senderId, text, Boolean(imageProjections.length)) } : {}),
                 prepareTurn: (plan: import('./turn-plan.js').TurnPlan) => persist(()=>openedStore.prepareTurn(
                   conversation.id,run.inputMessageId,plan,policy,inputExternal.mentionedSenderIds,
                   selfProfileBudget(runtime.estimate('').contextWindow)),text),

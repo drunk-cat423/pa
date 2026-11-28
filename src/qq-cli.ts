@@ -55,7 +55,9 @@ async function main(): Promise<void> {
   let openReady = false;
   let preparedReady = false;
   let gatewayReady = false;
-  function status(state: string): void {
+  let lastState = 'starting';
+  function status(state = lastState): void {
+    lastState = state;
     console.log(`QQ harness: ${state}`);
     const snapshot = { pid: process.pid, updatedAt: new Date().toISOString(), state,
       provider: config.provider, model: config.model,
@@ -140,13 +142,13 @@ async function main(): Promise<void> {
         }).catch(() => { status('persistence_failed'); process.exitCode = 1; void stop(); });
       },
     });
-    const transport = { send: async (message: import('./channel-types.js').OutboundMessage) => {
-      while (!stopping && gate()) await new Promise(resolve => setTimeout(resolve, 100));
-      return stopping ? { status: 'rejected' as const } : channel!.send(message);
+    const transport = { send: async (message: import('./channel-types.js').OutboundMessage, signal?: AbortSignal) => {
+      while (!stopping && !signal?.aborted && gate()) await new Promise(resolve => setTimeout(resolve, 100));
+      return stopping || signal?.aborted ? { status: 'rejected' as const } : channel!.send(message, signal);
     } };
     harness = new ChannelHarness(config, qq.routes, transport, qq.maxCalls, policy, undefined, () => {
       status('persistence_failed'); process.exitCode = 1; void stop();
-    },taskResult,{ standby: Boolean(inbox), mayRun: () => !gate() });
+    },taskResult,{ standby: Boolean(inbox), mayRun: () => !gate(), taskDeliveryAvailable: () => gatewayReady, onCoordinatorFailure: () => status() });
     await channel.start();
     if (inbox && !stopping) {
       await harness.prepare();

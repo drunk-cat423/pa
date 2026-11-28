@@ -24,6 +24,7 @@
 | 缓存前缀、命中骤降、提示/工具投影或 Pi 升级 | `runtime.ts`、`scripts/ops/server-status.mjs` | [缓存契约与故障检查](context-cache.md) | `cache`；按实际 HTTP 请求核对前缀，巡检读取真实用量及指纹 |
 | 队列、分段、重复或未知投递 | `channel-harness.ts`、`store.ts`、`markdown-chunks.ts`、`qq-channel.ts` | [QQ 长回答](qq-long-replies.md)、[恢复边界](robustness-review.md) | `delivery` |
 | 研究清单、材料、报告和清理 | `research-*.ts`、`scripts/deployment/research-retention.mjs` | [研究](research.md)、[正文保留](research-retention.md) | `research` |
+| QQ 私聊派单、切换和只读运维 | `src/task-coordinator/`、`src/channel-harness.ts` | [本人 QQ 操作](../README.md#本人-qq-私聊的后台文字任务) | `node scripts/verify-pa-tasks.mjs run P6` |
 | 任务协调器 P1 接单、修订与结案 | `src/task-coordinator/` | [协调器设计](design/task-coordinator-plan.md) | `node scripts/verify-pa-tasks.mjs run P1` |
 | 本人 QQ 私聊委派服务器任务、结果文件及续办 | `codex-service.ts`、`codex-worker*.ts`、`runtime.ts` | [Codex 任务](codex-tasks.md)、[执行器部署](codex-worker.md) | `delegation`；工具投影变动另跑 `cache` |
 | 本人确认发布、GitHub 提交、上线及回滚 | `codex-publication.ts`、`pa-publisher.mjs`、`publish-release.mjs` | [私聊发布](codex-publish.md) | `delegation`；切换和恢复需用独立服务演练 |
