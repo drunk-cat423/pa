@@ -13,6 +13,12 @@ const compiler = join(repo, 'node_modules', 'typescript', 'bin', 'tsc');
 const planFile = 'docs/design/task-coordinator-verification.json';
 const usage = '用法 node scripts/verify-pa-tasks.mjs doctor | list | run <feature> | list-stage | plan [stage]';
 const features = {
+  P5: {
+    test: 'test/task-coordinator-p5.test.mjs',
+    name: 'V09 artifacts and delivery intent freeze atomically and survive restart',
+    additional: ['V10 uncertain delivery stops remaining parts and authorized reclaim reuses the original result'],
+    fixtures: ['test/fixtures/task-coordinator-delivery-interrupted.mjs'],
+  },
   P4: {
     test: 'test/task-coordinator-p4.test.mjs',
     name: 'V06 recovery resumes an unsent claim and reconciles possibly sent attempts without replay',

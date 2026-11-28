@@ -111,16 +111,23 @@ test('V04 two processes claim once and run independent tasks concurrently', asyn
     inspect.exec('ROLLBACK');
   }
   const race = await Promise.all(processes.map(process => process.receive('claimed')));
-  assert.deepEqual(race.map(round => round.attempts.length).sort(), [0, 1]);
-  const winnerIndex = race.findIndex(round => round.attempts.length === 1);
+  assert.deepEqual(race.map(round => round.startCount).sort(), [0, 1]);
+  const winnerIndex = race.findIndex(round => round.startCount === 1);
   const winner = processes[winnerIndex];
   const other = processes[1 - winnerIndex];
   const beganFirst = await winner.receive('started');
   assert.equal(beganFirst.taskId, first.taskId);
   assert.equal(beganFirst.revision, first.revision);
-  assert.equal(beganFirst.attemptKey, race[winnerIndex].attempts[0].attemptKey);
+  assert.deepEqual(race.flatMap(round => round.started), [beganFirst.attemptKey]);
+  const candidates = race.flatMap(round => round.attempts);
+  assert.ok(candidates.length >= 1);
+  assert.ok(candidates.every(candidate => candidate.attemptKey === beganFirst.attemptKey));
   const attemptCount = inspect.prepare('SELECT count(*) AS total FROM task_attempts WHERE task_id = ? AND revision = ?');
   assert.equal(attemptCount.get(first.taskId, first.revision).total, 1);
+  const held = inspect.prepare(`SELECT resource_kind AS kind, count(*) AS count FROM task_reservations
+    WHERE attempt_key = ? AND released_at IS NULL GROUP BY resource_kind ORDER BY resource_kind`).all(beganFirst.attemptKey);
+  assert.deepEqual(held.map(({ kind, count }) => [kind, count]),
+    ['global', 'owner', 'pool', 'worker', 'workspace'].map(kind => [kind, 1]));
   assert.equal(f.phase(first), 'running');
 
   // The first adapter cannot return until this test explicitly unblocks it.
@@ -134,10 +141,12 @@ test('V04 two processes claim once and run independent tasks concurrently', asyn
   other.send('claim');
   const parallel = await other.receive('claimed');
   assert.equal(parallel.attempts.length, 1);
+  assert.equal(parallel.startCount, 1);
   const beganSecond = await other.receive('started');
   assert.equal(beganSecond.taskId, second.taskId);
   assert.equal(beganSecond.revision, second.revision);
   assert.equal(beganSecond.attemptKey, parallel.attempts[0].attemptKey);
+  assert.deepEqual(parallel.started, [beganSecond.attemptKey]);
   assert.notEqual(beganFirst.pid, beganSecond.pid);
   assert.equal(f.phase(first), 'running');
   assert.equal(f.phase(second, ownerB), 'running');

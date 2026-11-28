@@ -43,9 +43,15 @@ process.send({ type: 'ready', pid: process.pid });
 process.on('message', async message => {
   if (message.op === 'claim') {
     process.send({ type: 'contending', pid: process.pid });
+    const before = startCount;
+    const alreadyActive = new Set(active.keys());
     const round = scheduler.tick();
     for (const [index, key] of round.attempts.entries()) batches.set(key.attemptKey, round.dispatches[index]);
-    process.send({ type: 'claimed', pid: process.pid, attempts: round.attempts, examined: round.examined });
+    // tick queues dispatch in a microtask. Only the process that wins claimStart calls the adapter.
+    await Promise.resolve();
+    const started = [...active.keys()].filter(key => !alreadyActive.has(key));
+    process.send({ type: 'claimed', pid: process.pid, attempts: round.attempts, examined: round.examined,
+      started, startCount: startCount - before });
     return;
   }
   if (message.op === 'finish') {

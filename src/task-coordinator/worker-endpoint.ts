@@ -1,4 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import type { ArtifactMetadata, ArtifactUpload } from './artifacts.js';
+import { TaskCoordinatorError } from './store.js';
 import { WORKER_PROTOCOL_VERSION, positiveWorkerInteger, validWorkerFormat, validWorkerName } from './worker-contract.js';
 import type {
   AuthenticatedWorkerReport, WorkerAttemptFence, WorkerAttemptKey, WorkerEvent, WorkerInspection,
@@ -16,6 +18,8 @@ export interface WorkerAttemptPort {
   claimStart(fence: WorkerAttemptFence): boolean;
   // Atomically recheck the fence and adjudicate sequence, duplicate payloads and late evidence.
   recordReport(report: AuthenticatedWorkerReport): WorkerRecordDisposition;
+  // Revalidate the complete fence in the same transaction as the upload.
+  stageArtifact?(fence: WorkerAttemptFence, artifact: ArtifactUpload): ArtifactMetadata;
 }
 
 export type StartDisposition = Exclude<WorkerStartReceipt, { disposition: 'rejected' }> | {
@@ -29,6 +33,7 @@ export type ReportDisposition = {
 
 export interface WorkerConnection {
   report(payload: Uint8Array): ReportDisposition;
+  stageArtifact(fence: Omit<WorkerAttemptFence, 'workerId'>, artifact: ArtifactUpload): ArtifactMetadata;
 }
 
 const connectionSecretPattern = /^[a-f0-9]{64}$/;
@@ -129,10 +134,22 @@ export class WorkerEndpoint {
     const declaration = this.registry.declaration(workerId);
     if (!expected || !declaration || !connectionSecretPattern.test(secret)
       || !timingSafeEqual(digest(secret), expected)) return undefined;
-    return { report: payload => this.#report(workerId, declaration.limits.reportBytes, payload) };
+    return {
+      report: payload => this.#report(workerId, declaration.limits.reportBytes, payload),
+      stageArtifact: ({ attemptKey, leaseGeneration, attemptToken }, artifact) => {
+        if (!validWorkerName(attemptKey) || !positiveWorkerInteger(leaseGeneration)
+          || typeof attemptToken !== 'string' || !attemptTokenPattern.test(attemptToken)) {
+          throw new TaskCoordinatorError('invalid_request', 'Invalid task attempt identity.');
+        }
+        if (!this.attempts.stageArtifact) {
+          throw new TaskCoordinatorError('invalid_state', 'Artifact uploads are unavailable.');
+        }
+        return this.attempts.stageArtifact({ attemptKey, workerId, leaseGeneration, attemptToken }, artifact);
+      },
+    };
   }
 
-  // Called by the trusted scheduler. Worker connections can only submit reports.
+  // Starts come from the trusted scheduler. Connections can report or stage artifacts.
   async start(key: WorkerAttemptKey): Promise<StartDisposition> {
     const attempt = this.attempts.getAttempt(key.attemptKey);
     if (!validFence(attempt, key)) return { disposition: 'rejected', reason: 'stale_attempt' };

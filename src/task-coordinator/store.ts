@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { isSupportedArtifactFormat } from './artifacts.js';
 import { initializeTaskCoordinatorSchema, inImmediateTransaction, OUTCOME_STATUSES, TASK_PHASES } from './schema.js';
 import { closeTaskRevision, TaskSchedulingStore } from './scheduler-store.js';
 import { validWorkerFormat, validWorkerName } from './worker-contract.js';
@@ -14,6 +15,7 @@ export interface TaskSpec {
   readonly workspaceKey?: string;
   readonly inputFormats?: readonly string[];
   readonly outputFormats?: readonly string[];
+  readonly requiredArtifactFormats?: readonly string[];
   readonly waitingForInput?: boolean;
   readonly notBeforeAt?: number;
 }
@@ -30,7 +32,7 @@ export interface TaskDependency extends TaskReceipt {
   readonly allowPartial?: boolean;
 }
 
-export type TaskDispatchSpec = Pick<TaskSpec, 'workspaceKey' | 'inputFormats' | 'outputFormats'>;
+export type TaskDispatchSpec = Pick<TaskSpec, 'workspaceKey' | 'inputFormats' | 'outputFormats' | 'requiredArtifactFormats'>;
 
 export type TaskPhase = typeof TASK_PHASES[number];
 export type TaskOutcomeStatus = typeof OUTCOME_STATUSES[number];
@@ -101,7 +103,7 @@ function validateSpec(value: unknown): TaskSpec {
   if (!value || typeof value !== 'object' || Array.isArray(value)) invalid('spec');
   const input = value as Record<string, unknown>;
   const required = ['goal', 'capability', 'materials', 'deadlineAt', 'budget'];
-  const optional = ['dependencies', 'workspaceKey', 'inputFormats', 'outputFormats', 'waitingForInput', 'notBeforeAt'];
+  const optional = ['dependencies', 'workspaceKey', 'inputFormats', 'outputFormats', 'requiredArtifactFormats', 'waitingForInput', 'notBeforeAt'];
   if (!required.every(key => Object.hasOwn(input, key))
     || Object.keys(input).some(key => !required.includes(key) && !optional.includes(key))) invalid('spec');
   const goal = boundedText(input.goal, 'goal', MAX_TEXT_BYTES);
@@ -127,6 +129,13 @@ function validateSpec(value: unknown): TaskSpec {
     if (!Array.isArray(formats) || formats.length > 64 || !Array.from(formats).every(validWorkerFormat)
       || new Set(formats).size !== formats.length) invalid(key);
     dispatch[key] = [...formats];
+  }
+  if (Object.hasOwn(input, 'requiredArtifactFormats')) {
+    const formats = input.requiredArtifactFormats;
+    if (!Array.isArray(formats) || formats.length > 32 || !Array.from(formats).every(format =>
+      isSupportedArtifactFormat(format) && dispatch.outputFormats?.includes(format))
+      || new Set(formats).size !== formats.length) invalid('requiredArtifactFormats');
+    dispatch.requiredArtifactFormats = [...formats];
   }
   return Object.hasOwn(input, 'dependencies')
     ? { ...spec, ...dispatch, dependencies: validateDependencies(input.dependencies) }
@@ -325,12 +334,12 @@ export class TaskCoordinatorStore {
     positiveInteger(revision, 'revision');
     const proposed = validateOutcome(outcome);
     inImmediateTransaction(this.db, () => {
-      const row = this.db.prepare(`SELECT r.phase, c.status, c.summary, n.notification_id FROM tasks t
+      const row = this.db.prepare(`SELECT r.phase, r.dispatch_json, c.status, c.summary, n.notification_id FROM tasks t
         JOIN task_revisions r ON r.task_id = t.task_id AND r.revision = ?
         LEFT JOIN task_conclusions c ON c.task_id = r.task_id AND c.revision = r.revision
         LEFT JOIN task_notifications n ON n.task_id = c.task_id AND n.revision = c.revision
           AND n.recipient_owner = t.owner AND n.purpose = 'automatic'
-        WHERE t.owner = ? AND t.task_id = ?`).get(revision, owner, taskId) as (ConclusionRow & { notification_id: number | null }) | undefined;
+        WHERE t.owner = ? AND t.task_id = ?`).get(revision, owner, taskId) as (ConclusionRow & { notification_id: number | null; dispatch_json: string | null }) | undefined;
       if (!row) throw new TaskCoordinatorError('not_found', 'Task revision not found.');
       const conclusion = readConclusion(row);
       if (conclusion) {
@@ -341,6 +350,9 @@ export class TaskCoordinatorStore {
 
       if (row.phase === 'running' || row.phase === 'reconciling') {
         throw new TaskCoordinatorError('invalid_state', 'An active task must be settled by its assigned attempt.');
+      }
+      if (proposed.status === 'succeeded' && (JSON.parse(row.dispatch_json ?? '{}') as TaskDispatchSpec).requiredArtifactFormats?.length) {
+        throw new TaskCoordinatorError('invalid_state', 'File delivery requires a verified worker result.');
       }
       closeTaskRevision(this.db, owner, { taskId, revision }, proposed, row.phase, Date.now());
     });
