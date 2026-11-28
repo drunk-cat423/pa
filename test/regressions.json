@@ -567,6 +567,18 @@
       "name": "V12 offline operations stay bounded and read-only with 10000 closed revisions",
       "basis": "critical",
       "reason": "历史累积后应能定位排队和未送达的任务，管理查询不能读取历史正文或改变运行状态。"
+    },
+    {
+      "file": "test/ops-status.test.mjs",
+      "name": "QQ 仍在线时巡检能识别后台任务协调器已停止调度",
+      "basis": "critical",
+      "reason": "QQ 进程仍在运行时，后台任务协调器停止调度必须在巡检中单独报警。"
+    },
+    {
+      "file": "test/task-coordinator-upgrade.test.mjs",
+      "name": "P6 upgrades a populated v4 database without replaying execution or delivery",
+      "basis": "critical",
+      "reason": "升级现有任务库不能丢失原版文件、重发未知结果或重新执行可能已收费的任务。"
     }
   ]
 }

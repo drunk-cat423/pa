@@ -79,7 +79,12 @@ function businessError(error: unknown): MemoryError {
 function safeText(text: string): string { return text.replace(/<(?=\/?(?:qqbot-|@))/gi, '〈'); }
 
 export function hasQQCoordinatorCutover(dataDir: string): boolean {
-  return existsSync(join(dataDir, databaseName));
+  const file = join(dataDir, databaseName);
+  if (!existsSync(file)) return false;
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    return !!db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='qq_task_sources'").get();
+  } finally { db.close(); }
 }
 
 export class QQTaskRouter {
@@ -110,6 +115,7 @@ export class QQTaskRouter {
     private readonly deliveryAvailable: () => boolean,
     private readonly generate?: TaskTextGenerator,
     private readonly history?: LegacyStatus,
+    private readonly onFailure?: () => void,
   ) {
     this.owner = codexOwnerKey(binding);
     this.route = { ...binding.route };
@@ -139,7 +145,6 @@ export class QQTaskRouter {
       this.deliveryStore = new TaskDeliveryStore(this.databasePath);
       this.evidence = new DatabaseSync(this.databasePath);
       this.evidence.exec('PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;');
-      this.evidence.exec('CREATE TABLE IF NOT EXISTS qq_task_sources (source_key TEXT PRIMARY KEY, owner TEXT NOT NULL, recorded_at INTEGER NOT NULL) STRICT;');
       this.host = createTaskExecutionHost({
         store: this.store, config: this.config, deliveryStore: this.deliveryStore, owner: this.owner,
         ...(this.generate ? { generate: this.generate } : {}),
@@ -154,6 +159,7 @@ export class QQTaskRouter {
         },
         sendPart: (part, signal) => this.sendPart(part, signal),
       });
+      this.evidence.exec('CREATE TABLE IF NOT EXISTS qq_task_sources (source_key TEXT PRIMARY KEY, owner TEXT NOT NULL, recorded_at INTEGER NOT NULL) STRICT;');
       this.timer = setInterval(() => this.tick(), 100);
       this.timer.unref();
     } catch (error) {
@@ -179,6 +185,7 @@ export class QQTaskRouter {
     if (this.failed || this.closed) return;
     this.failed = true;
     clearInterval(this.timer);
+    this.onFailure?.();
   }
 
   async close(): Promise<void> {

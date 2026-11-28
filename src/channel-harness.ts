@@ -68,7 +68,7 @@ export class ChannelHarness {
     private readonly transport: ChannelTransport, private readonly maxCalls: number, policy: HarnessPolicy = NO_OWNER_POLICY,
     private readonly memoryProvider?: MemoryProvider, private readonly onTaskError?: () => void,
     private readonly onTaskResult?: (result: HarnessResult) => void,
-    startup: { standby?: boolean; mayRun?: () => boolean; taskGenerator?: TaskTextGenerator; taskDeliveryAvailable?: () => boolean } = {}) {
+    startup: { standby?: boolean; mayRun?: () => boolean; taskGenerator?: TaskTextGenerator; taskDeliveryAvailable?: () => boolean; onCoordinatorFailure?: () => void } = {}) {
     this.started = !startup.standby;
     this.runAllowed = startup.mayRun ?? (() => true);
     if (!Number.isSafeInteger(maxCalls) || maxCalls < 0) throw new Error('调用上限必须是非负整数，0 表示不限次数。');
@@ -93,7 +93,7 @@ export class ChannelHarness {
         coordinatorMode);
       if (coordinatorMode) this.coordinator = new QQTaskRouter(config, owner, available, (message, signal) => this.transport.send(message, signal),
         operation => this.output(owner.route, operation), startup.taskDeliveryAvailable ?? (() => true), startup.taskGenerator,
-        this.codex ? id => this.codex!.legacyStatus(owner.route, owner.senderId, id) : undefined);
+        this.codex ? id => this.codex!.legacyStatus(owner.route, owner.senderId, id) : undefined, startup.onCoordinatorFailure);
     }
     this.reminders=new ReminderService(config,
       ()=>this.routes.filter(route=>{

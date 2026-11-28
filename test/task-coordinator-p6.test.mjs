@@ -63,6 +63,7 @@ test('V11 QQ task entry preserves authorized versioned delivery across cutover a
   const originalTask = { id: 'OLD-42', revision: 1, status: 'queued', mode: 'read', summary: '旧任务已有结论，仅供查询。' };
   const revisionGate = Promise.withResolvers();
   let harness, qq, dispatchGateway, inbound;
+  const coordinatorFailures = [];
   let loseLegacyDelivery = true;
   const model = createServer(async (request, response) => {
     try {
@@ -169,7 +170,9 @@ test('V11 QQ task entry preserves authorized versioned delivery across cutover a
     });
     await qq.start();
     harness = new ChannelHarness({ ...config, ...(enabled ? { taskCoordinator: { enabled: true } } : {}) },
-      [ownerRoute, guestRoute], qq, 0, policy);
+      [ownerRoute, guestRoute], qq, 0, policy, undefined, undefined, undefined, {
+        onCoordinatorFailure: () => coordinatorFailures.push(harness.info().taskCoordinator),
+      });
     await harness.start();
   };
   const stop = async () => {
@@ -271,6 +274,19 @@ test('V11 QQ task entry preserves authorized versioned delivery across cutover a
   assert.deepEqual(await expectFileDelivery(4), Buffer.from(originalFile));
   await stop();
 
+  await run(true);
+  const faultDb = new DatabaseSync(tasksDb);
+  try {
+    faultDb.exec('ALTER TABLE task_scheduler_policy RENAME TO unavailable_policy');
+    await observe(() => coordinatorFailures.length, '无新 QQ 消息时协调器主动上报停止');
+    assert.equal(coordinatorFailures.length, 1);
+    assert.equal(coordinatorFailures[0].failed, true);
+    assert.equal(harness.info().taskCoordinator.failed, true);
+  } finally {
+    faultDb.exec('ALTER TABLE unavailable_policy RENAME TO task_scheduler_policy');
+    faultDb.close();
+    await stop();
+  }
   await run(false);
   assert.equal(await receive('status-after-disable', '/task 查询 ' + taskId + ' 1'), 'sent');
   assert.equal(renderText(userReply('status-after-disable')?.body), renderText(userReply('status-1')?.body));
