@@ -1,6 +1,7 @@
 import { closeSync, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { privateDirectory, startCoordinator } from "./service.js";
+import { TaskDeliveryStore } from "./delivery-store.js";
 import { TaskCoordinatorStore } from "./store.js";
 
 function readToken(path: string): string {
@@ -42,16 +43,25 @@ async function run(): Promise<void> {
   if (entry && !entry.isFile()) throw new Error("invalid_runtime_directory");
   if (process.platform !== "win32") process.umask(0o077);
   const store = new TaskCoordinatorStore(database);
+  let deliveryStore: TaskDeliveryStore | undefined;
   let service: Awaited<ReturnType<typeof startCoordinator>>;
   try {
-    service = await startCoordinator({ socketPath, owner, token, store });
+    deliveryStore = new TaskDeliveryStore(database);
+    service = await startCoordinator({ socketPath, owner, token, store, deliveryStore });
   } catch (error) {
-    store.close();
+    try { deliveryStore?.close(); }
+    finally { store.close(); }
     throw error;
   }
 
+  let shuttingDown = false;
   function shutdown(): void {
-    void service.close().then(() => store.close()).catch(() => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void service.close().finally(() => {
+      try { deliveryStore?.close(); }
+      finally { store.close(); }
+    }).catch(() => {
       process.stderr.write("Task coordinator could not close.\n");
       process.exitCode = 1;
     });

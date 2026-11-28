@@ -6,6 +6,7 @@ export interface WorkerRequirements {
   readonly capability: string;
   readonly inputFormats: readonly string[];
   readonly outputFormats: readonly string[];
+  readonly requiredArtifactFormats?: readonly string[];
 }
 
 export interface WorkerCapability {

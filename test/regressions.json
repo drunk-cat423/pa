@@ -543,6 +543,18 @@
       "name": "V08 cancellation and waiting deadlines close once without inventing stop evidence",
       "basis": "critical",
       "reason": "取消请求、执行结束和各阶段期限竞争时不能伪造停止或重复生成结论和通知。"
+    },
+    {
+      "file": "test/task-coordinator-p5.test.mjs",
+      "name": "V09 artifacts and delivery intent freeze atomically and survive restart",
+      "basis": "critical",
+      "reason": "不得领取未提交或其他任务的文件，结案时必须能恢复对应的不可变产物和通知意图。"
+    },
+    {
+      "file": "test/task-coordinator-p5.test.mjs",
+      "name": "V10 uncertain delivery stops remaining parts and authorized reclaim reuses the original result",
+      "basis": "critical",
+      "reason": "发送回执未知不得自动重发，单房间后续通知不能被永久阻塞，本人重复重领不得再次执行任务。"
     }
   ]
 }

@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
+import { freezeWorkerArtifacts, prepareWorkerResult, stageWorkerArtifact } from './artifacts.js';
 import { inImmediateTransaction } from './schema.js';
 import type { TaskCancellation, TaskDispatchSpec, TaskOutcome, TaskPhase, TaskReceipt } from './store.js';
 import { WORKER_PROTOCOL_VERSION } from './worker-contract.js';
@@ -71,7 +72,8 @@ type ClaimOptions = {
 
 function requirementsFor(capability: string, dispatch: TaskDispatchSpec): WorkerRequirements {
   return { protocolVersion: WORKER_PROTOCOL_VERSION, capability,
-    inputFormats: dispatch.inputFormats ?? [], outputFormats: dispatch.outputFormats ?? [] };
+    inputFormats: dispatch.inputFormats ?? [], outputFormats: dispatch.outputFormats ?? [],
+    ...(dispatch.requiredArtifactFormats === undefined ? {} : { requiredArtifactFormats: dispatch.requiredArtifactFormats }) };
 }
 
 function receiptFor(attempt: AttemptRow): TaskReceipt {
@@ -128,6 +130,7 @@ export class TaskSchedulingStore {
       getAttempt: attemptKey => this.getAttempt(attemptKey),
       claimStart: fence => this.claimStart(fence, now()),
       recordReport: report => this.recordReport(report, now()),
+      stageArtifact: (fence, artifact) => stageWorkerArtifact(this.db, fence, artifact),
     };
   }
 
@@ -520,7 +523,10 @@ export class TaskSchedulingStore {
       }
       this.db.prepare('UPDATE task_attempts SET last_event_seq = ? WHERE attempt_key = ?').run(eventSeq, report.attemptKey);
       if (event.kind === 'result') {
-        this.finishAttempt(attempt, { status: event.outcome, summary: event.summary }, 'worker_result', now);
+        const dispatch = JSON.parse(attempt.dispatch_json ?? '{}') as TaskDispatchSpec;
+        const result = prepareWorkerResult(this.db, attempt.attempt_key, dispatch.requiredArtifactFormats ?? [], event);
+        this.finishAttempt(attempt, result.outcome, 'worker_result', now);
+        freezeWorkerArtifacts(this.db, receiptFor(attempt), attempt.attempt_key, result.references);
       }
       return 'recorded';
     });

@@ -1,10 +1,11 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { DELIVERY_SCHEMA } from './delivery-schema.js';
 
 export const TASK_PHASES = ['waiting_input', 'waiting_dependency', 'queued', 'running', 'reconciling', 'closed'] as const;
 export const OUTCOME_STATUSES = ['succeeded', 'partial', 'failed', 'cancelled', 'timed_out', 'dependency_failed', 'outcome_unknown'] as const;
 
 const APPLICATION_ID = 0x50415443;
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const SCHEMA = `
   CREATE TABLE tasks (
@@ -202,9 +203,10 @@ export function initializeTaskCoordinatorSchema(db: DatabaseSync): void {
     const applicationId = db.prepare('PRAGMA application_id').get()?.application_id;
     const schemaVersion = db.prepare('PRAGMA user_version').get()?.user_version;
     if (applicationId === APPLICATION_ID && schemaVersion === SCHEMA_VERSION) return;
-    if (applicationId === APPLICATION_ID && (schemaVersion === 1 || schemaVersion === 2)) {
+    if (applicationId === APPLICATION_ID && (schemaVersion === 1 || schemaVersion === 2 || schemaVersion === 3)) {
       if (schemaVersion === 1) db.exec(SCHEDULING_SCHEMA);
-      db.exec(RECOVERY_SCHEMA);
+      if (schemaVersion <= 2) db.exec(RECOVERY_SCHEMA);
+      db.exec(DELIVERY_SCHEMA);
       db.exec(`PRAGMA user_version=${SCHEMA_VERSION};`);
       return;
     }
@@ -215,6 +217,7 @@ export function initializeTaskCoordinatorSchema(db: DatabaseSync): void {
     db.exec(SCHEMA);
     db.exec(SCHEDULING_SCHEMA);
     db.exec(RECOVERY_SCHEMA);
+    db.exec(DELIVERY_SCHEMA);
     db.exec(`PRAGMA application_id=${APPLICATION_ID}; PRAGMA user_version=${SCHEMA_VERSION};`);
   });
 }

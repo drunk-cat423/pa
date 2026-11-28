@@ -3,6 +3,9 @@ import { lstatSync } from "node:fs";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, isAbsolute } from "node:path";
+import { ArtifactUnavailableError } from "./artifacts.js";
+import type { TaskDeliveryStore } from "./delivery-store.js";
+import type { TaskDeliveryWorker } from "./delivery.js";
 import { validateSchedulingInterval } from "./scheduler.js";
 import type { TaskScheduler } from "./scheduler.js";
 import { TaskCoordinatorError } from "./store.js";
@@ -21,6 +24,9 @@ type CoordinatorOptions = {
   store: TaskCoordinatorStore;
   scheduler?: TaskScheduler;
   schedulingIntervalMs?: number;
+  deliveryStore?: TaskDeliveryStore;
+  deliveryWorker?: TaskDeliveryWorker;
+  deliveryIntervalMs?: number;
 };
 
 const errorStatuses = {
@@ -30,6 +36,7 @@ const errorStatuses = {
   method_not_allowed: 405,
   conflict: 409,
   invalid_state: 409,
+  artifact_unavailable: 409,
   request_too_large: 413,
   unsupported_media_type: 415,
   unsupported_version: 426,
@@ -121,7 +128,7 @@ function readList<T>(value: unknown, readItem: (item: unknown) => T): T[] {
 function parseSpec(value: unknown): TaskSpec {
   const spec = readObject(value);
   fields(spec, "goal", "capability", "materials", "deadlineAt", "budget", "workspaceKey", "inputFormats", "outputFormats",
-    "dependencies", "waitingForInput", "notBeforeAt");
+    "dependencies", "waitingForInput", "notBeforeAt", "requiredArtifactFormats");
   const { waitingForInput } = spec;
   if (waitingForInput !== undefined && typeof waitingForInput !== "boolean") throw new RequestError("invalid_request");
   return {
@@ -135,6 +142,7 @@ function parseSpec(value: unknown): TaskSpec {
     ...(spec.workspaceKey === undefined ? {} : { workspaceKey: readString(spec.workspaceKey) }),
     ...(spec.inputFormats === undefined ? {} : { inputFormats: readList(spec.inputFormats, readString) }),
     ...(spec.outputFormats === undefined ? {} : { outputFormats: readList(spec.outputFormats, readString) }),
+    ...(spec.requiredArtifactFormats === undefined ? {} : { requiredArtifactFormats: readList(spec.requiredArtifactFormats, readString) }),
     ...(spec.dependencies === undefined ? {} : { dependencies: readList(spec.dependencies, value => {
       const dependency = readObject(value);
       fields(dependency, "taskId", "revision", "allowPartial");
@@ -146,11 +154,24 @@ function parseSpec(value: unknown): TaskSpec {
   };
 }
 
+function readId(value: unknown, min = 1): number {
+  const id = readNumber(value);
+  if (!Number.isSafeInteger(id) || id < min) throw new RequestError("invalid_request");
+  return id;
+}
+
+function readReceipt(body: RequestBody): { taskId: string; revision: number } {
+  const taskId = readString(body.taskId);
+  if (!/^[a-f0-9-]{36}$/.test(taskId)) throw new RequestError("invalid_request");
+  return { taskId, revision: readId(body.revision) };
+}
+
 async function dispatch(
   request: IncomingMessage,
   owner: string,
   store: TaskCoordinatorStore,
-  scheduler?: TaskScheduler,
+  scheduler: TaskScheduler | undefined,
+  deliveryStore: TaskDeliveryStore | undefined,
 ): Promise<unknown> {
   if (request.method !== "POST") throw new RequestError("method_not_allowed");
   const body = await readBody(request);
@@ -173,6 +194,25 @@ async function dispatch(
     case "/v1/lookup":
       fields(body, "protocolVersion", "sourceKey");
       return store.lookupRequest(owner, readString(body.sourceKey));
+    case "/v1/result":
+      fields(body, "protocolVersion", "taskId", "revision", "afterNotificationId");
+      return deliveryStore?.result(owner, readReceipt(body),
+        body.afterNotificationId === undefined ? 0 : readId(body.afterNotificationId, 0));
+    case "/v1/artifact": {
+      fields(body, "protocolVersion", "taskId", "revision", "reference");
+      const reference = readString(body.reference);
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$/.test(reference)) throw new RequestError("invalid_request");
+      const artifact = deliveryStore?.readArtifact(owner, readReceipt(body), reference);
+      if (!artifact) return undefined;
+      const { bytes, ...metadata } = artifact;
+      return { ...metadata, bytesBase64: Buffer.from(bytes).toString("base64") };
+    }
+    case "/v1/reclaim":
+      fields(body, "protocolVersion", "taskId", "revision", "sourceKey");
+      return deliveryStore && { notificationId: deliveryStore.reclaim(owner, readString(body.sourceKey), readReceipt(body)) };
+    case "/v1/delivery":
+      fields(body, "protocolVersion", "notificationId");
+      return deliveryStore?.delivery(owner, readId(body.notificationId));
     case "/v1/status":
       fields(body, "protocolVersion", "taskId", "revision");
       return store.status(owner, readString(body.taskId), body.revision === undefined ? undefined : readNumber(body.revision));
@@ -215,12 +255,14 @@ function validateEndpoint(socketPath: string): void {
 
 export async function startCoordinator({
   socketPath, owner, token, store, scheduler, schedulingIntervalMs = 100,
+  deliveryStore, deliveryWorker, deliveryIntervalMs = 100,
 }: CoordinatorOptions): Promise<{ close(): Promise<void> }> {
   if (typeof owner !== "string" || owner.trim() !== owner || owner.length === 0 || owner.length > 256 ||
       typeof token !== "string" || !tokenPattern.test(token)) {
     throw new Error("invalid_credential");
   }
   if (scheduler) validateSchedulingInterval(schedulingIntervalMs);
+  if (deliveryWorker) validateSchedulingInterval(deliveryIntervalMs);
   validateEndpoint(socketPath);
   const tokenDigest = digest(token);
   const server = createServer({
@@ -232,14 +274,14 @@ export async function startCoordinator({
     void (async () => {
       try {
         if (!authorized(request, tokenDigest)) throw new RequestError("unauthorized");
-        const result = await dispatch(request, owner, store, scheduler);
+        const result = await dispatch(request, owner, store, scheduler, deliveryStore);
         if (result === undefined) throw new RequestError("not_found");
         respond(response, 200, { result });
       } catch (error) {
         if (response.destroyed) return;
         const code = error instanceof RequestError || error instanceof TaskCoordinatorError
           ? error.code
-          : "internal_error";
+          : error instanceof ArtifactUnavailableError ? "artifact_unavailable" : "internal_error";
         respond(response, errorStatuses[code], { error: code });
       }
     })();
@@ -265,15 +307,16 @@ export async function startCoordinator({
   });
   try {
     scheduler?.start(schedulingIntervalMs);
+    deliveryWorker?.start(deliveryIntervalMs);
   } catch (error) {
-    await closeServer();
+    await Promise.allSettled([closeServer(), scheduler?.close()]);
     throw error;
   }
 
   let closing: Promise<void> | undefined;
   return {
     close() {
-      closing ??= Promise.allSettled([closeServer(), scheduler?.close()]).then(results => {
+      closing ??= Promise.allSettled([closeServer(), scheduler?.close(), deliveryWorker?.close()]).then(results => {
         for (const result of results) if (result.status === "rejected") throw result.reason;
       });
       return closing;
