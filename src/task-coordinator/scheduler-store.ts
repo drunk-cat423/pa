@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { inImmediateTransaction } from './schema.js';
-import type { TaskDispatchSpec, TaskOutcome, TaskPhase, TaskReceipt } from './store.js';
+import type { TaskCancellation, TaskDispatchSpec, TaskOutcome, TaskPhase, TaskReceipt } from './store.js';
 import { WORKER_PROTOCOL_VERSION } from './worker-contract.js';
 import type {
   AuthenticatedWorkerReport, WorkerAttemptFence, WorkerAttemptKey, WorkerDeclaration, WorkerRecordDisposition,
@@ -34,6 +34,7 @@ type Usage = Record<ResourceKind, Map<string, number>>;
 type Candidate = {
   queue_id: number; task_id: string; revision: number; owner: string; phase: 'queued' | 'waiting_dependency';
   capability: string; dispatch_json: string | null; deadline_at: number; resume_worker_id: string | null;
+  not_before_at: number | null;
 };
 
 type AttemptRow = {
@@ -43,12 +44,27 @@ type AttemptRow = {
   owner: string; phase: TaskPhase; capability: string; dispatch_json: string | null;
   goal: string; materials_json: string; deadline_at: number; budget: number;
   resume_attempt_key: string | null; resume_revision: number | null; resume_external_id: string | null;
+  cancel_requested_at: number | null; next_recovery_at: number | null;
+  recovery_grace_ms: number | null; stop_requested_at: number | null;
 };
+
+export type RecoveryProbe = {
+  attempt: WorkerAttemptKey;
+  operation: 'inspect' | 'stop';
+  leaseUntil: number;
+};
+
+export type RecoveryEvidence = 'stopped' | 'finished' | 'unconfirmed';
+
+type RecoveryCandidate = { attempt_key: string; task_id: string; revision: number; owner: string; phase: TaskPhase;
+  worker_id: string; lease_generation: number; deadline_at: number; cancel_requested_at: number | null;
+  stop_requested_at: number | null; recovery_grace_ms: number | null; recovery_lease_until: number | null };
 
 type ClaimOptions = {
   limits: SchedulingLimits;
   scanLimit: number;
   now: number;
+  recoveryGraceMs?: number;
   permissions(owner: string): ReadonlySet<string>;
   select(requirements: WorkerRequirements, permissions: ReadonlySet<string>, hasCapacity: (worker: WorkerDeclaration) => boolean): WorkerDeclaration | undefined;
 };
@@ -87,6 +103,10 @@ function canReport(attempt: AttemptRow): boolean {
   return attempt.ended_at === null && (attempt.phase === 'running' || attempt.phase === 'reconciling');
 }
 
+function deadlineAfter(time: number, delay: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, time + delay);
+}
+
 export function closeTaskRevision(db: DatabaseSync, owner: string, { taskId, revision }: TaskReceipt,
   outcome: TaskOutcome, phase: TaskPhase, now: number): void {
   const update = db.prepare("UPDATE task_revisions SET phase = 'closed' WHERE task_id = ? AND revision = ? AND phase = ?")
@@ -106,7 +126,7 @@ export class TaskSchedulingStore {
   workerPort(now: () => number): WorkerAttemptPort {
     return {
       getAttempt: attemptKey => this.getAttempt(attemptKey),
-      claimStart: fence => this.claimStart(fence),
+      claimStart: fence => this.claimStart(fence, now()),
       recordReport: report => this.recordReport(report, now()),
     };
   }
@@ -137,7 +157,7 @@ export class TaskSchedulingStore {
       workspaces: new Set(usage.workspace.keys()) };
   }
 
-  claimRound({ limits, scanLimit, now, permissions, select }: ClaimOptions): SchedulingRound {
+  claimRound({ limits, scanLimit, now, recoveryGraceMs = 30_000, permissions, select }: ClaimOptions): SchedulingRound {
     return inImmediateTransaction(this.db, () => {
       const usage = this.readUsage();
       const attempts: WorkerAttemptKey[] = [];
@@ -161,7 +181,8 @@ export class TaskSchedulingStore {
           ON CONFLICT(owner) DO UPDATE SET queue_id = excluded.queue_id, scan_end_id = excluded.scan_end_id`)
           .run(owner, candidate.queue_id, scanEndId);
 
-        if (candidate.deadline_at <= now || !this.resolveDependencies(candidate)
+        if (candidate.deadline_at <= now || (candidate.not_before_at !== null && candidate.not_before_at > now)
+          || !this.resolveDependencies(candidate)
           || used(usage, 'owner', owner) >= limits.maxConcurrentPerOwner) continue;
         const dispatch = JSON.parse(candidate.dispatch_json ?? '{}') as TaskDispatchSpec;
         const workspace = workspaceFor(owner, candidate.task_id, dispatch);
@@ -177,7 +198,7 @@ export class TaskSchedulingStore {
         if (!worker) continue;
 
         const resources = resourcesFor(owner, worker, workspace);
-        const attempt = this.reserve(candidate, worker, allowed, resources, now);
+        const attempt = this.reserve(candidate, worker, allowed, resources, now, recoveryGraceMs);
         attempts.push(attempt);
         for (const { kind, key, units } of resources) usage[kind].set(key, used(usage, kind, key) + units);
       }
@@ -195,12 +216,17 @@ export class TaskSchedulingStore {
       const attempt = this.readAttempt(key.attemptKey);
       if (!ownsFence(attempt, key)) return;
       if (result.disposition === 'rejected') {
-        if (!canReport(attempt)) return;
-        this.db.prepare("UPDATE task_attempts SET dispatch_state = 'rejected' WHERE attempt_key = ?").run(key.attemptKey);
-        this.finishAttempt(attempt, { status: 'failed', summary: `Worker refused to start (${result.reason}).` }, 'start_rejected', now);
+        const expected = result.reason === 'adapter_rejected' ? 'possibly_sent' : 'unsent';
+        if (attempt.dispatch_state !== expected) return;
+        if (canReport(attempt)) {
+          this.db.prepare("UPDATE task_attempts SET dispatch_state = 'rejected' WHERE attempt_key = ?").run(key.attemptKey);
+          this.finishAttempt(attempt, attempt.cancel_requested_at === null
+            ? { status: 'failed', summary: `Worker refused to start (${result.reason}).` }
+            : { status: 'cancelled', summary: '执行方确认未启动。' }, 'start_rejected', now);
+        } else this.releaseResources(attempt.attempt_key, 'start_rejected', now);
         return;
       }
-      if (attempt.dispatch_state !== 'possibly_sent') return;
+      if (!canReport(attempt) || attempt.dispatch_state !== 'possibly_sent') return;
       this.db.prepare('UPDATE task_attempts SET dispatch_state = ?, external_id = ? WHERE attempt_key = ?')
         .run(result.disposition === 'accepted' ? 'accepted' : 'possibly_sent', result.externalId ?? null, key.attemptKey);
       if (result.disposition === 'unknown' && canReport(attempt)) {
@@ -208,6 +234,164 @@ export class TaskSchedulingStore {
           .run(attempt.task_id, attempt.revision);
       }
     });
+  }
+
+  cancel(owner: string, receipt: TaskReceipt, now: number): TaskCancellation | undefined {
+    return inImmediateTransaction(this.db, () => {
+      const row = this.db.prepare(`SELECT r.phase FROM task_revisions r JOIN tasks t USING (task_id)
+        WHERE t.owner = ? AND r.task_id = ? AND r.revision = ?`).get(owner, receipt.taskId, receipt.revision);
+      if (!row) return undefined;
+      const phase = row.phase as TaskPhase;
+      if (phase === 'closed') return { disposition: 'already_closed' };
+      const active = this.db.prepare(`SELECT attempt_key, dispatch_state FROM task_attempts
+        WHERE task_id = ? AND revision = ? AND ended_at IS NULL`).get(receipt.taskId, receipt.revision);
+      if (!active || active.dispatch_state === 'unsent') {
+        closeTaskRevision(this.db, owner, receipt, { status: 'cancelled', summary: '任务已取消，未启动执行。' }, phase, now);
+        if (active) this.releaseResources(String(active.attempt_key), 'cancelled_before_start', now);
+        return { disposition: 'cancelled' };
+      }
+      const updated = this.db.prepare(`UPDATE task_revisions SET cancel_requested_at = ?, phase = 'reconciling'
+        WHERE task_id = ? AND revision = ? AND cancel_requested_at IS NULL`).run(now, receipt.taskId, receipt.revision);
+      if (updated.changes) {
+        // Wake a future check. Preserve an already due check instead of changing its order.
+        this.db.prepare(`UPDATE task_attempts SET next_recovery_at = MIN(next_recovery_at, ?)
+          WHERE attempt_key = ?`).run(now, active.attempt_key!);
+      }
+      return { disposition: 'pending' };
+    });
+  }
+
+  /** Resource-accounted attempts proven not to have crossed the send boundary. */
+  unsent(now: number, healthy: ReadonlySet<string>, limit: number): WorkerAttemptKey[] {
+    if (!healthy.size) return [];
+    return this.db.prepare(`SELECT a.attempt_key AS attemptKey, a.worker_id AS workerId, a.lease_generation AS leaseGeneration
+      FROM task_attempts a JOIN task_revisions r USING (task_id, revision)
+      WHERE a.dispatch_state = 'unsent' AND a.ended_at IS NULL AND r.deadline_at > ? AND r.phase = 'running'
+        AND a.worker_id IN (SELECT value FROM json_each(?))
+      ORDER BY a.created_at, a.attempt_key LIMIT ?`).all(now, JSON.stringify([...healthy]), limit) as unknown as WorkerAttemptKey[];
+  }
+
+  recover(now: number, graceMs: number, limit: number, intervalMs: number,
+    timeouts: ReadonlyMap<string, number>, inFlight: ReadonlySet<string>): RecoveryProbe[] {
+    return inImmediateTransaction(this.db, () => {
+      this.closeOverdueRevisions(now, limit);
+      this.closeFailedDependencies(now, limit);
+      const due = this.db.prepare(`SELECT a.attempt_key, a.task_id, a.revision, a.worker_id, a.lease_generation,
+        a.recovery_grace_ms, a.stop_requested_at, a.recovery_lease_until, r.deadline_at, r.phase, r.cancel_requested_at, t.owner
+        FROM task_attempts a JOIN task_revisions r USING (task_id, revision) JOIN tasks t USING (task_id)
+        WHERE a.next_recovery_at <= ?
+        ORDER BY a.next_recovery_at, a.attempt_key LIMIT ?`).all(now, limit) as unknown as RecoveryCandidate[];
+      const probes: RecoveryProbe[] = [];
+      for (const row of due) {
+        const grace = row.recovery_grace_ms ?? graceMs;
+        const waitUntil = Math.min(row.deadline_at, row.cancel_requested_at ?? row.deadline_at);
+        const cutoff = deadlineAfter(waitUntil, grace);
+        const closed = row.phase === 'closed' || cutoff <= now;
+        if (row.phase !== 'closed' && cutoff <= now) {
+          closeTaskRevision(this.db, row.owner, { taskId: row.task_id, revision: row.revision },
+            { status: 'outcome_unknown', summary: '核对期限已到，执行结果仍无法确认。' }, row.phase, now);
+        } else if (row.phase === 'running' && waitUntil <= now) {
+          this.db.prepare("UPDATE task_revisions SET phase = 'reconciling' WHERE task_id = ? AND revision = ?")
+            .run(row.task_id, row.revision);
+        }
+        const timeout = timeouts.get(row.worker_id);
+        if ((row.recovery_lease_until !== null && row.recovery_lease_until > now)
+          || inFlight.has(row.attempt_key) || probes.length + inFlight.size >= limit || timeout === undefined) {
+          const dueAt = row.recovery_lease_until !== null && row.recovery_lease_until > now
+            ? row.recovery_lease_until : deadlineAfter(now, intervalMs);
+          this.db.prepare('UPDATE task_attempts SET next_recovery_at = ?, recovery_grace_ms = COALESCE(recovery_grace_ms, ?) WHERE attempt_key = ?')
+            .run(closed ? dueAt : Math.min(dueAt, cutoff), grace, row.attempt_key);
+          continue;
+        }
+        const operation = waitUntil <= now && row.stop_requested_at === null ? 'stop' : 'inspect';
+        const leaseUntil = deadlineAfter(now, timeout + 1_000);
+        const leased = this.db.prepare(`UPDATE task_attempts SET recovery_lease_until = ?,
+          next_recovery_at = ?, recovery_grace_ms = COALESCE(recovery_grace_ms, ?),
+          stop_requested_at = COALESCE(stop_requested_at, ?)
+          WHERE attempt_key = ? AND (recovery_lease_until IS NULL OR recovery_lease_until <= ?)`)
+          .run(leaseUntil, Math.min(leaseUntil, cutoff > now ? cutoff : leaseUntil), grace,
+            operation === 'stop' ? now : null, row.attempt_key, now);
+        if (leased.changes) probes.push({ attempt: { attemptKey: row.attempt_key, workerId: row.worker_id,
+          leaseGeneration: row.lease_generation }, operation, leaseUntil });
+      }
+      return probes;
+    });
+  }
+
+  finishRecovery(probe: RecoveryProbe, evidence: RecoveryEvidence, now: number, intervalMs: number): void {
+    inImmediateTransaction(this.db, () => {
+      const row = this.readAttempt(probe.attempt.attemptKey);
+      if (!ownsFence(row, probe.attempt) || row.next_recovery_at === null) return;
+      if (evidence !== 'unconfirmed') {
+        const releaseReason = evidence === 'stopped' ? 'worker_stopped' : 'worker_finished';
+        if (canReport(row)) {
+          let outcome: TaskOutcome = { status: 'outcome_unknown', summary: '执行方已结束，但未取得最终结果。' };
+          if (evidence === 'stopped') {
+            outcome = row.cancel_requested_at !== null
+              ? { status: 'cancelled', summary: '执行方确认已停止。' }
+              : { status: 'timed_out', summary: '执行期限已到，执行方确认已停止。' };
+          }
+          this.finishAttempt(row, outcome, releaseReason, now);
+        } else this.releaseResources(row.attempt_key, releaseReason, now);
+        return;
+      }
+      const waitUntil = Math.min(row.deadline_at, row.cancel_requested_at ?? row.deadline_at);
+      const cutoff = deadlineAfter(waitUntil, row.recovery_grace_ms!);
+      const due = row.phase === 'closed' ? deadlineAfter(now, intervalMs)
+        : Math.min(deadlineAfter(now, intervalMs), waitUntil > now ? waitUntil : cutoff);
+      this.db.prepare(`UPDATE task_attempts SET next_recovery_at = ?, recovery_lease_until = NULL
+        WHERE attempt_key = ? AND recovery_lease_until = ?`).run(due, row.attempt_key, probe.leaseUntil);
+    });
+  }
+
+  private closeOverdueRevisions(now: number, limit: number): void {
+    const queued = this.db.prepare(`SELECT r.task_id, r.revision, r.phase, t.owner
+      FROM task_revisions r JOIN tasks t USING (task_id)
+      WHERE r.phase IN ('waiting_input', 'waiting_dependency', 'queued') AND r.deadline_at <= ?
+      ORDER BY r.deadline_at, r.task_id, r.revision LIMIT ?`).all(now, limit);
+    for (const row of queued) {
+      closeTaskRevision(this.db, String(row.owner), { taskId: String(row.task_id), revision: Number(row.revision) },
+        { status: 'timed_out', summary: '任务在等待期间超过期限。' }, row.phase as TaskPhase, now);
+    }
+    const unsent = this.db.prepare(`SELECT a.attempt_key, r.task_id, r.revision, r.phase, t.owner
+      FROM task_attempts a JOIN task_revisions r USING (task_id, revision) JOIN tasks t USING (task_id)
+      WHERE a.dispatch_state = 'unsent' AND a.ended_at IS NULL AND r.deadline_at <= ?
+      ORDER BY a.created_at, a.attempt_key LIMIT ?`).all(now, limit);
+    for (const row of unsent) {
+      closeTaskRevision(this.db, String(row.owner), { taskId: String(row.task_id), revision: Number(row.revision) },
+        { status: 'timed_out', summary: '执行期限已到，任务尚未派发。' }, row.phase as TaskPhase, now);
+      this.releaseResources(String(row.attempt_key), 'expired_before_start', now);
+    }
+  }
+
+  private closeFailedDependencies(now: number, limit: number): void {
+    const policy = this.db.prepare(`SELECT dependency_recovery_cursor AS cursor, dependency_recovery_end AS end
+      FROM task_scheduler_policy WHERE singleton = 1`).get();
+    if (!policy) return;
+    let cursor = Number(policy.cursor);
+    let end = Number(policy.end);
+    const scan = this.db.prepare(`SELECT r.rowid AS position, r.task_id, r.revision, t.owner,
+      EXISTS (SELECT 1 FROM task_dependencies d JOIN task_conclusions c
+        ON c.task_id = d.prerequisite_id AND c.revision = d.prerequisite_revision
+        WHERE d.task_id = r.task_id AND d.revision = r.revision
+          AND c.status != 'succeeded' AND (c.status != 'partial' OR d.allow_partial = 0)) AS failed
+      FROM task_revisions r JOIN tasks t USING(task_id)
+      WHERE r.phase = 'waiting_dependency' AND r.rowid > ? AND r.rowid <= ?
+      ORDER BY r.rowid LIMIT ?`);
+    let rows = scan.all(cursor, end, limit);
+    if (!rows.length) {
+      cursor = 0;
+      end = Number(this.db.prepare("SELECT max(rowid) AS end FROM task_revisions WHERE phase = 'waiting_dependency'").get()?.end ?? 0);
+      rows = scan.all(cursor, end, limit);
+    }
+    if (!rows.length) return;
+    this.db.prepare(`UPDATE task_scheduler_policy SET dependency_recovery_cursor = ?, dependency_recovery_end = ?
+      WHERE singleton = 1`).run(rows.at(-1)!.position!, end);
+    for (const row of rows) {
+      if (row.failed === 1) closeTaskRevision(this.db, String(row.owner),
+        { taskId: String(row.task_id), revision: Number(row.revision) },
+        { status: 'dependency_failed', summary: '前置任务没有可用于此任务的结果。' }, 'waiting_dependency', now);
+    }
   }
 
   private readUsage(): Usage {
@@ -227,7 +411,7 @@ export class TaskSchedulingStore {
 
   private nextCandidate(owner: string): { candidate: Candidate; scanEndId: number } {
     const cursor = this.db.prepare('SELECT queue_id, scan_end_id FROM task_scheduler_cursors WHERE owner = ?').get(owner);
-    const next = this.db.prepare(`SELECT q.*, r.phase, r.capability, r.dispatch_json, r.deadline_at, prior.worker_id AS resume_worker_id
+    const next = this.db.prepare(`SELECT q.*, r.phase, r.capability, r.dispatch_json, r.deadline_at, r.not_before_at, prior.worker_id AS resume_worker_id
       FROM task_dispatch_queue q JOIN task_revisions r USING (task_id, revision)
       LEFT JOIN task_attempts prior ON prior.attempt_key = r.resume_attempt_key
       WHERE q.owner = ? AND q.queue_id > ? AND q.queue_id <= ?
@@ -255,7 +439,8 @@ export class TaskSchedulingStore {
     return true;
   }
 
-  private reserve(candidate: Candidate, worker: WorkerDeclaration, permissions: ReadonlySet<string>, resources: Resource[], now: number): WorkerAttemptKey {
+  private reserve(candidate: Candidate, worker: WorkerDeclaration, permissions: ReadonlySet<string>, resources: Resource[], now: number,
+    recoveryGraceMs: number): WorkerAttemptKey {
     const attemptKey = randomUUID();
     const { workerId, canResume } = worker;
     const leaseGeneration = Number(this.db.prepare(`SELECT COALESCE(MAX(lease_generation), 0) + 1 AS next
@@ -264,10 +449,10 @@ export class TaskSchedulingStore {
       .run(candidate.task_id, candidate.revision);
     if (update.changes !== 1) throw new Error('Task queue compare-and-set failed.');
     this.db.prepare(`INSERT INTO task_attempts
-      (attempt_key, task_id, revision, worker_id, lease_generation, attempt_token, can_resume, permissions_json, dispatch_state, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unsent', ?)`)
+      (attempt_key, task_id, revision, worker_id, lease_generation, attempt_token, can_resume, permissions_json, dispatch_state, created_at, recovery_grace_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unsent', ?, ?)`)
       .run(attemptKey, candidate.task_id, candidate.revision, workerId, leaseGeneration, randomBytes(32).toString('hex'),
-        Number(canResume), JSON.stringify([...permissions]), now);
+        Number(canResume), JSON.stringify([...permissions]), now, recoveryGraceMs);
     const reserve = this.db.prepare(`INSERT INTO task_reservations
       (attempt_key, resource_kind, resource_key, units, acquired_at) VALUES (?, ?, ?, ?, ?)`);
     for (const { kind, key, units } of resources) reserve.run(attemptKey, kind, key, units, now);
@@ -277,7 +462,7 @@ export class TaskSchedulingStore {
 
   private readAttempt(attemptKey: string): AttemptRow | undefined {
     return this.db.prepare(`SELECT a.*, t.owner, r.phase, r.capability, r.dispatch_json, r.goal, r.materials_json,
-      r.deadline_at, r.budget, r.resume_attempt_key, prior.revision AS resume_revision, prior.external_id AS resume_external_id
+      r.deadline_at, r.budget, r.cancel_requested_at, r.resume_attempt_key, prior.revision AS resume_revision, prior.external_id AS resume_external_id
       FROM task_attempts a JOIN task_revisions r USING (task_id, revision) JOIN tasks t USING (task_id)
       LEFT JOIN task_attempts prior ON prior.attempt_key = r.resume_attempt_key WHERE a.attempt_key = ?`)
       .get(attemptKey) as AttemptRow | undefined;
@@ -300,12 +485,13 @@ export class TaskSchedulingStore {
     };
   }
 
-  private claimStart({ attemptKey, workerId, leaseGeneration, attemptToken }: WorkerAttemptFence): boolean {
-    const result = this.db.prepare(`UPDATE task_attempts SET dispatch_state = 'possibly_sent'
+  private claimStart({ attemptKey, workerId, leaseGeneration, attemptToken }: WorkerAttemptFence, now: number): boolean {
+    const result = this.db.prepare(`UPDATE task_attempts SET dispatch_state = 'possibly_sent', next_recovery_at = ?
       WHERE attempt_key = ? AND worker_id = ? AND lease_generation = ? AND attempt_token = ?
         AND dispatch_state = 'unsent' AND ended_at IS NULL AND EXISTS (SELECT 1 FROM task_revisions r
-          WHERE r.task_id = task_attempts.task_id AND r.revision = task_attempts.revision AND r.phase = 'running')`)
-      .run(attemptKey, workerId, leaseGeneration, attemptToken);
+          WHERE r.task_id = task_attempts.task_id AND r.revision = task_attempts.revision
+            AND r.phase = 'running' AND r.deadline_at > ?)`)
+      .run(now, attemptKey, workerId, leaseGeneration, attemptToken, now);
     return result.changes === 1;
   }
 
@@ -313,7 +499,7 @@ export class TaskSchedulingStore {
     return inImmediateTransaction(this.db, () => {
       const attempt = this.readAttempt(report.attemptKey);
       if (!ownsFence(attempt, report) || attempt.attempt_token !== report.attemptToken
-        || attempt.dispatch_state === 'unsent') return 'stale_attempt';
+        || attempt.dispatch_state === 'unsent' || attempt.dispatch_state === 'rejected') return 'stale_attempt';
       const { eventSeq, event } = report;
       const payload = JSON.stringify(event);
       const original = this.db.prepare('SELECT event_json FROM task_attempt_events WHERE attempt_key = ? AND event_seq = ?')
@@ -323,7 +509,15 @@ export class TaskSchedulingStore {
       if (active && eventSeq <= attempt.last_event_seq) return 'out_of_order';
       this.db.prepare(`INSERT INTO task_attempt_events (attempt_key, event_seq, event_json, late, created_at) VALUES (?, ?, ?, ?, ?)`)
         .run(report.attemptKey, eventSeq, payload, active ? 0 : 1, now);
-      if (!active) return 'late';
+      if (!active) {
+        if (eventSeq > attempt.last_event_seq) {
+          this.db.prepare('UPDATE task_attempts SET last_event_seq = ? WHERE attempt_key = ?').run(eventSeq, report.attemptKey);
+        }
+        if (event.kind === 'result' && eventSeq > attempt.last_event_seq && attempt.ended_at === null) {
+          this.releaseResources(attempt.attempt_key, 'late_worker_result', now);
+        }
+        return 'late';
+      }
       this.db.prepare('UPDATE task_attempts SET last_event_seq = ? WHERE attempt_key = ?').run(eventSeq, report.attemptKey);
       if (event.kind === 'result') {
         this.finishAttempt(attempt, { status: event.outcome, summary: event.summary }, 'worker_result', now);
@@ -333,11 +527,14 @@ export class TaskSchedulingStore {
   }
 
   private finishAttempt(attempt: AttemptRow, outcome: TaskOutcome, releaseReason: string, now: number): void {
-    const ended = this.db.prepare('UPDATE task_attempts SET ended_at = ? WHERE attempt_key = ? AND ended_at IS NULL')
-      .run(now, attempt.attempt_key);
-    if (ended.changes !== 1) throw new Error('Task attempt compare-and-set failed.');
     closeTaskRevision(this.db, attempt.owner, receiptFor(attempt), outcome, attempt.phase, now);
+    this.releaseResources(attempt.attempt_key, releaseReason, now);
+  }
+
+  private releaseResources(attemptKey: string, releaseReason: string, now: number): void {
+    this.db.prepare(`UPDATE task_attempts SET ended_at = ?, next_recovery_at = NULL, recovery_lease_until = NULL
+      WHERE attempt_key = ? AND ended_at IS NULL`).run(now, attemptKey);
     this.db.prepare(`UPDATE task_reservations SET released_at = ?, release_reason = ?
-      WHERE attempt_key = ? AND released_at IS NULL`).run(now, releaseReason, attempt.attempt_key);
+      WHERE attempt_key = ? AND released_at IS NULL`).run(now, releaseReason, attemptKey);
   }
 }

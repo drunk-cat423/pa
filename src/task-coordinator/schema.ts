@@ -4,7 +4,7 @@ export const TASK_PHASES = ['waiting_input', 'waiting_dependency', 'queued', 'ru
 export const OUTCOME_STATUSES = ['succeeded', 'partial', 'failed', 'cancelled', 'timed_out', 'dependency_failed', 'outcome_unknown'] as const;
 
 const APPLICATION_ID = 0x50415443;
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
   CREATE TABLE tasks (
@@ -158,6 +158,29 @@ const SCHEDULING_SCHEMA = `
   ) STRICT;
 `;
 
+const RECOVERY_SCHEMA = `
+  ALTER TABLE task_revisions ADD COLUMN not_before_at INTEGER CHECK (not_before_at > 0);
+  ALTER TABLE task_revisions ADD COLUMN cancel_requested_at INTEGER;
+  ALTER TABLE task_attempts ADD COLUMN next_recovery_at INTEGER;
+  ALTER TABLE task_attempts ADD COLUMN recovery_lease_until INTEGER;
+  ALTER TABLE task_attempts ADD COLUMN recovery_grace_ms INTEGER CHECK (recovery_grace_ms > 0);
+  ALTER TABLE task_attempts ADD COLUMN stop_requested_at INTEGER;
+  ALTER TABLE task_scheduler_policy ADD COLUMN dependency_recovery_cursor INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE task_scheduler_policy ADD COLUMN dependency_recovery_end INTEGER NOT NULL DEFAULT 0;
+
+  UPDATE task_attempts SET next_recovery_at = 0
+    WHERE ended_at IS NULL AND dispatch_state IN ('possibly_sent', 'accepted');
+
+  CREATE INDEX task_revisions_expiry ON task_revisions(deadline_at, task_id, revision)
+    WHERE phase IN ('waiting_input', 'waiting_dependency', 'queued');
+  CREATE INDEX task_revisions_waiting_dependencies ON task_revisions(phase) WHERE phase = 'waiting_dependency';
+  CREATE INDEX task_attempts_recovery ON task_attempts(next_recovery_at, attempt_key)
+    WHERE next_recovery_at IS NOT NULL;
+  CREATE INDEX task_attempts_unsent ON task_attempts(created_at, attempt_key)
+    WHERE dispatch_state = 'unsent' AND ended_at IS NULL;
+  CREATE INDEX task_reservations_attempt_live ON task_reservations(attempt_key) WHERE released_at IS NULL;
+`;
+
 export function inImmediateTransaction<T>(db: DatabaseSync, operation: () => T): T {
   db.exec('BEGIN IMMEDIATE');
   try {
@@ -179,8 +202,9 @@ export function initializeTaskCoordinatorSchema(db: DatabaseSync): void {
     const applicationId = db.prepare('PRAGMA application_id').get()?.application_id;
     const schemaVersion = db.prepare('PRAGMA user_version').get()?.user_version;
     if (applicationId === APPLICATION_ID && schemaVersion === SCHEMA_VERSION) return;
-    if (applicationId === APPLICATION_ID && schemaVersion === 1) {
-      db.exec(SCHEDULING_SCHEMA);
+    if (applicationId === APPLICATION_ID && (schemaVersion === 1 || schemaVersion === 2)) {
+      if (schemaVersion === 1) db.exec(SCHEDULING_SCHEMA);
+      db.exec(RECOVERY_SCHEMA);
       db.exec(`PRAGMA user_version=${SCHEMA_VERSION};`);
       return;
     }
@@ -190,6 +214,7 @@ export function initializeTaskCoordinatorSchema(db: DatabaseSync): void {
     }
     db.exec(SCHEMA);
     db.exec(SCHEDULING_SCHEMA);
+    db.exec(RECOVERY_SCHEMA);
     db.exec(`PRAGMA application_id=${APPLICATION_ID}; PRAGMA user_version=${SCHEMA_VERSION};`);
   });
 }

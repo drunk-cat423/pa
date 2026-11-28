@@ -22,3 +22,5 @@ description: 查看 PA 任务协调器的阶段标准，通过隔离的本机服
 使用 `node scripts/verify-pa-tasks.mjs run P2` 验证适配器选择、回报身份和不明确接单。本阶段使用受控适配器和内存尝试记录，持久调度另行验收。
 
 使用 `node scripts/verify-pa-tasks.mjs run P3` 驱动双进程领取、外部回执等待、各层容量耗尽、跨发起人轮转及版本依赖。独立进程使用临时 SQLite，外部适配器受测试控制；报告包含实际执行区间和名额快照。
+
+使用 `node scripts/verify-pa-tasks.mjs run P4`。测试以临时 SQLite 和可控时钟重开协调器，通过独立进程留下派发断点，核对外部执行计数、任务结论、占用及自动通知记录。受控 worker 的停止回执用于验证协调器处理证据的方式，真实供应商的停止能力需在接入时独立核验。

@@ -120,13 +120,18 @@ function readList<T>(value: unknown, readItem: (item: unknown) => T): T[] {
 
 function parseSpec(value: unknown): TaskSpec {
   const spec = readObject(value);
-  fields(spec, "goal", "capability", "materials", "deadlineAt", "budget", "workspaceKey", "inputFormats", "outputFormats", "dependencies");
+  fields(spec, "goal", "capability", "materials", "deadlineAt", "budget", "workspaceKey", "inputFormats", "outputFormats",
+    "dependencies", "waitingForInput", "notBeforeAt");
+  const { waitingForInput } = spec;
+  if (waitingForInput !== undefined && typeof waitingForInput !== "boolean") throw new RequestError("invalid_request");
   return {
     goal: readString(spec.goal),
     capability: readString(spec.capability),
     materials: readList(spec.materials, readString),
     deadlineAt: readNumber(spec.deadlineAt),
     budget: readNumber(spec.budget),
+    ...(waitingForInput === undefined ? {} : { waitingForInput }),
+    ...(spec.notBeforeAt === undefined ? {} : { notBeforeAt: readNumber(spec.notBeforeAt) }),
     ...(spec.workspaceKey === undefined ? {} : { workspaceKey: readString(spec.workspaceKey) }),
     ...(spec.inputFormats === undefined ? {} : { inputFormats: readList(spec.inputFormats, readString) }),
     ...(spec.outputFormats === undefined ? {} : { outputFormats: readList(spec.outputFormats, readString) }),
@@ -145,6 +150,7 @@ async function dispatch(
   request: IncomingMessage,
   owner: string,
   store: TaskCoordinatorStore,
+  scheduler?: TaskScheduler,
 ): Promise<unknown> {
   if (request.method !== "POST") throw new RequestError("method_not_allowed");
   const body = await readBody(request);
@@ -153,10 +159,17 @@ async function dispatch(
       fields(body, "protocolVersion", "sourceKey", "spec");
       return store.submit(owner, readString(body.sourceKey), parseSpec(body.spec));
     case "/v1/revise":
-      fields(body, "protocolVersion", "sourceKey", "taskId", "expectedRevision", "newGoal");
+      fields(body, "protocolVersion", "sourceKey", "taskId", "expectedRevision", "newGoal", "materials", "deadlineAt");
       return store.revise(
         owner, readString(body.sourceKey), readString(body.taskId), readNumber(body.expectedRevision), readString(body.newGoal),
+        {
+          ...(body.materials === undefined ? {} : { materials: readList(body.materials, readString) }),
+          ...(body.deadlineAt === undefined ? {} : { deadlineAt: readNumber(body.deadlineAt) }),
+        },
       );
+    case "/v1/cancel":
+      fields(body, "protocolVersion", "taskId", "revision");
+      return store.cancel(owner, readString(body.taskId), readNumber(body.revision), scheduler?.now());
     case "/v1/lookup":
       fields(body, "protocolVersion", "sourceKey");
       return store.lookupRequest(owner, readString(body.sourceKey));
@@ -219,7 +232,7 @@ export async function startCoordinator({
     void (async () => {
       try {
         if (!authorized(request, tokenDigest)) throw new RequestError("unauthorized");
-        const result = await dispatch(request, owner, store);
+        const result = await dispatch(request, owner, store, scheduler);
         if (result === undefined) throw new RequestError("not_found");
         respond(response, 200, { result });
       } catch (error) {
