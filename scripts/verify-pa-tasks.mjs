@@ -13,6 +13,15 @@ const compiler = join(repo, 'node_modules', 'typescript', 'bin', 'tsc');
 const planFile = 'docs/design/task-coordinator-verification.json';
 const usage = '用法 node scripts/verify-pa-tasks.mjs doctor | list | run <feature> | list-stage | plan [stage]';
 const features = {
+  P4: {
+    test: 'test/task-coordinator-p4.test.mjs',
+    name: 'V06 recovery resumes an unsent claim and reconciles possibly sent attempts without replay',
+    additional: [
+      'V07 a lost worker closes its dependency chain without blocking independent work',
+      'V08 cancellation and waiting deadlines close once without inventing stop evidence',
+    ],
+    fixtures: ['test/fixtures/task-coordinator-interrupted.mjs'],
+  },
   P3: {
     test: 'test/task-coordinator-p3.test.mjs',
     name: 'V04 two processes claim once and run independent tasks concurrently',

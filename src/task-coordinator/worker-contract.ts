@@ -59,9 +59,11 @@ export type WorkerStartReceipt =
   | { readonly disposition: 'rejected' };
 
 export type WorkerInspection =
+  // 'finished' confirms that this attempt cannot keep using its reserved resources or workspace.
   | { readonly disposition: 'running' | 'finished' | 'never_started' | 'unknown' | 'unsupported' };
 
 export type WorkerStopReceipt =
+  // 'stopped' must also fence a delayed start of the same attempt.
   | { readonly disposition: 'stopped' | 'requested' | 'unknown' | 'unsupported' };
 
 export interface WorkerAdapter {
@@ -74,6 +76,7 @@ export interface WorkerAdapter {
 export type WorkerEvent =
   | { readonly kind: 'progress'; readonly message: string }
   | {
+    // A terminal report confirms execution and resource use have ended for the attempt.
     readonly kind: 'result';
     readonly outcome: 'succeeded' | 'partial' | 'failed' | 'cancelled';
     readonly summary: string;

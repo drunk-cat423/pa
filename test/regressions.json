@@ -525,6 +525,24 @@
       "name": "V05 dependencies are pinned to revisions and cycles are refused",
       "basis": "critical",
       "reason": "依赖只消费指定修订；依赖循环或被旧版本推进会导致任务挂起或使用错误产物。"
+    },
+    {
+      "file": "test/task-coordinator-p4.test.mjs",
+      "name": "V06 recovery resumes an unsent claim and reconciles possibly sent attempts without replay",
+      "basis": "critical",
+      "reason": "在领取、发送标记或外部已执行后崩溃只按原尝试恢复，防止重复计费。"
+    },
+    {
+      "file": "test/task-coordinator-p4.test.mjs",
+      "name": "V07 a lost worker closes its dependency chain without blocking independent work",
+      "basis": "critical",
+      "reason": "失联任务与依赖必须有结论；保留不确定占用，隔离旧写者，健康池仍可以继续处理。"
+    },
+    {
+      "file": "test/task-coordinator-p4.test.mjs",
+      "name": "V08 cancellation and waiting deadlines close once without inventing stop evidence",
+      "basis": "critical",
+      "reason": "取消请求、执行结束和各阶段期限竞争时不能伪造停止或重复生成结论和通知。"
     }
   ]
 }

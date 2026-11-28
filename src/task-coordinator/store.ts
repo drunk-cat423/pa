@@ -14,7 +14,12 @@ export interface TaskSpec {
   readonly workspaceKey?: string;
   readonly inputFormats?: readonly string[];
   readonly outputFormats?: readonly string[];
+  readonly waitingForInput?: boolean;
+  readonly notBeforeAt?: number;
 }
+
+export type TaskRevisionOptions = Pick<TaskSpec, 'deadlineAt' | 'materials'>;
+export type TaskCancellation = { disposition: 'pending' | 'cancelled' | 'already_closed' };
 
 export interface TaskReceipt {
   taskId: string;
@@ -35,7 +40,7 @@ export interface TaskOutcome {
   summary: string;
 }
 
-export type TaskStatus = TaskReceipt & { spec: TaskSpec } & (
+export type TaskStatus = TaskReceipt & { spec: TaskSpec; cancelRequestedAt?: number } & (
   | { phase: Exclude<TaskPhase, 'closed'>; conclusion: null }
   | { phase: 'closed'; conclusion: TaskOutcome }
 );
@@ -58,6 +63,8 @@ type StatusRow = ConclusionRow & {
   materials_json: string;
   deadline_at: number;
   budget: number;
+  not_before_at: number | null;
+  cancel_requested_at: number | null;
   dispatch_json: string | null;
   dependencies_locked: number;
 };
@@ -94,24 +101,21 @@ function validateSpec(value: unknown): TaskSpec {
   if (!value || typeof value !== 'object' || Array.isArray(value)) invalid('spec');
   const input = value as Record<string, unknown>;
   const required = ['goal', 'capability', 'materials', 'deadlineAt', 'budget'];
-  const optional = ['dependencies', 'workspaceKey', 'inputFormats', 'outputFormats'];
+  const optional = ['dependencies', 'workspaceKey', 'inputFormats', 'outputFormats', 'waitingForInput', 'notBeforeAt'];
   if (!required.every(key => Object.hasOwn(input, key))
     || Object.keys(input).some(key => !required.includes(key) && !optional.includes(key))) invalid('spec');
   const goal = boundedText(input.goal, 'goal', MAX_TEXT_BYTES);
   const capability = boundedText(input.capability, 'capability', 128);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(capability)) invalid('capability');
-  if (!Array.isArray(input.materials) || input.materials.length > MAX_MATERIALS) invalid('materials');
-  const materials = Array.from(input.materials, (value: unknown) => {
-    const reference = boundedText(value, 'material reference', 256);
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*(?::[0-9]+)?$/.test(reference) || /^[A-Za-z]:/.test(reference)) {
-      invalid('material reference');
-    }
-    return reference;
-  });
+  const materials = validateMaterials(input.materials);
   const deadlineAt = positiveInteger(input.deadlineAt, 'deadlineAt');
   const budget = input.budget;
   if (typeof budget !== 'number' || !Number.isFinite(budget) || budget < 0) invalid('budget');
-  const spec: TaskSpec = { goal, capability, materials, deadlineAt, budget };
+  if (input.waitingForInput !== undefined && typeof input.waitingForInput !== 'boolean') invalid('waitingForInput');
+  const notBeforeAt = input.notBeforeAt === undefined ? undefined : positiveInteger(input.notBeforeAt, 'notBeforeAt');
+  const spec: TaskSpec = { goal, capability, materials, deadlineAt, budget,
+    ...(input.waitingForInput ? { waitingForInput: true } : {}),
+    ...(notBeforeAt === undefined ? {} : { notBeforeAt }) };
   const dispatch: { -readonly [Key in keyof TaskDispatchSpec]: TaskDispatchSpec[Key] } = {};
   if (Object.hasOwn(input, 'workspaceKey')) {
     if (!validWorkerName(input.workspaceKey)) invalid('workspace key');
@@ -127,6 +131,15 @@ function validateSpec(value: unknown): TaskSpec {
   return Object.hasOwn(input, 'dependencies')
     ? { ...spec, ...dispatch, dependencies: validateDependencies(input.dependencies) }
     : { ...spec, ...dispatch };
+}
+
+function validateMaterials(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > MAX_MATERIALS) invalid('materials');
+  return Array.from(value, (value: unknown) => {
+    const reference = boundedText(value, 'material reference', 256);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*(?::[0-9]+)?$/.test(reference) || /^[A-Za-z]:/.test(reference)) invalid('material reference');
+    return reference;
+  });
 }
 
 function validateDependencies(value: unknown): TaskDependency[] {
@@ -188,16 +201,17 @@ export class TaskCoordinatorStore {
 
       const receipt = { taskId: randomUUID(), revision: 1 };
       const now = Date.now();
-      const { goal, capability, materials, deadlineAt, budget, dependencies, ...dispatch } = snapshot;
+      const { goal, capability, materials, deadlineAt, budget, dependencies, waitingForInput, notBeforeAt, ...dispatch } = snapshot;
       this.db.prepare('INSERT INTO tasks (task_id, owner, origin_source_key, head_revision, created_at) VALUES (?, ?, ?, ?, ?)')
         .run(receipt.taskId, owner, sourceKey, receipt.revision, now);
       this.db.prepare(`INSERT INTO task_revisions
-        (task_id, revision, goal, capability, materials_json, deadline_at, budget, phase, created_at, dispatch_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
+        (task_id, revision, goal, capability, materials_json, deadline_at, budget, phase, created_at, dispatch_json, not_before_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(receipt.taskId, receipt.revision, goal, capability, JSON.stringify(materials), deadlineAt, budget,
-          now, JSON.stringify(dispatch));
+          waitingForInput ? 'waiting_input' : 'queued', now,
+          JSON.stringify(waitingForInput ? { ...dispatch, waitingForInput } : dispatch), notBeforeAt ?? null);
       if (dependencies) this.writeDependencies(owner, receipt, dependencies);
-      this.enqueue(owner, receipt);
+      if (!waitingForInput) this.enqueue(owner, receipt);
       this.insertRequest(owner, sourceKey, 'submit', hash, receipt, now);
       return receipt;
     });
@@ -214,7 +228,7 @@ export class TaskCoordinatorStore {
     boundedText(taskId, 'task ID', MAX_TASK_ID_BYTES);
     if (revision !== undefined) positiveInteger(revision, 'revision');
     const row = this.db.prepare(`SELECT r.revision, r.goal, r.capability, r.materials_json, r.deadline_at, r.budget,
-        r.phase, r.dispatch_json, r.dependencies_locked, c.status, c.summary
+        r.phase, r.dispatch_json, r.dependencies_locked, r.not_before_at, r.cancel_requested_at, c.status, c.summary
       FROM tasks t JOIN task_revisions r ON r.task_id = t.task_id AND r.revision = COALESCE(?, t.head_revision)
       LEFT JOIN task_conclusions c ON c.task_id = r.task_id AND c.revision = r.revision
       WHERE t.owner = ? AND t.task_id = ?`).get(revision ?? null, owner, taskId) as StatusRow | undefined;
@@ -223,33 +237,49 @@ export class TaskCoordinatorStore {
       goal: row.goal, capability: row.capability, materials: JSON.parse(row.materials_json) as string[],
       deadlineAt: row.deadline_at, budget: row.budget,
       ...JSON.parse(row.dispatch_json ?? '{}') as TaskDispatchSpec,
+      ...(row.not_before_at === null ? {} : { notBeforeAt: row.not_before_at }),
       ...(row.dependencies_locked ? { dependencies: this.readDependencies(taskId, row.revision) } : {}),
     };
-    const receipt = { taskId, revision: row.revision, spec };
+    const receipt = { taskId, revision: row.revision, spec,
+      ...(row.cancel_requested_at === null ? {} : { cancelRequestedAt: row.cancel_requested_at }) };
     const conclusion = readConclusion(row);
     if (row.phase === 'closed' && conclusion) return { ...receipt, phase: row.phase, conclusion };
     if (row.phase !== 'closed') return { ...receipt, phase: row.phase, conclusion: null };
     throw new Error('Closed task revision has no conclusion.');
   }
 
-  revise(owner: string, sourceKey: string, taskId: string, expectedRevision: number, newGoal: string): TaskReceipt {
+  revise(owner: string, sourceKey: string, taskId: string, expectedRevision: number, newGoal: string,
+    options: Partial<TaskRevisionOptions> = {}): TaskReceipt {
     boundedText(owner, 'owner', MAX_OWNER_BYTES);
     boundedText(sourceKey, 'source key', MAX_SOURCE_KEY_BYTES);
     boundedText(taskId, 'task ID', MAX_TASK_ID_BYTES);
     positiveInteger(expectedRevision, 'expected revision');
     boundedText(newGoal, 'goal', MAX_TEXT_BYTES);
-    const hash = hashRequest('revise', taskId, expectedRevision, newGoal);
+    const materials = options.materials === undefined ? undefined : validateMaterials(options.materials);
+    const deadline = options.deadlineAt === undefined ? undefined : positiveInteger(options.deadlineAt, 'deadlineAt');
+    const change = materials === undefined && deadline === undefined ? [] : [{ materials, deadline }];
+    const hash = hashRequest('revise', taskId, expectedRevision, newGoal, ...change);
     return inImmediateTransaction(this.db, () => {
       const original = this.readRequest(owner, sourceKey, hash);
       if (original) return original;
 
-      const head = this.db.prepare(`SELECT t.head_revision, r.phase, c.status, c.summary FROM tasks t
+      const head = this.db.prepare(`SELECT t.head_revision, r.phase, c.status, c.summary,
+        json_extract(r.dispatch_json, '$.waitingForInput') AS needs_input FROM tasks t
         JOIN task_revisions r ON r.task_id = t.task_id AND r.revision = t.head_revision
         LEFT JOIN task_conclusions c ON c.task_id = r.task_id AND c.revision = r.revision
-        WHERE t.owner = ? AND t.task_id = ?`).get(owner, taskId) as (ConclusionRow & { head_revision: number }) | undefined;
+        WHERE t.owner = ? AND t.task_id = ?`).get(owner, taskId) as (ConclusionRow & { head_revision: number; needs_input: number | null }) | undefined;
       if (!head) throw new TaskCoordinatorError('not_found', 'Task not found.');
       if (head.head_revision !== expectedRevision) throw new TaskCoordinatorError('conflict', 'Task revision changed.');
-      if (!readConclusion(head)) throw new TaskCoordinatorError('invalid_state', 'Current task revision is still open.');
+      const now = Date.now();
+      if (head.needs_input === 1 && !materials?.length) {
+        throw new TaskCoordinatorError('invalid_request', 'Additional materials are required.');
+      }
+      if (head.phase === 'waiting_input') {
+        closeTaskRevision(this.db, owner, { taskId, revision: expectedRevision },
+          { status: 'cancelled', summary: '收到补充材料，任务将在新修订中继续。' }, head.phase, now);
+      } else if (!readConclusion(head)) {
+        throw new TaskCoordinatorError('invalid_state', 'Current task revision is still open.');
+      }
       const prior = this.db.prepare(`SELECT attempt_key, can_resume FROM task_attempts
         WHERE task_id = ? AND revision <= ? AND dispatch_state IN ('possibly_sent', 'accepted')
         ORDER BY revision DESC, lease_generation DESC LIMIT 1`).get(taskId, expectedRevision);
@@ -258,17 +288,18 @@ export class TaskCoordinatorStore {
       }
 
       const receipt = { taskId, revision: positiveInteger(expectedRevision + 1, 'next revision') };
-      const now = Date.now();
       const update = this.db.prepare('UPDATE tasks SET head_revision = ? WHERE task_id = ? AND owner = ? AND head_revision = ?')
         .run(receipt.revision, taskId, owner, expectedRevision);
       if (update.changes !== 1) throw new Error('Task head revision compare-and-set failed.');
       const insertion = this.db.prepare(`INSERT INTO task_revisions
         (task_id, revision, goal, capability, materials_json, deadline_at, budget, phase, created_at, dispatch_json,
           dependencies_locked, resume_attempt_key)
-        SELECT task_id, ?, ?, capability, materials_json, deadline_at, budget,
+        SELECT task_id, ?, ?, capability, COALESCE(?, materials_json), COALESCE(?, deadline_at), budget,
           CASE WHEN EXISTS (SELECT 1 FROM task_dependencies d WHERE d.task_id = r.task_id AND d.revision = r.revision)
-            THEN 'waiting_dependency' ELSE 'queued' END, ?, dispatch_json, dependencies_locked, ? FROM task_revisions r
-        WHERE task_id = ? AND revision = ?`).run(receipt.revision, newGoal, now, prior?.attempt_key ?? null, taskId, expectedRevision);
+            THEN 'waiting_dependency' ELSE 'queued' END, ?, json_remove(dispatch_json, '$.waitingForInput'),
+          dependencies_locked, ? FROM task_revisions r
+        WHERE task_id = ? AND revision = ?`).run(receipt.revision, newGoal, materials === undefined ? null : JSON.stringify(materials),
+          deadline ?? null, now, prior?.attempt_key ?? null, taskId, expectedRevision);
       if (insertion.changes !== 1) throw new Error('Task revision snapshot was not copied.');
       this.db.prepare(`INSERT INTO task_dependencies (task_id, revision, prerequisite_id, prerequisite_revision, allow_partial)
         SELECT task_id, ?, prerequisite_id, prerequisite_revision, allow_partial FROM task_dependencies
@@ -277,6 +308,15 @@ export class TaskCoordinatorStore {
       this.insertRequest(owner, sourceKey, 'revise', hash, receipt, now);
       return receipt;
     });
+  }
+
+  cancel(owner: string, taskId: string, revision: number, now = Date.now()): TaskCancellation {
+    boundedText(owner, 'owner', MAX_OWNER_BYTES);
+    boundedText(taskId, 'task ID', MAX_TASK_ID_BYTES);
+    positiveInteger(revision, 'revision');
+    const result = this.scheduling.cancel(owner, { taskId, revision }, now);
+    if (!result) throw new TaskCoordinatorError('not_found', 'Task revision not found.');
+    return result;
   }
 
   settle(owner: string, taskId: string, revision: number, outcome: TaskOutcome): void {
@@ -354,7 +394,8 @@ export class TaskCoordinatorStore {
         VALUES (?, ?, ?, ?, ?)`).run(taskId, revision, dependency.taskId, dependency.revision,
         dependency.allowPartial === undefined ? null : Number(dependency.allowPartial));
     }
-    this.db.prepare('UPDATE task_revisions SET dependencies_locked = 1, phase = ? WHERE task_id = ? AND revision = ?')
+    this.db.prepare(`UPDATE task_revisions SET dependencies_locked = 1,
+      phase = CASE WHEN phase = 'waiting_input' THEN phase ELSE ? END WHERE task_id = ? AND revision = ?`)
       .run(dependencies.length ? 'waiting_dependency' : 'queued', taskId, revision);
   }
 
