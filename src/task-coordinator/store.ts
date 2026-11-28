@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { initializeTaskCoordinatorSchema, inImmediateTransaction, OUTCOME_STATUSES, TASK_PHASES } from './schema.js';
+import { closeTaskRevision, TaskSchedulingStore } from './scheduler-store.js';
+import { validWorkerFormat, validWorkerName } from './worker-contract.js';
 
 export interface TaskSpec {
   readonly goal: string;
@@ -8,12 +10,22 @@ export interface TaskSpec {
   readonly materials: readonly string[];
   readonly deadlineAt: number;
   readonly budget: number;
+  readonly dependencies?: readonly TaskDependency[];
+  readonly workspaceKey?: string;
+  readonly inputFormats?: readonly string[];
+  readonly outputFormats?: readonly string[];
 }
 
 export interface TaskReceipt {
   taskId: string;
   revision: number;
 }
+
+export interface TaskDependency extends TaskReceipt {
+  readonly allowPartial?: boolean;
+}
+
+export type TaskDispatchSpec = Pick<TaskSpec, 'workspaceKey' | 'inputFormats' | 'outputFormats'>;
 
 export type TaskPhase = typeof TASK_PHASES[number];
 export type TaskOutcomeStatus = typeof OUTCOME_STATUSES[number];
@@ -46,6 +58,8 @@ type StatusRow = ConclusionRow & {
   materials_json: string;
   deadline_at: number;
   budget: number;
+  dispatch_json: string | null;
+  dependencies_locked: number;
 };
 
 const MAX_OWNER_BYTES = 256;
@@ -77,7 +91,12 @@ function exactRecord(value: unknown, fields: readonly string[], field: string): 
 }
 
 function validateSpec(value: unknown): TaskSpec {
-  const input = exactRecord(value, ['goal', 'capability', 'materials', 'deadlineAt', 'budget'], 'spec');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) invalid('spec');
+  const input = value as Record<string, unknown>;
+  const required = ['goal', 'capability', 'materials', 'deadlineAt', 'budget'];
+  const optional = ['dependencies', 'workspaceKey', 'inputFormats', 'outputFormats'];
+  if (!required.every(key => Object.hasOwn(input, key))
+    || Object.keys(input).some(key => !required.includes(key) && !optional.includes(key))) invalid('spec');
   const goal = boundedText(input.goal, 'goal', MAX_TEXT_BYTES);
   const capability = boundedText(input.capability, 'capability', 128);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(capability)) invalid('capability');
@@ -92,7 +111,40 @@ function validateSpec(value: unknown): TaskSpec {
   const deadlineAt = positiveInteger(input.deadlineAt, 'deadlineAt');
   const budget = input.budget;
   if (typeof budget !== 'number' || !Number.isFinite(budget) || budget < 0) invalid('budget');
-  return { goal, capability, materials, deadlineAt, budget };
+  const spec: TaskSpec = { goal, capability, materials, deadlineAt, budget };
+  const dispatch: { -readonly [Key in keyof TaskDispatchSpec]: TaskDispatchSpec[Key] } = {};
+  if (Object.hasOwn(input, 'workspaceKey')) {
+    if (!validWorkerName(input.workspaceKey)) invalid('workspace key');
+    dispatch.workspaceKey = input.workspaceKey;
+  }
+  for (const key of ['inputFormats', 'outputFormats'] as const) {
+    if (!Object.hasOwn(input, key)) continue;
+    const formats = input[key];
+    if (!Array.isArray(formats) || formats.length > 64 || !Array.from(formats).every(validWorkerFormat)
+      || new Set(formats).size !== formats.length) invalid(key);
+    dispatch[key] = [...formats];
+  }
+  return Object.hasOwn(input, 'dependencies')
+    ? { ...spec, ...dispatch, dependencies: validateDependencies(input.dependencies) }
+    : { ...spec, ...dispatch };
+}
+
+function validateDependencies(value: unknown): TaskDependency[] {
+  if (!Array.isArray(value) || value.length > 64) invalid('dependencies');
+  const seen = new Set<string>();
+  return Array.from(value, (value: unknown) => {
+    const fields = value && typeof value === 'object' && Object.hasOwn(value, 'allowPartial')
+      ? ['taskId', 'revision', 'allowPartial'] : ['taskId', 'revision'];
+    const input = exactRecord(value, fields, 'dependency');
+    const taskId = boundedText(input.taskId, 'prerequisite ID', MAX_TASK_ID_BYTES);
+    const revision = positiveInteger(input.revision, 'prerequisite revision');
+    const key = JSON.stringify([taskId, revision]);
+    if (seen.has(key)) invalid('duplicate dependency');
+    seen.add(key);
+    if (fields.length === 2) return { taskId, revision };
+    if (typeof input.allowPartial !== 'boolean') invalid('allow partial dependency result');
+    return { taskId, revision, allowPartial: input.allowPartial };
+  });
 }
 
 function validateOutcome(value: unknown): TaskOutcome {
@@ -115,12 +167,14 @@ function readConclusion(row: ConclusionRow): TaskOutcome | null {
 /** Callers obtain owner and source keys from the trusted PA endpoint. */
 export class TaskCoordinatorStore {
   private readonly db: DatabaseSync;
+  readonly scheduling: TaskSchedulingStore;
 
   constructor(dbPath: string) {
     const db = new DatabaseSync(dbPath);
     try { initializeTaskCoordinatorSchema(db); }
     catch (error) { db.close(); throw error; }
     this.db = db;
+    this.scheduling = new TaskSchedulingStore(db);
   }
 
   submit(owner: string, sourceKey: string, spec: TaskSpec): TaskReceipt {
@@ -134,13 +188,16 @@ export class TaskCoordinatorStore {
 
       const receipt = { taskId: randomUUID(), revision: 1 };
       const now = Date.now();
+      const { goal, capability, materials, deadlineAt, budget, dependencies, ...dispatch } = snapshot;
       this.db.prepare('INSERT INTO tasks (task_id, owner, origin_source_key, head_revision, created_at) VALUES (?, ?, ?, ?, ?)')
         .run(receipt.taskId, owner, sourceKey, receipt.revision, now);
       this.db.prepare(`INSERT INTO task_revisions
-        (task_id, revision, goal, capability, materials_json, deadline_at, budget, phase, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)`)
-        .run(receipt.taskId, receipt.revision, snapshot.goal, snapshot.capability, JSON.stringify(snapshot.materials),
-          snapshot.deadlineAt, snapshot.budget, now);
+        (task_id, revision, goal, capability, materials_json, deadline_at, budget, phase, created_at, dispatch_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
+        .run(receipt.taskId, receipt.revision, goal, capability, JSON.stringify(materials), deadlineAt, budget,
+          now, JSON.stringify(dispatch));
+      if (dependencies) this.writeDependencies(owner, receipt, dependencies);
+      this.enqueue(owner, receipt);
       this.insertRequest(owner, sourceKey, 'submit', hash, receipt, now);
       return receipt;
     });
@@ -157,14 +214,16 @@ export class TaskCoordinatorStore {
     boundedText(taskId, 'task ID', MAX_TASK_ID_BYTES);
     if (revision !== undefined) positiveInteger(revision, 'revision');
     const row = this.db.prepare(`SELECT r.revision, r.goal, r.capability, r.materials_json, r.deadline_at, r.budget,
-        r.phase, c.status, c.summary
+        r.phase, r.dispatch_json, r.dependencies_locked, c.status, c.summary
       FROM tasks t JOIN task_revisions r ON r.task_id = t.task_id AND r.revision = COALESCE(?, t.head_revision)
       LEFT JOIN task_conclusions c ON c.task_id = r.task_id AND c.revision = r.revision
       WHERE t.owner = ? AND t.task_id = ?`).get(revision ?? null, owner, taskId) as StatusRow | undefined;
     if (!row) return undefined;
-    const spec = {
+    const spec: TaskSpec = {
       goal: row.goal, capability: row.capability, materials: JSON.parse(row.materials_json) as string[],
       deadlineAt: row.deadline_at, budget: row.budget,
+      ...JSON.parse(row.dispatch_json ?? '{}') as TaskDispatchSpec,
+      ...(row.dependencies_locked ? { dependencies: this.readDependencies(taskId, row.revision) } : {}),
     };
     const receipt = { taskId, revision: row.revision, spec };
     const conclusion = readConclusion(row);
@@ -191,6 +250,12 @@ export class TaskCoordinatorStore {
       if (!head) throw new TaskCoordinatorError('not_found', 'Task not found.');
       if (head.head_revision !== expectedRevision) throw new TaskCoordinatorError('conflict', 'Task revision changed.');
       if (!readConclusion(head)) throw new TaskCoordinatorError('invalid_state', 'Current task revision is still open.');
+      const prior = this.db.prepare(`SELECT attempt_key, can_resume FROM task_attempts
+        WHERE task_id = ? AND revision <= ? AND dispatch_state IN ('possibly_sent', 'accepted')
+        ORDER BY revision DESC, lease_generation DESC LIMIT 1`).get(taskId, expectedRevision);
+      if (prior?.can_resume === 0) {
+        throw new TaskCoordinatorError('invalid_state', 'Assigned worker does not support continuation.');
+      }
 
       const receipt = { taskId, revision: positiveInteger(expectedRevision + 1, 'next revision') };
       const now = Date.now();
@@ -198,10 +263,17 @@ export class TaskCoordinatorStore {
         .run(receipt.revision, taskId, owner, expectedRevision);
       if (update.changes !== 1) throw new Error('Task head revision compare-and-set failed.');
       const insertion = this.db.prepare(`INSERT INTO task_revisions
-        (task_id, revision, goal, capability, materials_json, deadline_at, budget, phase, created_at)
-        SELECT task_id, ?, ?, capability, materials_json, deadline_at, budget, 'queued', ? FROM task_revisions
-        WHERE task_id = ? AND revision = ?`).run(receipt.revision, newGoal, now, taskId, expectedRevision);
+        (task_id, revision, goal, capability, materials_json, deadline_at, budget, phase, created_at, dispatch_json,
+          dependencies_locked, resume_attempt_key)
+        SELECT task_id, ?, ?, capability, materials_json, deadline_at, budget,
+          CASE WHEN EXISTS (SELECT 1 FROM task_dependencies d WHERE d.task_id = r.task_id AND d.revision = r.revision)
+            THEN 'waiting_dependency' ELSE 'queued' END, ?, dispatch_json, dependencies_locked, ? FROM task_revisions r
+        WHERE task_id = ? AND revision = ?`).run(receipt.revision, newGoal, now, prior?.attempt_key ?? null, taskId, expectedRevision);
       if (insertion.changes !== 1) throw new Error('Task revision snapshot was not copied.');
+      this.db.prepare(`INSERT INTO task_dependencies (task_id, revision, prerequisite_id, prerequisite_revision, allow_partial)
+        SELECT task_id, ?, prerequisite_id, prerequisite_revision, allow_partial FROM task_dependencies
+        WHERE task_id = ? AND revision = ?`).run(receipt.revision, taskId, expectedRevision);
+      this.enqueue(owner, receipt);
       this.insertRequest(owner, sourceKey, 'revise', hash, receipt, now);
       return receipt;
     });
@@ -227,19 +299,63 @@ export class TaskCoordinatorStore {
         throw new TaskCoordinatorError('conflict', 'Task revision already has a different conclusion.');
       }
 
-      const now = Date.now();
-      const update = this.db.prepare("UPDATE task_revisions SET phase = 'closed' WHERE task_id = ? AND revision = ? AND phase = ?")
-        .run(taskId, revision, row.phase);
-      if (update.changes !== 1) throw new Error('Task phase compare-and-set failed.');
-      this.db.prepare('INSERT INTO task_conclusions (task_id, revision, status, summary, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(taskId, revision, proposed.status, proposed.summary, now);
-      this.db.prepare(`INSERT INTO task_notifications (task_id, revision, recipient_owner, purpose, status, created_at)
-        VALUES (?, ?, ?, 'automatic', 'pending', ?)`).run(taskId, revision, owner, now);
+      if (row.phase === 'running' || row.phase === 'reconciling') {
+        throw new TaskCoordinatorError('invalid_state', 'An active task must be settled by its assigned attempt.');
+      }
+      closeTaskRevision(this.db, owner, { taskId, revision }, proposed, row.phase, Date.now());
+    });
+  }
+
+  setDependencies(owner: string, receipt: TaskReceipt, dependencies: readonly TaskDependency[]): void {
+    boundedText(owner, 'owner', MAX_OWNER_BYTES);
+    const taskId = boundedText(receipt.taskId, 'task ID', MAX_TASK_ID_BYTES);
+    const revision = positiveInteger(receipt.revision, 'revision');
+    const snapshot = validateDependencies(dependencies);
+    inImmediateTransaction(this.db, () => {
+      const row = this.db.prepare(`SELECT r.phase, r.dependencies_locked FROM task_revisions r JOIN tasks t USING (task_id)
+        WHERE r.task_id = ? AND r.revision = ? AND t.owner = ?`).get(taskId, revision, owner);
+      if (!row) throw new TaskCoordinatorError('not_found', 'Task revision not found.');
+      if (row.dependencies_locked || row.phase !== 'queued') {
+        throw new TaskCoordinatorError('invalid_state', 'Task dependencies are already frozen.');
+      }
+      this.writeDependencies(owner, { taskId, revision }, snapshot);
     });
   }
 
   close(): void {
     this.db.close();
+  }
+
+  private enqueue(owner: string, { taskId, revision }: TaskReceipt): void {
+    this.db.prepare('INSERT INTO task_dispatch_queue (owner, task_id, revision) VALUES (?, ?, ?)').run(owner, taskId, revision);
+  }
+
+  private readDependencies(taskId: string, revision: number): TaskDependency[] {
+    const rows = this.db.prepare(`SELECT prerequisite_id, prerequisite_revision, allow_partial FROM task_dependencies
+      WHERE task_id = ? AND revision = ? ORDER BY rowid`).all(taskId, revision);
+    return rows.map(row => ({ taskId: String(row.prerequisite_id), revision: Number(row.prerequisite_revision),
+      ...(row.allow_partial === null ? {} : { allowPartial: row.allow_partial === 1 }) }));
+  }
+
+  private writeDependencies(owner: string, { taskId, revision }: TaskReceipt, dependencies: readonly TaskDependency[]): void {
+    for (const dependency of dependencies) {
+      const prerequisite = this.db.prepare(`SELECT 1 FROM task_revisions r JOIN tasks t USING (task_id)
+        WHERE r.task_id = ? AND r.revision = ? AND t.owner = ?`).get(dependency.taskId, dependency.revision, owner);
+      if (!prerequisite) throw new TaskCoordinatorError('not_found', 'Prerequisite revision not found.');
+      const cycle = this.db.prepare(`WITH RECURSIVE ancestors(id, rev) AS (
+        VALUES (?, ?)
+        UNION
+        SELECT d.prerequisite_id, d.prerequisite_revision FROM task_dependencies d
+          JOIN ancestors a ON d.task_id = a.id AND d.revision = a.rev
+      ) SELECT 1 FROM ancestors WHERE id = ? AND rev = ? LIMIT 1`)
+        .get(dependency.taskId, dependency.revision, taskId, revision);
+      if (cycle) throw new TaskCoordinatorError('invalid_request', 'Task dependency would create a cycle.');
+      this.db.prepare(`INSERT INTO task_dependencies (task_id, revision, prerequisite_id, prerequisite_revision, allow_partial)
+        VALUES (?, ?, ?, ?, ?)`).run(taskId, revision, dependency.taskId, dependency.revision,
+        dependency.allowPartial === undefined ? null : Number(dependency.allowPartial));
+    }
+    this.db.prepare('UPDATE task_revisions SET dependencies_locked = 1, phase = ? WHERE task_id = ? AND revision = ?')
+      .run(dependencies.length ? 'waiting_dependency' : 'queued', taskId, revision);
   }
 
   private readRequest(owner: string, sourceKey: string, expectedHash?: string): TaskReceipt | undefined {

@@ -142,8 +142,10 @@ export class WorkerEndpoint {
     const adapter = this.registry.adapter(key.workerId);
     if (!adapter) return { disposition: 'rejected', reason: 'unavailable_worker' };
     const fence = fenceFor(attempt);
-    const { taskId, revision, requirements, goal, materials, deadlineAt, budget } = attempt;
-    const start = { ...fence, taskId, revision, requirements: structuredClone(requirements), goal, materials: [...materials], deadlineAt, budget };
+    const { taskId, revision, requirements, goal, materials, deadlineAt, budget, workspaceKey, resumeFrom } = attempt;
+    const start = { ...fence, taskId, revision, requirements: structuredClone(requirements), goal, materials: [...materials],
+      deadlineAt, budget, ...(workspaceKey === undefined ? {} : { workspaceKey }),
+      ...(resumeFrom === undefined ? {} : { resumeFrom: { ...resumeFrom } }) };
     if (!this.attempts.claimStart(fence)) return { disposition: 'rejected', reason: 'dispatch_not_claimed' };
 
     const result = await invoke(adapter.declaration.limits.operationTimeoutMs, signal => adapter.start(start, signal));

@@ -13,6 +13,16 @@ const compiler = join(repo, 'node_modules', 'typescript', 'bin', 'tsc');
 const planFile = 'docs/design/task-coordinator-verification.json';
 const usage = '用法 node scripts/verify-pa-tasks.mjs doctor | list | run <feature> | list-stage | plan [stage]';
 const features = {
+  P3: {
+    test: 'test/task-coordinator-p3.test.mjs',
+    name: 'V04 two processes claim once and run independent tasks concurrently',
+    additional: [
+      'V04 global, worker, pool and workspace capacity each block an eligible task',
+      'V05 bounded scans and owner rotation preserve runnable FIFO',
+      'V05 dependencies are pinned to revisions and cycles are refused',
+    ],
+    fixtures: ['test/fixtures/task-coordinator-claim.mjs'],
+  },
   P2: {
     test: 'test/task-coordinator-p2.test.mjs',
     name: 'V03 selects a new compatible worker and fences start and authenticated reports',

@@ -501,6 +501,30 @@
       "name": "a silent adapter times out with unknown effects and no second start",
       "basis": "critical",
       "reason": "接单响应丢失不能导致重复发起一次可能已收费的任务。"
+    },
+    {
+      "file": "test/task-coordinator-p3.test.mjs",
+      "name": "V04 two processes claim once and run independent tasks concurrently",
+      "basis": "critical",
+      "reason": "并发争领可能重复收费，外部请求等待期间仍需允许其他任务写入和运行。"
+    },
+    {
+      "file": "test/task-coordinator-p3.test.mjs",
+      "name": "V04 global, worker, pool and workspace capacity each block an eligible task",
+      "basis": "critical",
+      "reason": "真实耗尽各层名额，避免同工作区并写或共享资源被重复占用。"
+    },
+    {
+      "file": "test/task-coordinator-p3.test.mjs",
+      "name": "V05 bounded scans and owner rotation preserve runnable FIFO",
+      "basis": "critical",
+      "reason": "拥塞的任务不能挡死其他发起人和空闲池，新调度进程也须保持轮转进度。"
+    },
+    {
+      "file": "test/task-coordinator-p3.test.mjs",
+      "name": "V05 dependencies are pinned to revisions and cycles are refused",
+      "basis": "critical",
+      "reason": "依赖只消费指定修订；依赖循环或被旧版本推进会导致任务挂起或使用错误产物。"
     }
   ]
 }

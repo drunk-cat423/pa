@@ -20,3 +20,5 @@ description: 查看 PA 任务协调器的阶段标准，通过隔离的本机服
 命令输出证据目录，包含源码摘要、命令、退出码和 TAP 日志。临时数据库和 socket 由用例关闭，编译副本由 CLI 清理；核对 run.json 中的 outcome 与 scratchRemoved。plan 只展示验收条件。
 
 使用 `node scripts/verify-pa-tasks.mjs run P2` 验证适配器选择、回报身份和不明确接单。本阶段使用受控适配器和内存尝试记录，持久调度另行验收。
+
+使用 `node scripts/verify-pa-tasks.mjs run P3` 驱动双进程领取、外部回执等待、各层容量耗尽、跨发起人轮转及版本依赖。独立进程使用临时 SQLite，外部适配器受测试控制；报告包含实际执行区间和名额快照。

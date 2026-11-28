@@ -3,6 +3,8 @@ import { lstatSync } from "node:fs";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, isAbsolute } from "node:path";
+import { validateSchedulingInterval } from "./scheduler.js";
+import type { TaskScheduler } from "./scheduler.js";
 import { TaskCoordinatorError } from "./store.js";
 import type { TaskCoordinatorStore, TaskSpec } from "./store.js";
 
@@ -17,6 +19,8 @@ type CoordinatorOptions = {
   owner: string;
   token: string;
   store: TaskCoordinatorStore;
+  scheduler?: TaskScheduler;
+  schedulingIntervalMs?: number;
 };
 
 const errorStatuses = {
@@ -109,16 +113,31 @@ function readNumber(value: unknown): number {
   return value;
 }
 
+function readList<T>(value: unknown, readItem: (item: unknown) => T): T[] {
+  if (!Array.isArray(value)) throw new RequestError("invalid_request");
+  return value.map(readItem);
+}
+
 function parseSpec(value: unknown): TaskSpec {
   const spec = readObject(value);
-  fields(spec, "goal", "capability", "materials", "deadlineAt", "budget");
-  if (!Array.isArray(spec.materials)) throw new RequestError("invalid_request");
+  fields(spec, "goal", "capability", "materials", "deadlineAt", "budget", "workspaceKey", "inputFormats", "outputFormats", "dependencies");
   return {
     goal: readString(spec.goal),
     capability: readString(spec.capability),
-    materials: spec.materials.map(readString),
+    materials: readList(spec.materials, readString),
     deadlineAt: readNumber(spec.deadlineAt),
     budget: readNumber(spec.budget),
+    ...(spec.workspaceKey === undefined ? {} : { workspaceKey: readString(spec.workspaceKey) }),
+    ...(spec.inputFormats === undefined ? {} : { inputFormats: readList(spec.inputFormats, readString) }),
+    ...(spec.outputFormats === undefined ? {} : { outputFormats: readList(spec.outputFormats, readString) }),
+    ...(spec.dependencies === undefined ? {} : { dependencies: readList(spec.dependencies, value => {
+      const dependency = readObject(value);
+      fields(dependency, "taskId", "revision", "allowPartial");
+      const { allowPartial } = dependency;
+      if (allowPartial !== undefined && typeof allowPartial !== "boolean") throw new RequestError("invalid_request");
+      return { taskId: readString(dependency.taskId), revision: readNumber(dependency.revision),
+        ...(allowPartial === undefined ? {} : { allowPartial }) };
+    }) }),
   };
 }
 
@@ -182,12 +201,13 @@ function validateEndpoint(socketPath: string): void {
 }
 
 export async function startCoordinator({
-  socketPath, owner, token, store,
+  socketPath, owner, token, store, scheduler, schedulingIntervalMs = 100,
 }: CoordinatorOptions): Promise<{ close(): Promise<void> }> {
   if (typeof owner !== "string" || owner.trim() !== owner || owner.length === 0 || owner.length > 256 ||
       typeof token !== "string" || !tokenPattern.test(token)) {
     throw new Error("invalid_credential");
   }
+  if (scheduler) validateSchedulingInterval(schedulingIntervalMs);
   validateEndpoint(socketPath);
   const tokenDigest = digest(token);
   const server = createServer({
@@ -224,14 +244,24 @@ export async function startCoordinator({
     });
   });
 
+  const closeServer = () => new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(new Error("endpoint_close_failed"));
+      else resolve();
+    });
+  });
+  try {
+    scheduler?.start(schedulingIntervalMs);
+  } catch (error) {
+    await closeServer();
+    throw error;
+  }
+
   let closing: Promise<void> | undefined;
   return {
     close() {
-      closing ??= new Promise<void>((resolve, reject) => {
-        server.close((error) => {
-          if (error) reject(new Error("endpoint_close_failed"));
-          else resolve();
-        });
+      closing ??= Promise.allSettled([closeServer(), scheduler?.close()]).then(results => {
+        for (const result of results) if (result.status === "rejected") throw result.reason;
       });
       return closing;
     },
